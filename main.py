@@ -1,0 +1,76 @@
+import sys
+import os
+import asyncio
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
+
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
+from rich.console import Console
+from rich.live   import Live
+
+import config
+import feeds
+import dashboard
+
+console = Console(force_terminal=True)
+
+
+def pick(title: str, options: list[str]) -> str:
+    console.print(f"\n[bold]{title}[/bold]")
+    for i, o in enumerate(options, 1):
+        console.print(f"  [{i}] {o}")
+    while True:
+        raw = input("  → ").strip()
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        except ValueError:
+            pass
+        console.print("  [red]invalid – try again[/red]")
+
+
+async def display_loop(state: feeds.State, coin: str, tf: str):
+    await asyncio.sleep(2)
+    with Live(console=console, refresh_per_second=1, transient=False) as live:
+        while True:
+            if state.mid > 0 and state.klines:
+                live.update(dashboard.render(state, coin, tf))
+            await asyncio.sleep(config.REFRESH)
+
+
+async def main():
+    console.print("\n[bold magenta]═══ CRYPTO PREDICTION DASHBOARD ═══[/bold magenta]\n")
+
+    coin = pick("Select coin:", config.COINS)
+    tf   = pick("Select timeframe:", config.TIMEFRAMES)
+
+    console.print(f"\n[bold green]Starting {coin} {tf} …[/bold green]\n")
+
+    state = feeds.State()
+
+    state.pm_up_id, state.pm_dn_id = feeds.fetch_pm_tokens(coin, tf)
+    if state.pm_up_id:
+        console.print(f"  [PM] Up   → {state.pm_up_id[:24]}…")
+        console.print(f"  [PM] Down → {state.pm_dn_id[:24]}…")
+    else:
+        console.print("  [yellow][PM] no market for this coin/timeframe – prices will not show[/yellow]")
+
+    binance_sym = config.COIN_BINANCE[coin]
+    kline_iv    = config.TF_KLINE[tf]
+    console.print("  [Binance] bootstrapping candles …")
+    await feeds.bootstrap(binance_sym, kline_iv, state)
+
+    await asyncio.gather(
+        feeds.ob_poller(binance_sym, state),
+        feeds.binance_feed(binance_sym, kline_iv, state),
+        feeds.pm_feed(state),
+        display_loop(state, coin, tf),
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
