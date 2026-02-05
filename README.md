@@ -4,6 +4,7 @@ Real-time terminal dashboard that combines live Binance order flow with Polymark
 
 **By [@SolSt1ne](https://x.com/SolSt1ne)**
 
+**[Polymarket](https://polymarket.com/?via=Yxwa280)**
 ---
 
 ## What it does
