@@ -53,7 +53,7 @@ console = Console(force_terminal=True)
 
 # ── Outcome detection ────────────────────────────────────────
 
-def fetch_period_outcome(coin: str, period_start_ts: int) -> str | None:
+def fetch_period_outcome(coin: str, period_start_ts: int, verbose: bool = False) -> str | None:
     """Check if a period has resolved and return 'up' or 'down' (or None if pending)."""
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(period_start_ts, tz=timezone.utc)
@@ -70,16 +70,25 @@ def fetch_period_outcome(coin: str, period_start_ts: int) -> str | None:
             "variant": "fifteen",
             "assetType": "crypto",
             "currentEventStartTime": next_iso,
-        }, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        }, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
 
         if resp.status_code == 200:
             data = resp.json()
-            for r in data.get("data", {}).get("results", []):
+            results = data.get("data", {}).get("results", [])
+            for r in results:
                 st = r.get("startTime", "")
                 if st.startswith(start_iso.replace("Z", "")):
                     return r.get("outcome")  # "up" or "down"
-    except Exception:
-        pass
+            if verbose:
+                n = len(results)
+                last_st = results[-1].get("startTime", "?") if results else "none"
+                print(f"  [BOT] settlement query: {n} results, last={last_st}, "
+                      f"looking for {start_iso}", flush=True)
+        elif verbose:
+            print(f"  [BOT] settlement query failed: HTTP {resp.status_code}", flush=True)
+    except Exception as e:
+        if verbose:
+            print(f"  [BOT] settlement query error: {e}", flush=True)
     return None
 
 
@@ -227,10 +236,13 @@ async def bot_loop(
 
             # ── Settlement check (wait a bit after period ends for oracle) ──
             if pending_settlement_ts > 0:
-                # Wait 30 seconds after period end for oracle to report
+                # Wait 45 seconds after period end for oracle to report
                 period_end = pending_settlement_ts + 900
-                if now > period_end + 30:
-                    outcome = fetch_period_outcome(coin, pending_settlement_ts)
+                wait_elapsed = now - period_end
+                if wait_elapsed > 45:
+                    # Log verbose details after 90s of waiting
+                    verbose = wait_elapsed > 90
+                    outcome = fetch_period_outcome(coin, pending_settlement_ts, verbose=verbose)
                     if outcome:
                         executor.settle(outcome)
                         bot = executor.bot
@@ -241,9 +253,10 @@ async def bot_loop(
                               f"{bot.wins}W/{bot.losses}L ({bot.win_rate:.0%})",
                               flush=True)
                         pending_settlement_ts = 0
-                    elif now > period_end + 120:
-                        # Give up after 2 minutes — oracle may not be available
-                        print(f"  [BOT] settlement timeout for period {pending_settlement_ts}, skipping")
+                    elif wait_elapsed > 300:
+                        # Give up after 5 minutes — oracle may not be available
+                        print(f"  [BOT] settlement timeout for period {pending_settlement_ts} "
+                              f"(waited {wait_elapsed:.0f}s), skipping", flush=True)
                         executor.cancel()
                         pending_settlement_ts = 0
 
