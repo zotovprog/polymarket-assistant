@@ -205,9 +205,18 @@ async def pm_feed(state: State):
                 close_timeout=5,
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                print("  [PM] connected", flush=True)
+                print(f"  [PM] connected (tokens: {assets[0][:12]}…)", flush=True)
                 while True:
-                    raw = json.loads(await ws.recv())
+                    # If period_tracker updated tokens, break out to reconnect with new ones
+                    if state.pm_up_id != assets[0]:
+                        print(f"  [PM] token IDs changed, reconnecting for new period…", flush=True)
+                        break
+
+                    try:
+                        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+                    except asyncio.TimeoutError:
+                        # No data in 60s — check if tokens changed, otherwise continue waiting
+                        continue
 
                     if isinstance(raw, list):
                         for entry in raw:

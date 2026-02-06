@@ -318,6 +318,7 @@ async def headless_loop(
     """Headless status logger for Railway/server deployment (plain stdout)."""
     await asyncio.sleep(5)
     last_period = 0
+    last_heartbeat = 0
     while True:
         try:
             bot = executor.bot
@@ -326,23 +327,24 @@ async def headless_loop(
             # Log on period change
             if state.period_start_ts != last_period and state.period_start_ts > 0:
                 last_period = state.period_start_ts
-                remaining = max(0, state.period_end_ts - now)
-                pm_str = f"↑{state.pm_up:.3f} ↓{state.pm_dn:.3f}" if state.pm_up else "?"
+                pm_str = f"↑{state.pm_up:.3f} ↓{state.pm_dn:.3f}" if state.pm_up is not None else "?"
                 print(f"[{mode}] period {state.period_start_ts} | "
                       f"PM: {pm_str} | "
                       f"snaps: {len(strat_state.snapshots)} | "
                       f"pos: {bot.current_side or 'none'} | "
                       f"P&L: ${bot.total_pnl:+.2f} ({bot.wins}W/{bot.losses}L)",
                       flush=True)
+                last_heartbeat = now
 
             # Periodic heartbeat every 60s
-            elif int(now) % 60 < 3 and state.period_start_ts > 0:
+            elif now - last_heartbeat >= 60 and state.period_start_ts > 0:
                 elapsed = (now - state.period_start_ts) / 60
-                pm_str = f"↑{state.pm_up:.3f} ↓{state.pm_dn:.3f}" if state.pm_up else "?"
+                pm_str = f"↑{state.pm_up:.3f} ↓{state.pm_dn:.3f}" if state.pm_up is not None else "?"
                 print(f"[{mode}] min {elapsed:.1f} | PM: {pm_str} | "
                       f"snaps: {len(strat_state.snapshots)} | "
                       f"pos: {bot.current_side or 'none'}",
                       flush=True)
+                last_heartbeat = now
 
         except Exception as e:
             print(f"[HEADLESS] error: {e}", flush=True)
