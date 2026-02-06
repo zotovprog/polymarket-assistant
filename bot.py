@@ -416,16 +416,22 @@ async def main():
     else:
         display_task = display_loop(state, strat_state, executor, args.coin, mode)
 
-    # Run all tasks concurrently
-    await asyncio.gather(
+    # Build task list
+    tasks = [
         feeds.ob_poller(binance_sym, state),
         feeds.binance_feed(binance_sym, kline_iv, state),
-        feeds.pm_feed(state),
         feeds.pm_price_poller(state, args.coin, tf),
         feeds.period_tracker(state, args.coin, tf),
         bot_loop(state, executor, args.coin, strat_state),
         display_task,
-    )
+    ]
+    # PM WebSocket is unreliable on Railway — skip in headless mode, rely on REST poller
+    if not args.headless:
+        tasks.append(feeds.pm_feed(state))
+    else:
+        log("  [PM] WebSocket disabled in headless mode — using REST poller only")
+
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

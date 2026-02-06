@@ -332,16 +332,24 @@ async def period_tracker(state: State, coin: str, tf: str):
             state.period_start_ts = current_period
             state.period_end_ts = current_period + 900
 
-            # Fetch new oracle strike for the new period
-            strike = _fetch_oracle_strike(coin, tf)
+            # Fetch new oracle strike for the new period (retry up to 3 times)
+            strike = None
+            for attempt in range(3):
+                strike = _fetch_oracle_strike(coin, tf)
+                if strike is not None:
+                    break
+                await asyncio.sleep(2)
+
             if strike is not None:
                 state.strike = strike
                 state.strike_is_oracle = True
-                print(f"  [FV] new period {current_period}, oracle strike=${strike:,.2f}")
+                print(f"  [FV] new period {current_period}, oracle strike=${strike:,.2f}",
+                      flush=True)
             else:
                 state.strike = state.mid if state.mid > 0 else None
                 state.strike_is_oracle = False
-                print(f"  [FV] new period {current_period}, fallback strike={state.strike}")
+                print(f"  [FV] new period {current_period}, fallback strike={state.strike}",
+                      flush=True)
 
             # Re-fetch PM token IDs for the new period market
             new_up, new_dn = fetch_pm_tokens(coin, tf)
