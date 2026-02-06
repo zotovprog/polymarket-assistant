@@ -60,7 +60,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
 
     while True:
         try:
-            async with websockets.connect(url, ping_interval=20) as ws:
+            async with websockets.connect(url, ping_interval=30, ping_timeout=30) as ws:
                 print(f"  [Binance WS] connected – {symbol}")
                 while True:
                     data   = json.loads(await ws.recv())
@@ -192,7 +192,7 @@ async def pm_feed(state: State):
     assets = [state.pm_up_id, state.pm_dn_id]
     while True:
         try:
-            async with websockets.connect(config.PM_WS, ping_interval=20) as ws:
+            async with websockets.connect(config.PM_WS, ping_interval=30, ping_timeout=30) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                 print("  [PM] connected")
                 while True:
