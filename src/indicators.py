@@ -1,3 +1,4 @@
+import math
 import time
 import config
 
@@ -142,3 +143,108 @@ def heikin_ashi(klines):
             "green": c >= o,
         })
     return ha
+
+
+# ── Fair Value ────────────────────────────────────────────────
+
+
+def _norm_cdf(x: float) -> float:
+    """Standard normal cumulative distribution function."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _cc_vol(klines: list[dict]) -> float | None:
+    """Close-to-close log-return volatility (fallback)."""
+    if len(klines) < 5:
+        return None
+    closes = [k["c"] for k in klines]
+    log_rets = [math.log(closes[i] / closes[i - 1])
+                for i in range(1, len(closes)) if closes[i - 1] > 0]
+    if len(log_rets) < 3:
+        return None
+    mean = sum(log_rets) / len(log_rets)
+    var = sum((r - mean) ** 2 for r in log_rets) / (len(log_rets) - 1)
+    return math.sqrt(max(var, 0.0) * config.MINUTES_PER_YEAR)
+
+
+def yang_zhang_vol(klines: list[dict], window: int) -> float | None:
+    """
+    Yang-Zhang OHLC volatility estimator.
+    Returns annualized sigma, or None if insufficient data.
+    """
+    if len(klines) < max(window, config.FV_VOL_MIN):
+        return _cc_vol(klines)
+
+    recent = klines[-window:]
+    n = len(recent)
+
+    # overnight: log(open / prev_close)
+    log_oc = []
+    # close-to-open (intraday): log(close / open)
+    log_co = []
+    log_ho = []
+    log_lo = []
+
+    for i in range(1, n):
+        prev_c = recent[i - 1]["c"]
+        o, h, l, c = recent[i]["o"], recent[i]["h"], recent[i]["l"], recent[i]["c"]
+        if prev_c <= 0 or o <= 0:
+            continue
+        log_oc.append(math.log(o / prev_c))
+        log_co.append(math.log(c / o) if c > 0 and o > 0 else 0.0)
+        log_ho.append(math.log(h / o) if h > 0 and o > 0 else 0.0)
+        log_lo.append(math.log(l / o) if l > 0 and o > 0 else 0.0)
+
+    m = len(log_oc)
+    if m < 2:
+        return _cc_vol(klines)
+
+    # overnight variance
+    mean_oc = sum(log_oc) / m
+    var_overnight = sum((x - mean_oc) ** 2 for x in log_oc) / (m - 1)
+
+    # close-to-open variance
+    mean_co = sum(log_co) / m
+    var_close_open = sum((x - mean_co) ** 2 for x in log_co) / (m - 1)
+
+    # Rogers-Satchell variance
+    var_rs = sum(
+        log_ho[i] * (log_ho[i] - log_co[i]) + log_lo[i] * (log_lo[i] - log_co[i])
+        for i in range(m)
+    ) / m
+
+    k_yz = 0.34 / (1.34 + (m + 1) / (m - 1))
+    var_yz = var_overnight + k_yz * var_close_open + (1 - k_yz) * var_rs
+
+    # annualize: var_yz is per-bar (1-minute) variance
+    sigma = math.sqrt(max(var_yz, 0.0) * config.MINUTES_PER_YEAR)
+    return sigma
+
+
+def fair_value(
+    spot: float,
+    strike: float | None,
+    sigma: float | None,
+    time_remaining_sec: float,
+) -> tuple[float | None, float | None]:
+    """
+    Binary option fair value for Up/Down contracts.
+
+    P(Up) = Φ((ln(S/K) + (-σ²/2)·T) / (σ·√T))
+    P(Down) = 1 - P(Up)
+
+    Returns (p_up, p_down) or (None, None) if inputs are invalid.
+    """
+    if strike is None or sigma is None or strike <= 0 or sigma <= 0 or spot <= 0:
+        return None, None
+
+    if time_remaining_sec <= 0:
+        p_up = 1.0 if spot >= strike else 0.0
+        return p_up, 1.0 - p_up
+
+    T = time_remaining_sec / (365.25 * 24 * 3600)
+    sqrt_T = math.sqrt(T)
+
+    d = (math.log(spot / strike) + (-sigma ** 2 / 2) * T) / (sigma * sqrt_T)
+    p_up = _norm_cdf(d)
+    return p_up, 1.0 - p_up

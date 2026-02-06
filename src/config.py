@@ -15,7 +15,9 @@ COIN_PM_LONG = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xr
 TIMEFRAMES = ["15m", "1h", "4h", "daily"]
 
 # Binance kline interval used for TA candles
-TF_KLINE = {"15m": "1m", "1h": "1m", "4h": "15m", "daily": "1h"}
+TF_KLINE   = {"15m": "1m", "1h": "1m", "4h": "15m", "daily": "1h"}
+# Polymarket past-results variant name
+TF_VARIANT = {"15m": "fifteen", "1h": "hourly", "4h": "four_hour", "daily": "daily"}
 
 # ── Binance ─────────────────────────────────────────────────────
 BINANCE_WS   = "wss://stream.binance.com/stream"
@@ -26,8 +28,10 @@ KLINE_MAX    = 150         # max candles in memory
 KLINE_BOOT   = 100         # candles fetched on startup
 
 # ── Polymarket ──────────────────────────────────────────────────
-PM_GAMMA = "https://gamma-api.polymarket.com/events"
-PM_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+PM_GAMMA        = "https://gamma-api.polymarket.com/events"
+PM_WS           = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+PM_PAST_RESULTS = "https://polymarket.com/api/past-results"
+PM_PRICE_POLL   = 10         # seconds between REST price polls
 
 # ── Orderbook indicators ───────────────────────────────────────
 OBI_BAND_PCT = 1.0          # % band around mid for OBI calc
@@ -48,6 +52,12 @@ MACD_SLOW  = 26
 MACD_SIG   = 9
 EMA_S      = 5
 EMA_L      = 20
+
+# ── Fair Value ─────────────────────────────────────────────────
+FV_VOL_WINDOW    = 60         # 1m klines for volatility estimate
+FV_VOL_MIN       = 20         # minimum klines for Yang-Zhang
+FV_EDGE_THRESH   = 0.02       # 2¢ edge to trigger signal
+MINUTES_PER_YEAR = 525960     # 365.25 × 24 × 60
 
 # ── Dashboard ──────────────────────────────────────────────────
 HA_COUNT   = 8          # Heikin Ashi candles shown
