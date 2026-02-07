@@ -54,41 +54,55 @@ console = Console(force_terminal=True)
 # ── Outcome detection ────────────────────────────────────────
 
 def fetch_period_outcome(coin: str, period_start_ts: int, verbose: bool = False) -> str | None:
-    """Check if a period has resolved and return 'up' or 'down' (or None if pending)."""
+    """Check if a period has resolved and return 'up' or 'down' (or None if pending).
+
+    The past-results API returns results that ended BEFORE currentEventStartTime,
+    with a ~15min reporting delay. So to find outcome of period P, we query with
+    currentEventStartTime set to the CURRENT period (as far ahead as possible).
+    We also try period P+2 as a fallback in case the current period is too far ahead
+    and the result window doesn't reach back to P.
+    """
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(period_start_ts, tz=timezone.utc)
     start_iso = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Query past-results for the period AFTER this one (which would contain our result)
-    next_period_ts = period_start_ts + 900
-    dt_next = datetime.fromtimestamp(next_period_ts, tz=timezone.utc)
-    next_iso = dt_next.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Try multiple currentEventStartTime values to maximize our chance of finding the result
+    now_ts = int(time.time())
+    current_period_ts = (now_ts // 900) * 900
+    query_timestamps = [
+        current_period_ts,              # current period (most likely to work)
+        period_start_ts + 1800,         # 2 periods after target
+        period_start_ts + 2700,         # 3 periods after target
+    ]
+    # Deduplicate and sort
+    query_timestamps = sorted(set(query_timestamps))
 
-    try:
-        resp = requests.get(config.PM_PAST_RESULTS, params={
-            "symbol": coin,
-            "variant": "fifteen",
-            "assetType": "crypto",
-            "currentEventStartTime": next_iso,
-        }, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+    for query_ts in query_timestamps:
+        query_iso = datetime.fromtimestamp(query_ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        try:
+            resp = requests.get(config.PM_PAST_RESULTS, params={
+                "symbol": coin,
+                "variant": "fifteen",
+                "assetType": "crypto",
+                "currentEventStartTime": query_iso,
+            }, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
 
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("data", {}).get("results", [])
-            for r in results:
-                st = r.get("startTime", "")
-                if st.startswith(start_iso.replace("Z", "")):
-                    return r.get("outcome")  # "up" or "down"
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("data", {}).get("results", [])
+                for r in results:
+                    st = r.get("startTime", "")
+                    if st.startswith(start_iso.replace("Z", "")):
+                        return r.get("outcome")  # "up" or "down"
+        except Exception as e:
             if verbose:
-                n = len(results)
-                last_st = results[-1].get("startTime", "?") if results else "none"
-                print(f"  [BOT] settlement query: {n} results, last={last_st}, "
-                      f"looking for {start_iso}", flush=True)
-        elif verbose:
-            print(f"  [BOT] settlement query failed: HTTP {resp.status_code}", flush=True)
-    except Exception as e:
-        if verbose:
-            print(f"  [BOT] settlement query error: {e}", flush=True)
+                print(f"  [BOT] settlement query error: {e}", flush=True)
+
+    if verbose:
+        print(f"  [BOT] settlement: not found for {start_iso} "
+              f"(tried {len(query_timestamps)} queries)", flush=True)
     return None
 
 
@@ -211,6 +225,7 @@ async def bot_loop(
     last_period_ts = 0
     last_snapshot_minute = -1
     pending_settlement_ts = 0
+    last_settlement_log = 0
 
     # Wait for feeds to populate
     await asyncio.sleep(5)
@@ -240,9 +255,11 @@ async def bot_loop(
                 period_end = pending_settlement_ts + 900
                 wait_elapsed = now - period_end
                 if wait_elapsed > 45:
-                    # Log verbose details after 90s of waiting
-                    verbose = wait_elapsed > 90
+                    # Log verbose details every 30s after 90s of waiting
+                    verbose = wait_elapsed > 90 and (now - last_settlement_log) > 30
                     outcome = fetch_period_outcome(coin, pending_settlement_ts, verbose=verbose)
+                    if verbose:
+                        last_settlement_log = now
                     if outcome:
                         executor.settle(outcome)
                         bot = executor.bot
@@ -253,8 +270,8 @@ async def bot_loop(
                               f"{bot.wins}W/{bot.losses}L ({bot.win_rate:.0%})",
                               flush=True)
                         pending_settlement_ts = 0
-                    elif wait_elapsed > 300:
-                        # Give up after 5 minutes — oracle may not be available
+                    elif wait_elapsed > 600:
+                        # Give up after 10 minutes — oracle may not be available
                         print(f"  [BOT] settlement timeout for period {pending_settlement_ts} "
                               f"(waited {wait_elapsed:.0f}s), skipping", flush=True)
                         executor.cancel()
