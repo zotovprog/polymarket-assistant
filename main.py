@@ -68,8 +68,6 @@ async def main():
         feeds.ob_poller(binance_sym, state),
         feeds.binance_feed(binance_sym, kline_iv, state),
         feeds.pm_feed(state),
-        feeds.pm_price_poller(state, coin, tf),
-        feeds.period_tracker(state, coin, tf),
         display_loop(state, coin, tf),
     )
 
