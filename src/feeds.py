@@ -52,36 +52,53 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
     ])
     url = f"{config.BINANCE_WS}?streams={streams}"
 
-    async with websockets.connect(url, ping_interval=20) as ws:
-        print(f"  [Binance WS] connected – {symbol}")
-        while True:
-            data   = json.loads(await ws.recv())
-            stream = data.get("stream", "")
-            pay    = data["data"]
+    while True:
+        try:
+            async with websockets.connect(
+                url,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=10
+            ) as ws:
+                print(f"  [Binance WS] connected – {symbol}")
 
-            if "@trade" in stream:
-                state.trades.append({
-                    "t":      pay["T"] / 1000.0,
-                    "price":  float(pay["p"]),
-                    "qty":    float(pay["q"]),
-                    "is_buy": not pay["m"],
-                })
-                if len(state.trades) > 5000:
-                    cut = time.time() - config.TRADE_TTL
-                    state.trades = [t for t in state.trades if t["t"] >= cut]
+                while True:
+                    try:
+                        data   = json.loads(await ws.recv())
+                        stream = data.get("stream", "")
+                        pay    = data["data"]
 
-            elif "@kline" in stream:
-                k = pay["k"]
-                candle = {
-                    "t": k["t"] / 1000.0,
-                    "o": float(k["o"]), "h": float(k["h"]),
-                    "l": float(k["l"]), "c": float(k["c"]),
-                    "v": float(k["v"]),
-                }
-                state.cur_kline = candle
-                if k["x"]:
-                    state.klines.append(candle)
-                    state.klines = state.klines[-config.KLINE_MAX:]
+                        if "@trade" in stream:
+                            state.trades.append({
+                                "t":      pay["T"] / 1000.0,
+                                "price":  float(pay["p"]),
+                                "qty":    float(pay["q"]),
+                                "is_buy": not pay["m"],
+                            })
+                            if len(state.trades) > 5000:
+                                cut = time.time() - config.TRADE_TTL
+                                state.trades = [t for t in state.trades if t["t"] >= cut]
+
+                        elif "@kline" in stream:
+                            k = pay["k"]
+                            candle = {
+                                "t": k["t"] / 1000.0,
+                                "o": float(k["o"]), "h": float(k["h"]),
+                                "l": float(k["l"]), "c": float(k["c"]),
+                                "v": float(k["v"]),
+                            }
+                            state.cur_kline = candle
+                            if k["x"]:
+                                state.klines.append(candle)
+                                state.klines = state.klines[-config.KLINE_MAX:]
+
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"  [Binance WS] connection closed, reconnecting...")
+                        break
+
+        except Exception as e:
+            print(f"  [Binance WS] connection error: {e}, reconnecting in 5s...")
+            await asyncio.sleep(5)
 
 
 async def bootstrap(symbol: str, interval: str, state: State):
@@ -136,6 +153,10 @@ def _build_slug(coin: str, tf: str) -> str | None:
     now_ts  = int(now_utc.timestamp())
     et      = _et_now()
 
+    if tf == "5m":
+        ts = (now_ts // 300) * 300
+        return f"{config.COIN_PM[coin]}-updown-5m-{ts}"
+
     if tf == "15m":
         ts = (now_ts // 900) * 900
         return f"{config.COIN_PM[coin]}-updown-15m-{ts}"
@@ -157,19 +178,32 @@ def _build_slug(coin: str, tf: str) -> str | None:
     return None
 
 
-def fetch_pm_tokens(coin: str, tf: str) -> tuple:
+def fetch_pm_event_data(coin: str, tf: str) -> dict | None:
+    """Fetch full event data from Polymarket API."""
     slug = _build_slug(coin, tf)
     if slug is None:
-        return None, None
+        return None
     try:
-        data = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 1}).json()
+        data = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 1}, timeout=5).json()
         if not data or data[0].get("ticker") != slug:
             print(f"  [PM] no active market for slug: {slug}")
-            return None, None
-        ids = json.loads(data[0]["markets"][0]["clobTokenIds"])
+            return None
+        return data[0]
+    except Exception as e:
+        print(f"  [PM] event fetch failed ({slug}): {e}")
+        return None
+
+
+def fetch_pm_tokens(coin: str, tf: str) -> tuple:
+    """Fetch PM token IDs for up/down markets."""
+    event_data = fetch_pm_event_data(coin, tf)
+    if event_data is None:
+        return None, None
+    try:
+        ids = json.loads(event_data["markets"][0]["clobTokenIds"])
         return ids[0], ids[1]
     except Exception as e:
-        print(f"  [PM] token fetch failed ({slug}): {e}")
+        print(f"  [PM] token extraction failed: {e}")
         return None, None
 
 
@@ -179,20 +213,38 @@ async def pm_feed(state: State):
         return
 
     assets = [state.pm_up_id, state.pm_dn_id]
-    async with websockets.connect(config.PM_WS, ping_interval=20) as ws:
-        await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-        print("  [PM] connected")
-        while True:
-            raw = json.loads(await ws.recv())
 
-            if isinstance(raw, list):
-                for entry in raw:
-                    _pm_apply(entry.get("asset_id"), entry.get("asks", []), state)
+    while True:
+        try:
+            async with websockets.connect(
+                config.PM_WS,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=10
+            ) as ws:
+                await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
+                print("  [PM] connected")
 
-            elif isinstance(raw, dict) and raw.get("event_type") == "price_change":
-                for ch in raw.get("price_changes", []):
-                    if ch.get("best_ask"):
-                        _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
+                while True:
+                    try:
+                        raw = json.loads(await ws.recv())
+
+                        if isinstance(raw, list):
+                            for entry in raw:
+                                _pm_apply(entry.get("asset_id"), entry.get("asks", []), state)
+
+                        elif isinstance(raw, dict) and raw.get("event_type") == "price_change":
+                            for ch in raw.get("price_changes", []):
+                                if ch.get("best_ask"):
+                                    _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
+
+                    except websockets.exceptions.ConnectionClosed:
+                        print("  [PM] connection closed, reconnecting...")
+                        break
+
+        except Exception as e:
+            print(f"  [PM] connection error: {e}, reconnecting in 5s...")
+            await asyncio.sleep(5)
 
 
 def _pm_apply(asset, asks, state):
