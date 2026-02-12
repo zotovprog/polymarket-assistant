@@ -35,18 +35,19 @@ def pick(title: str, options: list[str]) -> str:
 
 async def display_loop(state: feeds.State, coin: str, tf: str):
     await asyncio.sleep(2)
+    refresh_interval = config.REFRESH_5M if tf == "5m" else config.REFRESH
     with Live(console=console, refresh_per_second=1, transient=False) as live:
         while True:
             if state.mid > 0 and state.klines:
                 live.update(dashboard.render(state, coin, tf))
-            await asyncio.sleep(config.REFRESH)
+            await asyncio.sleep(refresh_interval)
 
 
 async def main():
     console.print("\n[bold magenta]═══ CRYPTO PREDICTION DASHBOARD ═══[/bold magenta]\n")
 
     coin = pick("Select coin:", config.COINS)
-    tf   = pick("Select timeframe:", config.TIMEFRAMES)
+    tf   = pick("Select timeframe:", config.COIN_TIMEFRAMES[coin])
 
     console.print(f"\n[bold green]Starting {coin} {tf} …[/bold green]\n")
 
