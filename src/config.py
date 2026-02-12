@@ -12,10 +12,16 @@ COIN_PM      = {"BTC": "btc",     "ETH": "eth",      "SOL": "sol",    "XRP": "xr
 COIN_PM_LONG = {"BTC": "bitcoin", "ETH": "ethereum", "SOL": "solana", "XRP": "xrp"}
 
 # ── Timeframes ──────────────────────────────────────────────────
-TIMEFRAMES = ["15m", "1h", "4h", "daily"]
+# Available timeframes per coin (5m only for BTC)
+COIN_TIMEFRAMES = {
+    "BTC": ["5m", "15m", "1h", "4h", "daily"],
+    "ETH": ["15m", "1h", "4h", "daily"],
+    "SOL": ["15m", "1h", "4h", "daily"],
+    "XRP": ["15m", "1h", "4h", "daily"],
+}
 
 # Binance kline interval used for TA candles
-TF_KLINE = {"15m": "1m", "1h": "1m", "4h": "15m", "daily": "1h"}
+TF_KLINE = {"5m": "1m", "15m": "1m", "1h": "1m", "4h": "15m", "daily": "1h"}
 
 # ── Binance ─────────────────────────────────────────────────────
 BINANCE_WS   = "wss://stream.binance.com/stream"
@@ -54,3 +60,4 @@ HA_COUNT   = 8          # Heikin Ashi candles shown
 VP_BINS    = 30         # volume profile price buckets
 VP_SHOW    = 9          # VP rows visible
 REFRESH    = 10         # seconds between dashboard redraws
+REFRESH_5M = 3          # faster refresh for 5m timeframe (seconds)
