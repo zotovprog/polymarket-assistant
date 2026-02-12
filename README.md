@@ -4,7 +4,7 @@ Real-time terminal dashboard that combines live Binance order flow with Polymark
 
 **By [@SolSt1ne](https://x.com/SolSt1ne)**
 
-**[Polymarket](https://polymarket.com/?via=Yxwa280)**
+**[Polymarket](https://polymarket.com/?via=SolSt1ne)**
 ---
 
 ## What it does
@@ -21,7 +21,7 @@ Real-time terminal dashboard that combines live Binance order flow with Polymark
 
 | Coins | Timeframes |
 |-------|------------|
-| BTC, ETH, SOL, XRP | 15m, 1h, 4h, daily |
+| BTC, ETH, SOL, XRP | 5m, 15m, 1h, 4h, daily |
 
 All 16 coin × timeframe combinations are supported on Polymarket.
 
