@@ -95,6 +95,7 @@ def _header(st, coin, tf):
         (f" {tf} ", "bold white on dark_green"),
         (f"  Price: {_p(st.mid)}  ", "bold white"),
     ]
+
     if st.pm_up is not None and st.pm_dn is not None:
         parts.append((f"  PM ↑ {st.pm_up:.3f}  ↓ {st.pm_dn:.3f}  ", "cyan"))
 
