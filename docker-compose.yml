@@ -2,6 +2,8 @@ services:
   polymarket-web:
     build: .
     container_name: polymarket-assistant-web
+    environment:
+      - PM_WEB_ACCESS_KEY=${PM_WEB_ACCESS_KEY:?set PM_WEB_ACCESS_KEY}
     ports:
       - "8000:8000"
     restart: unless-stopped

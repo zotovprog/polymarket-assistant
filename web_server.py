@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import secrets
 import sys
 import time
 import uuid
@@ -30,33 +29,22 @@ import trading
 
 SESSION_COOKIE = "pm_session_id"
 AUTH_COOKIE = "pm_web_auth"
-ACCESS_KEY_FILE = BASE_DIR / ".web_access_key"
 
 
-def _load_or_create_access_key() -> tuple[str, str]:
-    env_key = os.environ.get("PM_WEB_ACCESS_KEY", "").strip()
-    if env_key:
-        return env_key, "env"
-
-    if ACCESS_KEY_FILE.exists():
-        key = ACCESS_KEY_FILE.read_text(encoding="utf-8").strip()
-        if key:
-            return key, "file"
-
-    key = secrets.token_urlsafe(24)
-    ACCESS_KEY_FILE.write_text(key + "\n", encoding="utf-8")
-    try:
-        os.chmod(ACCESS_KEY_FILE, 0o600)
-    except Exception:
-        pass
-    return key, "generated"
+def _load_access_key_from_env() -> str:
+    key = os.environ.get("PM_WEB_ACCESS_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "PM_WEB_ACCESS_KEY is required for web auth. "
+            "Set it in environment (Railway Variables / Docker env / shell export)."
+        )
+    if len(key) < 16:
+        raise RuntimeError("PM_WEB_ACCESS_KEY is too short (minimum 16 chars).")
+    return key
 
 
-ACCESS_KEY, ACCESS_KEY_SOURCE = _load_or_create_access_key()
-print(
-    f"[WEB AUTH] source={ACCESS_KEY_SOURCE} key_file={ACCESS_KEY_FILE} "
-    f"access_key={ACCESS_KEY}"
-)
+ACCESS_KEY = _load_access_key_from_env()
+print(f"[WEB AUTH] source=env key_length={len(ACCESS_KEY)}")
 
 PRESETS: dict[str, dict[str, float | int]] = {
     "safe": {

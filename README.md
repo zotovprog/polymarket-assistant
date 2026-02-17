@@ -70,13 +70,13 @@ This build includes a local web UI with:
 Access control:
 
 - web API is protected by an access key
-- set your own key with env: `PM_WEB_ACCESS_KEY=...`
-- or let the app auto-generate and persist it in `.web_access_key`
+- set it with env: `PM_WEB_ACCESS_KEY=...` (required)
 - browser must unlock once via key prompt; after that auth cookie is used
 
 Run locally:
 
 ```bash
+export PM_WEB_ACCESS_KEY='your-long-random-key'
 pip install -r requirements.txt
 pip install -r requirements-trading.txt
 uvicorn web_server:app --host 0.0.0.0 --port 8000
@@ -97,8 +97,17 @@ Important:
 ### Docker
 
 ```bash
+export PM_WEB_ACCESS_KEY='your-long-random-key'
 docker compose up --build
 ```
+
+### Railway
+
+In Railway project variables add:
+
+- `PM_WEB_ACCESS_KEY` = your random secret key
+
+After deploy, open app URL and enter this key in auth dialog.
 
 Then open:
 
