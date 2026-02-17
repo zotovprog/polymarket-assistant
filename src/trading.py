@@ -385,9 +385,15 @@ class LiveExecutor:
 
         self._ensure_conditional_allowance(position.token_id)
         bal_info = self._get_conditional_balance_allowance(position.token_id)
+        bal_raw = ""
+        est_balance_shares = None
         if bal_info is not None:
             bal_raw = str(bal_info.get("balance", "")).strip()
-            if bal_raw == "0":
+            est_balance_shares = self._estimate_shares_from_balance_raw(
+                bal_raw,
+                expected=position.shares,
+            )
+            if est_balance_shares is not None and est_balance_shares <= 0:
                 return TradeRecord(
                     ts_iso=datetime.now(timezone.utc).isoformat(),
                     action="exit",
@@ -398,13 +404,17 @@ class LiveExecutor:
                     token_id=position.token_id,
                     price=price,
                     size_usd=position.size_usd,
-                    shares=size,
+                    shares=0.0,
                     status="exit_no_token_balance",
                     reason=f"{reason}, conditional_balance=0",
                     order_id=None,
                     pnl_usd=pnl_usd,
                     pnl_pct=pnl_pct,
                 )
+
+        if est_balance_shares is not None and est_balance_shares > 0:
+            size = round(min(size, est_balance_shares * 0.995), 2)
+            reason = f"{reason}, est_balance={est_balance_shares:.4f}"
 
         min_size = self._get_min_order_size(position.token_id)
         if min_size is not None and size < min_size:
@@ -426,20 +436,52 @@ class LiveExecutor:
                 pnl_pct=pnl_pct,
             )
 
-        try:
-            signed_order = self.client.create_order(
-                OrderArgs(
-                    token_id=position.token_id,
-                    price=price,
-                    size=size,
-                    side=SELL,
-                )
+        attempt_sizes = self._build_exit_attempt_sizes(size, min_size)
+        if not attempt_sizes:
+            return TradeRecord(
+                ts_iso=datetime.now(timezone.utc).isoformat(),
+                action="exit",
+                mode=TradeMode.LIVE.value,
+                coin=coin,
+                timeframe=timeframe,
+                side=position.side,
+                token_id=position.token_id,
+                price=price,
+                size_usd=position.size_usd,
+                shares=size,
+                status="exit_blocked_min_size",
+                reason=f"{reason}, min_order_size={min_size:.2f}" if min_size is not None else reason,
+                order_id=None,
+                pnl_usd=pnl_usd,
+                pnl_pct=pnl_pct,
             )
-            resp = self.client.post_order(signed_order, OrderType.GTC)
-            order_id = resp.get("orderID") or resp.get("id")
-            status = "exit_posted" if order_id else "exit_failed"
-        except Exception as e:  # pragma: no cover
-            status = self._format_exception_status("exit_error", e)
+
+        final_attempt = attempt_sizes[0]
+        for idx, sz in enumerate(attempt_sizes, start=1):
+            final_attempt = sz
+            try:
+                signed_order = self.client.create_order(
+                    OrderArgs(
+                        token_id=position.token_id,
+                        price=price,
+                        size=sz,
+                        side=SELL,
+                    )
+                )
+                resp = self.client.post_order(signed_order, OrderType.GTC)
+                order_id = resp.get("orderID") or resp.get("id")
+                status = "exit_posted" if order_id else "exit_failed"
+                reason = f"{reason}, attempt={idx}/{len(attempt_sizes)}, placed_sell_size={sz:.2f}"
+                if order_id:
+                    break
+            except Exception as e:  # pragma: no cover
+                status = self._format_exception_status("exit_error", e)
+                reason = f"{reason}, attempt={idx}/{len(attempt_sizes)}, try_sell_size={sz:.2f}"
+                if self._is_not_enough_balance_or_allowance(status):
+                    # Force-refresh allowance and try next smaller size.
+                    self._ensure_conditional_allowance(position.token_id, force=True)
+                    continue
+                break
 
         return TradeRecord(
             ts_iso=datetime.now(timezone.utc).isoformat(),
@@ -451,7 +493,7 @@ class LiveExecutor:
             token_id=position.token_id,
             price=price,
             size_usd=position.size_usd,
-            shares=size,
+            shares=final_attempt,
             status=status,
             reason=reason,
             order_id=order_id,
@@ -627,8 +669,8 @@ class LiveExecutor:
         except Exception:
             return None
 
-    def _ensure_conditional_allowance(self, token_id: str):
-        if token_id in self._conditional_allowance_checked:
+    def _ensure_conditional_allowance(self, token_id: str, force: bool = False):
+        if (not force) and token_id in self._conditional_allowance_checked:
             return
         self._conditional_allowance_checked.add(token_id)
 
@@ -642,11 +684,53 @@ class LiveExecutor:
             )
             data = self.client.get_balance_allowance(params)
             allowances = data.get("allowances") if isinstance(data, dict) else None
-            if not self._allowances_positive(allowances):
+            if force or not self._allowances_positive(allowances):
                 self.client.update_balance_allowance(params)
                 time.sleep(0.3)
         except Exception:
             pass
+
+    @staticmethod
+    def _is_not_enough_balance_or_allowance(status: str) -> bool:
+        s = (status or "").lower()
+        return (
+            "not enough balance" in s
+            or "allowance" in s
+            or "insufficient" in s
+        )
+
+    def _estimate_shares_from_balance_raw(self, balance_raw: str, expected: float) -> float | None:
+        bal = self._as_float(balance_raw)
+        if bal is None:
+            return None
+        if bal <= 0:
+            return 0.0
+
+        # Different endpoints may return raw token units (scaled) or float shares.
+        divisors = [1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0, 1_000_000.0, 1_000_000_000_000_000_000.0]
+        candidates = [bal / d for d in divisors if (bal / d) > 0]
+        if not candidates:
+            return None
+
+        ref = max(0.01, float(expected))
+        near = [c for c in candidates if c <= ref * 3.0]
+        pool = near if near else candidates
+        best = min(pool, key=lambda c: abs(c - ref))
+        return max(0.0, best)
+
+    @staticmethod
+    def _build_exit_attempt_sizes(initial_size: float, min_size: float | None) -> list[float]:
+        if initial_size <= 0:
+            return []
+        scales = [1.0, 0.85, 0.7, 0.55, 0.45, 0.35, 0.25, 0.18]
+        out: list[float] = []
+        for mul in scales:
+            s = round(max(0.01, initial_size * mul), 2)
+            if min_size is not None and s < min_size:
+                continue
+            if s not in out:
+                out.append(s)
+        return out
 
     def _get_min_order_size(self, token_id: str) -> float | None:
         cached = self._min_size_cache.get(token_id)
