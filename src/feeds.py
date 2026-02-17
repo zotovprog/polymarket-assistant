@@ -25,6 +25,12 @@ class State:
         self.pm_up:     float | None = None
         self.pm_dn:     float | None = None
 
+        self.binance_ws_connected: bool = False
+        self.binance_ob_ready: bool = False
+        self.binance_ob_last_ok_ts: float = 0.0
+        self.pm_connected: bool = False
+        self.pm_prices_ready: bool = False
+
 
 OB_POLL_INTERVAL = 2
 
@@ -39,7 +45,10 @@ async def ob_poller(symbol: str, state: State):
             state.asks = [(float(p), float(q)) for p, q in resp["asks"]]
             if state.bids and state.asks:
                 state.mid = (state.bids[0][0] + state.asks[0][0]) / 2
+                state.binance_ob_ready = True
+                state.binance_ob_last_ok_ts = time.time()
         except Exception:
+            # Keep last good orderbook state; staleness is handled by trader gate.
             pass
         await asyncio.sleep(OB_POLL_INTERVAL)
 
@@ -61,6 +70,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                 close_timeout=10
             ) as ws:
                 print(f"  [Binance WS] connected – {symbol}")
+                state.binance_ws_connected = True
 
                 while True:
                     try:
@@ -94,28 +104,41 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
 
                     except websockets.exceptions.ConnectionClosed:
                         print(f"  [Binance WS] connection closed, reconnecting...")
+                        state.binance_ws_connected = False
                         break
 
         except Exception as e:
             print(f"  [Binance WS] connection error: {e}, reconnecting in 5s...")
+            state.binance_ws_connected = False
             await asyncio.sleep(5)
 
 
 async def bootstrap(symbol: str, interval: str, state: State):
-    resp = requests.get(
-        f"{config.BINANCE_REST}/klines",
-        params={"symbol": symbol, "interval": interval, "limit": config.KLINE_BOOT},
-    ).json()
-    state.klines = [
-        {
-            "t": r[0] / 1e3,
-            "o": float(r[1]), "h": float(r[2]),
-            "l": float(r[3]), "c": float(r[4]),
-            "v": float(r[5]),
-        }
-        for r in resp
-    ]
-    print(f"  [Binance] loaded {len(state.klines)} historical candles")
+    for attempt in range(1, 6):
+        try:
+            resp = requests.get(
+                f"{config.BINANCE_REST}/klines",
+                params={"symbol": symbol, "interval": interval, "limit": config.KLINE_BOOT},
+                timeout=5,
+            ).json()
+            state.klines = [
+                {
+                    "t": r[0] / 1e3,
+                    "o": float(r[1]), "h": float(r[2]),
+                    "l": float(r[3]), "c": float(r[4]),
+                    "v": float(r[5]),
+                }
+                for r in resp
+            ]
+            print(f"  [Binance] loaded {len(state.klines)} historical candles")
+            return
+        except Exception as e:
+            if attempt >= 5:
+                print(f"  [Binance] bootstrap failed after {attempt} attempts: {e}")
+                state.klines = []
+                return
+            print(f"  [Binance] bootstrap attempt {attempt} failed: {e} (retrying)")
+            await asyncio.sleep(min(2 * attempt, 8))
 
 
 _MONTHS = ["", "january", "february", "march", "april", "may", "june",
@@ -224,6 +247,7 @@ async def pm_feed(state: State):
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                 print("  [PM] connected")
+                state.pm_connected = True
 
                 while True:
                     try:
@@ -240,10 +264,12 @@ async def pm_feed(state: State):
 
                     except websockets.exceptions.ConnectionClosed:
                         print("  [PM] connection closed, reconnecting...")
+                        state.pm_connected = False
                         break
 
         except Exception as e:
             print(f"  [PM] connection error: {e}, reconnecting in 5s...")
+            state.pm_connected = False
             await asyncio.sleep(5)
 
 
@@ -257,3 +283,4 @@ def _pm_set(asset, price, state):
         state.pm_up = price
     elif asset == state.pm_dn_id:
         state.pm_dn = price
+    state.pm_prices_ready = state.pm_up is not None and state.pm_dn is not None

@@ -1,3 +1,4 @@
 requests>=2.32.5
 websockets>=16.0
 rich>=14.3.2
+python-socks>=2.8.1
