@@ -51,6 +51,7 @@ const fields = [
 ];
 
 const checks = [
+  "auto_approve_live",
   "auto_exit_enabled",
   "reverse_exit_enabled",
   "live_entry_require_fill",
@@ -563,6 +564,9 @@ function renderState(state) {
   );
 
   const trader = state.trader || null;
+  const manualApproval = !!(trader?.cfg?.live_manual_approval ?? true);
+  ui.approveBtn.disabled = !manualApproval;
+  ui.rejectBtn.disabled = !manualApproval;
   renderTrades(trader?.trades || []);
 
   const pending = trader?.pending_decision || null;

@@ -305,6 +305,7 @@ class StartRequest(BaseModel):
     keep_unfilled_entry_open: bool = False
     binance_ob_stale_sec: int = 12
     executions_log_file: str = ""
+    auto_approve_live: bool = False
 
 
 class CommandRequest(BaseModel):
@@ -553,7 +554,7 @@ class SessionRuntime:
                 control_file=f"/tmp/pm_traderctl_{self.session_id}",
                 executions_log_file=exec_log,
                 binance_ob_stale_sec=max(3, payload.binance_ob_stale_sec),
-                live_manual_approval=True,
+                live_manual_approval=not payload.auto_approve_live,
                 approval_beep_enabled=False,
                 approval_sound_command="",
                 live_entry_require_fill=payload.live_entry_require_fill,
@@ -615,6 +616,12 @@ class SessionRuntime:
                 "Session started",
                 f"{self.mode.value.upper()} on {self.coin} {self.timeframe}",
             )
+            if self.mode == trading.TradeMode.LIVE and payload.auto_approve_live:
+                self.notify(
+                    "warning",
+                    "Auto-approve enabled",
+                    "All live entries will be sent automatically without manual approve",
+                )
 
     def _notify_preflight_checks(self, checks: list[dict], prefix: str = "Credentials check"):
         for c in checks:

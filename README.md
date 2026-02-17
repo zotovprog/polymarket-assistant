@@ -63,6 +63,7 @@ This build includes a local web UI with:
 - session-scoped live env inputs (`PM_PRIVATE_KEY`, `PM_FUNDER`, `PM_SIGNATURE_TYPE`)
 - live preflight checks on start (key format, signature type, API collateral read test)
 - manual approve/reject buttons for pending live trades
+- optional auto-approve switch for live entries (dangerous; disables manual confirm step)
 - frontend sound alert + toast notifications for pending trades and start/runtime issues
 - compact English market summary at the top (current regime snapshot)
 - trade history + runtime logs in browser
