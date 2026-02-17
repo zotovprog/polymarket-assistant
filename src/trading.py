@@ -5,7 +5,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from queue import Empty, SimpleQueue
@@ -168,19 +168,26 @@ class PaperExecutor:
 
 
 class LiveExecutor:
-    def __init__(self, cfg: TradingConfig):
+    def __init__(self, cfg: TradingConfig, runtime_env: dict[str, str] | None = None):
         self.cfg = cfg
+        self.runtime_env = runtime_env or {}
         self.client = None
         self._min_size_cache: dict[str, float] = {}
         self._conditional_allowance_checked: set[str] = set()
         self._init_client()
 
-    def _init_client(self):
-        private_key = os.environ.get("PM_PRIVATE_KEY")
-        funder = os.environ.get("PM_FUNDER")
-        sig_type = int(os.environ.get("PM_SIGNATURE_TYPE", "0"))
+    def _env_get(self, key: str, default: str | None = None) -> str | None:
+        val = self.runtime_env.get(key)
+        if val is None:
+            return os.environ.get(key, default)
+        return str(val)
 
-        if os.environ.get("PM_ENABLE_LIVE") != "1":
+    def _init_client(self):
+        private_key = self._env_get("PM_PRIVATE_KEY")
+        funder = self._env_get("PM_FUNDER")
+        sig_type = int(self._env_get("PM_SIGNATURE_TYPE", "0") or "0")
+
+        if self._env_get("PM_ENABLE_LIVE") != "1":
             raise ValueError("PM_ENABLE_LIVE=1 is required for live mode")
         if not private_key:
             raise ValueError("PM_PRIVATE_KEY is required for live mode")
@@ -602,11 +609,11 @@ class LiveExecutor:
 
 
 class TradingEngine:
-    def __init__(self, mode: TradeMode, cfg: TradingConfig):
+    def __init__(self, mode: TradeMode, cfg: TradingConfig, runtime_env: dict[str, str] | None = None):
         self.mode = mode
         self.cfg = cfg
         self.state = TraderState()
-        self.executor = LiveExecutor(cfg) if mode == TradeMode.LIVE else PaperExecutor(cfg)
+        self.executor = LiveExecutor(cfg, runtime_env=runtime_env) if mode == TradeMode.LIVE else PaperExecutor(cfg)
         self.control_file = os.path.abspath(cfg.control_file)
         self._runtime_cmd_queue: SimpleQueue[str] = SimpleQueue()
         self._init_control_file()
@@ -855,6 +862,45 @@ class TradingEngine:
         self.state.open_position = None
         self.state.open_side = None
         self.state.open_order_id = None
+
+    @staticmethod
+    def _record_dict(rec: TradeRecord) -> dict:
+        return asdict(rec)
+
+    def snapshot(self) -> dict:
+        return {
+            "mode": self.mode.value,
+            "trades_today": self.state.trades_today,
+            "max_trades_per_day": self.cfg.max_trades_per_day,
+            "open_position": asdict(self.state.open_position) if self.state.open_position else None,
+            "open_order_id": self.state.open_order_id,
+            "pending_decision": asdict(self.state.pending_decision) if self.state.pending_decision else None,
+            "pending_key": self.state.pending_key,
+            "approval_armed": self.state.approval_armed,
+            "last_trade_ts": self.state.last_trade_ts,
+            "force_close_requested": self.state.force_close_requested,
+            "next_exit_attempt_ts": self.state.next_exit_attempt_ts,
+            "trades": [self._record_dict(t) for t in self.state.trades[-200:]],
+            "cfg": {
+                "size_usd": self.cfg.size_usd,
+                "min_abs_bias": self.cfg.min_abs_bias,
+                "min_abs_obi": self.cfg.min_abs_obi,
+                "min_price": self.cfg.min_price,
+                "max_price": self.cfg.max_price,
+                "cooldown_sec": self.cfg.cooldown_sec,
+                "max_trades_per_day": self.cfg.max_trades_per_day,
+                "eval_interval_sec": self.cfg.eval_interval_sec,
+                "tp_pct": self.cfg.tp_pct,
+                "sl_pct": self.cfg.sl_pct,
+                "max_hold_sec": self.cfg.max_hold_sec,
+                "reverse_exit_enabled": self.cfg.reverse_exit_enabled,
+                "reverse_exit_bias": self.cfg.reverse_exit_bias,
+                "live_manual_approval": self.cfg.live_manual_approval,
+                "live_entry_require_fill": self.cfg.live_entry_require_fill,
+                "live_entry_fill_timeout_sec": self.cfg.live_entry_fill_timeout_sec,
+                "live_entry_fill_poll_sec": self.cfg.live_entry_fill_poll_sec,
+            },
+        }
 
     def _persist_execution(self, rec: TradeRecord):
         path = (self.cfg.executions_log_file or "").strip()

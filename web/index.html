@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Polymarket Assistant Web</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="bg-orb orb-a"></div>
+    <div class="bg-orb orb-b"></div>
+
+    <main class="app">
+      <header class="topbar">
+        <h1>Polymarket Crypto Assistant</h1>
+        <div id="statusBadge" class="badge idle">IDLE</div>
+      </header>
+
+      <section class="layout">
+        <aside class="panel controls">
+          <h2>Control</h2>
+
+          <div class="grid two">
+            <label>
+              <span>Mode</span>
+              <select id="mode">
+                <option value="observe">observe</option>
+                <option value="paper" selected>paper</option>
+                <option value="live">live</option>
+              </select>
+            </label>
+            <label>
+              <span>Preset</span>
+              <select id="preset">
+                <option value="safe">safe</option>
+                <option value="medium" selected>medium</option>
+                <option value="aggressive">aggressive</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="grid two">
+            <label>
+              <span>Coin</span>
+              <select id="coin"></select>
+            </label>
+            <label>
+              <span>Timeframe</span>
+              <select id="timeframe"></select>
+            </label>
+          </div>
+
+          <h3>Strategy</h3>
+          <div class="grid two">
+            <label><span>Size USD</span><input id="size_usd" type="number" min="5" step="1" value="5" /></label>
+            <label><span>Min Bias</span><input id="min_bias" type="number" step="1" value="55" /></label>
+            <label><span>Min OBI</span><input id="min_obi" type="number" step="0.01" value="0.40" /></label>
+            <label><span>Cooldown sec</span><input id="cooldown_sec" type="number" step="1" value="420" /></label>
+            <label><span>Min Price</span><input id="min_price" type="number" step="0.01" value="0.40" /></label>
+            <label><span>Max Price</span><input id="max_price" type="number" step="0.01" value="0.68" /></label>
+            <label><span>TP %</span><input id="tp_pct" type="number" step="0.1" value="10" /></label>
+            <label><span>SL %</span><input id="sl_pct" type="number" step="0.1" value="6" /></label>
+            <label><span>Max Hold sec</span><input id="max_hold_sec" type="number" step="1" value="1200" /></label>
+            <label><span>Max trades/day</span><input id="max_trades_per_day" type="number" step="1" value="4" /></label>
+            <label><span>Eval sec</span><input id="eval_interval_sec" type="number" step="1" value="3" /></label>
+            <label><span>Reverse bias</span><input id="reverse_exit_bias" type="number" step="1" value="55" /></label>
+            <label><span>Fill timeout sec</span><input id="live_entry_fill_timeout_sec" type="number" step="1" value="25" /></label>
+            <label><span>Fill poll sec</span><input id="live_entry_fill_poll_sec" type="number" step="0.1" value="1" /></label>
+          </div>
+
+          <div class="switches">
+            <label><input id="auto_exit_enabled" type="checkbox" checked /> <span>Auto Exit</span></label>
+            <label><input id="reverse_exit_enabled" type="checkbox" checked /> <span>Reverse Exit</span></label>
+            <label><input id="live_entry_require_fill" type="checkbox" checked /> <span>Require Fill</span></label>
+            <label><input id="keep_unfilled_entry_open" type="checkbox" /> <span>Keep unfilled open</span></label>
+          </div>
+
+          <h3>Live Env (session only)</h3>
+          <div class="grid one">
+            <label><span>PM_PRIVATE_KEY</span><input id="pm_private_key" type="password" autocomplete="off" /></label>
+            <label><span>PM_FUNDER</span><input id="pm_funder" type="text" autocomplete="off" /></label>
+          </div>
+          <div class="grid two">
+            <label>
+              <span>PM_SIGNATURE_TYPE</span>
+              <select id="pm_signature_type">
+                <option value="0">0 (EOA)</option>
+                <option value="1">1 (Magic)</option>
+                <option value="2">2 (Proxy)</option>
+              </select>
+            </label>
+            <label><span>Live Confirm Token</span><input id="confirm_live_token" type="text" /></label>
+          </div>
+
+          <div class="actions">
+            <button id="startBtn" class="btn primary">Start</button>
+            <button id="stopBtn" class="btn">Stop</button>
+            <button id="approveBtn" class="btn success">Approve</button>
+            <button id="rejectBtn" class="btn danger">Reject</button>
+          </div>
+
+          <p id="errorBox" class="error"></p>
+        </aside>
+
+        <section class="panel board">
+          <div class="hero">
+            <div>
+              <h2 id="marketTitle">BTC 15m</h2>
+              <p id="gateText">feed gate: waiting</p>
+            </div>
+            <div class="hero-metrics">
+              <div><span>Price</span><strong id="priceText">-</strong></div>
+              <div><span>PM Up/Down</span><strong id="pmText">-</strong></div>
+              <div><span>Trend</span><strong id="trendText">-</strong></div>
+              <div><span>Bias</span><strong id="biasText">-</strong></div>
+            </div>
+          </div>
+
+          <div id="pendingCard" class="pending hidden">
+            <div>
+              <p class="pending-label">Pending Approval</p>
+              <p id="pendingText">-</p>
+            </div>
+            <div class="pending-actions">
+              <button class="btn success" data-cmd="approve">Approve</button>
+              <button class="btn danger" data-cmd="reject">Reject</button>
+            </div>
+          </div>
+
+          <div class="metrics-grid">
+            <article>
+              <h3>Order Book</h3>
+              <ul id="orderbookList"></ul>
+            </article>
+            <article>
+              <h3>Flow</h3>
+              <ul id="flowList"></ul>
+            </article>
+            <article>
+              <h3>Technical</h3>
+              <ul id="techList"></ul>
+            </article>
+            <article>
+              <h3>Signals</h3>
+              <ul id="signalsList"></ul>
+            </article>
+          </div>
+
+          <article>
+            <h3>Trades</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Action</th>
+                    <th>Side</th>
+                    <th>Price</th>
+                    <th>Size</th>
+                    <th>Status</th>
+                    <th>PnL</th>
+                  </tr>
+                </thead>
+                <tbody id="tradesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article>
+            <h3>Runtime Logs</h3>
+            <pre id="logsBox" class="logs"></pre>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

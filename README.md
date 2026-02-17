@@ -55,6 +55,48 @@ pip install -r requirements.txt
 python main.py
 ```
 
+## Web Interface (Local Server)
+
+This build includes a local web UI with:
+
+- live market/indicator dashboard
+- session-scoped live env inputs (`PM_PRIVATE_KEY`, `PM_FUNDER`, `PM_SIGNATURE_TYPE`)
+- manual approve/reject buttons for pending live trades
+- frontend sound alert when new approval is needed
+- trade history + runtime logs in browser
+
+Run locally:
+
+```bash
+pip install -r requirements.txt
+pip install -r requirements-trading.txt
+uvicorn web_server:app --host 0.0.0.0 --port 8000
+```
+
+Open:
+
+```text
+http://localhost:8000
+```
+
+Important:
+
+- live env values are kept in-memory per browser session (not exported to shell)
+- web mode keeps manual approvals enabled by default
+- live start requires token: `I_UNDERSTAND_REAL_MONEY_RISK`
+
+### Docker
+
+```bash
+docker compose up --build
+```
+
+Then open:
+
+```text
+http://localhost:8000
+```
+
 ## Trading Modes (Cautious Defaults)
 
 The app supports three modes:
@@ -205,6 +247,7 @@ You can change the file path:
 
 ```
 arbi-pred/
+├── web/                   # frontend (HTML/CSS/JS)
 ├── src/
 │   ├── config.py          # all constants — coins, URLs, indicator params
 │   ├── feeds.py           # Binance + Polymarket data feeds
@@ -212,10 +255,13 @@ arbi-pred/
 │   ├── dashboard.py       # Rich terminal UI & trend scoring
 │   └── trading.py         # paper/live execution + risk guardrails
 ├── main.py                # entry point — menu & async orchestration
+├── web_server.py          # FastAPI local backend for web UI
 ├── run_preset.sh          # preset launcher (safe/medium/aggressive)
 ├── safe.sh                # safe preset wrapper
 ├── medium.sh              # medium preset wrapper
 ├── aggressive.sh          # aggressive preset wrapper
+├── Dockerfile
+├── docker-compose.yml
 ├── requirements.txt       # Python dependencies
 ├── requirements-trading.txt # optional trading dependency
 └── README.md
