@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
 import sys
 import time
 import uuid
@@ -27,6 +29,34 @@ import trading
 
 
 SESSION_COOKIE = "pm_session_id"
+AUTH_COOKIE = "pm_web_auth"
+ACCESS_KEY_FILE = BASE_DIR / ".web_access_key"
+
+
+def _load_or_create_access_key() -> tuple[str, str]:
+    env_key = os.environ.get("PM_WEB_ACCESS_KEY", "").strip()
+    if env_key:
+        return env_key, "env"
+
+    if ACCESS_KEY_FILE.exists():
+        key = ACCESS_KEY_FILE.read_text(encoding="utf-8").strip()
+        if key:
+            return key, "file"
+
+    key = secrets.token_urlsafe(24)
+    ACCESS_KEY_FILE.write_text(key + "\n", encoding="utf-8")
+    try:
+        os.chmod(ACCESS_KEY_FILE, 0o600)
+    except Exception:
+        pass
+    return key, "generated"
+
+
+ACCESS_KEY, ACCESS_KEY_SOURCE = _load_or_create_access_key()
+print(
+    f"[WEB AUTH] source={ACCESS_KEY_SOURCE} key_file={ACCESS_KEY_FILE} "
+    f"access_key={ACCESS_KEY}"
+)
 
 PRESETS: dict[str, dict[str, float | int]] = {
     "safe": {
@@ -244,6 +274,10 @@ class CommandRequest(BaseModel):
     command: str
 
 
+class AuthRequest(BaseModel):
+    key: str = ""
+
+
 @dataclass
 class SessionRuntime:
     session_id: str
@@ -255,6 +289,8 @@ class SessionRuntime:
     feed_state: feeds.State = field(default_factory=feeds.State)
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=500))
     tasks: list[asyncio.Task] = field(default_factory=list)
+    events: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=120))
+    event_seq: int = 0
     running: bool = False
     started_ts: float = 0.0
     last_error: str = ""
@@ -263,6 +299,18 @@ class SessionRuntime:
     def log(self, message: str):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self.logs.append(f"[{ts}] {message}")
+
+    def notify(self, level: str, title: str, message: str):
+        self.event_seq += 1
+        self.events.append(
+            {
+                "id": self.event_seq,
+                "ts": _utc_now_iso(),
+                "level": level,
+                "title": title,
+                "message": message,
+            }
+        )
 
     async def _stop_locked(self):
         if not self.tasks:
@@ -315,6 +363,8 @@ class SessionRuntime:
         async with self.lock:
             await self._stop_locked()
             self.logs.clear()
+            self.events.clear()
+            self.event_seq = 0
             self.last_error = ""
 
             self.mode = self._validate_start(payload)
@@ -378,6 +428,19 @@ class SessionRuntime:
             self.engine = None
             if self.mode != trading.TradeMode.OBSERVE:
                 self.engine = trading.TradingEngine(self.mode, cfg, runtime_env=self.env)
+                if self.mode == trading.TradeMode.LIVE:
+                    preflight = await asyncio.to_thread(self.engine.preflight)
+                    for c in preflight.get("checks", []):
+                        status = c.get("status", "info")
+                        name = c.get("name", "check")
+                        detail = c.get("detail", "")
+                        self.notify(
+                            "error" if status == "error" else ("warning" if status == "warn" else "success"),
+                            f"Live preflight: {name}",
+                            str(detail),
+                        )
+                    if not preflight.get("ok", False):
+                        raise ValueError("live preflight failed: check toast details")
 
             self.tasks = [
                 asyncio.create_task(feeds.ob_poller(binance_sym, self.feed_state)),
@@ -402,6 +465,11 @@ class SessionRuntime:
             self.log(
                 f"[SYS] started mode={self.mode.value} {self.coin} {self.timeframe} "
                 f"size=${cfg.size_usd:.2f} eval={cfg.eval_interval_sec}s"
+            )
+            self.notify(
+                "success",
+                "Session started",
+                f"{self.mode.value.upper()} on {self.coin} {self.timeframe}",
             )
 
     def _feed_gate(self) -> dict[str, Any]:
@@ -477,6 +545,7 @@ class SessionRuntime:
                 "pm_down": st.pm_dn,
                 "trend": {"score": trend_score, "label": trend_label},
                 "bias": {"value": bias, "label": _bias_label(bias), "pct": abs(bias)},
+                "summary": self._market_summary(trend_score, trend_label, bias),
                 "orderbook": {
                     "obi": obi_v,
                     "depth": depths,
@@ -505,6 +574,7 @@ class SessionRuntime:
             },
             "trader": trader_state,
             "logs": list(self.logs)[-200:],
+            "events": list(self.events),
             "env_meta": {
                 "PM_ENABLE_LIVE": self.env.get("PM_ENABLE_LIVE", ""),
                 "PM_PRIVATE_KEY_SET": bool(self.env.get("PM_PRIVATE_KEY")),
@@ -515,9 +585,54 @@ class SessionRuntime:
             "error": self.last_error,
         }
 
+    def _market_summary(self, trend_score: int, trend_label: str, bias: float) -> str:
+        st = self.feed_state
+        if st.mid <= 0 or not st.klines:
+            return (
+                f"{self.coin} {self.timeframe} is warming up. "
+                "Waiting for a stable feed from Binance and Polymarket."
+            )
+
+        cvd5 = ind.cvd(st.trades, 300)
+        obi_v = ind.obi(st.bids, st.asks, st.mid) if st.mid else 0.0
+        up = st.pm_up
+        dn = st.pm_dn
+        pressure = "buy pressure" if cvd5 > 0 else ("sell pressure" if cvd5 < 0 else "flat flow")
+        skew = "bullish" if obi_v > 0 else ("bearish" if obi_v < 0 else "neutral")
+        summary = (
+            f"{self.coin} {self.timeframe}: {trend_label.lower()} structure "
+            f"(trend {trend_score:+d}, bias {bias:+.1f}%). "
+            f"Orderbook skew is {skew} ({obi_v * 100:+.1f}%), with {pressure} on 5m CVD "
+            f"(${abs(cvd5):,.0f}). "
+        )
+        if up is not None and dn is not None:
+            summary += f"Polymarket quotes are Up {up:.3f} / Down {dn:.3f}."
+        else:
+            summary += "Polymarket quotes are still loading."
+        return summary
+
 
 SESSIONS: dict[str, SessionRuntime] = {}
 SESSIONS_LOCK = asyncio.Lock()
+
+
+def _is_authorized(request: Request) -> bool:
+    return request.cookies.get(AUTH_COOKIE, "") == ACCESS_KEY
+
+
+def _require_auth(request: Request):
+    if not _is_authorized(request):
+        raise HTTPException(status_code=401, detail="unauthorized: provide access key")
+
+
+def _set_auth_cookie(response: Response):
+    response.set_cookie(
+        AUTH_COOKIE,
+        ACCESS_KEY,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 30,
+    )
 
 
 async def _get_or_create_session(request: Request, response: Response) -> SessionRuntime:
@@ -546,8 +661,17 @@ async def root() -> FileResponse:
     return FileResponse(BASE_DIR / "web" / "index.html")
 
 
+@app.post("/api/auth")
+async def api_auth(payload: AuthRequest, response: Response):
+    if payload.key.strip() != ACCESS_KEY:
+        raise HTTPException(status_code=401, detail="invalid access key")
+    _set_auth_cookie(response)
+    return {"ok": True}
+
+
 @app.get("/api/bootstrap")
 async def api_bootstrap(request: Request, response: Response):
+    _require_auth(request)
     session = await _get_or_create_session(request, response)
     return {
         "ok": True,
@@ -562,12 +686,14 @@ async def api_bootstrap(request: Request, response: Response):
 
 @app.get("/api/state")
 async def api_state(request: Request, response: Response):
+    _require_auth(request)
     session = await _get_or_create_session(request, response)
     return {"ok": True, "state": session.snapshot()}
 
 
 @app.post("/api/start")
 async def api_start(payload: StartRequest, request: Request, response: Response):
+    _require_auth(request)
     session = await _get_or_create_session(request, response)
     try:
         await session.start(payload)
@@ -578,6 +704,7 @@ async def api_start(payload: StartRequest, request: Request, response: Response)
 
 @app.post("/api/stop")
 async def api_stop(request: Request, response: Response):
+    _require_auth(request)
     session = await _get_or_create_session(request, response)
     await session.stop()
     return {"ok": True, "state": session.snapshot()}
@@ -585,6 +712,7 @@ async def api_stop(request: Request, response: Response):
 
 @app.post("/api/command")
 async def api_command(payload: CommandRequest, request: Request, response: Response):
+    _require_auth(request)
     session = await _get_or_create_session(request, response)
     if not session.engine:
         raise HTTPException(status_code=400, detail="trader is disabled in observe mode")
@@ -599,4 +727,3 @@ async def _shutdown():
     async with SESSIONS_LOCK:
         sessions = list(SESSIONS.values())
     await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
-

@@ -12,12 +12,25 @@
   <body>
     <div class="bg-orb orb-a"></div>
     <div class="bg-orb orb-b"></div>
+    <div id="authOverlay" class="auth-overlay hidden">
+      <div class="auth-card">
+        <h2>Access Key Required</h2>
+        <p>Enter your private web access key to unlock trading dashboard.</p>
+        <label>
+          <span>Access key</span>
+          <input id="authKeyInput" type="password" autocomplete="off" placeholder="Paste access key" />
+        </label>
+        <button id="authSubmitBtn" class="btn primary">Unlock</button>
+        <p id="authHint" class="auth-hint"></p>
+      </div>
+    </div>
 
     <main class="app">
       <header class="topbar">
         <h1>Polymarket Crypto Assistant</h1>
         <div id="statusBadge" class="badge idle">IDLE</div>
       </header>
+      <div id="toastContainer" class="toasts"></div>
 
       <section class="layout">
         <aside class="panel controls">
@@ -110,6 +123,7 @@
             <div>
               <h2 id="marketTitle">BTC 15m</h2>
               <p id="gateText">feed gate: waiting</p>
+              <p id="summaryText" class="summary">Market summary will appear here.</p>
             </div>
             <div class="hero-metrics">
               <div><span>Price</span><strong id="priceText">-</strong></div>

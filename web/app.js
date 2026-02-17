@@ -1,6 +1,10 @@
 const el = (id) => document.getElementById(id);
 
 const ui = {
+  authOverlay: el("authOverlay"),
+  authKeyInput: el("authKeyInput"),
+  authSubmitBtn: el("authSubmitBtn"),
+  authHint: el("authHint"),
   statusBadge: el("statusBadge"),
   mode: el("mode"),
   preset: el("preset"),
@@ -11,8 +15,10 @@ const ui = {
   approveBtn: el("approveBtn"),
   rejectBtn: el("rejectBtn"),
   errorBox: el("errorBox"),
+  toastContainer: el("toastContainer"),
   marketTitle: el("marketTitle"),
   gateText: el("gateText"),
+  summaryText: el("summaryText"),
   priceText: el("priceText"),
   pmText: el("pmText"),
   trendText: el("trendText"),
@@ -55,6 +61,27 @@ let bootstrap = null;
 let pollTimer = null;
 let lastPendingSignature = "";
 let audioCtx = null;
+let lastEventId = 0;
+let pendingToastEl = null;
+let controlsBound = false;
+let authVisible = false;
+let bootstrappedOnce = false;
+let coinTfBound = false;
+
+function sentimentClass(label) {
+  const raw = String(label || "").toLowerCase();
+  if (raw.includes("bull")) return "bullish";
+  if (raw.includes("bear")) return "bearish";
+  return "neutral";
+}
+
+function signClass(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "neutral";
+  const x = Number(value);
+  if (x > 0) return "positive";
+  if (x < 0) return "negative";
+  return "neutral";
+}
 
 function fmtPrice(v) {
   if (v === null || v === undefined || Number.isNaN(v)) return "-";
@@ -74,6 +101,70 @@ function fmtNum(v, digits = 2) {
 
 function setError(msg = "") {
   ui.errorBox.textContent = msg;
+}
+
+function showToast(level, title, message, timeoutMs = 5200, sticky = false) {
+  if (!ui.toastContainer) return;
+  const toast = document.createElement("div");
+  toast.className = `toast ${level || "info"}`;
+  const h = document.createElement("h4");
+  const p = document.createElement("p");
+  h.textContent = title || "Notice";
+  p.textContent = message || "";
+  toast.appendChild(h);
+  toast.appendChild(p);
+  ui.toastContainer.appendChild(toast);
+  if (sticky) return toast;
+  window.setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transform = "translateY(-4px)";
+    toast.style.transition = "opacity 0.2s ease, transform 0.2s ease";
+    window.setTimeout(() => toast.remove(), 220);
+  }, timeoutMs);
+  return toast;
+}
+
+function removeToast(toast) {
+  if (!toast) return;
+  toast.style.opacity = "0";
+  toast.style.transform = "translateY(-4px)";
+  toast.style.transition = "opacity 0.2s ease, transform 0.2s ease";
+  window.setTimeout(() => toast.remove(), 220);
+}
+
+function dismissPendingActionToast() {
+  if (!pendingToastEl) return;
+  removeToast(pendingToastEl);
+  pendingToastEl = null;
+}
+
+function showPendingActionToast(text) {
+  dismissPendingActionToast();
+  const toast = showToast("warning", "Pending Trade Approval", text, 0, true);
+  if (!toast) return;
+  toast.classList.add("toast-pending");
+
+  const actions = document.createElement("div");
+  actions.className = "toast-actions";
+
+  const approve = document.createElement("button");
+  approve.className = "toast-btn success";
+  approve.textContent = "Approve";
+  approve.addEventListener("click", async () => {
+    await runCommand("approve");
+  });
+
+  const reject = document.createElement("button");
+  reject.className = "toast-btn danger";
+  reject.textContent = "Reject";
+  reject.addEventListener("click", async () => {
+    await runCommand("reject");
+  });
+
+  actions.appendChild(approve);
+  actions.appendChild(reject);
+  toast.appendChild(actions);
+  pendingToastEl = toast;
 }
 
 function setStatus(running, mode) {
@@ -105,7 +196,10 @@ function setupCoinTimeframes() {
     }
   };
 
-  ui.coin.addEventListener("change", refreshTimeframes);
+  if (!coinTfBound) {
+    ui.coin.addEventListener("change", refreshTimeframes);
+    coinTfBound = true;
+  }
   ui.coin.value = "BTC";
   refreshTimeframes();
 }
@@ -160,9 +254,68 @@ async function api(path, options = {}) {
     data = null;
   }
   if (!res.ok) {
-    throw new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    const err = new Error(data?.detail || data?.error || `HTTP ${res.status}`);
+    err.status = res.status;
+    err.unauthorized = res.status === 401;
+    throw err;
   }
   return data;
+}
+
+function showAuthOverlay(message = "") {
+  authVisible = true;
+  if (ui.authOverlay) ui.authOverlay.classList.remove("hidden");
+  if (ui.authHint) ui.authHint.textContent = message || "Access key required";
+}
+
+function hideAuthOverlay() {
+  authVisible = false;
+  if (ui.authOverlay) ui.authOverlay.classList.add("hidden");
+  if (ui.authHint) ui.authHint.textContent = "";
+}
+
+async function submitAccessKey() {
+  const key = String(ui.authKeyInput?.value || "").trim();
+  if (!key) {
+    showAuthOverlay("Enter access key");
+    return false;
+  }
+  try {
+    await api("/api/auth", { method: "POST", body: { key } });
+    hideAuthOverlay();
+    if (ui.authKeyInput) ui.authKeyInput.value = "";
+    showToast("success", "Authorized", "Access granted");
+    return true;
+  } catch (e) {
+    const msg = e.message || String(e);
+    showAuthOverlay(msg);
+    showToast("error", "Auth Error", msg, 5000);
+    return false;
+  }
+}
+
+function bindControlsOnce() {
+  if (controlsBound) return;
+  controlsBound = true;
+
+  ui.preset.addEventListener("change", () => applyPreset(ui.preset.value));
+  ui.startBtn.addEventListener("click", onStart);
+  ui.stopBtn.addEventListener("click", onStop);
+  ui.approveBtn.addEventListener("click", () => runCommand("approve"));
+  ui.rejectBtn.addEventListener("click", () => runCommand("reject"));
+  ui.authSubmitBtn?.addEventListener("click", async () => {
+    const ok = await submitAccessKey();
+    if (ok) await bootstrapApp();
+  });
+  ui.authKeyInput?.addEventListener("keydown", async (ev) => {
+    if (ev.key !== "Enter") return;
+    const ok = await submitAccessKey();
+    if (ok) await bootstrapApp();
+  });
+
+  document.querySelectorAll("[data-cmd]").forEach((node) => {
+    node.addEventListener("click", () => runCommand(node.dataset.cmd));
+  });
 }
 
 function initAudio() {
@@ -206,7 +359,15 @@ function renderList(node, items) {
     node.appendChild(li("-"));
     return;
   }
-  items.forEach((x) => node.appendChild(li(String(x))));
+  items.forEach((item) => {
+    if (typeof item === "string") {
+      node.appendChild(li(item));
+      return;
+    }
+    const nodeItem = li(String(item?.text || "-"));
+    if (item?.className) nodeItem.classList.add(item.className);
+    node.appendChild(nodeItem);
+  });
 }
 
 function renderTrades(trades) {
@@ -217,17 +378,19 @@ function renderTrades(trades) {
     const pnl = t.pnl_pct !== null && t.pnl_pct !== undefined
       ? `${fmtPct(t.pnl_pct)} / $${fmtNum(t.pnl_usd, 2)}`
       : "-";
-    [
-      when,
-      t.action || "-",
-      t.side || "-",
-      t.price !== undefined ? Number(t.price).toFixed(3) : "-",
-      t.size_usd !== undefined ? `$${fmtNum(t.size_usd, 2)}` : "-",
-      t.status || "-",
-      pnl,
-    ].forEach((txt) => {
+    const columns = [
+      { text: when },
+      { text: t.action || "-" },
+      { text: t.side || "-", className: String(t.side || "").toLowerCase() === "up" ? "bullish" : (String(t.side || "").toLowerCase() === "down" ? "bearish" : "") },
+      { text: t.price !== undefined ? Number(t.price).toFixed(3) : "-" },
+      { text: t.size_usd !== undefined ? `$${fmtNum(t.size_usd, 2)}` : "-" },
+      { text: t.status || "-", className: String(t.status || "").includes("error") || String(t.status || "").includes("failed") ? "bearish" : (String(t.status || "").includes("filled") || String(t.status || "").includes("posted") ? "bullish" : "") },
+      { text: pnl, className: signClass(t.pnl_pct) },
+    ];
+    columns.forEach((col) => {
       const td = document.createElement("td");
-      td.textContent = txt;
+      td.textContent = col.text;
+      if (col.className) td.classList.add(col.className);
       tr.appendChild(td);
     });
     ui.tradesBody.appendChild(tr);
@@ -252,34 +415,43 @@ function renderState(state) {
     : "-";
   ui.trendText.textContent = `${market.trend?.label || "-"} (${market.trend?.score ?? "-"})`;
   ui.biasText.textContent = `${market.bias?.label || "-"} ${fmtPct(market.bias?.value)}`;
+  ui.summaryText.textContent = market.summary || "Market summary is unavailable.";
+  ui.trendText.className = sentimentClass(market.trend?.label);
+  ui.biasText.className = sentimentClass(market.bias?.label);
 
   renderList(ui.orderbookList, [
-    `OBI: ${fmtPct((orderbook.obi || 0) * 100)}`,
-    `Depth 0.1%: ${fmtPrice(orderbook.depth?.[0.1])}`,
-    `Depth 0.5%: ${fmtPrice(orderbook.depth?.[0.5])}`,
-    `Depth 1.0%: ${fmtPrice(orderbook.depth?.[1.0])}`,
-    `BUY walls: ${(orderbook.buy_walls || []).map((x) => Number(x[0]).toFixed(2)).join(", ") || "none"}`,
-    `SELL walls: ${(orderbook.sell_walls || []).map((x) => Number(x[0]).toFixed(2)).join(", ") || "none"}`,
+    { text: `OBI: ${fmtPct((orderbook.obi || 0) * 100)}`, className: signClass((orderbook.obi || 0) * 100) },
+    { text: `Depth 0.1%: ${fmtPrice(orderbook.depth?.[0.1])}` },
+    { text: `Depth 0.5%: ${fmtPrice(orderbook.depth?.[0.5])}` },
+    { text: `Depth 1.0%: ${fmtPrice(orderbook.depth?.[1.0])}` },
+    { text: `BUY walls: ${(orderbook.buy_walls || []).map((x) => Number(x[0]).toFixed(2)).join(", ") || "none"}`, className: (orderbook.buy_walls || []).length ? "bullish" : "" },
+    { text: `SELL walls: ${(orderbook.sell_walls || []).map((x) => Number(x[0]).toFixed(2)).join(", ") || "none"}`, className: (orderbook.sell_walls || []).length ? "bearish" : "" },
   ]);
 
   renderList(ui.flowList, [
-    `CVD 1m: $${fmtNum(flow.cvd_1m, 2)}`,
-    `CVD 3m: $${fmtNum(flow.cvd_3m, 2)}`,
-    `CVD 5m: $${fmtNum(flow.cvd_5m, 2)}`,
-    `Delta 1m: $${fmtNum(flow.delta_1m, 2)}`,
-    `POC: ${fmtPrice(flow.poc)}`,
+    { text: `CVD 1m: $${fmtNum(flow.cvd_1m, 2)}`, className: signClass(flow.cvd_1m) },
+    { text: `CVD 3m: $${fmtNum(flow.cvd_3m, 2)}`, className: signClass(flow.cvd_3m) },
+    { text: `CVD 5m: $${fmtNum(flow.cvd_5m, 2)}`, className: signClass(flow.cvd_5m) },
+    { text: `Delta 1m: $${fmtNum(flow.delta_1m, 2)}`, className: signClass(flow.delta_1m) },
+    { text: `POC: ${fmtPrice(flow.poc)}` },
   ]);
 
   const ha = (tech.ha_last8 || []).map((x) => (x ? "▲" : "▼")).join(" ");
   renderList(ui.techList, [
-    `RSI: ${fmtNum(tech.rsi, 1)}`,
-    `MACD: ${fmtNum(tech.macd, 6)} | signal ${fmtNum(tech.signal, 6)}`,
-    `VWAP: ${fmtPrice(tech.vwap)}`,
-    `EMA5 / EMA20: ${fmtPrice(tech.ema5)} / ${fmtPrice(tech.ema20)}`,
-    `Heikin Ashi: ${ha || "-"}`,
+    { text: `RSI: ${fmtNum(tech.rsi, 1)}`, className: (tech.rsi ?? 50) >= 70 ? "bearish" : ((tech.rsi ?? 50) <= 30 ? "bullish" : "neutral") },
+    { text: `MACD: ${fmtNum(tech.macd, 6)} | signal ${fmtNum(tech.signal, 6)}`, className: signClass(tech.macd_hist ?? tech.macd) },
+    { text: `VWAP: ${fmtPrice(tech.vwap)}` },
+    { text: `EMA5 / EMA20: ${fmtPrice(tech.ema5)} / ${fmtPrice(tech.ema20)}`, className: (tech.ema5 ?? 0) > (tech.ema20 ?? 0) ? "bullish" : "bearish" },
+    { text: `Heikin Ashi: ${ha || "-"}` },
   ]);
 
-  renderList(ui.signalsList, market.signals || []);
+  renderList(
+    ui.signalsList,
+    (market.signals || []).map((s) => ({
+      text: s,
+      className: sentimentClass(s),
+    }))
+  );
 
   const trader = state.trader || null;
   renderTrades(trader?.trades || []);
@@ -288,19 +460,34 @@ function renderState(state) {
   if (pending) {
     ui.pendingCard.classList.remove("hidden");
     ui.pendingText.textContent = `${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`;
-    const signature = `${trader.pending_key || ""}|${Number(pending.price).toFixed(3)}`;
+    const signature = trader.pending_key || `${pending.side}|${pending.token_id || ""}`;
     if (signature && signature !== lastPendingSignature) {
       lastPendingSignature = signature;
       playPendingSound();
+      showPendingActionToast(`${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`);
+    } else if (!pendingToastEl) {
+      showPendingActionToast(`${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`);
     }
   } else {
     ui.pendingCard.classList.add("hidden");
     ui.pendingText.textContent = "-";
     lastPendingSignature = "";
+    dismissPendingActionToast();
   }
 
   ui.logsBox.textContent = (state.logs || []).join("\n");
   ui.logsBox.scrollTop = ui.logsBox.scrollHeight;
+
+  const events = state.events || [];
+  if (events.length && events[events.length - 1].id < lastEventId) {
+    lastEventId = 0;
+  }
+  events.forEach((evt) => {
+    const id = Number(evt.id || 0);
+    if (!id || id <= lastEventId) return;
+    showToast(evt.level || "info", evt.title || "Event", evt.message || "");
+    lastEventId = Math.max(lastEventId, id);
+  });
 }
 
 async function pollState() {
@@ -308,7 +495,13 @@ async function pollState() {
     const data = await api("/api/state");
     renderState(data.state);
   } catch (e) {
-    setError(e.message || String(e));
+    if (e.unauthorized) {
+      showAuthOverlay("Enter access key to continue");
+      return;
+    }
+    const msg = e.message || String(e);
+    setError(msg);
+    showToast("error", "State Error", msg);
   }
 }
 
@@ -317,7 +510,13 @@ async function runCommand(command) {
     await api("/api/command", { method: "POST", body: { command } });
     await pollState();
   } catch (e) {
-    setError(e.message || String(e));
+    if (e.unauthorized) {
+      showAuthOverlay("Session is locked. Enter access key.");
+      return;
+    }
+    const msg = e.message || String(e);
+    setError(msg);
+    showToast("error", "Command Error", msg);
   }
 }
 
@@ -329,7 +528,16 @@ async function onStart() {
     await api("/api/start", { method: "POST", body: payload });
     await pollState();
   } catch (e) {
-    setError(e.message || String(e));
+    if (e.unauthorized) {
+      showAuthOverlay("Session is locked. Enter access key.");
+      return;
+    }
+    const msg = e.message || String(e);
+    setError(msg);
+    showToast("error", "Start Error", msg, 7000);
+    try {
+      await pollState();
+    } catch {}
   }
 }
 
@@ -339,11 +547,17 @@ async function onStop() {
     await api("/api/stop", { method: "POST" });
     await pollState();
   } catch (e) {
-    setError(e.message || String(e));
+    if (e.unauthorized) {
+      showAuthOverlay("Session is locked. Enter access key.");
+      return;
+    }
+    const msg = e.message || String(e);
+    setError(msg);
+    showToast("error", "Stop Error", msg);
   }
 }
 
-async function init() {
+async function bootstrapApp() {
   try {
     const data = await api("/api/bootstrap");
     bootstrap = data;
@@ -351,22 +565,30 @@ async function init() {
     el("confirm_live_token").value = data.live_confirm_token || "";
     applyPreset("medium");
     renderState(data.state);
-
-    ui.preset.addEventListener("change", () => applyPreset(ui.preset.value));
-    ui.startBtn.addEventListener("click", onStart);
-    ui.stopBtn.addEventListener("click", onStop);
-    ui.approveBtn.addEventListener("click", () => runCommand("approve"));
-    ui.rejectBtn.addEventListener("click", () => runCommand("reject"));
-
-    document.querySelectorAll("[data-cmd]").forEach((node) => {
-      node.addEventListener("click", () => runCommand(node.dataset.cmd));
-    });
+    hideAuthOverlay();
+    if (!bootstrappedOnce) {
+      showToast("success", "Ready", "Web terminal loaded");
+    }
+    bootstrappedOnce = true;
 
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollState, 1200);
+    return true;
   } catch (e) {
-    setError(e.message || String(e));
+    if (e.unauthorized) {
+      showAuthOverlay("Enter access key to unlock dashboard");
+      return false;
+    }
+    const msg = e.message || String(e);
+    setError(msg);
+    showToast("error", "Bootstrap Error", msg, 7000);
+    return false;
   }
+}
+
+async function init() {
+  bindControlsOnce();
+  await bootstrapApp();
 }
 
 init();

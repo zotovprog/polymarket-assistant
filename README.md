@@ -61,9 +61,18 @@ This build includes a local web UI with:
 
 - live market/indicator dashboard
 - session-scoped live env inputs (`PM_PRIVATE_KEY`, `PM_FUNDER`, `PM_SIGNATURE_TYPE`)
+- live preflight checks on start (key format, signature type, API collateral read test)
 - manual approve/reject buttons for pending live trades
-- frontend sound alert when new approval is needed
+- frontend sound alert + toast notifications for pending trades and start/runtime issues
+- compact English market summary at the top (current regime snapshot)
 - trade history + runtime logs in browser
+
+Access control:
+
+- web API is protected by an access key
+- set your own key with env: `PM_WEB_ACCESS_KEY=...`
+- or let the app auto-generate and persist it in `.web_access_key`
+- browser must unlock once via key prompt; after that auth cookie is used
 
 Run locally:
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -215,6 +216,64 @@ class LiveExecutor:
             funder=funder,
             creds=api_creds,
         )
+
+    def preflight(self) -> dict:
+        private_key = self._env_get("PM_PRIVATE_KEY") or ""
+        funder = self._env_get("PM_FUNDER") or ""
+        sig_raw = self._env_get("PM_SIGNATURE_TYPE", "0") or "0"
+        checks: list[dict] = []
+        ok = True
+
+        def add_check(name: str, status: str, detail: str):
+            nonlocal ok
+            checks.append({"name": name, "status": status, "detail": detail})
+            if status == "error":
+                ok = False
+
+        if re.fullmatch(r"0x[a-fA-F0-9]{64}", private_key):
+            add_check("private_key_format", "ok", "looks valid")
+        else:
+            add_check("private_key_format", "error", "expected 0x + 64 hex chars")
+
+        if re.fullmatch(r"0x[a-fA-F0-9]{40}", funder):
+            add_check("funder_format", "ok", "looks valid")
+        else:
+            add_check("funder_format", "error", "expected 0x + 40 hex chars")
+
+        if sig_raw in {"0", "1", "2"}:
+            detail = {
+                "0": "EOA/private-key signer",
+                "1": "Magic/email signer",
+                "2": "proxy signer",
+            }[sig_raw]
+            add_check("signature_type", "ok", f"{sig_raw} ({detail})")
+        else:
+            add_check("signature_type", "error", f"unsupported value: {sig_raw}")
+
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=-1,
+            )
+            data = self.client.get_balance_allowance(params)
+            bal_raw = str((data or {}).get("balance", "")).strip()
+            bal = self._as_float(bal_raw)
+            if bal is None:
+                add_check("api_collateral_read", "warn", "response parsed but balance is not numeric")
+            else:
+                add_check("api_collateral_read", "ok", f"balance={bal}")
+        except Exception as e:
+            add_check("api_collateral_read", "error", self._format_exception_status("preflight", e))
+
+        return {
+            "ok": ok,
+            "checks": checks,
+            "signature_type": sig_raw,
+            "funder": funder,
+            "private_key_masked": f"{private_key[:6]}...{private_key[-4:]}" if private_key else "",
+        }
 
     def execute_entry(self, decision: TradeDecision, coin: str, timeframe: str) -> TradeRecord:
         from py_clob_client.clob_types import OrderArgs, OrderType
@@ -928,6 +987,13 @@ class TradingEngine:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    def preflight(self) -> dict:
+        if self.mode != TradeMode.LIVE:
+            return {"ok": True, "checks": [{"name": "mode", "status": "ok", "detail": self.mode.value}]}
+        if not isinstance(self.executor, LiveExecutor):
+            return {"ok": False, "checks": [{"name": "executor", "status": "error", "detail": "live executor missing"}]}
+        return self.executor.preflight()
 
     def _reset_state(self, log):
         cancelled = False
