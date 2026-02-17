@@ -57,6 +57,8 @@ const checks = [
   "keep_unfilled_entry_open",
 ];
 
+const FORM_STORAGE_KEY = "pm_assistant_form_v1";
+
 let bootstrap = null;
 let pollTimer = null;
 let lastPendingSignature = "";
@@ -98,6 +100,78 @@ function fmtPct(v) {
 function fmtNum(v, digits = 2) {
   if (v === null || v === undefined || Number.isNaN(v)) return "-";
   return Number(v).toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+
+function allPersistedFieldIds() {
+  return [
+    "mode",
+    "preset",
+    "coin",
+    "timeframe",
+    "pm_private_key",
+    "pm_funder",
+    "pm_signature_type",
+    "confirm_live_token",
+    ...fields,
+    ...checks,
+  ];
+}
+
+function saveFormState() {
+  const payload = {};
+  allPersistedFieldIds().forEach((id) => {
+    const node = el(id);
+    if (!node) return;
+    if (node.type === "checkbox") {
+      payload[id] = !!node.checked;
+      return;
+    }
+    payload[id] = node.value;
+  });
+  try {
+    localStorage.setItem(FORM_STORAGE_KEY, JSON.stringify(payload));
+  } catch {}
+}
+
+function restoreFormState() {
+  let raw = "";
+  try {
+    raw = localStorage.getItem(FORM_STORAGE_KEY) || "";
+  } catch {
+    raw = "";
+  }
+  if (!raw) return false;
+
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!data || typeof data !== "object") return false;
+
+  if (data.coin && ui.coin.querySelector(`option[value="${String(data.coin)}"]`)) {
+    ui.coin.value = String(data.coin);
+    ui.coin.dispatchEvent(new Event("change"));
+  }
+  if (data.timeframe && ui.timeframe.querySelector(`option[value="${String(data.timeframe)}"]`)) {
+    ui.timeframe.value = String(data.timeframe);
+  }
+
+  allPersistedFieldIds().forEach((id) => {
+    if (id === "coin" || id === "timeframe") return;
+    if (!(id in data)) return;
+    const node = el(id);
+    if (!node) return;
+    if (node.type === "checkbox") {
+      node.checked = !!data[id];
+      return;
+    }
+    node.value = String(data[id] ?? "");
+  });
+
+  syncModeByPreset(false);
+  return true;
 }
 
 function setError(msg = "") {
@@ -233,6 +307,7 @@ function syncModeByPreset(showNotice = false) {
 
 function gatherStartPayload() {
   syncModeByPreset(false);
+  saveFormState();
   const env = {
     PM_PRIVATE_KEY: el("pm_private_key").value.trim(),
     PM_FUNDER: el("pm_funder").value.trim(),
@@ -320,8 +395,12 @@ function bindControlsOnce() {
   ui.preset.addEventListener("change", () => {
     applyPreset(ui.preset.value);
     syncModeByPreset(true);
+    saveFormState();
   });
-  ui.mode.addEventListener("change", () => syncModeByPreset(true));
+  ui.mode.addEventListener("change", () => {
+    syncModeByPreset(true);
+    saveFormState();
+  });
   ui.startBtn.addEventListener("click", onStart);
   ui.stopBtn.addEventListener("click", onStop);
   ui.approveBtn.addEventListener("click", () => runCommand("approve"));
@@ -338,6 +417,13 @@ function bindControlsOnce() {
 
   document.querySelectorAll("[data-cmd]").forEach((node) => {
     node.addEventListener("click", () => runCommand(node.dataset.cmd));
+  });
+
+  allPersistedFieldIds().forEach((id) => {
+    const node = el(id);
+    if (!node) return;
+    const evName = node.type === "checkbox" || node.tagName === "SELECT" ? "change" : "input";
+    node.addEventListener(evName, saveFormState);
   });
 }
 
@@ -585,8 +671,15 @@ async function bootstrapApp() {
     const data = await api("/api/bootstrap");
     bootstrap = data;
     setupCoinTimeframes();
-    el("confirm_live_token").value = data.live_confirm_token || "";
-    applyPreset("medium");
+    const restored = restoreFormState();
+    if (!restored) {
+      el("confirm_live_token").value = data.live_confirm_token || "";
+      applyPreset("medium");
+      saveFormState();
+    } else if (!el("confirm_live_token").value) {
+      el("confirm_live_token").value = data.live_confirm_token || "";
+      saveFormState();
+    }
     syncModeByPreset(false);
     renderState(data.state);
     hideAuthOverlay();
