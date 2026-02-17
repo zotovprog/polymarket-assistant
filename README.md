@@ -154,7 +154,7 @@ Preset launcher scripts are included:
 
 Web preset note:
 
-- `MEGA AGGRESSIVE` exists only in web UI and is paper-only by design.
+- `SUPER AGGRESSIVE` exists only in web UI and is paper-only by design.
 
 Quick start:
 

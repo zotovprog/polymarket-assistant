@@ -215,12 +215,12 @@ function applyPreset(name) {
 }
 
 function syncModeByPreset(showNotice = false) {
-  const isMega = ui.preset.value === "mega_aggressive";
-  if (isMega) {
+  const isPaperOnlyAggro = ui.preset.value === "mega_aggressive" || ui.preset.value === "super_aggressive";
+  if (isPaperOnlyAggro) {
     if (ui.mode.value !== "paper") {
       ui.mode.value = "paper";
       if (showNotice || !megaPresetNoticeShown) {
-        showToast("warning", "Preset lock", "MEGA AGGRESSIVE is paper-only. Mode switched to PAPER.");
+        showToast("warning", "Preset lock", "SUPER AGGRESSIVE is paper-only. Mode switched to PAPER.");
         megaPresetNoticeShown = true;
       }
     }

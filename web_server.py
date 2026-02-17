@@ -86,18 +86,31 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "max_hold_sec": 900,
         "reverse_exit_bias": 45,
     },
-    "mega_aggressive": {
-        "min_bias": 35,
-        "min_obi": 0.20,
-        "min_price": 0.20,
-        "max_price": 0.90,
-        "cooldown_sec": 60,
-        "max_trades_per_day": 24,
+    "super_aggressive": {
+        "min_bias": 12,
+        "min_obi": 0.05,
+        "min_price": 0.10,
+        "max_price": 0.95,
+        "cooldown_sec": 5,
+        "max_trades_per_day": 300,
         "eval_interval_sec": 1,
-        "tp_pct": 7,
-        "sl_pct": 10,
-        "max_hold_sec": 600,
-        "reverse_exit_bias": 40,
+        "tp_pct": 4,
+        "sl_pct": 7,
+        "max_hold_sec": 240,
+        "reverse_exit_bias": 20,
+    },
+    "mega_aggressive": {
+        "min_bias": 12,
+        "min_obi": 0.05,
+        "min_price": 0.10,
+        "max_price": 0.95,
+        "cooldown_sec": 5,
+        "max_trades_per_day": 300,
+        "eval_interval_sec": 1,
+        "tp_pct": 4,
+        "sl_pct": 7,
+        "max_hold_sec": 240,
+        "reverse_exit_bias": 20,
     },
 }
 
@@ -340,8 +353,8 @@ class SessionRuntime:
     def _validate_start(self, payload: StartRequest) -> trading.TradeMode:
         if payload.preset not in PRESETS:
             raise ValueError(f"unknown preset: {payload.preset}")
-        if payload.preset == "mega_aggressive" and payload.mode.lower().strip() != "paper":
-            raise ValueError("MEGA AGGRESSIVE preset is paper-only")
+        if payload.preset in {"mega_aggressive", "super_aggressive"} and payload.mode.lower().strip() != "paper":
+            raise ValueError("SUPER AGGRESSIVE preset is paper-only")
 
         coin = payload.coin.upper()
         if coin not in config.COINS:
