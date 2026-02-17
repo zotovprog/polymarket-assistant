@@ -67,6 +67,7 @@ let controlsBound = false;
 let authVisible = false;
 let bootstrappedOnce = false;
 let coinTfBound = false;
+let megaPresetNoticeShown = false;
 
 function sentimentClass(label) {
   const raw = String(label || "").toLowerCase();
@@ -213,7 +214,25 @@ function applyPreset(name) {
   });
 }
 
+function syncModeByPreset(showNotice = false) {
+  const isMega = ui.preset.value === "mega_aggressive";
+  if (isMega) {
+    if (ui.mode.value !== "paper") {
+      ui.mode.value = "paper";
+      if (showNotice || !megaPresetNoticeShown) {
+        showToast("warning", "Preset lock", "MEGA AGGRESSIVE is paper-only. Mode switched to PAPER.");
+        megaPresetNoticeShown = true;
+      }
+    }
+    ui.mode.setAttribute("disabled", "disabled");
+    return;
+  }
+  ui.mode.removeAttribute("disabled");
+  megaPresetNoticeShown = false;
+}
+
 function gatherStartPayload() {
+  syncModeByPreset(false);
   const env = {
     PM_PRIVATE_KEY: el("pm_private_key").value.trim(),
     PM_FUNDER: el("pm_funder").value.trim(),
@@ -298,7 +317,11 @@ function bindControlsOnce() {
   if (controlsBound) return;
   controlsBound = true;
 
-  ui.preset.addEventListener("change", () => applyPreset(ui.preset.value));
+  ui.preset.addEventListener("change", () => {
+    applyPreset(ui.preset.value);
+    syncModeByPreset(true);
+  });
+  ui.mode.addEventListener("change", () => syncModeByPreset(true));
   ui.startBtn.addEventListener("click", onStart);
   ui.stopBtn.addEventListener("click", onStop);
   ui.approveBtn.addEventListener("click", () => runCommand("approve"));
@@ -564,6 +587,7 @@ async function bootstrapApp() {
     setupCoinTimeframes();
     el("confirm_live_token").value = data.live_confirm_token || "";
     applyPreset("medium");
+    syncModeByPreset(false);
     renderState(data.state);
     hideAuthOverlay();
     if (!bootstrappedOnce) {

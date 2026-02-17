@@ -86,6 +86,19 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "max_hold_sec": 900,
         "reverse_exit_bias": 45,
     },
+    "mega_aggressive": {
+        "min_bias": 35,
+        "min_obi": 0.20,
+        "min_price": 0.20,
+        "max_price": 0.90,
+        "cooldown_sec": 60,
+        "max_trades_per_day": 24,
+        "eval_interval_sec": 1,
+        "tp_pct": 7,
+        "sl_pct": 10,
+        "max_hold_sec": 600,
+        "reverse_exit_bias": 40,
+    },
 }
 
 
@@ -325,6 +338,11 @@ class SessionRuntime:
             return ok
 
     def _validate_start(self, payload: StartRequest) -> trading.TradeMode:
+        if payload.preset not in PRESETS:
+            raise ValueError(f"unknown preset: {payload.preset}")
+        if payload.preset == "mega_aggressive" and payload.mode.lower().strip() != "paper":
+            raise ValueError("MEGA AGGRESSIVE preset is paper-only")
+
         coin = payload.coin.upper()
         if coin not in config.COINS:
             raise ValueError(f"invalid coin: {coin}")
@@ -373,6 +391,15 @@ class SessionRuntime:
                 runtime_env.setdefault("PM_SIGNATURE_TYPE", "0")
             self.env = runtime_env
 
+            # Notify credential state at startup for both PAPER and LIVE modes.
+            preflight_report: dict[str, Any] | None = None
+            if self.mode in {trading.TradeMode.PAPER, trading.TradeMode.LIVE}:
+                preflight_report = await asyncio.to_thread(
+                    self._run_live_credentials_preflight,
+                    runtime_env,
+                    self.mode == trading.TradeMode.LIVE,
+                )
+
             exec_log = payload.executions_log_file.strip()
             if not exec_log:
                 exec_log = str(BASE_DIR / f"executions.{self.session_id}.jsonl")
@@ -417,17 +444,7 @@ class SessionRuntime:
             if self.mode != trading.TradeMode.OBSERVE:
                 self.engine = trading.TradingEngine(self.mode, cfg, runtime_env=self.env)
                 if self.mode == trading.TradeMode.LIVE:
-                    preflight = await asyncio.to_thread(self.engine.preflight)
-                    for c in preflight.get("checks", []):
-                        status = c.get("status", "info")
-                        name = c.get("name", "check")
-                        detail = c.get("detail", "")
-                        self.notify(
-                            "error" if status == "error" else ("warning" if status == "warn" else "success"),
-                            f"Live preflight: {name}",
-                            str(detail),
-                        )
-                    if not preflight.get("ok", False):
+                    if not preflight_report or not preflight_report.get("ok", False):
                         raise ValueError("live preflight failed: check toast details")
 
             self.tasks = [
@@ -459,6 +476,60 @@ class SessionRuntime:
                 "Session started",
                 f"{self.mode.value.upper()} on {self.coin} {self.timeframe}",
             )
+
+    def _notify_preflight_checks(self, checks: list[dict], prefix: str = "Credentials check"):
+        for c in checks:
+            status = str(c.get("status", "info")).lower()
+            name = c.get("name", "check")
+            detail = c.get("detail", "")
+            self.notify(
+                "error" if status == "error" else ("warning" if status == "warn" else "success"),
+                f"{prefix}: {name}",
+                str(detail),
+            )
+
+    def _run_live_credentials_preflight(
+        self, runtime_env: dict[str, str], strict: bool
+    ) -> dict[str, Any]:
+        key_present = bool(runtime_env.get("PM_PRIVATE_KEY"))
+        funder_present = bool(runtime_env.get("PM_FUNDER"))
+        sig_type = runtime_env.get("PM_SIGNATURE_TYPE", "0")
+
+        if not key_present and not funder_present:
+            if strict:
+                self.notify("error", "Credentials", "PM_PRIVATE_KEY and PM_FUNDER are required for live mode")
+                return {"ok": False, "checks": []}
+            self.notify("warning", "Credentials", "Live credentials not provided (paper mode, check skipped)")
+            return {"ok": True, "checks": []}
+
+        if key_present != funder_present:
+            missing = "PM_FUNDER" if key_present else "PM_PRIVATE_KEY"
+            self.notify("warning", "Credentials", f"Missing {missing}; full preflight skipped")
+            return {"ok": not strict, "checks": []}
+
+        probe_env = dict(runtime_env)
+        probe_env["PM_ENABLE_LIVE"] = "1"
+        probe_env.setdefault("PM_SIGNATURE_TYPE", sig_type or "0")
+        try:
+            probe = trading.LiveExecutor(trading.TradingConfig(), runtime_env=probe_env)
+            report = probe.preflight()
+            self._notify_preflight_checks(report.get("checks", []), prefix="Live preflight")
+            if report.get("ok", False):
+                self.notify(
+                    "success",
+                    "Credentials OK",
+                    f"Signer/funder and API checks passed (sig_type={probe_env.get('PM_SIGNATURE_TYPE')})",
+                )
+            else:
+                self.notify(
+                    "error",
+                    "Credentials issue",
+                    "Some checks failed; review preflight toasts",
+                )
+            return report
+        except Exception as e:
+            self.notify("error", "Credentials preflight failed", str(e))
+            return {"ok": not strict, "checks": [{"name": "preflight", "status": "error", "detail": str(e)}]}
 
     def _feed_gate(self) -> dict[str, Any]:
         if not self.engine:

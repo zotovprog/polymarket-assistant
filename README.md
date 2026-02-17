@@ -152,6 +152,10 @@ Preset launcher scripts are included:
 - `aggressive.sh`
 - `run_preset.sh` (generic launcher)
 
+Web preset note:
+
+- `MEGA AGGRESSIVE` exists only in web UI and is paper-only by design.
+
 Quick start:
 
 ```bash
