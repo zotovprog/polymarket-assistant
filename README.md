@@ -73,6 +73,16 @@ Access control:
 - set it with env: `PM_WEB_ACCESS_KEY=...` (required)
 - browser must unlock once via key prompt; after that auth cookie is used
 
+Safety behavior in live mode:
+
+- on `Stop`, server attempts emergency flatten (close open position) before shutting session tasks
+- if client heartbeat disappears for too long, server blocks new entries and requests emergency close
+- tunable by env:
+  - `PM_FLATTEN_ON_STOP=1` (default)
+  - `PM_CLIENT_IDLE_FLATTEN=1` (default)
+  - `PM_CLIENT_IDLE_FLATTEN_SEC=45` (default)
+  - `PM_FLATTEN_TIMEOUT_SEC=25` (default)
+
 Run locally:
 
 ```bash

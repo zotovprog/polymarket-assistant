@@ -46,6 +46,29 @@ def _load_access_key_from_env() -> str:
 ACCESS_KEY = _load_access_key_from_env()
 print(f"[WEB AUTH] source=env key_length={len(ACCESS_KEY)}")
 
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+CLIENT_IDLE_FLATTEN_SEC = max(10, _env_int("PM_CLIENT_IDLE_FLATTEN_SEC", 45))
+FLATTEN_TIMEOUT_SEC = max(5, _env_int("PM_FLATTEN_TIMEOUT_SEC", 25))
+ENABLE_CLIENT_IDLE_FLATTEN = _env_flag("PM_CLIENT_IDLE_FLATTEN", True)
+ENABLE_FLATTEN_ON_STOP = _env_flag("PM_FLATTEN_ON_STOP", True)
+
 PRESETS: dict[str, dict[str, float | int]] = {
     "safe": {
         "min_bias": 60,
@@ -308,6 +331,9 @@ class SessionRuntime:
     running: bool = False
     started_ts: float = 0.0
     last_error: str = ""
+    last_client_seen_ts: float = 0.0
+    client_disconnected_mode: bool = False
+    blocked_max_trades_saved: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def log(self, message: str):
@@ -326,7 +352,102 @@ class SessionRuntime:
             }
         )
 
+    def touch_client(self):
+        self.last_client_seen_ts = time.time()
+        if (
+            self.client_disconnected_mode
+            and self.engine is not None
+            and self.blocked_max_trades_saved is not None
+        ):
+            self.engine.cfg.max_trades_per_day = self.blocked_max_trades_saved
+            self.blocked_max_trades_saved = None
+            self.client_disconnected_mode = False
+            self.notify("success", "Client reconnected", "Normal trade limits restored")
+
+    async def _attempt_emergency_flatten(self, reason: str):
+        if not self.engine or self.mode != trading.TradeMode.LIVE:
+            return
+        if self.engine.state.open_position is None:
+            return
+
+        self.notify("warning", "Emergency flatten", f"Attempting exit before stop ({reason})")
+        self.log(f"[SYS] emergency flatten requested: {reason}")
+
+        deadline = time.time() + FLATTEN_TIMEOUT_SEC
+        while time.time() < deadline:
+            if self.engine.state.open_position is None:
+                self.notify("success", "Emergency flatten", "Position closed")
+                return
+            self.engine.state.force_close_requested = True
+            try:
+                self.engine.maybe_close_position(self.feed_state, self.coin, self.timeframe, self.log)
+            except Exception as e:
+                self.log(f"[SYS] emergency flatten error: {e}")
+            await asyncio.sleep(max(0.5, min(2.0, float(self.engine.cfg.eval_interval_sec))))
+
+        if self.engine.state.open_position is not None:
+            self.notify(
+                "error",
+                "Emergency flatten failed",
+                f"Could not close within {FLATTEN_TIMEOUT_SEC}s; position may still be open",
+            )
+
+    async def _client_watchdog_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(2)
+                if (
+                    not self.running
+                    or self.mode != trading.TradeMode.LIVE
+                    or self.engine is None
+                    or not ENABLE_CLIENT_IDLE_FLATTEN
+                ):
+                    continue
+
+                idle = time.time() - (self.last_client_seen_ts or self.started_ts or time.time())
+                if idle < CLIENT_IDLE_FLATTEN_SEC:
+                    continue
+
+                if not self.client_disconnected_mode:
+                    self.client_disconnected_mode = True
+                    if self.blocked_max_trades_saved is None:
+                        self.blocked_max_trades_saved = self.engine.cfg.max_trades_per_day
+                    # Freeze new entries while client is disconnected.
+                    self.engine.cfg.max_trades_per_day = self.engine.state.trades_today
+                    self.engine.state.pending_decision = None
+                    self.engine.state.pending_sig = ""
+                    self.engine.state.pending_key = ""
+                    self.engine.state.approval_armed = False
+                    self.notify(
+                        "warning",
+                        "Client disconnected",
+                        f"No client heartbeat for {int(idle)}s; flatten protection is active",
+                    )
+                    self.log(f"[SYS] client idle {int(idle)}s: block new entries and try flatten")
+
+                if self.engine.state.open_position is not None:
+                    self.engine.state.force_close_requested = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.log(f"[SYS] client watchdog error: {e}")
+
     async def _stop_locked(self):
+        if (
+            ENABLE_FLATTEN_ON_STOP
+            and self.mode == trading.TradeMode.LIVE
+            and self.engine is not None
+            and self.engine.state.open_position is not None
+        ):
+            if self.blocked_max_trades_saved is None:
+                self.blocked_max_trades_saved = self.engine.cfg.max_trades_per_day
+            self.engine.cfg.max_trades_per_day = self.engine.state.trades_today
+            self.engine.state.pending_decision = None
+            self.engine.state.pending_sig = ""
+            self.engine.state.pending_key = ""
+            self.engine.state.approval_armed = False
+            await self._attempt_emergency_flatten("stop")
+
         if not self.tasks:
             self.running = False
             return
@@ -385,6 +506,9 @@ class SessionRuntime:
             self.events.clear()
             self.event_seq = 0
             self.last_error = ""
+            self.last_client_seen_ts = time.time()
+            self.client_disconnected_mode = False
+            self.blocked_max_trades_saved = None
 
             self.mode = self._validate_start(payload)
             self.coin = payload.coin.upper()
@@ -477,6 +601,8 @@ class SessionRuntime:
                         )
                     )
                 )
+                if self.mode == trading.TradeMode.LIVE and ENABLE_CLIENT_IDLE_FLATTEN:
+                    self.tasks.append(asyncio.create_task(self._client_watchdog_loop()))
 
             self.running = True
             self.started_ts = time.time()
@@ -596,6 +722,8 @@ class SessionRuntime:
             "ts": _utc_now_iso(),
             "running": self.running,
             "started_ts": self.started_ts,
+            "last_client_seen_ts": self.last_client_seen_ts,
+            "client_disconnected_mode": self.client_disconnected_mode,
             "mode": self.mode.value,
             "coin": self.coin,
             "timeframe": self.timeframe,
@@ -745,6 +873,7 @@ async def api_auth(payload: AuthRequest, response: Response):
 async def api_bootstrap(request: Request, response: Response):
     _require_auth(request)
     session = await _get_or_create_session(request, response)
+    session.touch_client()
     return {
         "ok": True,
         "session_id": session.session_id,
@@ -760,6 +889,7 @@ async def api_bootstrap(request: Request, response: Response):
 async def api_state(request: Request, response: Response):
     _require_auth(request)
     session = await _get_or_create_session(request, response)
+    session.touch_client()
     return {"ok": True, "state": session.snapshot()}
 
 
@@ -767,6 +897,7 @@ async def api_state(request: Request, response: Response):
 async def api_start(payload: StartRequest, request: Request, response: Response):
     _require_auth(request)
     session = await _get_or_create_session(request, response)
+    session.touch_client()
     try:
         await session.start(payload)
     except ValueError as e:
@@ -778,6 +909,7 @@ async def api_start(payload: StartRequest, request: Request, response: Response)
 async def api_stop(request: Request, response: Response):
     _require_auth(request)
     session = await _get_or_create_session(request, response)
+    session.touch_client()
     await session.stop()
     return {"ok": True, "state": session.snapshot()}
 
@@ -786,6 +918,7 @@ async def api_stop(request: Request, response: Response):
 async def api_command(payload: CommandRequest, request: Request, response: Response):
     _require_auth(request)
     session = await _get_or_create_session(request, response)
+    session.touch_client()
     if not session.engine:
         raise HTTPException(status_code=400, detail="trader is disabled in observe mode")
     ok = await session.submit_command(payload.command)
