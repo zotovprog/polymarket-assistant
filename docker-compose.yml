@@ -4,6 +4,12 @@ services:
     container_name: polymarket-assistant-web
     environment:
       - PM_WEB_ACCESS_KEY=${PM_WEB_ACCESS_KEY:?set PM_WEB_ACCESS_KEY}
+      - PM_PRIVATE_KEY=${PM_PRIVATE_KEY:-}
+      - PM_FUNDER=${PM_FUNDER:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_THREAD_ID=${TELEGRAM_THREAD_ID:-}
+      - TELEGRAM_BOT_USERNAME=${TELEGRAM_BOT_USERNAME:-}
     ports:
       - "8000:8000"
     restart: unless-stopped
