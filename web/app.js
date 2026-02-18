@@ -12,8 +12,8 @@ const ui = {
   timeframe: el("timeframe"),
   startBtn: el("startBtn"),
   stopBtn: el("stopBtn"),
-  approveBtn: el("approveBtn"),
-  rejectBtn: el("rejectBtn"),
+  windowBar: el("windowBar"),
+  windowTimer: el("windowTimer"),
   errorBox: el("errorBox"),
   toastContainer: el("toastContainer"),
   marketTitle: el("marketTitle"),
@@ -23,8 +23,6 @@ const ui = {
   pmText: el("pmText"),
   trendText: el("trendText"),
   biasText: el("biasText"),
-  pendingCard: el("pendingCard"),
-  pendingText: el("pendingText"),
   orderbookList: el("orderbookList"),
   flowList: el("flowList"),
   techList: el("techList"),
@@ -110,9 +108,6 @@ function allPersistedFieldIds() {
     "preset",
     "coin",
     "timeframe",
-    "pm_private_key",
-    "pm_funder",
-    "pm_signature_type",
     "confirm_live_token",
     ...fields,
     ...checks,
@@ -209,39 +204,35 @@ function removeToast(toast) {
   window.setTimeout(() => toast.remove(), 220);
 }
 
-function dismissPendingActionToast() {
-  if (!pendingToastEl) return;
-  removeToast(pendingToastEl);
-  pendingToastEl = null;
-}
+// -- Modal System --
+function showModal(title, message, confirmLabel = "Confirm", confirmClass = "danger") {
+  return new Promise((resolve) => {
+    const overlay = el("modalOverlay");
+    const titleEl = el("modalTitle");
+    const msgEl = el("modalMessage");
+    const confirmBtn = el("modalConfirmBtn");
+    const cancelBtn = el("modalCancelBtn");
 
-function showPendingActionToast(text) {
-  dismissPendingActionToast();
-  const toast = showToast("warning", "Pending Trade Approval", text, 0, true);
-  if (!toast) return;
-  toast.classList.add("toast-pending");
+    titleEl.textContent = title;
+    msgEl.textContent = message;
+    confirmBtn.textContent = confirmLabel;
+    confirmBtn.className = "btn " + confirmClass;
+    overlay.classList.remove("hidden");
 
-  const actions = document.createElement("div");
-  actions.className = "toast-actions";
+    function cleanup() {
+      overlay.classList.add("hidden");
+      confirmBtn.removeEventListener("click", onConfirm);
+      cancelBtn.removeEventListener("click", onCancel);
+      overlay.removeEventListener("click", onOverlay);
+    }
+    function onConfirm() { cleanup(); resolve(true); }
+    function onCancel() { cleanup(); resolve(false); }
+    function onOverlay(e) { if (e.target === overlay) { cleanup(); resolve(false); } }
 
-  const approve = document.createElement("button");
-  approve.className = "toast-btn success";
-  approve.textContent = "Approve";
-  approve.addEventListener("click", async () => {
-    await runCommand("approve");
+    confirmBtn.addEventListener("click", onConfirm);
+    cancelBtn.addEventListener("click", onCancel);
+    overlay.addEventListener("click", onOverlay);
   });
-
-  const reject = document.createElement("button");
-  reject.className = "toast-btn danger";
-  reject.textContent = "Reject";
-  reject.addEventListener("click", async () => {
-    await runCommand("reject");
-  });
-
-  actions.appendChild(approve);
-  actions.appendChild(reject);
-  toast.appendChild(actions);
-  pendingToastEl = toast;
 }
 
 function setStatus(running, mode) {
@@ -310,11 +301,6 @@ function syncModeByPreset(showNotice = false) {
 function gatherStartPayload() {
   syncModeByPreset(false);
   saveFormState();
-  const env = {
-    PM_PRIVATE_KEY: el("pm_private_key").value.trim(),
-    PM_FUNDER: el("pm_funder").value.trim(),
-    PM_SIGNATURE_TYPE: el("pm_signature_type").value,
-  };
 
   const payload = {
     mode: ui.mode.value,
@@ -322,7 +308,6 @@ function gatherStartPayload() {
     coin: ui.coin.value,
     timeframe: ui.timeframe.value,
     confirm_live_token: el("confirm_live_token").value.trim(),
-    env,
     executions_log_file: "",
   };
 
@@ -403,10 +388,26 @@ function bindControlsOnce() {
     syncModeByPreset(true);
     saveFormState();
   });
-  ui.startBtn.addEventListener("click", onStart);
-  ui.stopBtn.addEventListener("click", onStop);
-  ui.approveBtn.addEventListener("click", () => runCommand("approve"));
-  ui.rejectBtn.addEventListener("click", () => runCommand("reject"));
+  ui.startBtn.addEventListener("click", async () => {
+    const mode = ui.mode.value;
+    if (mode === "live") {
+      const ok = await showModal(
+        "Start LIVE Trading",
+        "You are about to start LIVE trading with real money. Confirm?",
+        "Start Live", "danger"
+      );
+      if (!ok) return;
+    }
+    await onStart();
+  });
+  ui.stopBtn.addEventListener("click", async () => {
+    const ok = await showModal(
+      "Stop Session",
+      "This will stop the trading session. If a live position is open, an emergency flatten will be attempted.",
+      "Stop", "danger"
+    );
+    if (ok) await onStop();
+  });
   ui.authSubmitBtn?.addEventListener("click", async () => {
     const ok = await submitAccessKey();
     if (ok) await bootstrapApp();
@@ -417,9 +418,6 @@ function bindControlsOnce() {
     if (ok) await bootstrapApp();
   });
 
-  document.querySelectorAll("[data-cmd]").forEach((node) => {
-    node.addEventListener("click", () => runCommand(node.dataset.cmd));
-  });
 
   allPersistedFieldIds().forEach((id) => {
     const node = el(id);
@@ -565,28 +563,25 @@ function renderState(state) {
   );
 
   const trader = state.trader || null;
-  const manualApproval = !!(trader?.cfg?.live_manual_approval ?? true);
-  ui.approveBtn.disabled = !manualApproval;
-  ui.rejectBtn.disabled = !manualApproval;
   renderTrades(trader?.trades || []);
 
-  const pending = trader?.pending_decision || null;
-  if (pending) {
-    ui.pendingCard.classList.remove("hidden");
-    ui.pendingText.textContent = `${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`;
-    const signature = trader.pending_key || `${pending.side}|${pending.token_id || ""}`;
-    if (signature && signature !== lastPendingSignature) {
-      lastPendingSignature = signature;
-      playPendingSound();
-      showPendingActionToast(`${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`);
-    } else if (!pendingToastEl) {
-      showPendingActionToast(`${pending.side} @ ${Number(pending.price).toFixed(3)} | ${pending.reason || ""}`);
+  // Window countdown
+  const win = state.window;
+  if (win && ui.windowBar && ui.windowTimer) {
+    const mins = Math.floor(win.remaining_sec / 60);
+    const secs = win.remaining_sec % 60;
+    const timeStr = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+    ui.windowTimer.textContent = timeStr;
+    ui.windowBar.classList.remove("hidden");
+    if (win.exit_forced) {
+      ui.windowTimer.className = "window-timer bearish";
+    } else if (win.entry_blocked) {
+      ui.windowTimer.className = "window-timer neutral";
+    } else {
+      ui.windowTimer.className = "window-timer";
     }
-  } else {
-    ui.pendingCard.classList.add("hidden");
-    ui.pendingText.textContent = "-";
-    lastPendingSignature = "";
-    dismissPendingActionToast();
+  } else if (ui.windowBar) {
+    ui.windowBar.classList.add("hidden");
   }
 
   ui.logsBox.textContent = (state.logs || []).join("\n");
@@ -686,6 +681,17 @@ async function bootstrapApp() {
       el("confirm_live_token").value = data.live_confirm_token || "";
       saveFormState();
     }
+    // Credential status indicator
+    const credAvail = !!data.credentials_available;
+    const dot = el("credDot");
+    const credLabel = el("credLabel");
+    if (dot && credLabel) {
+      dot.className = credAvail ? "cred-dot ok" : "cred-dot missing";
+      credLabel.textContent = credAvail
+        ? "Server credentials configured"
+        : "PM_PRIVATE_KEY / PM_FUNDER not set on server";
+    }
+
     syncModeByPreset(false);
     renderState(data.state);
     hideAuthOverlay();

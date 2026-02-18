@@ -752,9 +752,13 @@ class LiveExecutor:
 
 
 class TradingEngine:
-    def __init__(self, mode: TradeMode, cfg: TradingConfig, runtime_env: dict[str, str] | None = None):
+    def __init__(self, mode: TradeMode, cfg: TradingConfig, runtime_env: dict[str, str] | None = None,
+                 timeframe: str = "15m", on_entry_callback=None, on_exit_callback=None):
         self.mode = mode
         self.cfg = cfg
+        self.timeframe = timeframe
+        self._on_entry = on_entry_callback
+        self._on_exit = on_exit_callback
         self.state = TraderState()
         self.executor = LiveExecutor(cfg, runtime_env=runtime_env) if mode == TradeMode.LIVE else PaperExecutor(cfg)
         self.control_file = os.path.abspath(cfg.control_file)
@@ -926,6 +930,13 @@ class TradingEngine:
     def _allowed(self) -> tuple[bool, str]:
         self._rollover_day()
         now = time.time()
+
+        # Window safety: block entries near window close
+        import window as window_mod
+        winfo = window_mod.get_window_info(self.timeframe)
+        if winfo.entry_blocked:
+            buf = window_mod.WINDOW_ENTRY_BUFFER.get(self.timeframe, 0)
+            return False, f"window_entry_blocked: {winfo.remaining_sec}s remaining (buffer={buf}s)"
 
         if self.state.open_position is not None:
             return False, f"position already open: {self.state.open_position.side}"
@@ -1186,6 +1197,11 @@ class TradingEngine:
                     self.state.open_side = rec.side
                     self.state.open_order_id = rec.order_id
                     self._persist_execution(rec)
+                    if self._on_entry:
+                        try:
+                            self._on_entry(rec)
+                        except Exception:
+                            pass
 
                 log(
                     "  [TRADER] "
@@ -1270,6 +1286,11 @@ class TradingEngine:
             self.state.open_side = rec.side
             self.state.open_order_id = rec.order_id
             self._persist_execution(rec)
+            if self._on_entry:
+                try:
+                    self._on_entry(rec)
+                except Exception:
+                    pass
 
         log(
             "  [TRADER] "
@@ -1291,6 +1312,22 @@ class TradingEngine:
             pnl_pct = (mark / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else None
             pnl_usd = pos.shares * (mark - pos.entry_price)
             return "manual_close", mark, pnl_usd, pnl_pct
+
+        # Window close safety (second highest priority after manual close)
+        import window as window_mod
+        winfo = window_mod.get_window_info(self.timeframe)
+        if winfo.exit_forced:
+            mark = self._mark_price(feed_state, pos.side)
+            if mark is None:
+                mark = pos.entry_price
+            pnl_pct = (mark / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else None
+            pnl_usd = pos.shares * (mark - pos.entry_price)
+            return (
+                f"window_close: {winfo.remaining_sec}s remaining in {self.timeframe} window",
+                mark,
+                pnl_usd,
+                pnl_pct,
+            )
 
         mark = self._mark_price(feed_state, pos.side)
         if mark is None:
@@ -1363,6 +1400,11 @@ class TradingEngine:
             self.state.last_trade_ts = time.time()
             self.state.next_exit_attempt_ts = 0.0
             self._persist_execution(rec)
+            if self._on_exit:
+                try:
+                    self._on_exit(rec)
+                except Exception:
+                    pass
         else:
             self.state.next_exit_attempt_ts = time.time() + self.cfg.exit_retry_backoff_sec
 
@@ -1410,6 +1452,10 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
     )
     log(f"  [TRADER] {engine.control_help()}")
     last_gate_reason = ""
+    last_window_start_ts = 0
+
+    import window as window_mod
+
     while True:
         try:
             ready, gate_reason = feeds_ready()
@@ -1422,6 +1468,15 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
             if last_gate_reason:
                 log("  [TRADER] feed gate: ready (Binance + Polymarket)")
                 last_gate_reason = ""
+
+            # Window transition tracking
+            winfo = window_mod.get_window_info(timeframe)
+            if last_window_start_ts and winfo.start_ts != last_window_start_ts:
+                log(
+                    f"  [TRADER] window transition: new {timeframe} window started "
+                    f"(start={winfo.start_ts}, end={winfo.end_ts})"
+                )
+            last_window_start_ts = winfo.start_ts
 
             engine.process_control_commands(feed_state, log)
             engine.maybe_close_position(feed_state, coin, timeframe, log)

@@ -6,12 +6,10 @@
     <title>Polymarket Assistant Web</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <div class="bg-orb orb-a"></div>
-    <div class="bg-orb orb-b"></div>
     <div id="authOverlay" class="auth-overlay hidden">
       <div class="auth-card">
         <h2>Access Key Required</h2>
@@ -25,15 +23,20 @@
       </div>
     </div>
 
-    <main class="app">
-      <header class="topbar">
-        <h1>Polymarket Crypto Assistant</h1>
-        <div id="statusBadge" class="badge idle">IDLE</div>
-      </header>
-      <div id="toastContainer" class="toasts"></div>
+    <main class="optics-app">
+      <aside class="sidebar panel">
+        <div class="brand-block">
+          <p class="brand-kicker">@optics/trader</p>
+          <h1>Polymarket Assistant</h1>
+          <p class="brand-sub">Realtime monitoring and execution terminal</p>
+        </div>
 
-      <section class="layout">
-        <aside class="panel controls">
+        <div class="command-fake">
+          <span>Search controls...</span>
+          <kbd>⌘ J</kbd>
+        </div>
+
+        <section class="controls">
           <h2>Control</h2>
 
           <div class="grid two">
@@ -95,38 +98,40 @@
             <label><input id="keep_unfilled_entry_open" type="checkbox" /> <span>Keep unfilled open</span></label>
           </div>
 
-          <h3>Live Env (session only)</h3>
-          <div class="grid one">
-            <label><span>PM_PRIVATE_KEY</span><input id="pm_private_key" type="password" autocomplete="off" /></label>
-            <label><span>PM_FUNDER</span><input id="pm_funder" type="text" autocomplete="off" /></label>
+          <h3>Live Mode</h3>
+          <div class="cred-status" id="credStatus">
+            <span class="cred-dot" id="credDot"></span>
+            <span id="credLabel">Checking credentials...</span>
           </div>
-          <div class="grid two">
-            <label>
-              <span>PM_SIGNATURE_TYPE</span>
-              <select id="pm_signature_type">
-                <option value="0">0 (EOA)</option>
-                <option value="1">1 (Magic)</option>
-                <option value="2">2 (Proxy)</option>
-              </select>
-            </label>
+          <div class="grid one">
             <label><span>Live Confirm Token</span><input id="confirm_live_token" type="text" /></label>
           </div>
 
           <div class="actions">
             <button id="startBtn" class="btn primary">Start</button>
             <button id="stopBtn" class="btn">Stop</button>
-            <button id="approveBtn" class="btn success">Approve</button>
-            <button id="rejectBtn" class="btn danger">Reject</button>
           </div>
 
           <p id="errorBox" class="error"></p>
-        </aside>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <header class="workspace-top panel">
+          <div>
+            <p class="workspace-kicker">Live Dashboard</p>
+            <h2 id="marketTitle">BTC 15m</h2>
+            <p id="gateText">feed gate: waiting</p>
+          </div>
+          <div id="statusBadge" class="badge idle">IDLE</div>
+        </header>
+
+        <div id="toastContainer" class="toasts"></div>
 
         <section class="panel board">
           <div class="hero">
             <div>
-              <h2 id="marketTitle">BTC 15m</h2>
-              <p id="gateText">feed gate: waiting</p>
+              <p class="summary-title">Market Summary</p>
               <p id="summaryText" class="summary">Market summary will appear here.</p>
             </div>
             <div class="hero-metrics">
@@ -137,15 +142,9 @@
             </div>
           </div>
 
-          <div id="pendingCard" class="pending hidden">
-            <div>
-              <p class="pending-label">Pending Approval</p>
-              <p id="pendingText">-</p>
-            </div>
-            <div class="pending-actions">
-              <button class="btn success" data-cmd="approve">Approve</button>
-              <button class="btn danger" data-cmd="reject">Reject</button>
-            </div>
+          <div id="windowBar" class="window-bar hidden">
+            <span class="window-label">Window</span>
+            <span id="windowTimer" class="window-timer">--:--</span>
           </div>
 
           <div class="metrics-grid">
@@ -194,6 +193,17 @@
         </section>
       </section>
     </main>
+
+    <div id="modalOverlay" class="modal-overlay hidden">
+      <div class="modal-card">
+        <h3 id="modalTitle">Confirm</h3>
+        <p id="modalMessage">Are you sure?</p>
+        <div class="modal-actions">
+          <button id="modalConfirmBtn" class="btn danger">Confirm</button>
+          <button id="modalCancelBtn" class="btn">Cancel</button>
+        </div>
+      </div>
+    </div>
 
     <script src="/static/app.js"></script>
   </body>

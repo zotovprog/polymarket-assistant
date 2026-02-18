@@ -25,6 +25,8 @@ import config
 import feeds
 import indicators as ind
 import trading
+from telegram_notifier import TelegramNotifier
+from telegram_bot import TelegramBot
 
 
 SESSION_COOKIE = "pm_session_id"
@@ -45,6 +47,24 @@ def _load_access_key_from_env() -> str:
 
 ACCESS_KEY = _load_access_key_from_env()
 print(f"[WEB AUTH] source=env key_length={len(ACCESS_KEY)}")
+
+PM_PRIVATE_KEY = os.environ.get("PM_PRIVATE_KEY", "").strip()
+PM_FUNDER = os.environ.get("PM_FUNDER", "").strip()
+PM_SIGNATURE_TYPE = 2  # hardcoded: proxy signer
+print(
+    f"[CREDENTIALS] PM_PRIVATE_KEY={'set' if PM_PRIVATE_KEY else 'MISSING'} "
+    f"PM_FUNDER={'set' if PM_FUNDER else 'MISSING'} PM_SIGNATURE_TYPE={PM_SIGNATURE_TYPE}"
+)
+
+_telegram = TelegramNotifier()
+if _telegram.enabled:
+    print(f"[TELEGRAM] notifications enabled for chat_id={_telegram.chat_id}")
+else:
+    print("[TELEGRAM] notifications disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)")
+
+_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+_BOT_SETTINGS_PATH = BASE_DIR / "workspace" / "bot_last_session.json"
+_bot: TelegramBot | None = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -285,7 +305,7 @@ class StartRequest(BaseModel):
     timeframe: str = "15m"
     preset: str = "medium"
     confirm_live_token: str = ""
-    env: dict[str, str] = Field(default_factory=dict)
+    # env field removed: credentials now read from server env vars
     size_usd: float = 5.0
     min_bias: float = 55.0
     min_obi: float = 0.40
@@ -461,6 +481,7 @@ class SessionRuntime:
         self.tasks = []
         self.running = False
         self.log("[SYS] session stopped")
+        _telegram.notify_session_stop(coin=self.coin, timeframe=self.timeframe)
 
     async def stop(self):
         async with self.lock:
@@ -523,18 +544,16 @@ class SessionRuntime:
             self.coin = payload.coin.upper()
             self.timeframe = payload.timeframe
 
-            runtime_env = {
-                k.strip(): str(v).strip()
-                for k, v in payload.env.items()
-                if k and str(v).strip()
-            }
+            runtime_env: dict[str, str] = {}
             if self.mode == trading.TradeMode.LIVE:
                 runtime_env["PM_ENABLE_LIVE"] = "1"
-                if not runtime_env.get("PM_PRIVATE_KEY"):
-                    raise ValueError("PM_PRIVATE_KEY is required in live mode")
-                if not runtime_env.get("PM_FUNDER"):
-                    raise ValueError("PM_FUNDER is required in live mode")
-                runtime_env.setdefault("PM_SIGNATURE_TYPE", "0")
+                if not PM_PRIVATE_KEY:
+                    raise ValueError("PM_PRIVATE_KEY environment variable is required for live mode")
+                if not PM_FUNDER:
+                    raise ValueError("PM_FUNDER environment variable is required for live mode")
+                runtime_env["PM_PRIVATE_KEY"] = PM_PRIVATE_KEY
+                runtime_env["PM_FUNDER"] = PM_FUNDER
+                runtime_env["PM_SIGNATURE_TYPE"] = str(PM_SIGNATURE_TYPE)
             self.env = runtime_env
 
             # Notify credential state at startup for both PAPER and LIVE modes.
@@ -586,9 +605,39 @@ class SessionRuntime:
             kline_iv = config.TF_KLINE[self.timeframe]
             await feeds.bootstrap(binance_sym, kline_iv, self.feed_state)
 
+            def _on_entry(rec):
+                _telegram.notify_entry(
+                    mode=rec.mode, coin=rec.coin, timeframe=rec.timeframe,
+                    side=rec.side, price=rec.price, size_usd=rec.size_usd,
+                    status=rec.status, reason=rec.reason, order_id=getattr(rec, "order_id", None),
+                )
+
+            def _on_exit(rec):
+                _telegram.notify_exit(
+                    mode=rec.mode, coin=rec.coin, timeframe=rec.timeframe,
+                    side=rec.side, price=rec.price, size_usd=rec.size_usd,
+                    status=rec.status, reason=rec.reason,
+                    pnl_usd=getattr(rec, "pnl_usd", None),
+                    pnl_pct=getattr(rec, "pnl_pct", None),
+                    order_id=getattr(rec, "order_id", None),
+                )
+                if "window_close" in (rec.reason or ""):
+                    import re
+                    m = re.search(r"(\d+)s remaining", rec.reason or "")
+                    remaining = int(m.group(1)) if m else 0
+                    _telegram.notify_window_exit(
+                        coin=rec.coin, timeframe=rec.timeframe,
+                        side=rec.side, remaining_sec=remaining,
+                    )
+
             self.engine = None
             if self.mode != trading.TradeMode.OBSERVE:
-                self.engine = trading.TradingEngine(self.mode, cfg, runtime_env=self.env)
+                self.engine = trading.TradingEngine(
+                    self.mode, cfg, runtime_env=self.env,
+                    timeframe=self.timeframe,
+                    on_entry_callback=_on_entry,
+                    on_exit_callback=_on_exit,
+                )
                 if self.mode == trading.TradeMode.LIVE:
                     if not preflight_report or not preflight_report.get("ok", False):
                         raise ValueError("live preflight failed: check toast details")
@@ -623,6 +672,10 @@ class SessionRuntime:
                 "success",
                 "Session started",
                 f"{self.mode.value.upper()} on {self.coin} {self.timeframe}",
+            )
+            _telegram.notify_session_start(
+                mode=self.mode.value, coin=self.coin,
+                timeframe=self.timeframe, size_usd=cfg.size_usd,
             )
             if self.mode == trading.TradeMode.LIVE and payload.auto_approve_live:
                 self.notify(
@@ -738,6 +791,10 @@ class SessionRuntime:
         trader_state = self.engine.snapshot() if self.engine else None
         feed_gate = self._feed_gate()
 
+        # Window timing info
+        import window as window_mod
+        window_info = window_mod.get_window_info(self.timeframe) if self.running else None
+
         return {
             "session_id": self.session_id,
             "ts": _utc_now_iso(),
@@ -750,6 +807,14 @@ class SessionRuntime:
             "coin": self.coin,
             "timeframe": self.timeframe,
             "feed_gate": feed_gate,
+            "window": {
+                "timeframe": window_info.timeframe,
+                "remaining_sec": window_info.remaining_sec,
+                "start_ts": window_info.start_ts,
+                "end_ts": window_info.end_ts,
+                "entry_blocked": window_info.entry_blocked,
+                "exit_forced": window_info.exit_forced,
+            } if window_info else None,
             "connections": {
                 "binance_ws_connected": st.binance_ws_connected,
                 "binance_ob_ready": st.binance_ob_ready,
@@ -800,9 +865,8 @@ class SessionRuntime:
             "env_meta": {
                 "PM_ENABLE_LIVE": self.env.get("PM_ENABLE_LIVE", ""),
                 "PM_PRIVATE_KEY_SET": bool(self.env.get("PM_PRIVATE_KEY")),
-                "PM_PRIVATE_KEY_MASKED": _mask(self.env.get("PM_PRIVATE_KEY", "")),
-                "PM_FUNDER": self.env.get("PM_FUNDER", ""),
-                "PM_SIGNATURE_TYPE": self.env.get("PM_SIGNATURE_TYPE", "0"),
+                "PM_FUNDER_SET": bool(self.env.get("PM_FUNDER")),
+                "PM_SIGNATURE_TYPE": self.env.get("PM_SIGNATURE_TYPE", str(PM_SIGNATURE_TYPE)),
             },
             "error": self.last_error,
         }
@@ -836,6 +900,55 @@ class SessionRuntime:
 
 SESSIONS: dict[str, SessionRuntime] = {}
 SESSIONS_LOCK = asyncio.Lock()
+
+
+def _get_primary_session() -> SessionRuntime | None:
+    """Return the first running session, or any session if none running."""
+    for s in SESSIONS.values():
+        if s.running:
+            return s
+    return next(iter(SESSIONS.values()), None)
+
+
+async def _bot_start_session(params: dict) -> None:
+    """Start a session from Telegram bot with given params dict."""
+    session = _get_primary_session()
+    if not session:
+        async with SESSIONS_LOCK:
+            sid = uuid.uuid4().hex
+            SESSIONS[sid] = SessionRuntime(session_id=sid)
+            session = SESSIONS[sid]
+
+    preset_name = params.get("preset", "medium")
+    preset_vals = PRESETS.get(preset_name, PRESETS["medium"])
+
+    payload = StartRequest(
+        mode=params.get("mode", "paper"),
+        coin=params.get("coin", "BTC"),
+        timeframe=params.get("timeframe", "15m"),
+        preset=preset_name,
+        confirm_live_token=trading.LIVE_CONFIRM_TOKEN if params.get("mode") == "live" else "",
+        size_usd=params.get("size_usd", 5.0),
+        min_bias=preset_vals.get("min_bias", 55),
+        min_obi=preset_vals.get("min_obi", 0.40),
+        min_price=preset_vals.get("min_price", 0.40),
+        max_price=preset_vals.get("max_price", 0.68),
+        cooldown_sec=int(preset_vals.get("cooldown_sec", 420)),
+        max_trades_per_day=int(preset_vals.get("max_trades_per_day", 4)),
+        eval_interval_sec=int(preset_vals.get("eval_interval_sec", 3)),
+        tp_pct=preset_vals.get("tp_pct", 10),
+        sl_pct=preset_vals.get("sl_pct", 6),
+        max_hold_sec=int(preset_vals.get("max_hold_sec", 1200)),
+        reverse_exit_bias=preset_vals.get("reverse_exit_bias", 55),
+    )
+    await session.start(payload)
+
+
+async def _bot_stop_session() -> None:
+    """Stop the primary running session."""
+    session = _get_primary_session()
+    if session and session.running:
+        await session.stop()
 
 
 def _is_authorized(request: Request) -> bool:
@@ -878,6 +991,26 @@ app = FastAPI(title="Polymarket Assistant Web")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "web")), name="static")
 
 
+@app.on_event("startup")
+async def _startup():
+    global _bot
+    if _telegram.enabled and _BOT_USERNAME:
+        _bot = TelegramBot(
+            notifier=_telegram,
+            get_session=_get_primary_session,
+            start_session=_bot_start_session,
+            stop_session=_bot_stop_session,
+            presets=PRESETS,
+            settings_path=_BOT_SETTINGS_PATH,
+        )
+        await _bot.start_polling()
+        print(f"[TELEGRAM BOT] interactive bot started for @{_BOT_USERNAME}")
+    else:
+        if not _BOT_USERNAME:
+            print("[TELEGRAM BOT] disabled (TELEGRAM_BOT_USERNAME not set)")
+
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(BASE_DIR / "web" / "index.html")
@@ -906,6 +1039,7 @@ async def api_bootstrap(request: Request, response: Response):
         "defaults": {
             "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
         },
+        "credentials_available": bool(PM_PRIVATE_KEY and PM_FUNDER),
         "state": session.snapshot(),
     }
 
@@ -927,6 +1061,11 @@ async def api_start(payload: StartRequest, request: Request, response: Response)
         await session.start(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    if _bot:
+        _bot.save_settings_from_web(
+            mode=payload.mode, coin=payload.coin, timeframe=payload.timeframe,
+            preset=payload.preset, size_usd=payload.size_usd,
+        )
     return {"ok": True, "state": session.snapshot()}
 
 
@@ -954,6 +1093,9 @@ async def api_command(payload: CommandRequest, request: Request, response: Respo
 
 @app.on_event("shutdown")
 async def _shutdown():
+    if _bot:
+        await _bot.stop()
     async with SESSIONS_LOCK:
         sessions = list(SESSIONS.values())
     await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+    await _telegram.close()
