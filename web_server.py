@@ -1001,6 +1001,7 @@ async def _startup():
             start_session=_bot_start_session,
             stop_session=_bot_stop_session,
             presets=PRESETS,
+            coin_timeframes=config.COIN_TIMEFRAMES,
             settings_path=_BOT_SETTINGS_PATH,
         )
         await _bot.start_polling()
