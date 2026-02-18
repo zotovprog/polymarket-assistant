@@ -941,6 +941,7 @@ async def _bot_start_session(params: dict) -> None:
         sl_pct=preset_vals.get("sl_pct", 6),
         max_hold_sec=int(preset_vals.get("max_hold_sec", 1200)),
         reverse_exit_bias=preset_vals.get("reverse_exit_bias", 55),
+        auto_approve_live=True,
     )
     await session.start(payload)
 

@@ -304,11 +304,18 @@ class TelegramBot:
             coin = params.get("coin", "BTC")
             tf = params.get("timeframe", "15m")
             bal_line = f"\n\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
+
+            # Window info for saved timeframe
+            import window as window_mod
+            winfo = window_mod.get_window_info(tf)
+            w_m, w_s = divmod(winfo.remaining_sec, 60)
+            win_line = f"\n\u23f1 Window {tf}: <code>{w_m}m {w_s:02d}s</code> left"
+
             html = (
                 "\U0001f534 <b>Trading Bot — STOPPED</b>\n"
                 f"Coin: <code>{coin} {tf}</code>\n"
                 f"Last strategy: <code>{preset}</code> | Size: <code>${size:.2f}</code>\n"
-                f"No active session.{bal_line}"
+                f"No active session.{bal_line}{win_line}"
             )
         else:
             mode = session.mode.value.upper()
@@ -340,6 +347,13 @@ class TelegramBot:
             # Polymarket USDC balance
             if pm_balance is not None:
                 html += f"\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>\n"
+
+            # Window info
+            import window as window_mod
+            winfo = window_mod.get_window_info(tf)
+            w_m, w_s = divmod(winfo.remaining_sec, 60)
+            entry_status = "BLOCKED \u26d4" if winfo.entry_blocked else "OK \u2705"
+            html += f"\u23f1 Window: <code>{w_m}m {w_s:02d}s</code> left | Entry: {entry_status}\n"
 
             # Total PnL from completed trades
             trades_list = snap.get("trades", [])

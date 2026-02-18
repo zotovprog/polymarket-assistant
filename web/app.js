@@ -322,12 +322,19 @@ function gatherStartPayload() {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    method: options.method || "GET",
-    headers: { "Content-Type": "application/json" },
-    credentials: "include",
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(path, {
+      method: options.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+  } catch {
+    const err = new Error("Server unreachable — retrying...");
+    err.networkError = true;
+    throw err;
+  }
   let data = null;
   try {
     data = await res.json();
@@ -602,6 +609,7 @@ function renderState(state) {
 async function pollState() {
   try {
     const data = await api("/api/state");
+    setError("");
     renderState(data.state);
   } catch (e) {
     if (e.unauthorized) {
@@ -610,7 +618,10 @@ async function pollState() {
     }
     const msg = e.message || String(e);
     setError(msg);
-    showToast("error", "State Error", msg);
+    // Don't spam toasts for network/polling errors — error bar is enough
+    if (!e.networkError) {
+      showToast("error", "State Error", msg);
+    }
   }
 }
 
