@@ -66,7 +66,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 CLIENT_IDLE_FLATTEN_SEC = max(10, _env_int("PM_CLIENT_IDLE_FLATTEN_SEC", 45))
 FLATTEN_TIMEOUT_SEC = max(5, _env_int("PM_FLATTEN_TIMEOUT_SEC", 25))
-ENABLE_CLIENT_IDLE_FLATTEN = _env_flag("PM_CLIENT_IDLE_FLATTEN", True)
+# Default is autonomous run: UI heartbeat is optional unless explicitly enabled.
+DEFAULT_CLIENT_IDLE_FLATTEN = _env_flag("PM_CLIENT_IDLE_FLATTEN", False)
 ENABLE_FLATTEN_ON_STOP = _env_flag("PM_FLATTEN_ON_STOP", True)
 
 PRESETS: dict[str, dict[str, float | int]] = {
@@ -306,6 +307,7 @@ class StartRequest(BaseModel):
     binance_ob_stale_sec: int = 12
     executions_log_file: str = ""
     auto_approve_live: bool = False
+    client_watchdog_enabled: bool | None = None
 
 
 class CommandRequest(BaseModel):
@@ -334,6 +336,7 @@ class SessionRuntime:
     last_error: str = ""
     last_client_seen_ts: float = 0.0
     client_disconnected_mode: bool = False
+    client_watchdog_enabled: bool = False
     blocked_max_trades_saved: int | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -401,7 +404,7 @@ class SessionRuntime:
                     not self.running
                     or self.mode != trading.TradeMode.LIVE
                     or self.engine is None
-                    or not ENABLE_CLIENT_IDLE_FLATTEN
+                    or not self.client_watchdog_enabled
                 ):
                     continue
 
@@ -509,6 +512,11 @@ class SessionRuntime:
             self.last_error = ""
             self.last_client_seen_ts = time.time()
             self.client_disconnected_mode = False
+            self.client_watchdog_enabled = (
+                DEFAULT_CLIENT_IDLE_FLATTEN
+                if payload.client_watchdog_enabled is None
+                else bool(payload.client_watchdog_enabled)
+            )
             self.blocked_max_trades_saved = None
 
             self.mode = self._validate_start(payload)
@@ -602,7 +610,7 @@ class SessionRuntime:
                         )
                     )
                 )
-                if self.mode == trading.TradeMode.LIVE and ENABLE_CLIENT_IDLE_FLATTEN:
+                if self.mode == trading.TradeMode.LIVE and self.client_watchdog_enabled:
                     self.tasks.append(asyncio.create_task(self._client_watchdog_loop()))
 
             self.running = True
@@ -621,6 +629,12 @@ class SessionRuntime:
                     "warning",
                     "Auto-approve enabled",
                     "All live entries will be sent automatically without manual approve",
+                )
+            if self.mode == trading.TradeMode.LIVE and not self.client_watchdog_enabled:
+                self.notify(
+                    "info",
+                    "Autonomous run",
+                    "Client disconnect watchdog is disabled; strategy keeps running until Stop",
                 )
 
     def _notify_preflight_checks(self, checks: list[dict], prefix: str = "Credentials check"):
@@ -731,6 +745,7 @@ class SessionRuntime:
             "started_ts": self.started_ts,
             "last_client_seen_ts": self.last_client_seen_ts,
             "client_disconnected_mode": self.client_disconnected_mode,
+            "client_watchdog_enabled": self.client_watchdog_enabled,
             "mode": self.mode.value,
             "coin": self.coin,
             "timeframe": self.timeframe,
@@ -888,6 +903,9 @@ async def api_bootstrap(request: Request, response: Response):
         "coins": config.COINS,
         "coin_timeframes": config.COIN_TIMEFRAMES,
         "presets": PRESETS,
+        "defaults": {
+            "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
+        },
         "state": session.snapshot(),
     }
 

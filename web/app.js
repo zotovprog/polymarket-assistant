@@ -52,6 +52,7 @@ const fields = [
 
 const checks = [
   "auto_approve_live",
+  "client_watchdog_enabled",
   "auto_exit_enabled",
   "reverse_exit_enabled",
   "live_entry_require_fill",
@@ -679,6 +680,7 @@ async function bootstrapApp() {
     if (!restored) {
       el("confirm_live_token").value = data.live_confirm_token || "";
       applyPreset("medium");
+      el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
       saveFormState();
     } else if (!el("confirm_live_token").value) {
       el("confirm_live_token").value = data.live_confirm_token || "";
