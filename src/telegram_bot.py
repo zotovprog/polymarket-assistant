@@ -8,11 +8,53 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import traceback
 from pathlib import Path
 from typing import Any, Callable
 
 from telegram_notifier import TelegramNotifier
+
+
+def _fetch_polymarket_balance() -> float | None:
+    """Fetch USDC collateral balance from Polymarket. Returns None if unavailable."""
+    try:
+        private_key = os.environ.get("PM_PRIVATE_KEY", "").strip()
+        funder = os.environ.get("PM_FUNDER", "").strip()
+        if not private_key or not funder:
+            return None
+
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+
+        host = "https://clob.polymarket.com"
+        chain_id = 137
+        sig_type = int(os.environ.get("PM_SIGNATURE_TYPE", "2"))
+
+        client = ClobClient(host, key=private_key, chain_id=chain_id)
+        api_creds = client.create_or_derive_api_creds()
+        client = ClobClient(
+            host,
+            key=private_key,
+            chain_id=chain_id,
+            creds=api_creds,
+            signature_type=sig_type,
+            funder=funder,
+        )
+
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
+        data = client.get_balance_allowance(params)
+        bal_raw = str((data or {}).get("balance", "")).strip()
+        if not bal_raw:
+            return None
+        # Balance is in raw units (6 decimals for USDC)
+        val = float(bal_raw)
+        if val > 1_000_000:
+            val = val / 1_000_000  # convert from raw to USDC
+        return val
+    except Exception as e:
+        print(f"  [TELEGRAM BOT] balance fetch error: {e}")
+        return None
 
 # Preset descriptions (short labels for keyboard buttons)
 PRESET_LABELS: dict[str, str] = {
@@ -249,6 +291,11 @@ class TelegramBot:
 
     async def _cb_status(self, cb_id: str, msg_id: int) -> None:
         await self._n.answer_callback_query(cb_id)
+
+        # Fetch real Polymarket balance in a thread (blocking I/O)
+        loop = asyncio.get_running_loop()
+        pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+
         session = self._get_session()
         if not session or not session.running:
             params = self._load_settings()
@@ -256,11 +303,12 @@ class TelegramBot:
             size = params.get("size_usd", 5.0)
             coin = params.get("coin", "BTC")
             tf = params.get("timeframe", "15m")
+            bal_line = f"\n\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
             html = (
                 "\U0001f534 <b>Trading Bot — STOPPED</b>\n"
                 f"Coin: <code>{coin} {tf}</code>\n"
                 f"Last strategy: <code>{preset}</code> | Size: <code>${size:.2f}</code>\n"
-                "No active session."
+                f"No active session.{bal_line}"
             )
         else:
             mode = session.mode.value.upper()
@@ -289,6 +337,10 @@ class TelegramBot:
             if price:
                 html += f"Price: <code>{price:.3f}</code> | Bias: <code>{bias:+.1f}</code>\n"
 
+            # Polymarket USDC balance
+            if pm_balance is not None:
+                html += f"\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>\n"
+
             # Total PnL from completed trades
             trades_list = snap.get("trades", [])
             total_pnl_usd = 0.0
@@ -309,7 +361,6 @@ class TelegramBot:
                 html += (
                     f"\n\U0001f4b5 <b>Session PnL:</b> {pnl_emoji} <code>${total_pnl_usd:+.2f}</code>\n"
                     f"W/L: <code>{wins}/{losses}</code> ({winrate:.0f}% win rate)\n"
-                    f"Balance: <code>${size * closed_count + total_pnl_usd:.2f}</code> from <code>{closed_count}</code> trades"
                 )
 
             # Open position
@@ -324,7 +375,7 @@ class TelegramBot:
                         pnl_pct = ((entry_price - price) / entry_price) * 100
                     pnl_emoji = "\U0001f7e2" if pnl_pct >= 0 else "\U0001f534"
                     html += (
-                        f"\n\n<b>Open Position:</b> {side} @ <code>{entry_price:.3f}</code>\n"
+                        f"\n<b>Open Position:</b> {side} @ <code>{entry_price:.3f}</code>\n"
                         f"Current: <code>{price:.3f}</code> | PnL: {pnl_emoji} <code>{pnl_pct:+.1f}%</code>"
                     )
 
@@ -382,9 +433,16 @@ class TelegramBot:
             tf = params.get("timeframe", "15m")
             size = params.get("size_usd", 5.0)
             self._notify("success", "Started", f"{mode.upper()} {coin} {tf} | {preset} | ${size:.2f}")
+
+            # Fetch balance in background thread
+            loop = asyncio.get_running_loop()
+            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            bal_line = f"\n\U0001f4b0 Balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
+
             html = (
                 f"\u2705 <b>Session started — {mode.upper()}</b>\n"
                 f"<b>{coin} {tf}</b> | Strategy: <code>{preset}</code> | Size: <code>${size:.2f}</code>"
+                f"{bal_line}"
             )
         except Exception as e:
             self._log(f"Start failed: {e}")
@@ -425,9 +483,16 @@ class TelegramBot:
             tf = params.get("timeframe", "15m")
             size = params.get("size_usd", 5.0)
             self._notify("success", "Restarted", f"{mode.upper()} {coin} {tf} | {preset} | ${size:.2f}")
+
+            # Fetch balance in background thread
+            loop = asyncio.get_running_loop()
+            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            bal_line = f"\n\U0001f4b0 Balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
+
             html = (
                 f"\u2705 <b>Restarted — {mode.upper()}</b>\n"
                 f"<b>{coin} {tf}</b> | Strategy: <code>{preset}</code> | Size: <code>${size:.2f}</code>"
+                f"{bal_line}"
             )
         except Exception as e:
             self._log(f"Restart failed: {e}")

@@ -676,6 +676,7 @@ class SessionRuntime:
             _telegram.notify_session_start(
                 mode=self.mode.value, coin=self.coin,
                 timeframe=self.timeframe, size_usd=cfg.size_usd,
+                preset=payload.preset,
             )
             if self.mode == trading.TradeMode.LIVE and payload.auto_approve_live:
                 self.notify(

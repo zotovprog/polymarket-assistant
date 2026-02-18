@@ -178,11 +178,17 @@ class TelegramNotifier:
         coin: str,
         timeframe: str,
         size_usd: float,
+        preset: str = "",
+        balance: float | None = None,
     ) -> None:
+        strategy_line = f"Strategy: <code>{preset}</code>\n" if preset else ""
+        bal_line = f"\U0001f4b0 Balance: <code>${balance:.2f}</code>\n" if balance is not None else ""
         html = (
             f"\U0001f680 <b>SESSION STARTED</b>\n"
             f"<b>{coin} {timeframe}</b> | Mode: <code>{mode.upper()}</code>\n"
             f"Size: <code>${size_usd:.2f}</code>\n"
+            f"{strategy_line}"
+            f"{bal_line}"
             f"<i>{self._ts()}</i>"
         )
         self._fire(html)
