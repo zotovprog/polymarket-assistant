@@ -37,12 +37,17 @@ class State:
 OB_POLL_INTERVAL = 2
 
 
+def _fetch_binance_depth(url: str, symbol: str) -> dict:
+    return requests.get(url, params={"symbol": symbol, "limit": 20}, timeout=3).json()
+
+
 async def ob_poller(symbol: str, state: State):
     url = f"{config.BINANCE_REST}/depth"
     print(f"  [Binance OB] polling {symbol} every {OB_POLL_INTERVAL}s")
     while True:
         try:
-            resp = requests.get(url, params={"symbol": symbol, "limit": 20}, timeout=3).json()
+            # Run blocking HTTP call off the event loop.
+            resp = await asyncio.to_thread(_fetch_binance_depth, url, symbol)
             state.bids = [(float(p), float(q)) for p, q in resp["bids"]]
             state.asks = [(float(p), float(q)) for p, q in resp["asks"]]
             if state.bids and state.asks:
@@ -118,11 +123,14 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
 async def bootstrap(symbol: str, interval: str, state: State):
     for attempt in range(1, 6):
         try:
-            resp = requests.get(
-                f"{config.BINANCE_REST}/klines",
-                params={"symbol": symbol, "interval": interval, "limit": config.KLINE_BOOT},
-                timeout=5,
-            ).json()
+            # Run blocking HTTP call off the event loop.
+            resp = await asyncio.to_thread(
+                lambda: requests.get(
+                    f"{config.BINANCE_REST}/klines",
+                    params={"symbol": symbol, "interval": interval, "limit": config.KLINE_BOOT},
+                    timeout=5,
+                ).json()
+            )
             state.klines = [
                 {
                     "t": r[0] / 1e3,

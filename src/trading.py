@@ -1630,9 +1630,14 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                     log(f"  [TRADER] PM token refresh error: {e}")
             last_window_start_ts = winfo.start_ts
 
-            engine.process_control_commands(feed_state, log)
-            engine.maybe_close_position(feed_state, coin, timeframe, log)
-            engine.maybe_open_position(feed_state, coin, timeframe, log)
+            # Engine operations may perform blocking I/O (CLOB calls + fill polling + sleeps).
+            # Run them off the event loop to keep FastAPI/UI/Telegram responsive.
+            def _engine_cycle():
+                engine.process_control_commands(feed_state, log)
+                engine.maybe_close_position(feed_state, coin, timeframe, log)
+                engine.maybe_open_position(feed_state, coin, timeframe, log)
+
+            await asyncio.to_thread(_engine_cycle)
         except Exception as e:
             log(f"  [TRADER] loop error: {e}")
         await asyncio.sleep(engine.cfg.eval_interval_sec)

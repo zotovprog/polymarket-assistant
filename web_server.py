@@ -572,7 +572,14 @@ class SessionRuntime:
                 return
             self.engine.state.force_close_requested = True
             try:
-                self.engine.maybe_close_position(self.feed_state, self.coin, self.timeframe, self.log)
+                # maybe_close_position may perform blocking CLOB calls; keep event loop responsive.
+                await asyncio.to_thread(
+                    self.engine.maybe_close_position,
+                    self.feed_state,
+                    self.coin,
+                    self.timeframe,
+                    self.log,
+                )
             except Exception as e:
                 self.log(f"[SYS] emergency flatten error: {e}")
             await asyncio.sleep(max(0.5, min(2.0, float(self.engine.cfg.eval_interval_sec))))
@@ -659,10 +666,9 @@ class SessionRuntime:
         async with self.lock:
             if not self.engine:
                 return False
-            ok = self.engine.enqueue_command(command)
-            if ok:
-                self.engine.process_control_commands(self.feed_state, self.log)
-            return ok
+            # Queue command and let trading loop process it.
+            # This avoids concurrent state mutations and keeps the API handler non-blocking.
+            return self.engine.enqueue_command(command)
 
     def _validate_start(self, payload: StartRequest) -> trading.TradeMode:
         if payload.preset not in PRESETS:
