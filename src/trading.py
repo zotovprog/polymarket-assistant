@@ -1429,7 +1429,11 @@ class TradingEngine:
                 except Exception:
                     pass
         else:
-            self.state.next_exit_attempt_ts = time.time() + self.cfg.exit_retry_backoff_sec
+            # Shorter retry for balance settlement race condition (tokens not yet credited)
+            if rec.status == "exit_no_token_balance":
+                self.state.next_exit_attempt_ts = time.time() + 3
+            else:
+                self.state.next_exit_attempt_ts = time.time() + self.cfg.exit_retry_backoff_sec
 
         pnl_txt = ""
         if rec.pnl_pct is not None and rec.pnl_usd is not None:
