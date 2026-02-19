@@ -1188,10 +1188,14 @@ class TradingEngine:
                         if rec.shares is not None and rec.shares > 0
                         else rec.size_usd / max(rec.price, 0.01)
                     )
+                    # Use current market price as entry_price (not stale decision price)
+                    # This prevents instant SL trigger when fill takes time
+                    mark = self._mark_price(feed_state, rec.side)
+                    effective_entry = mark if mark is not None else rec.price
                     self.state.open_position = OpenPosition(
                         side=rec.side,
                         token_id=rec.token_id,
-                        entry_price=rec.price,
+                        entry_price=effective_entry,
                         size_usd=rec.size_usd,
                         shares=shares,
                         entry_ts=time.time(),
@@ -1202,6 +1206,8 @@ class TradingEngine:
                     self.state.open_side = rec.side
                     self.state.open_order_id = rec.order_id
                     self._persist_execution(rec)
+                    if effective_entry != rec.price:
+                        log(f"  [TRADER] entry_price adjusted: order={rec.price:.3f} → mark={effective_entry:.3f}")
                     if self._on_entry:
                         try:
                             self._on_entry(rec)
@@ -1286,10 +1292,14 @@ class TradingEngine:
                 if rec.shares is not None and rec.shares > 0
                 else rec.size_usd / max(rec.price, 0.01)
             )
+            # Use current market price as entry_price (not stale decision price)
+            # This prevents instant SL trigger when fill takes time
+            mark = self._mark_price(feed_state, rec.side)
+            effective_entry = mark if mark is not None else rec.price
             self.state.open_position = OpenPosition(
                 side=rec.side,
                 token_id=rec.token_id,
-                entry_price=rec.price,
+                entry_price=effective_entry,
                 size_usd=rec.size_usd,
                 shares=shares,
                 entry_ts=time.time(),
@@ -1300,6 +1310,8 @@ class TradingEngine:
             self.state.open_side = rec.side
             self.state.open_order_id = rec.order_id
             self._persist_execution(rec)
+            if effective_entry != rec.price:
+                log(f"  [TRADER] entry_price adjusted: order={rec.price:.3f} → mark={effective_entry:.3f}")
             if self._on_entry:
                 try:
                     self._on_entry(rec)
