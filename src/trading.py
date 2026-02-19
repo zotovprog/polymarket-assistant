@@ -1204,6 +1204,13 @@ class TradingEngine:
                             self._on_entry(rec)
                         except Exception:
                             pass
+                else:
+                    status_lower = rec.status.lower()
+                    if "balance" in status_lower or "allowance" in status_lower:
+                        self.state.last_trade_ts = time.time() + 600 - self.cfg.cooldown_sec
+                        log("  [TRADER] balance/allowance error — pausing entries for 10 min")
+                    else:
+                        self.state.last_trade_ts = time.time()
 
                 log(
                     "  [TRADER] "
@@ -1295,6 +1302,15 @@ class TradingEngine:
                     self._on_entry(rec)
                 except Exception:
                     pass
+        else:
+            # Failed entry: apply cooldown to prevent rapid-fire retries.
+            # For balance errors, use a long pause (10 min); otherwise use normal cooldown.
+            status_lower = rec.status.lower()
+            if "balance" in status_lower or "allowance" in status_lower:
+                self.state.last_trade_ts = time.time() + 600 - self.cfg.cooldown_sec
+                log("  [TRADER] balance/allowance error — pausing entries for 10 min")
+            else:
+                self.state.last_trade_ts = time.time()
 
         log(
             "  [TRADER] "
