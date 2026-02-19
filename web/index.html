@@ -187,7 +187,12 @@
           </article>
 
           <article>
-            <h3>Runtime Logs</h3>
+            <h3>Runtime Logs
+              <span style="float:right; display:flex; gap:6px; font-size:0.75rem;">
+                <button class="btn" onclick="downloadLogs()" title="Download logs as .txt">⬇ Logs</button>
+                <button class="btn" onclick="downloadTrades()" title="Download trades as .csv">⬇ Trades</button>
+              </span>
+            </h3>
             <pre id="logsBox" class="logs"></pre>
           </article>
         </section>

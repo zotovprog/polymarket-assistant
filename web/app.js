@@ -69,6 +69,7 @@ let controlsBound = false;
 let authVisible = false;
 let bootstrappedOnce = false;
 let coinTfBound = false;
+let lastState = null;
 let megaPresetNoticeShown = false;
 
 function sentimentClass(label) {
@@ -513,8 +514,39 @@ function renderTrades(trades) {
   });
 }
 
+function downloadLogs() {
+  const text = ui.logsBox.textContent || "No logs";
+  const blob = new Blob([text], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `pm_logs_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function downloadTrades() {
+  const trades = lastState?.trader?.trades || [];
+  if (!trades.length) { alert("No trades to export"); return; }
+  const header = "time,action,side,price,size_usd,status,pnl_pct,pnl_usd,reason\n";
+  const rows = trades.map(t => [
+    t.ts_iso || "", t.action || "", t.side || "",
+    t.price ?? "", t.size_usd ?? "", t.status || "",
+    t.pnl_pct ?? "", t.pnl_usd ?? "",
+    `"${(t.reason || "").replace(/"/g, '""')}"`,
+  ].join(",")).join("\n");
+  const blob = new Blob([header + rows], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `pm_trades_${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function renderState(state) {
   if (!state) return;
+  lastState = state;
 
   setStatus(state.running, state.mode);
   ui.marketTitle.textContent = `${state.coin || "-"} ${state.timeframe || "-"}`;
