@@ -968,13 +968,32 @@ def _get_singleton_session() -> SessionRuntime:
 
 
 def _load_saved_settings() -> dict:
-    """Load last-used settings from bot_last_session.json (survives restarts)."""
+    """Load last-used settings from bot_last_session.json.
+
+    Falls back to PM_DEFAULT_SETTINGS env var (JSON) if file doesn't exist.
+    This ensures settings survive container re-deploys on Railway.
+    """
     import json as _json
     try:
         if _BOT_SETTINGS_PATH.exists():
             return _json.loads(_BOT_SETTINGS_PATH.read_text())
     except Exception:
         pass
+    # Fallback: read from env var (set once in Railway Variables)
+    env_settings = os.environ.get("PM_DEFAULT_SETTINGS", "").strip()
+    if env_settings:
+        try:
+            settings = _json.loads(env_settings)
+            # Persist to file so subsequent loads are fast
+            try:
+                _BOT_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                _BOT_SETTINGS_PATH.write_text(_json.dumps(settings, indent=2))
+                print(f"[SETTINGS] restored from PM_DEFAULT_SETTINGS env var: {settings}")
+            except Exception:
+                pass
+            return settings
+        except Exception as e:
+            print(f"[SETTINGS] failed to parse PM_DEFAULT_SETTINGS: {e}")
     return {}
 
 

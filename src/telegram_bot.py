@@ -784,6 +784,15 @@ class TelegramBot:
                 return json.loads(self._settings_path.read_text())
         except Exception:
             pass
+        # Fallback: PM_DEFAULT_SETTINGS env var (survives container re-deploys)
+        env_raw = os.environ.get("PM_DEFAULT_SETTINGS", "").strip()
+        if env_raw:
+            try:
+                settings = json.loads(env_raw)
+                self._save_settings(settings)
+                return settings
+            except Exception:
+                pass
         return {
             "mode": "paper",
             "coin": "BTC",

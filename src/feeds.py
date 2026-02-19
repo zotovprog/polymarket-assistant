@@ -31,6 +31,7 @@ class State:
         self.pm_connected: bool = False
         self.pm_prices_ready: bool = False
         self.pm_last_update_ts: float = 0.0
+        self.pm_reconnect_requested: bool = False
 
 
 OB_POLL_INTERVAL = 2
@@ -236,11 +237,19 @@ async def pm_feed(state: State):
         print("  [PM] no tokens for this coin/timeframe – skipped")
         return
 
-    assets = [state.pm_up_id, state.pm_dn_id]
     _last_msg_log_ts = 0.0
     _msg_count = 0
 
     while True:
+        # Pick up current token IDs (may have been updated by trading_loop)
+        assets = [state.pm_up_id, state.pm_dn_id]
+        if not assets[0] or not assets[1]:
+            print("  [PM] waiting for token IDs...")
+            await asyncio.sleep(5)
+            continue
+
+        state.pm_reconnect_requested = False
+
         try:
             async with websockets.connect(
                 config.PM_WS,
@@ -249,13 +258,22 @@ async def pm_feed(state: State):
                 close_timeout=10
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                print(f"  [PM] connected, subscribed to {len(assets)} assets")
+                print(
+                    f"  [PM] connected, subscribed to {len(assets)} assets "
+                    f"(up={assets[0][:12]}.. dn={assets[1][:12]}..)"
+                )
                 state.pm_connected = True
                 _msg_count = 0
 
                 while True:
+                    # Check if trading_loop requested reconnect (new window = new tokens)
+                    if state.pm_reconnect_requested:
+                        print("  [PM] reconnect requested (new market window), closing WS...")
+                        state.pm_connected = False
+                        break
+
                     try:
-                        raw = json.loads(await ws.recv())
+                        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
                         _msg_count += 1
 
                         # Throttled debug log: show message stats every 60s
@@ -288,6 +306,10 @@ async def pm_feed(state: State):
                             for ch in raw.get("price_changes", []):
                                 if ch.get("best_ask"):
                                     _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
+
+                    except asyncio.TimeoutError:
+                        # No message in 30s — check reconnect flag and loop
+                        continue
 
                     except websockets.exceptions.ConnectionClosed:
                         print(f"  [PM] connection closed after {_msg_count} msgs, reconnecting...")

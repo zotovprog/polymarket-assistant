@@ -1516,11 +1516,27 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                     f"pm_up={feed_state.pm_up} pm_dn={feed_state.pm_dn} "
                     f"mid={feed_state.mid:.2f} trades_today={engine.state.trades_today}"
                 )
-                # Reset PM prices on window transition — old market may be settled
+                # Reset PM prices and re-fetch tokens for the new market window
                 feed_state.pm_up = None
                 feed_state.pm_dn = None
                 feed_state.pm_prices_ready = False
-                log("  [TRADER] PM prices reset on window transition")
+                try:
+                    import feeds as feeds_mod
+                    new_up, new_dn = await asyncio.to_thread(
+                        feeds_mod.fetch_pm_tokens, coin, timeframe
+                    )
+                    if new_up and new_dn:
+                        feed_state.pm_up_id = new_up
+                        feed_state.pm_dn_id = new_dn
+                        feed_state.pm_reconnect_requested = True
+                        log(
+                            f"  [TRADER] new PM tokens: up={new_up[:12]}.. dn={new_dn[:12]}.. "
+                            f"— WS reconnect requested"
+                        )
+                    else:
+                        log("  [TRADER] WARNING: failed to fetch new PM tokens for this window")
+                except Exception as e:
+                    log(f"  [TRADER] PM token refresh error: {e}")
             last_window_start_ts = winfo.start_ts
 
             engine.process_control_commands(feed_state, log)
