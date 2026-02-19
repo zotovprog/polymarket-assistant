@@ -44,7 +44,7 @@ class TradingConfig:
     live_entry_fill_timeout_sec: int = 20
     live_entry_fill_poll_sec: float = 1.0
     live_cancel_unfilled_entry: bool = True
-    live_exit_size_buffer_pct: float = 0.5
+    live_exit_size_buffer_pct: float = 0.0
     exit_retry_backoff_sec: int = 15
     auto_exit_enabled: bool = True
     tp_pct: float = 15.0
@@ -377,6 +377,8 @@ class LiveExecutor:
         from py_clob_client.order_builder.constants import SELL
 
         price = round(exit_price, 3)
+        # Default behavior: try to liquidate as much as possible (including residuals),
+        # not just the tracked position size.
         size_raw = position.shares * (1.0 - self.cfg.live_exit_size_buffer_pct / 100.0)
         size = round(max(0.01, size_raw), 2)
         order_id = None
@@ -413,7 +415,9 @@ class LiveExecutor:
                 )
 
         if est_balance_shares is not None and est_balance_shares > 0:
-            size = round(min(size, est_balance_shares * 0.995), 2)
+            # Prefer actual token balance to clean residuals automatically.
+            target_size = max(0.01, est_balance_shares * (1.0 - self.cfg.live_exit_size_buffer_pct / 100.0))
+            size = round(target_size, 2)
             reason = f"{reason}, est_balance={est_balance_shares:.4f}"
 
         min_size = self._get_min_order_size(position.token_id)
@@ -457,6 +461,7 @@ class LiveExecutor:
             )
 
         final_attempt = attempt_sizes[0]
+        matched_shares = 0.0
         for idx, sz in enumerate(attempt_sizes, start=1):
             final_attempt = sz
             try:
@@ -470,10 +475,68 @@ class LiveExecutor:
                 )
                 resp = self.client.post_order(signed_order, OrderType.GTC)
                 order_id = resp.get("orderID") or resp.get("id")
-                status = "exit_posted" if order_id else "exit_failed"
                 reason = f"{reason}, attempt={idx}/{len(attempt_sizes)}, placed_sell_size={sz:.2f}"
-                if order_id:
-                    break
+                if not order_id:
+                    status = "exit_failed"
+                    continue
+
+                outcome, fill_state, matched, total, err = self._wait_for_fill(order_id)
+                if matched is not None and matched > 0:
+                    matched_shares = float(matched)
+                denom = total if (total is not None and total > 0) else sz
+                reason = (
+                    f"{reason}, exit_fill={fill_state}, "
+                    f"filled={matched_shares:.2f}/{denom:.2f}"
+                )
+
+                if outcome == "filled":
+                    status = "exit_filled"
+                    return TradeRecord(
+                        ts_iso=datetime.now(timezone.utc).isoformat(),
+                        action="exit",
+                        mode=TradeMode.LIVE.value,
+                        coin=coin,
+                        timeframe=timeframe,
+                        side=position.side,
+                        token_id=position.token_id,
+                        price=price,
+                        size_usd=position.size_usd,
+                        shares=matched_shares if matched_shares > 0 else sz,
+                        status=status,
+                        reason=reason,
+                        order_id=order_id,
+                        pnl_usd=pnl_usd,
+                        pnl_pct=pnl_pct,
+                    )
+
+                cancelled = False
+                if self.cfg.live_cancel_unfilled_entry:
+                    cancelled = self.cancel(order_id)
+
+                if outcome == "partial" and matched_shares > 0:
+                    status = "exit_partial_cancelled" if cancelled else "exit_partial_open"
+                else:
+                    status = "exit_unfilled_cancelled" if cancelled else "exit_unfilled_open"
+                    if err:
+                        reason = f"{reason}, err={err}"
+
+                return TradeRecord(
+                    ts_iso=datetime.now(timezone.utc).isoformat(),
+                    action="exit",
+                    mode=TradeMode.LIVE.value,
+                    coin=coin,
+                    timeframe=timeframe,
+                    side=position.side,
+                    token_id=position.token_id,
+                    price=price,
+                    size_usd=position.size_usd,
+                    shares=matched_shares if matched_shares > 0 else 0.0,
+                    status=status,
+                    reason=reason,
+                    order_id=order_id,
+                    pnl_usd=pnl_usd,
+                    pnl_pct=pnl_pct,
+                )
             except Exception as e:  # pragma: no cover
                 status = self._format_exception_status("exit_error", e)
                 reason = f"{reason}, attempt={idx}/{len(attempt_sizes)}, try_sell_size={sz:.2f}"
@@ -493,7 +556,7 @@ class LiveExecutor:
             token_id=position.token_id,
             price=price,
             size_usd=position.size_usd,
-            shares=final_attempt,
+            shares=matched_shares if matched_shares > 0 else final_attempt,
             status=status,
             reason=reason,
             order_id=order_id,
@@ -1157,7 +1220,7 @@ class TradingEngine:
         return status == "paper"
 
     def _exit_success(self, status: str) -> bool:
-        return status in {"paper_exit", "exit_posted"}
+        return status in {"paper_exit", "exit_filled"}
 
     def maybe_open_position(self, feed_state, coin: str, timeframe: str, log):
         if (
@@ -1441,6 +1504,18 @@ class TradingEngine:
                 except Exception:
                     pass
         else:
+            if rec.status in {"exit_partial_cancelled", "exit_partial_open"}:
+                # Keep position open and shrink tracked shares by matched amount.
+                if rec.shares is not None and rec.shares > 0:
+                    pos.shares = max(0.0, pos.shares - rec.shares)
+                self.state.next_exit_attempt_ts = time.time() + 2
+                if pos.shares <= 0.02:
+                    self._clear_position_state()
+                    log("  [TRADER] exit residual below dust threshold; position cleared")
+                    return
+                log(f"  [TRADER] partial exit matched; remaining_shares={pos.shares:.4f}")
+                return
+
             # Shorter retry for balance settlement race condition (tokens not yet credited)
             if rec.status == "exit_no_token_balance":
                 self.state.next_exit_attempt_ts = time.time() + 3

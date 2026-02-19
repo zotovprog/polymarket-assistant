@@ -270,10 +270,11 @@ async def pm_feed(state: State):
                     if state.pm_reconnect_requested:
                         print("  [PM] reconnect requested (new market window), closing WS...")
                         state.pm_connected = False
+                        await ws.close()
                         break
 
                     try:
-                        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
                         _msg_count += 1
 
                         # Throttled debug log: show message stats every 60s
