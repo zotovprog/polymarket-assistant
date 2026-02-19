@@ -275,10 +275,14 @@ async def pm_feed(state: State):
 
 def _pm_apply(asset, asks, state):
     if asks:
-        _pm_set(asset, min(float(a["price"]) for a in asks), state)
+        valid = [float(a["price"]) for a in asks if float(a["price"]) < 0.99]
+        if valid:
+            _pm_set(asset, min(valid), state)
 
 
 def _pm_set(asset, price, state):
+    if price >= 0.99:
+        return  # ignore: no real liquidity at this price
     if asset == state.pm_up_id:
         state.pm_up = price
     elif asset == state.pm_dn_id:

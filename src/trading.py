@@ -954,6 +954,9 @@ class TradingEngine:
             reason != self.state.last_skip_reason
             or (now - self.state.last_skip_log_ts) >= 60
         )
+        # Global throttle: at most one skip log every 30 seconds
+        if should_log and (now - self.state.last_skip_log_ts) < 30:
+            should_log = False
         if should_log:
             log(f"  [TRADER] skip: {reason}")
             self.state.last_skip_reason = reason
