@@ -437,6 +437,8 @@ class TelegramBot:
         await self._n.answer_callback_query(cb_id)
         params = self._load_settings()
         params["mode"] = mode
+        if mode == "live":
+            params["auto_approve_live"] = True
 
         try:
             self._log(f"Start requested via Telegram: {mode.upper()} {params.get('coin','BTC')} {params.get('timeframe','15m')} strategy={params.get('preset','medium')} size=${params.get('size_usd',5.0):.2f}")
@@ -487,6 +489,8 @@ class TelegramBot:
 
         params = self._load_settings()
         params["mode"] = mode
+        if mode == "live":
+            params["auto_approve_live"] = True
 
         try:
             self._log(f"Restart requested via Telegram: {mode.upper()} {params.get('coin','BTC')} {params.get('timeframe','15m')} strategy={params.get('preset','medium')} size=${params.get('size_usd',5.0):.2f}")

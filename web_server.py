@@ -1080,6 +1080,9 @@ async def _bot_start_session(params: dict) -> None:
     """Start a session from Telegram bot with given params dict."""
     session = SESSIONS["primary"]
     settings = _sanitize_settings(params)
+    # Telegram-run live sessions default to autonomous execution.
+    if settings["mode"] == "live":
+        settings["auto_approve_live"] = True
     if settings["mode"] == "live" and not settings.get("confirm_live_token"):
         settings["confirm_live_token"] = trading.LIVE_CONFIRM_TOKEN
     payload = StartRequest(**settings)
