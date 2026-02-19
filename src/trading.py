@@ -886,13 +886,14 @@ class TradingEngine:
     def _decision_key(self, decision: TradeDecision) -> str:
         return f"{decision.side}|{decision.token_id}"
 
-    def _build_decision(self, feed_state) -> TradeDecision | None:
+    def _build_decision(self, feed_state) -> tuple[TradeDecision | None, str]:
+        """Build a trade decision or return (None, skip_reason)."""
         if not feed_state.mid or not feed_state.klines:
-            return None
+            return None, "no feed data (mid/klines)"
         if not feed_state.pm_up_id or not feed_state.pm_dn_id:
-            return None
+            return None, "no PM token IDs"
         if feed_state.pm_up is None or feed_state.pm_dn is None:
-            return None
+            return None, "no PM prices"
 
         bias = ind.bias_score(
             feed_state.bids, feed_state.asks, feed_state.mid, feed_state.trades, feed_state.klines
@@ -900,9 +901,9 @@ class TradingEngine:
         obi = ind.obi(feed_state.bids, feed_state.asks, feed_state.mid) if feed_state.mid else 0.0
 
         if abs(bias) < self.cfg.min_abs_bias:
-            return None
+            return None, f"bias too low ({bias:+.1f} < ±{self.cfg.min_abs_bias})"
         if abs(obi) < self.cfg.min_abs_obi:
-            return None
+            return None, f"OBI too low ({obi:+.3f} < ±{self.cfg.min_abs_obi})"
 
         if bias > 0:
             side = "Up"
@@ -914,7 +915,8 @@ class TradingEngine:
             price = feed_state.pm_dn
 
         if price is None or not (self.cfg.min_price <= price <= self.cfg.max_price):
-            return None
+            px_str = f"{price:.3f}" if price is not None else "N/A"
+            return None, f"PM price out of range ({px_str} not in [{self.cfg.min_price}, {self.cfg.max_price}])"
 
         reason = f"bias={bias:+.1f}, obi={obi:+.3f}, px={price:.3f}"
         return TradeDecision(
@@ -925,7 +927,7 @@ class TradingEngine:
             obi=obi,
             reason=reason,
             ts=time.time(),
-        )
+        ), ""
 
     def _allowed(self) -> tuple[bool, str]:
         self._rollover_day()
@@ -1220,8 +1222,10 @@ class TradingEngine:
                 f">{self.cfg.pending_approval_ttl_sec}s without execution"
             )
 
-        decision = self._build_decision(feed_state)
+        decision, skip_reason = self._build_decision(feed_state)
         if decision is None:
+            if skip_reason:
+                self._maybe_log_skip(log, skip_reason)
             return
 
         ok, reason = self._allowed()
@@ -1469,12 +1473,25 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                 log("  [TRADER] feed gate: ready (Binance + Polymarket)")
                 last_gate_reason = ""
 
-            # Window transition tracking
+            # Window transition tracking + heartbeat
             winfo = window_mod.get_window_info(timeframe)
             if last_window_start_ts and winfo.start_ts != last_window_start_ts:
                 log(
                     f"  [TRADER] window transition: new {timeframe} window started "
                     f"(start={winfo.start_ts}, end={winfo.end_ts})"
+                )
+                # Heartbeat: snapshot of current state for diagnostics
+                _hb_bias = ind.bias_score(
+                    feed_state.bids, feed_state.asks, feed_state.mid,
+                    feed_state.trades, feed_state.klines,
+                ) if feed_state.mid and feed_state.klines else 0.0
+                _hb_obi = ind.obi(
+                    feed_state.bids, feed_state.asks, feed_state.mid,
+                ) if feed_state.mid else 0.0
+                log(
+                    f"  [TRADER] heartbeat: bias={_hb_bias:+.1f} obi={_hb_obi:+.3f} "
+                    f"pm_up={feed_state.pm_up} pm_dn={feed_state.pm_dn} "
+                    f"mid={feed_state.mid:.2f} trades_today={engine.state.trades_today}"
                 )
             last_window_start_ts = winfo.start_ts
 
