@@ -361,6 +361,10 @@ class TelegramBot:
             wins = 0
             losses = 0
             for t in trades_list:
+                if t.get("action") != "exit":
+                    continue
+                if t.get("is_execution") is False:
+                    continue
                 pnl = t.get("pnl_usd")
                 if pnl is not None:
                     total_pnl_usd += pnl

@@ -97,6 +97,37 @@ class TradeRecord:
     pnl_pct: float | None = None
 
 
+ENTRY_EXECUTION_STATUSES = {
+    "paper",
+    "posted",
+    "filled",
+    "partial_filled",
+    "partial_filled_cancelled",
+    "partial_filled_open",
+}
+
+EXIT_EXECUTION_STATUSES = {
+    "paper_exit",
+    "exit_filled",
+    "exit_partial_cancelled",
+    "exit_partial_open",
+    # Local state cleanup when residual size is below market minimum.
+    "exit_dust_cleared",
+}
+
+
+def is_execution_status(action: str | None, status: str | None) -> bool:
+    action_norm = (action or "").strip().lower()
+    status_norm = (status or "").strip().lower()
+    if not action_norm or not status_norm:
+        return False
+    if action_norm == "entry":
+        return status_norm in ENTRY_EXECUTION_STATUSES
+    if action_norm == "exit":
+        return status_norm in EXIT_EXECUTION_STATUSES
+    return False
+
+
 @dataclass
 class TraderState:
     trades: list[TradeRecord] = field(default_factory=list)
@@ -421,6 +452,29 @@ class LiveExecutor:
             reason = f"{reason}, est_balance={est_balance_shares:.4f}"
 
         min_size = self._get_min_order_size(position.token_id)
+        if (
+            min_size is not None
+            and est_balance_shares is not None
+            and est_balance_shares > 0
+            and est_balance_shares < min_size
+        ):
+            return TradeRecord(
+                ts_iso=datetime.now(timezone.utc).isoformat(),
+                action="exit",
+                mode=TradeMode.LIVE.value,
+                coin=coin,
+                timeframe=timeframe,
+                side=position.side,
+                token_id=position.token_id,
+                price=price,
+                size_usd=position.size_usd,
+                shares=est_balance_shares,
+                status="exit_dust_cleared",
+                reason=f"{reason}, min_order_size={min_size:.2f}, dust_autoclear=1",
+                order_id=None,
+                pnl_usd=pnl_usd,
+                pnl_pct=pnl_pct,
+            )
         if min_size is not None and size < min_size:
             return TradeRecord(
                 ts_iso=datetime.now(timezone.utc).isoformat(),
@@ -1087,7 +1141,13 @@ class TradingEngine:
 
     @staticmethod
     def _record_dict(rec: TradeRecord) -> dict:
-        return asdict(rec)
+        payload = asdict(rec)
+        payload["is_execution"] = is_execution_status(rec.action, rec.status)
+        if rec.shares is not None and rec.price is not None:
+            payload["effective_size_usd"] = abs(float(rec.shares) * float(rec.price))
+        else:
+            payload["effective_size_usd"] = None
+        return payload
 
     def snapshot(self) -> dict:
         return {
@@ -1220,7 +1280,7 @@ class TradingEngine:
         return status == "paper"
 
     def _exit_success(self, status: str) -> bool:
-        return status in {"paper_exit", "exit_filled"}
+        return status in {"paper_exit", "exit_filled", "exit_dust_cleared"}
 
     def maybe_open_position(self, feed_state, coin: str, timeframe: str, log):
         if (
@@ -1508,6 +1568,18 @@ class TradingEngine:
                 # Keep position open and shrink tracked shares by matched amount.
                 if rec.shares is not None and rec.shares > 0:
                     pos.shares = max(0.0, pos.shares - rec.shares)
+                min_size = None
+                if self.mode == TradeMode.LIVE and isinstance(self.executor, LiveExecutor):
+                    min_size = self.executor._get_min_order_size(pos.token_id)
+                if min_size is not None and pos.shares < min_size:
+                    self._clear_position_state()
+                    self.state.last_trade_ts = time.time()
+                    self.state.next_exit_attempt_ts = 0.0
+                    log(
+                        "  [TRADER] partial exit residual below min order size; "
+                        f"position cleared (remaining={pos.shares:.4f}, min_size={min_size:.2f})"
+                    )
+                    return
                 self.state.next_exit_attempt_ts = time.time() + 2
                 if pos.shares <= 0.02:
                     self._clear_position_state()
@@ -1519,6 +1591,8 @@ class TradingEngine:
             # Shorter retry for balance settlement race condition (tokens not yet credited)
             if rec.status == "exit_no_token_balance":
                 self.state.next_exit_attempt_ts = time.time() + 3
+            elif rec.status == "exit_blocked_min_size":
+                self.state.next_exit_attempt_ts = time.time() + max(30, self.cfg.exit_retry_backoff_sec)
             else:
                 self.state.next_exit_attempt_ts = time.time() + self.cfg.exit_retry_backoff_sec
 

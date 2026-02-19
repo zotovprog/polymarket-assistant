@@ -576,20 +576,49 @@ function renderList(node, items) {
   });
 }
 
+function isExecutionTrade(t) {
+  if (!t) return false;
+  if (typeof t.is_execution === "boolean") return t.is_execution;
+  const action = String(t.action || "").toLowerCase();
+  const status = String(t.status || "").toLowerCase();
+  const entryOk = new Set([
+    "paper",
+    "posted",
+    "filled",
+    "partial_filled",
+    "partial_filled_cancelled",
+    "partial_filled_open",
+  ]);
+  const exitOk = new Set([
+    "paper_exit",
+    "exit_filled",
+    "exit_partial_cancelled",
+    "exit_partial_open",
+    "exit_dust_cleared",
+  ]);
+  if (action === "entry") return entryOk.has(status);
+  if (action === "exit") return exitOk.has(status);
+  return false;
+}
+
 function renderTrades(trades) {
   ui.tradesBody.innerHTML = "";
-  (trades || []).slice(-40).reverse().forEach((t) => {
+  const visibleTrades = (trades || []).filter(isExecutionTrade);
+  visibleTrades.slice(-40).reverse().forEach((t) => {
     const tr = document.createElement("tr");
     const when = t.ts_iso ? new Date(t.ts_iso).toLocaleTimeString() : "-";
     const pnl = t.pnl_pct !== null && t.pnl_pct !== undefined
       ? `${fmtPct(t.pnl_pct)} / $${fmtNum(t.pnl_usd, 2)}`
       : "-";
+    const effectiveSize = t.effective_size_usd !== null && t.effective_size_usd !== undefined
+      ? t.effective_size_usd
+      : t.size_usd;
     const columns = [
       { text: when },
       { text: t.action || "-" },
       { text: t.side || "-", className: String(t.side || "").toLowerCase() === "up" ? "bullish" : (String(t.side || "").toLowerCase() === "down" ? "bearish" : "") },
       { text: t.price !== undefined ? Number(t.price).toFixed(3) : "-" },
-      { text: t.size_usd !== undefined ? `$${fmtNum(t.size_usd, 2)}` : "-" },
+      { text: effectiveSize !== undefined ? `$${fmtNum(effectiveSize, 2)}` : "-" },
       { text: t.status || "-", className: String(t.status || "").includes("error") || String(t.status || "").includes("failed") ? "bearish" : (String(t.status || "").includes("filled") || String(t.status || "").includes("posted") ? "bullish" : "") },
       { text: pnl, className: signClass(t.pnl_pct) },
     ];
@@ -615,12 +644,15 @@ function downloadLogs() {
 }
 
 function downloadTrades() {
-  const trades = lastState?.trader?.trades || [];
+  const trades = (lastState?.trader?.trades || []).filter(isExecutionTrade);
   if (!trades.length) { alert("No trades to export"); return; }
-  const header = "time,action,side,price,size_usd,status,pnl_pct,pnl_usd,reason\n";
+  const header = "time,action,side,price,effective_size_usd,size_usd,status,pnl_pct,pnl_usd,reason\n";
   const rows = trades.map(t => [
     t.ts_iso || "", t.action || "", t.side || "",
-    t.price ?? "", t.size_usd ?? "", t.status || "",
+    t.price ?? "",
+    t.effective_size_usd ?? "",
+    t.size_usd ?? "",
+    t.status || "",
     t.pnl_pct ?? "", t.pnl_usd ?? "",
     `"${(t.reason || "").replace(/"/g, '""')}"`,
   ].join(",")).join("\n");

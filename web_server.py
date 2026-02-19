@@ -787,6 +787,8 @@ class SessionRuntime:
                 )
 
             def _on_exit(rec):
+                if not trading.is_execution_status(rec.action, rec.status):
+                    return
                 _telegram.notify_exit(
                     mode=rec.mode, coin=rec.coin, timeframe=rec.timeframe,
                     side=rec.side, price=rec.price, size_usd=rec.size_usd,
