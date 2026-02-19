@@ -808,14 +808,11 @@ class TelegramBot:
         except Exception as e:
             print(f"  [TELEGRAM BOT] save settings error: {e}")
 
-    def save_settings_from_web(self, mode: str, coin: str, timeframe: str, preset: str, size_usd: float) -> None:
-        """Called from web_server to sync web UI start params."""
+    def save_settings_from_web(self, settings: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        """Called from web_server to sync full web UI params into Telegram settings storage."""
         params = self._load_settings()
-        params.update({
-            "mode": mode,
-            "coin": coin,
-            "timeframe": timeframe,
-            "preset": preset,
-            "size_usd": size_usd,
-        })
+        if isinstance(settings, dict):
+            params.update(settings)
+        if kwargs:
+            params.update(kwargs)
         self._save_settings(params)

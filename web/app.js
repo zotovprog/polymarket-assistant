@@ -71,6 +71,11 @@ let bootstrappedOnce = false;
 let coinTfBound = false;
 let lastState = null;
 let megaPresetNoticeShown = false;
+let lastSettingsRev = "";
+let settingsSyncTimer = null;
+let settingsSyncInFlight = false;
+let settingsSyncReady = false;
+let suppressSettingsSync = false;
 
 function sentimentClass(label) {
   const raw = String(label || "").toLowerCase();
@@ -170,6 +175,53 @@ function restoreFormState() {
 
   syncModeByPreset(false);
   return true;
+}
+
+function applySavedSettings(settings) {
+  if (!settings || typeof settings !== "object") return;
+
+  const coin = String(settings.coin || "");
+  if (coin && ui.coin.querySelector(`option[value="${coin}"]`)) {
+    ui.coin.value = coin;
+    ui.coin.dispatchEvent(new Event("change"));
+  }
+
+  const timeframe = String(settings.timeframe || "");
+  if (timeframe && ui.timeframe.querySelector(`option[value="${timeframe}"]`)) {
+    ui.timeframe.value = timeframe;
+  }
+
+  allPersistedFieldIds().forEach((id) => {
+    if (id === "coin" || id === "timeframe") return;
+    if (!(id in settings)) return;
+    const node = el(id);
+    if (!node) return;
+    if (node.type === "checkbox") {
+      node.checked = !!settings[id];
+      return;
+    }
+    node.value = String(settings[id] ?? "");
+  });
+
+  syncModeByPreset(false);
+  saveFormState();
+}
+
+function applyRemoteSettingsIfChanged(data, announce = false) {
+  const rev = String(data?.settings_rev || "");
+  if (!rev || rev === lastSettingsRev) return;
+  lastSettingsRev = rev;
+  if (!data?.saved_settings || typeof data.saved_settings !== "object") return;
+
+  suppressSettingsSync = true;
+  try {
+    applySavedSettings(data.saved_settings);
+  } finally {
+    suppressSettingsSync = false;
+  }
+  if (announce) {
+    showToast("info", "Settings synced", "Settings were updated from another client (Telegram/Web).");
+  }
 }
 
 function setError(msg = "") {
@@ -322,6 +374,36 @@ function gatherStartPayload() {
   return payload;
 }
 
+async function pushSettingsToServer() {
+  if (!settingsSyncReady || settingsSyncInFlight) return;
+  settingsSyncInFlight = true;
+  try {
+    const payload = gatherStartPayload();
+    const data = await api("/api/settings", { method: "POST", body: payload });
+    if (data?.settings_rev) {
+      lastSettingsRev = String(data.settings_rev);
+    }
+  } catch (e) {
+    if (e?.unauthorized) {
+      showAuthOverlay("Session is locked. Enter access key.");
+    } else if (!e?.networkError) {
+      setError(e.message || String(e));
+    }
+  } finally {
+    settingsSyncInFlight = false;
+  }
+}
+
+function scheduleSettingsSync() {
+  if (!settingsSyncReady || suppressSettingsSync) return;
+  if (settingsSyncTimer) {
+    window.clearTimeout(settingsSyncTimer);
+  }
+  settingsSyncTimer = window.setTimeout(() => {
+    pushSettingsToServer().catch(() => {});
+  }, 450);
+}
+
 async function api(path, options = {}) {
   let res;
   try {
@@ -391,10 +473,12 @@ function bindControlsOnce() {
     applyPreset(ui.preset.value);
     syncModeByPreset(true);
     saveFormState();
+    scheduleSettingsSync();
   });
   ui.mode.addEventListener("change", () => {
     syncModeByPreset(true);
     saveFormState();
+    scheduleSettingsSync();
   });
   ui.startBtn.addEventListener("click", async () => {
     const mode = ui.mode.value;
@@ -430,8 +514,13 @@ function bindControlsOnce() {
   allPersistedFieldIds().forEach((id) => {
     const node = el(id);
     if (!node) return;
-    const evName = node.type === "checkbox" || node.tagName === "SELECT" ? "change" : "input";
-    node.addEventListener(evName, saveFormState);
+    const evName = (node.type === "checkbox" || node.tagName === "SELECT" || node.type === "number")
+      ? "change"
+      : "input";
+    node.addEventListener(evName, () => {
+      saveFormState();
+      scheduleSettingsSync();
+    });
   });
 }
 
@@ -643,6 +732,7 @@ async function pollState() {
     const data = await api("/api/state");
     setError("");
     renderState(data.state);
+    applyRemoteSettingsIfChanged(data, true);
   } catch (e) {
     if (e.unauthorized) {
       showAuthOverlay("Enter access key to continue");
@@ -713,32 +803,35 @@ async function bootstrapApp() {
   try {
     const data = await api("/api/bootstrap");
     bootstrap = data;
+    lastSettingsRev = String(data.settings_rev || "");
     setupCoinTimeframes();
-    const restored = restoreFormState();
-    if (!restored && data.saved_settings && Object.keys(data.saved_settings).length > 0) {
-      // Apply server-side settings from bot_last_session.json (Telegram bot or previous run)
-      const ss = data.saved_settings;
-      if (ss.coin && ui.coin.querySelector(`option[value="${ss.coin}"]`)) {
-        ui.coin.value = ss.coin;
-        ui.coin.dispatchEvent(new Event("change"));
+
+    const hasServerSettings = !!(data.saved_settings && Object.keys(data.saved_settings).length > 0);
+    if (hasServerSettings) {
+      suppressSettingsSync = true;
+      try {
+        applySavedSettings(data.saved_settings);
+      } finally {
+        suppressSettingsSync = false;
       }
-      if (ss.timeframe && ui.timeframe.querySelector(`option[value="${ss.timeframe}"]`)) {
-        ui.timeframe.value = ss.timeframe;
+      if (!el("confirm_live_token").value) {
+        el("confirm_live_token").value = data.live_confirm_token || "";
       }
-      if (ss.preset) { ui.preset.value = ss.preset; applyPreset(ss.preset); }
-      if (ss.mode) ui.mode.value = ss.mode;
-      if (ss.size_usd) el("size_usd").value = String(ss.size_usd);
-      el("confirm_live_token").value = data.live_confirm_token || "";
-      el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
+      if (el("client_watchdog_enabled") && !("client_watchdog_enabled" in data.saved_settings)) {
+        el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
+      }
       saveFormState();
-    } else if (!restored) {
-      el("confirm_live_token").value = data.live_confirm_token || "";
-      applyPreset("medium");
-      el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
-      saveFormState();
-    } else if (!el("confirm_live_token").value) {
-      el("confirm_live_token").value = data.live_confirm_token || "";
-      saveFormState();
+    } else {
+      const restored = restoreFormState();
+      if (!restored) {
+        el("confirm_live_token").value = data.live_confirm_token || "";
+        applyPreset("medium");
+        el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
+        saveFormState();
+      } else if (!el("confirm_live_token").value) {
+        el("confirm_live_token").value = data.live_confirm_token || "";
+        saveFormState();
+      }
     }
     // Credential status indicator
     const credAvail = !!data.credentials_available;
@@ -758,6 +851,7 @@ async function bootstrapApp() {
       showToast("success", "Ready", "Web terminal loaded");
     }
     bootstrappedOnce = true;
+    settingsSyncReady = true;
 
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollState, 1200);

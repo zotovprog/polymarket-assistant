@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -61,7 +62,13 @@ else:
     print("[TELEGRAM] notifications disabled (TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set)")
 
 _BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
-_BOT_SETTINGS_PATH = BASE_DIR / "workspace" / "bot_last_session.json"
+_SETTINGS_PATH_RAW = os.environ.get("PM_SETTINGS_PATH", "").strip()
+if _SETTINGS_PATH_RAW:
+    _BOT_SETTINGS_PATH = Path(_SETTINGS_PATH_RAW).expanduser()
+    if not _BOT_SETTINGS_PATH.is_absolute():
+        _BOT_SETTINGS_PATH = BASE_DIR / _BOT_SETTINGS_PATH
+else:
+    _BOT_SETTINGS_PATH = BASE_DIR / "workspace" / "bot_last_session.json"
 _bot: TelegramBot | None = None
 
 
@@ -155,6 +162,169 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "reverse_exit_bias": 20,
     },
 }
+
+
+def _default_settings() -> dict[str, Any]:
+    medium = PRESETS["medium"]
+    return {
+        "mode": "paper",
+        "coin": "BTC",
+        "timeframe": "15m",
+        "preset": "medium",
+        "confirm_live_token": trading.LIVE_CONFIRM_TOKEN,
+        "size_usd": 5.0,
+        "min_bias": float(medium["min_bias"]),
+        "min_obi": float(medium["min_obi"]),
+        "min_price": float(medium["min_price"]),
+        "max_price": float(medium["max_price"]),
+        "cooldown_sec": int(medium["cooldown_sec"]),
+        "max_trades_per_day": int(medium["max_trades_per_day"]),
+        "eval_interval_sec": int(medium["eval_interval_sec"]),
+        "tp_pct": float(medium["tp_pct"]),
+        "sl_pct": float(medium["sl_pct"]),
+        "max_hold_sec": int(medium["max_hold_sec"]),
+        "reverse_exit_bias": float(medium["reverse_exit_bias"]),
+        "auto_exit_enabled": True,
+        "reverse_exit_enabled": True,
+        "live_entry_require_fill": True,
+        "live_entry_fill_timeout_sec": 25,
+        "live_entry_fill_poll_sec": 1.0,
+        "keep_unfilled_entry_open": False,
+        "binance_ob_stale_sec": 12,
+        "executions_log_file": "",
+        "auto_approve_live": False,
+        "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
+    }
+
+
+def _to_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _to_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _to_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _sanitize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
+    settings = _default_settings()
+    src = raw if isinstance(raw, dict) else {}
+
+    preset = str(src.get("preset", settings["preset"])).strip().lower()
+    if preset in PRESETS:
+        settings["preset"] = preset
+        for key, value in PRESETS[preset].items():
+            settings[key] = value
+
+    mode = str(src.get("mode", settings["mode"])).strip().lower()
+    if mode in {"observe", "paper", "live"}:
+        settings["mode"] = mode
+
+    coin = str(src.get("coin", settings["coin"])).strip().upper()
+    if coin in config.COINS:
+        settings["coin"] = coin
+
+    tf_options = config.COIN_TIMEFRAMES.get(settings["coin"], ["15m"])
+    timeframe = str(src.get("timeframe", settings["timeframe"])).strip()
+    if timeframe in tf_options:
+        settings["timeframe"] = timeframe
+    elif settings["timeframe"] not in tf_options:
+        settings["timeframe"] = "15m" if "15m" in tf_options else tf_options[0]
+
+    settings["confirm_live_token"] = str(
+        src.get("confirm_live_token", settings["confirm_live_token"])
+    ).strip()
+    settings["executions_log_file"] = str(
+        src.get("executions_log_file", settings["executions_log_file"])
+    ).strip()
+
+    settings["size_usd"] = max(5.0, _to_float(src.get("size_usd"), float(settings["size_usd"])))
+    settings["min_bias"] = max(0.0, _to_float(src.get("min_bias"), float(settings["min_bias"])))
+    settings["min_obi"] = max(0.0, _to_float(src.get("min_obi"), float(settings["min_obi"])))
+    settings["min_price"] = max(0.01, _to_float(src.get("min_price"), float(settings["min_price"])))
+    settings["max_price"] = min(0.99, _to_float(src.get("max_price"), float(settings["max_price"])))
+    settings["cooldown_sec"] = max(10, _to_int(src.get("cooldown_sec"), int(settings["cooldown_sec"])))
+    settings["max_trades_per_day"] = max(
+        1, _to_int(src.get("max_trades_per_day"), int(settings["max_trades_per_day"]))
+    )
+    settings["eval_interval_sec"] = max(
+        1, _to_int(src.get("eval_interval_sec"), int(settings["eval_interval_sec"]))
+    )
+    settings["tp_pct"] = max(0.1, _to_float(src.get("tp_pct"), float(settings["tp_pct"])))
+    settings["sl_pct"] = max(0.1, _to_float(src.get("sl_pct"), float(settings["sl_pct"])))
+    settings["max_hold_sec"] = max(30, _to_int(src.get("max_hold_sec"), int(settings["max_hold_sec"])))
+    settings["reverse_exit_bias"] = max(
+        1.0, _to_float(src.get("reverse_exit_bias"), float(settings["reverse_exit_bias"]))
+    )
+    settings["live_entry_fill_timeout_sec"] = max(
+        1, _to_int(src.get("live_entry_fill_timeout_sec"), int(settings["live_entry_fill_timeout_sec"]))
+    )
+    settings["live_entry_fill_poll_sec"] = max(
+        0.2, _to_float(src.get("live_entry_fill_poll_sec"), float(settings["live_entry_fill_poll_sec"]))
+    )
+    settings["binance_ob_stale_sec"] = max(
+        3, _to_int(src.get("binance_ob_stale_sec"), int(settings["binance_ob_stale_sec"]))
+    )
+
+    settings["auto_exit_enabled"] = _to_bool(src.get("auto_exit_enabled"), bool(settings["auto_exit_enabled"]))
+    settings["reverse_exit_enabled"] = _to_bool(
+        src.get("reverse_exit_enabled"), bool(settings["reverse_exit_enabled"])
+    )
+    settings["live_entry_require_fill"] = _to_bool(
+        src.get("live_entry_require_fill"), bool(settings["live_entry_require_fill"])
+    )
+    settings["keep_unfilled_entry_open"] = _to_bool(
+        src.get("keep_unfilled_entry_open"), bool(settings["keep_unfilled_entry_open"])
+    )
+    settings["auto_approve_live"] = _to_bool(src.get("auto_approve_live"), bool(settings["auto_approve_live"]))
+    settings["client_watchdog_enabled"] = _to_bool(
+        src.get("client_watchdog_enabled"), bool(settings["client_watchdog_enabled"])
+    )
+
+    if settings["preset"] in {"super_aggressive", "mega_aggressive"} and settings["mode"] != "paper":
+        settings["mode"] = "paper"
+
+    return settings
+
+
+def _save_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    clean = _sanitize_settings(settings)
+    try:
+        _BOT_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _BOT_SETTINGS_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(clean, indent=2, ensure_ascii=True))
+        tmp_path.replace(_BOT_SETTINGS_PATH)
+    except Exception as e:
+        print(f"[SETTINGS] save error: {e}")
+    return clean
+
+
+def _settings_revision() -> str:
+    try:
+        st = _BOT_SETTINGS_PATH.stat()
+        return f"{st.st_mtime_ns}-{st.st_size}"
+    except Exception:
+        return "0"
 
 
 def _utc_now_iso() -> str:
@@ -909,30 +1079,10 @@ def _get_primary_session() -> SessionRuntime | None:
 async def _bot_start_session(params: dict) -> None:
     """Start a session from Telegram bot with given params dict."""
     session = SESSIONS["primary"]
-
-    preset_name = params.get("preset", "medium")
-    preset_vals = PRESETS.get(preset_name, PRESETS["medium"])
-
-    payload = StartRequest(
-        mode=params.get("mode", "paper"),
-        coin=params.get("coin", "BTC"),
-        timeframe=params.get("timeframe", "15m"),
-        preset=preset_name,
-        confirm_live_token=trading.LIVE_CONFIRM_TOKEN if params.get("mode") == "live" else "",
-        size_usd=params.get("size_usd", 5.0),
-        min_bias=preset_vals.get("min_bias", 55),
-        min_obi=preset_vals.get("min_obi", 0.40),
-        min_price=preset_vals.get("min_price", 0.40),
-        max_price=preset_vals.get("max_price", 0.68),
-        cooldown_sec=int(preset_vals.get("cooldown_sec", 420)),
-        max_trades_per_day=int(preset_vals.get("max_trades_per_day", 4)),
-        eval_interval_sec=int(preset_vals.get("eval_interval_sec", 3)),
-        tp_pct=preset_vals.get("tp_pct", 10),
-        sl_pct=preset_vals.get("sl_pct", 6),
-        max_hold_sec=int(preset_vals.get("max_hold_sec", 1200)),
-        reverse_exit_bias=preset_vals.get("reverse_exit_bias", 55),
-        auto_approve_live=True,
-    )
+    settings = _sanitize_settings(params)
+    if settings["mode"] == "live" and not settings.get("confirm_live_token"):
+        settings["confirm_live_token"] = trading.LIVE_CONFIRM_TOKEN
+    payload = StartRequest(**settings)
     await session.start(payload)
 
 
@@ -973,28 +1123,26 @@ def _load_saved_settings() -> dict:
     Falls back to PM_DEFAULT_SETTINGS env var (JSON) if file doesn't exist.
     This ensures settings survive container re-deploys on Railway.
     """
-    import json as _json
     try:
         if _BOT_SETTINGS_PATH.exists():
-            return _json.loads(_BOT_SETTINGS_PATH.read_text())
-    except Exception:
-        pass
+            raw = json.loads(_BOT_SETTINGS_PATH.read_text())
+            clean = _sanitize_settings(raw)
+            if clean != raw:
+                _save_settings(clean)
+            return clean
+    except Exception as e:
+        print(f"[SETTINGS] failed reading settings file: {e}")
     # Fallback: read from env var (set once in Railway Variables)
     env_settings = os.environ.get("PM_DEFAULT_SETTINGS", "").strip()
     if env_settings:
         try:
-            settings = _json.loads(env_settings)
-            # Persist to file so subsequent loads are fast
-            try:
-                _BOT_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-                _BOT_SETTINGS_PATH.write_text(_json.dumps(settings, indent=2))
-                print(f"[SETTINGS] restored from PM_DEFAULT_SETTINGS env var: {settings}")
-            except Exception:
-                pass
-            return settings
+            settings = json.loads(env_settings)
+            clean = _save_settings(settings)
+            print(f"[SETTINGS] restored from PM_DEFAULT_SETTINGS env var")
+            return clean
         except Exception as e:
             print(f"[SETTINGS] failed to parse PM_DEFAULT_SETTINGS: {e}")
-    return {}
+    return _save_settings(_default_settings())
 
 
 app = FastAPI(title="Polymarket Assistant Web")
@@ -1040,6 +1188,7 @@ async def api_bootstrap(request: Request):
     _require_auth(request)
     session = _get_singleton_session()
     session.touch_client()
+    saved_settings = _load_saved_settings()
     return {
         "ok": True,
         "session_id": session.session_id,
@@ -1051,7 +1200,8 @@ async def api_bootstrap(request: Request):
             "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
         },
         "credentials_available": bool(PM_PRIVATE_KEY and PM_FUNDER),
-        "saved_settings": _load_saved_settings(),
+        "saved_settings": saved_settings,
+        "settings_rev": _settings_revision(),
         "state": session.snapshot(),
     }
 
@@ -1061,7 +1211,12 @@ async def api_state(request: Request):
     _require_auth(request)
     session = _get_singleton_session()
     session.touch_client()
-    return {"ok": True, "state": session.snapshot()}
+    return {
+        "ok": True,
+        "state": session.snapshot(),
+        "saved_settings": _load_saved_settings(),
+        "settings_rev": _settings_revision(),
+    }
 
 
 @app.post("/api/start")
@@ -1073,12 +1228,25 @@ async def api_start(payload: StartRequest, request: Request):
         await session.start(payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    clean_settings = _save_settings(payload.model_dump())
     if _bot:
-        _bot.save_settings_from_web(
-            mode=payload.mode, coin=payload.coin, timeframe=payload.timeframe,
-            preset=payload.preset, size_usd=payload.size_usd,
-        )
+        _bot.save_settings_from_web(clean_settings)
     return {"ok": True, "state": session.snapshot()}
+
+
+@app.post("/api/settings")
+async def api_settings(payload: StartRequest, request: Request):
+    _require_auth(request)
+    session = _get_singleton_session()
+    session.touch_client()
+    clean_settings = _save_settings(payload.model_dump())
+    if _bot:
+        _bot.save_settings_from_web(clean_settings)
+    return {
+        "ok": True,
+        "saved_settings": clean_settings,
+        "settings_rev": _settings_revision(),
+    }
 
 
 @app.post("/api/stop")
