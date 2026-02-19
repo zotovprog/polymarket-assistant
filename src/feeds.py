@@ -30,6 +30,7 @@ class State:
         self.binance_ob_last_ok_ts: float = 0.0
         self.pm_connected: bool = False
         self.pm_prices_ready: bool = False
+        self.pm_last_update_ts: float = 0.0
 
 
 OB_POLL_INTERVAL = 2
@@ -236,6 +237,8 @@ async def pm_feed(state: State):
         return
 
     assets = [state.pm_up_id, state.pm_dn_id]
+    _last_msg_log_ts = 0.0
+    _msg_count = 0
 
     while True:
         try:
@@ -246,12 +249,36 @@ async def pm_feed(state: State):
                 close_timeout=10
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                print("  [PM] connected")
+                print(f"  [PM] connected, subscribed to {len(assets)} assets")
                 state.pm_connected = True
+                _msg_count = 0
 
                 while True:
                     try:
                         raw = json.loads(await ws.recv())
+                        _msg_count += 1
+
+                        # Throttled debug log: show message stats every 60s
+                        now = time.time()
+                        if now - _last_msg_log_ts >= 60:
+                            if isinstance(raw, list):
+                                print(
+                                    f"  [PM] snapshot: {len(raw)} entries, "
+                                    f"pm_up={state.pm_up}, pm_dn={state.pm_dn} "
+                                    f"(msgs={_msg_count})"
+                                )
+                            elif isinstance(raw, dict):
+                                print(
+                                    f"  [PM] event: {raw.get('event_type', '?')}, "
+                                    f"pm_up={state.pm_up}, pm_dn={state.pm_dn} "
+                                    f"(msgs={_msg_count})"
+                                )
+                            else:
+                                print(
+                                    f"  [PM] heartbeat: pm_up={state.pm_up}, "
+                                    f"pm_dn={state.pm_dn} (msgs={_msg_count})"
+                                )
+                            _last_msg_log_ts = now
 
                         if isinstance(raw, list):
                             for entry in raw:
@@ -263,7 +290,7 @@ async def pm_feed(state: State):
                                     _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
 
                     except websockets.exceptions.ConnectionClosed:
-                        print("  [PM] connection closed, reconnecting...")
+                        print(f"  [PM] connection closed after {_msg_count} msgs, reconnecting...")
                         state.pm_connected = False
                         break
 
@@ -280,11 +307,21 @@ def _pm_apply(asset, asks, state):
             _pm_set(asset, min(valid), state)
 
 
+_pm_filter_log_ts = 0.0
+
+
 def _pm_set(asset, price, state):
+    global _pm_filter_log_ts
     if price >= 0.99:
-        return  # ignore: no real liquidity at this price
+        now = time.time()
+        if now - _pm_filter_log_ts >= 60:
+            asset_label = (asset or "")[:12]
+            print(f"  [PM] filtered price={price:.4f} for asset={asset_label}.. (>= 0.99)")
+            _pm_filter_log_ts = now
+        return
     if asset == state.pm_up_id:
         state.pm_up = price
     elif asset == state.pm_dn_id:
         state.pm_dn = price
+    state.pm_last_update_ts = time.time()
     state.pm_prices_ready = state.pm_up is not None and state.pm_dn is not None

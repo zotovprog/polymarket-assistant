@@ -1461,6 +1461,10 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
             return False, "waiting Polymarket WS connection"
         if not feed_state.pm_prices_ready:
             return False, "waiting Polymarket prices"
+        if feed_state.pm_last_update_ts > 0:
+            pm_age = now - feed_state.pm_last_update_ts
+            if pm_age > 120:
+                return False, f"PM prices stale ({int(pm_age)}s old)"
         return True, ""
 
     log(
@@ -1512,6 +1516,11 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                     f"pm_up={feed_state.pm_up} pm_dn={feed_state.pm_dn} "
                     f"mid={feed_state.mid:.2f} trades_today={engine.state.trades_today}"
                 )
+                # Reset PM prices on window transition — old market may be settled
+                feed_state.pm_up = None
+                feed_state.pm_dn = None
+                feed_state.pm_prices_ready = False
+                log("  [TRADER] PM prices reset on window transition")
             last_window_start_ts = winfo.start_ts
 
             engine.process_control_commands(feed_state, log)
