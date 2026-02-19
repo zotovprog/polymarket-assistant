@@ -683,7 +683,23 @@ async function bootstrapApp() {
     bootstrap = data;
     setupCoinTimeframes();
     const restored = restoreFormState();
-    if (!restored) {
+    if (!restored && data.saved_settings && Object.keys(data.saved_settings).length > 0) {
+      // Apply server-side settings from bot_last_session.json (Telegram bot or previous run)
+      const ss = data.saved_settings;
+      if (ss.coin && ui.coin.querySelector(`option[value="${ss.coin}"]`)) {
+        ui.coin.value = ss.coin;
+        ui.coin.dispatchEvent(new Event("change"));
+      }
+      if (ss.timeframe && ui.timeframe.querySelector(`option[value="${ss.timeframe}"]`)) {
+        ui.timeframe.value = ss.timeframe;
+      }
+      if (ss.preset) { ui.preset.value = ss.preset; applyPreset(ss.preset); }
+      if (ss.mode) ui.mode.value = ss.mode;
+      if (ss.size_usd) el("size_usd").value = String(ss.size_usd);
+      el("confirm_live_token").value = data.live_confirm_token || "";
+      el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;
+      saveFormState();
+    } else if (!restored) {
       el("confirm_live_token").value = data.live_confirm_token || "";
       applyPreset("medium");
       el("client_watchdog_enabled").checked = !!data?.defaults?.client_watchdog_enabled;

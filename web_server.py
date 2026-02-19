@@ -4,7 +4,6 @@ import asyncio
 import os
 import sys
 import time
-import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -29,7 +28,6 @@ from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBot
 
 
-SESSION_COOKIE = "pm_session_id"
 AUTH_COOKIE = "pm_web_auth"
 
 
@@ -899,26 +897,18 @@ class SessionRuntime:
         return summary
 
 
-SESSIONS: dict[str, SessionRuntime] = {}
-SESSIONS_LOCK = asyncio.Lock()
+# Singleton session: all clients (web, Telegram bot) share one session
+SESSIONS: dict[str, SessionRuntime] = {"primary": SessionRuntime(session_id="primary")}
 
 
 def _get_primary_session() -> SessionRuntime | None:
-    """Return the first running session, or any session if none running."""
-    for s in SESSIONS.values():
-        if s.running:
-            return s
-    return next(iter(SESSIONS.values()), None)
+    """Return the singleton session."""
+    return SESSIONS.get("primary")
 
 
 async def _bot_start_session(params: dict) -> None:
     """Start a session from Telegram bot with given params dict."""
-    session = _get_primary_session()
-    if not session:
-        async with SESSIONS_LOCK:
-            sid = uuid.uuid4().hex
-            SESSIONS[sid] = SessionRuntime(session_id=sid)
-            session = SESSIONS[sid]
+    session = SESSIONS["primary"]
 
     preset_name = params.get("preset", "medium")
     preset_vals = PRESETS.get(preset_name, PRESETS["medium"])
@@ -972,21 +962,20 @@ def _set_auth_cookie(response: Response):
     )
 
 
-async def _get_or_create_session(request: Request, response: Response) -> SessionRuntime:
-    sid = request.cookies.get(SESSION_COOKIE, "").strip()
-    async with SESSIONS_LOCK:
-        if not sid or sid not in SESSIONS:
-            sid = uuid.uuid4().hex
-            SESSIONS[sid] = SessionRuntime(session_id=sid)
-        session = SESSIONS[sid]
-    response.set_cookie(
-        SESSION_COOKIE,
-        sid,
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 24 * 7,
-    )
-    return session
+def _get_singleton_session() -> SessionRuntime:
+    """Return the single shared session used by all clients."""
+    return SESSIONS["primary"]
+
+
+def _load_saved_settings() -> dict:
+    """Load last-used settings from bot_last_session.json (survives restarts)."""
+    import json as _json
+    try:
+        if _BOT_SETTINGS_PATH.exists():
+            return _json.loads(_BOT_SETTINGS_PATH.read_text())
+    except Exception:
+        pass
+    return {}
 
 
 app = FastAPI(title="Polymarket Assistant Web")
@@ -1028,9 +1017,9 @@ async def api_auth(payload: AuthRequest, response: Response):
 
 
 @app.get("/api/bootstrap")
-async def api_bootstrap(request: Request, response: Response):
+async def api_bootstrap(request: Request):
     _require_auth(request)
-    session = await _get_or_create_session(request, response)
+    session = _get_singleton_session()
     session.touch_client()
     return {
         "ok": True,
@@ -1043,22 +1032,23 @@ async def api_bootstrap(request: Request, response: Response):
             "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
         },
         "credentials_available": bool(PM_PRIVATE_KEY and PM_FUNDER),
+        "saved_settings": _load_saved_settings(),
         "state": session.snapshot(),
     }
 
 
 @app.get("/api/state")
-async def api_state(request: Request, response: Response):
+async def api_state(request: Request):
     _require_auth(request)
-    session = await _get_or_create_session(request, response)
+    session = _get_singleton_session()
     session.touch_client()
     return {"ok": True, "state": session.snapshot()}
 
 
 @app.post("/api/start")
-async def api_start(payload: StartRequest, request: Request, response: Response):
+async def api_start(payload: StartRequest, request: Request):
     _require_auth(request)
-    session = await _get_or_create_session(request, response)
+    session = _get_singleton_session()
     session.touch_client()
     try:
         await session.start(payload)
@@ -1073,18 +1063,18 @@ async def api_start(payload: StartRequest, request: Request, response: Response)
 
 
 @app.post("/api/stop")
-async def api_stop(request: Request, response: Response):
+async def api_stop(request: Request):
     _require_auth(request)
-    session = await _get_or_create_session(request, response)
+    session = _get_singleton_session()
     session.touch_client()
     await session.stop()
     return {"ok": True, "state": session.snapshot()}
 
 
 @app.post("/api/command")
-async def api_command(payload: CommandRequest, request: Request, response: Response):
+async def api_command(payload: CommandRequest, request: Request):
     _require_auth(request)
-    session = await _get_or_create_session(request, response)
+    session = _get_singleton_session()
     session.touch_client()
     if not session.engine:
         raise HTTPException(status_code=400, detail="trader is disabled in observe mode")
@@ -1098,7 +1088,7 @@ async def api_command(payload: CommandRequest, request: Request, response: Respo
 async def _shutdown():
     if _bot:
         await _bot.stop()
-    async with SESSIONS_LOCK:
-        sessions = list(SESSIONS.values())
-    await asyncio.gather(*(s.stop() for s in sessions), return_exceptions=True)
+    session = SESSIONS.get("primary")
+    if session:
+        await session.stop()
     await _telegram.close()
