@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
@@ -224,24 +225,70 @@ class TelegramBot:
 
     # ---- main menu ----
 
+    def _default_quick_start_settings(self) -> dict:
+        return {
+            "mode": "live",
+            "coin": "BTC",
+            "timeframe": "15m",
+            "preset": "medium",
+            "size_usd": 5.0,
+        }
+
+    def _format_size_compact(self, value: Any) -> str:
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            amount = 5.0
+        if abs(amount - round(amount)) < 1e-9:
+            return f"${int(round(amount))}"
+        return f"${amount:.2f}".rstrip("0").rstrip(".")
+
+    def _preset_short_label(self, preset: Any) -> str:
+        raw = str(preset or "medium").strip().lower()
+        if not raw:
+            raw = "medium"
+        return raw.capitalize()
+
+    def _main_menu_text(self) -> str:
+        return f"{self._status_line()}\nВыберите действие:"
+
+    def _start_button_text(self) -> str:
+        params = self._load_settings()
+        if not isinstance(params, dict):
+            params = {}
+        defaults = self._default_quick_start_settings()
+        for k, v in defaults.items():
+            params.setdefault(k, v)
+
+        coin = str(params.get("coin", "BTC")).upper()
+        tf = str(params.get("timeframe", "15m"))
+        preset = self._preset_short_label(params.get("preset", "medium"))
+        size = self._format_size_compact(params.get("size_usd", 5.0))
+        return f"\u25b6\ufe0f Старт: {coin} {tf} {preset} {size}"
+
     def _main_keyboard(self) -> list[list[dict]]:
+        session = self._get_session()
+        if session and session.running:
+            return [
+                [_btn("\U0001f4ca Статус", "status")],
+                [_btn("\u23f9 Стоп", "stop")],
+                [_btn("\u2699\ufe0f Настройки", "settings_menu")],
+            ]
         return [
-            [_btn("\U0001f4ca Status", "status"), _btn("\U0001f6d1 Stop", "stop")],
-            [_btn("\u25b6\ufe0f Start", "start_menu"), _btn("\U0001f504 Restart", "restart_menu")],
-            [_btn("\U0001f3af Strategy", "strategy_menu"), _btn("\U0001f4b0 Amount", "amount_menu")],
-            [_btn("\U0001fa99 Coin", "coin_menu"), _btn("\u23f1 Timeframe", "tf_menu")],
+            [_btn(self._start_button_text(), "quick_start")],
+            [_btn("\U0001f4ca Статус", "status")],
+            [_btn("\u2699\ufe0f Настройки", "settings_menu")],
         ]
 
     def _status_line(self) -> str:
         session = self._get_session()
         if session and session.running:
             mode = session.mode.value.upper()
-            return f"\U0001f7e2 <b>Bot is RUNNING</b> — {mode}"
-        return "\U0001f534 <b>Bot is STOPPED</b>"
+            return f"\U0001f7e2 <b>Бот запущен</b> — {mode}"
+        return "\U0001f534 <b>Бот остановлен</b>"
 
     async def _send_main_menu(self, msg: dict) -> None:
-        html = f"{self._status_line()}\nSelect an action:"
-        await self._n.send_with_keyboard(html, self._main_keyboard())
+        await self._n.send_with_keyboard(self._main_menu_text(), self._main_keyboard())
 
     # ---- callback handlers ----
 
@@ -255,6 +302,10 @@ class TelegramBot:
             await self._cb_status(cb_id, msg_id)
         elif data == "stop":
             await self._cb_stop(cb_id, msg_id)
+        elif data == "quick_start":
+            await self._cb_quick_start(cb_id, msg_id)
+        elif data == "settings_menu":
+            await self._cb_settings_menu(cb_id, msg_id)
         elif data == "start_menu":
             await self._cb_start_menu(cb_id, msg_id)
         elif data.startswith("start:"):
@@ -288,6 +339,8 @@ class TelegramBot:
         elif data.startswith("tf:"):
             tf = data.split(":", 1)[1]
             await self._cb_tf(cb_id, msg_id, tf)
+        elif data == "back_settings":
+            await self._cb_back_settings(cb_id, msg_id)
         elif data == "back":
             await self._cb_back(cb_id, msg_id)
         else:
@@ -305,23 +358,25 @@ class TelegramBot:
         session = self._get_session()
         if not session or not session.running:
             params = self._load_settings()
-            preset = params.get("preset", "medium")
-            size = params.get("size_usd", 5.0)
-            coin = params.get("coin", "BTC")
-            tf = params.get("timeframe", "15m")
-            bal_line = f"\n\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
+            preset = str(params.get("preset", "medium"))
+            size = float(params.get("size_usd", 5.0))
+            coin = str(params.get("coin", "BTC")).upper()
+            tf = str(params.get("timeframe", "15m"))
+            min_bias = float(self._presets.get(preset, {}).get("min_bias", 55.0))
+            bal_line = f"\n\U0001f4b0 Баланс Polymarket: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
 
             # Window info for saved timeframe
             import window as window_mod
             winfo = window_mod.get_window_info(tf)
             w_m, w_s = divmod(winfo.remaining_sec, 60)
-            win_line = f"\n\u23f1 Window {tf}: <code>{w_m}m {w_s:02d}s</code> left"
+            win_line = f"\n\u23f1 Окно {tf}: <code>{w_m}m {w_s:02d}s</code> до закрытия"
 
             html = (
+                "\U0001f4a4 Бот остановлен\n"
                 "\U0001f534 <b>Trading Bot — STOPPED</b>\n"
-                f"Coin: <code>{coin} {tf}</code>\n"
-                f"Last strategy: <code>{preset}</code> | Size: <code>${size:.2f}</code>\n"
-                f"No active session.{bal_line}{win_line}"
+                f"Пара: <code>{coin} {tf}</code>\n"
+                f"Стратегия: <code>{self._preset_short_label(preset)}</code> | Размер: <code>${size:.2f}</code>\n"
+                f"Следующий вход при bias > {min_bias:.1f}{bal_line}{win_line}"
             )
         else:
             mode = session.mode.value.upper()
@@ -329,7 +384,8 @@ class TelegramBot:
             tf = session.timeframe
             preset = self._detect_preset(session)
             cfg = session.engine.cfg if session.engine else None
-            size = cfg.size_usd if cfg else 0
+            size = float(cfg.size_usd) if cfg else 0.0
+            min_bias = float(cfg.min_abs_bias) if cfg else 0.0
 
             snap = session.engine.snapshot() if session.engine else {}
             trades_today = snap.get("trades_today", 0)
@@ -342,24 +398,47 @@ class TelegramBot:
             from indicators import bias_score
             bias = bias_score(st.bids, st.asks, st.mid, st.trades, st.klines) if st.mid and st.klines else 0.0
 
+            gate_reason = self._feed_gate_block_reason(session)
+            open_pos_obj = session.engine.state.open_position if session.engine else None
+            cb_active = bool(session.engine and session.engine.state.circuit_breaker_active)
+            cb_reason = session.engine.state.circuit_breaker_reason if cb_active and session.engine else ""
+
+            if gate_reason:
+                activity_line = f"\u23f3 Ожидание данных ({gate_reason})"
+            elif open_pos_obj:
+                hold_price = self._position_display_price(session, open_pos_obj.side, open_pos_obj.entry_price)
+                if hold_price:
+                    activity_line = f"\U0001f4c8 Держит позицию {open_pos_obj.side} @ {hold_price:.3f}"
+                else:
+                    activity_line = f"\U0001f4c8 Держит позицию {open_pos_obj.side}"
+            elif cb_active:
+                activity_line = "\U0001f6ab Circuit breaker активен"
+            else:
+                activity_line = f"\U0001f50d Ищет сигнал (bias: {bias:+.1f})"
+
             html = (
+                f"{activity_line}\n"
                 f"\U0001f7e2 <b>Trading Bot — RUNNING</b>\n"
-                f"<code>{mode}</code> | <b>{coin} {tf}</b> | Strategy: <code>{preset}</code>\n"
-                f"Size: <code>${size:.2f}</code> | Trades: <code>{trades_today}/{max_trades}</code>\n"
+                f"<code>{mode}</code> | <b>{coin} {tf}</b> | Стратегия: <code>{self._preset_short_label(preset)}</code>\n"
+                f"Размер: <code>${size:.2f}</code> | Сделки: <code>{trades_today}/{max_trades}</code>\n"
+                f"Следующий вход при bias > {min_bias:.1f}\n"
             )
             if price:
-                html += f"Price: <code>{price:.3f}</code> | Bias: <code>{bias:+.1f}</code>\n"
+                html += f"Цена: <code>{price:.3f}</code> | Bias: <code>{bias:+.1f}</code>\n"
+
+            if cb_active and cb_reason:
+                html += f"Причина circuit breaker: <code>{cb_reason}</code>\n"
 
             # Polymarket USDC balance
             if pm_balance is not None:
-                html += f"\U0001f4b0 Polymarket balance: <code>${pm_balance:.2f}</code>\n"
+                html += f"\U0001f4b0 Баланс Polymarket: <code>${pm_balance:.2f}</code>\n"
 
             # Window info
             import window as window_mod
             winfo = window_mod.get_window_info(tf)
             w_m, w_s = divmod(winfo.remaining_sec, 60)
-            entry_status = "BLOCKED \u26d4" if winfo.entry_blocked else "OK \u2705"
-            html += f"\u23f1 Window: <code>{w_m}m {w_s:02d}s</code> left | Entry: {entry_status}\n"
+            entry_status = "ЗАБЛОКИРОВАН \u26d4" if winfo.entry_blocked else "ОТКРЫТ \u2705"
+            html += f"\u23f1 Окно: <code>{w_m}m {w_s:02d}s</code> до закрытия | Вход: {entry_status}\n"
 
             # Total PnL from completed trades
             trades_list = snap.get("trades", [])
@@ -383,24 +462,26 @@ class TelegramBot:
                 pnl_emoji = "\U0001f7e2" if total_pnl_usd >= 0 else "\U0001f534"
                 winrate = wins / closed_count * 100
                 html += (
-                    f"\n\U0001f4b5 <b>Session PnL:</b> {pnl_emoji} <code>${total_pnl_usd:+.2f}</code>\n"
+                    f"\n\U0001f4b5 <b>PnL сессии:</b> {pnl_emoji} <code>${total_pnl_usd:+.2f}</code>\n"
                     f"W/L: <code>{wins}/{losses}</code> ({winrate:.0f}% win rate)\n"
                 )
 
             # Open position
             pos = snap.get("open_position")
             if pos:
-                entry_price = pos.get("entry_price", 0)
-                side = pos.get("side", "?")
-                if entry_price and price:
-                    if side == "YES":
-                        pnl_pct = ((price - entry_price) / entry_price) * 100
+                entry_price = float(pos.get("entry_price", 0) or 0)
+                side = str(pos.get("side", "?"))
+                mark_price = self._position_display_price(session, side, entry_price)
+                if entry_price and mark_price:
+                    side_up = side.upper() in {"UP", "YES", "LONG"}
+                    if side_up:
+                        pnl_pct = ((mark_price - entry_price) / entry_price) * 100
                     else:
-                        pnl_pct = ((entry_price - price) / entry_price) * 100
+                        pnl_pct = ((entry_price - mark_price) / entry_price) * 100
                     pnl_emoji = "\U0001f7e2" if pnl_pct >= 0 else "\U0001f534"
                     html += (
-                        f"\n<b>Open Position:</b> {side} @ <code>{entry_price:.3f}</code>\n"
-                        f"Current: <code>{price:.3f}</code> | PnL: {pnl_emoji} <code>{pnl_pct:+.1f}%</code>"
+                        f"\n<b>Открытая позиция:</b> {side} @ <code>{entry_price:.3f}</code>\n"
+                        f"Текущая цена: <code>{mark_price:.3f}</code> | PnL: {pnl_emoji} <code>{pnl_pct:+.1f}%</code>"
                     )
 
         keyboard = [[_btn("\u25c0 Back", "back")]]
@@ -412,7 +493,7 @@ class TelegramBot:
         await self._n.answer_callback_query(cb_id)
         session = self._get_session()
         if not session or not session.running:
-            html = "\u26a0\ufe0f Bot is not running."
+            html = "\u26a0\ufe0f Бот уже остановлен."
             keyboard = [[_btn("\u25c0 Back", "back")]]
             await self._n.edit_message_text(msg_id, html, keyboard)
             return
@@ -421,9 +502,141 @@ class TelegramBot:
         self._notify("warning", "Stop", "Session stop requested via Telegram")
         await self._stop_session()
         self._log("Session stopped via Telegram")
-        html = "\u2705 <b>Session stopped.</b>"
+        html = "\u2705 <b>Сессия остановлена.</b>"
         keyboard = [[_btn("\u25c0 Back", "back")]]
         await self._n.edit_message_text(msg_id, html, keyboard)
+
+    # ---- Quick start ----
+
+    async def _cb_quick_start(self, cb_id: str, msg_id: int) -> None:
+        await self._n.answer_callback_query(cb_id)
+        session = self._get_session()
+        if session and session.running:
+            html = "\u26a0\ufe0f Бот уже запущен. Остановите сессию перед новым стартом."
+            keyboard = [[_btn("\u25c0 Back", "back")]]
+            await self._n.edit_message_text(msg_id, html, keyboard)
+            return
+
+        env_raw = os.environ.get("PM_DEFAULT_SETTINGS", "").strip()
+        has_env_settings = False
+        if env_raw:
+            try:
+                json.loads(env_raw)
+                has_env_settings = True
+            except Exception:
+                has_env_settings = False
+
+        has_saved_settings = self._settings_path.exists() or has_env_settings
+        params = self._load_settings()
+        if not isinstance(params, dict) or not has_saved_settings:
+            params = self._default_quick_start_settings()
+
+        defaults = self._default_quick_start_settings()
+        for k, v in defaults.items():
+            params.setdefault(k, v)
+
+        params["mode"] = "live"
+        params["auto_approve_live"] = True
+
+        try:
+            self._log(
+                f"Quick start via Telegram: LIVE {params.get('coin','BTC')} "
+                f"{params.get('timeframe','15m')} strategy={params.get('preset','medium')} "
+                f"size=${float(params.get('size_usd', 5.0)):.2f}"
+            )
+            await self._start_session(params)
+            self._save_settings(params)
+
+            coin = str(params.get("coin", "BTC")).upper()
+            tf = str(params.get("timeframe", "15m"))
+            preset = self._preset_short_label(params.get("preset", "medium"))
+            size = float(params.get("size_usd", 5.0))
+            self._notify("success", "Quick start", f"LIVE {coin} {tf} | {preset} | ${size:.2f}")
+
+            loop = asyncio.get_running_loop()
+            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            bal_line = f"\n\U0001f4b0 Баланс: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
+
+            html = (
+                "\u2705 <b>Сессия запущена — LIVE</b>\n"
+                f"<b>{coin} {tf}</b> | Стратегия: <code>{preset}</code> | Размер: <code>${size:.2f}</code>"
+                f"{bal_line}"
+            )
+        except Exception as e:
+            self._log(f"Quick start failed: {e}")
+            self._notify("error", "Quick start failed", str(e))
+            html = f"\u274c <b>Ошибка запуска:</b> {e}"
+
+        keyboard = [[_btn("\u25c0 Back", "back")]]
+        await self._n.edit_message_text(msg_id, html, keyboard)
+
+    # ---- Settings menu ----
+
+    def _settings_keyboard(self) -> list[list[dict]]:
+        params = self._load_settings()
+        if not isinstance(params, dict):
+            params = {}
+
+        coin = str(params.get("coin", "BTC")).upper()
+        tf = str(params.get("timeframe", "15m"))
+        preset = self._preset_short_label(params.get("preset", "medium"))
+        size = self._format_size_compact(params.get("size_usd", 5.0))
+
+        return [
+            [_btn(f"\u041c\u043e\u043d\u0435\u0442\u0430: {coin} \u2705", "coin_menu"), _btn(f"\u0422\u0430\u0439\u043c\u0444\u0440\u0435\u0439\u043c: {tf} \u2705", "tf_menu")],
+            [_btn(f"\u0421\u0442\u0440\u0430\u0442\u0435\u0433\u0438\u044f: {preset} \u2705", "strategy_menu"), _btn(f"\u0420\u0430\u0437\u043c\u0435\u0440: {size} \u2705", "amount_menu")],
+            [_btn("\u25c0 \u041d\u0430\u0437\u0430\u0434", "back")],
+        ]
+
+    def _settings_menu_text(self, note: str = "") -> str:
+        html = "\u2699\ufe0f <b>\u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438</b>"
+        if note:
+            html += f"\n\n{note}"
+        return html
+
+    async def _show_settings_menu(self, msg_id: int, note: str = "") -> None:
+        await self._n.edit_message_text(msg_id, self._settings_menu_text(note), self._settings_keyboard())
+
+    async def _cb_settings_menu(self, cb_id: str, msg_id: int) -> None:
+        await self._n.answer_callback_query(cb_id)
+        self._waiting_custom_amount_from = None
+        await self._show_settings_menu(msg_id)
+
+    async def _cb_back_settings(self, cb_id: str, msg_id: int) -> None:
+        await self._n.answer_callback_query(cb_id)
+        self._waiting_custom_amount_from = None
+        await self._show_settings_menu(msg_id)
+
+    async def _restart_running_session(self, params: dict) -> tuple[bool, str]:
+        session = self._get_session()
+        if not session or not session.running:
+            return True, ""
+
+        mode_obj = getattr(session, "mode", None)
+        mode = getattr(mode_obj, "value", str(mode_obj or "live")).strip().lower()
+        if "." in mode:
+            mode = mode.split(".")[-1]
+        if not mode:
+            mode = "live"
+
+        restart_params = dict(params)
+        restart_params["mode"] = mode
+        if mode == "live":
+            restart_params["auto_approve_live"] = True
+
+        try:
+            self._log(
+                f"Auto-restart via Telegram: {mode.upper()} {restart_params.get('coin','BTC')} "
+                f"{restart_params.get('timeframe','15m')}"
+            )
+            await self._stop_session()
+            await self._start_session(restart_params)
+            self._save_settings(restart_params)
+            return True, mode
+        except Exception as e:
+            self._log(f"Auto-restart failed: {e}")
+            self._notify("error", "Auto-restart failed", str(e))
+            return False, str(e)
 
     # ---- Start menu (mode selection) ----
 
@@ -535,19 +748,19 @@ class TelegramBot:
     async def _cb_strategy_menu(self, cb_id: str, msg_id: int) -> None:
         await self._n.answer_callback_query(cb_id)
         current = self._get_current_preset()
-        html = f"\U0001f3af <b>Change Strategy</b>\nCurrent: <code>{current}</code>"
+        html = f"\U0001f3af <b>Стратегия</b>\nТекущая: <code>{self._preset_short_label(current)}</code>"
         keyboard = []
         for key, label in PRESET_LABELS.items():
             marker = " \u2705" if key == current else ""
             keyboard.append([_btn(f"{label}{marker}", f"strategy:{key}")])
-        keyboard.append([_btn("\u25c0 Back", "back")])
+        keyboard.append([_btn("\u25c0 Назад", "back_settings")])
         await self._n.edit_message_text(msg_id, html, keyboard)
 
     async def _cb_strategy(self, cb_id: str, msg_id: int, preset: str) -> None:
         await self._n.answer_callback_query(cb_id)
         if preset not in self._presets:
-            html = f"\u274c Unknown preset: {preset}"
-            keyboard = [[_btn("\u25c0 Back", "back")]]
+            html = f"\u274c Неизвестная стратегия: {preset}"
+            keyboard = [[_btn("\u25c0 Назад", "back_settings")]]
             await self._n.edit_message_text(msg_id, html, keyboard)
             return
 
@@ -577,21 +790,21 @@ class TelegramBot:
         params["preset"] = preset
         self._save_settings(params)
 
-        label = PRESET_LABELS.get(preset, preset)
-        html = f"\u2705 <b>Strategy set to {preset.upper()}</b>\n{label}"
-        keyboard = [[_btn("\u25c0 Back", "back")]]
-        await self._n.edit_message_text(msg_id, html, keyboard)
+        await self._show_settings_menu(
+            msg_id,
+            f"\u2705 Стратегия обновлена: <code>{self._preset_short_label(preset)}</code>",
+        )
 
     # ---- Amount menu ----
 
     async def _cb_amount_menu(self, cb_id: str, msg_id: int) -> None:
         await self._n.answer_callback_query(cb_id)
         current = self._get_current_amount()
-        html = f"\U0001f4b0 <b>Change Amount</b>\nCurrent: <code>${current:.2f}</code>"
+        html = f"\U0001f4b0 <b>Размер позиции</b>\nТекущий: <code>${current:.2f}</code>"
         row1 = [_btn(f"${v:.0f}", f"amount:{v}") for v in AMOUNT_OPTIONS[:3]]
         row2 = [_btn(f"${v:.0f}", f"amount:{v}") for v in AMOUNT_OPTIONS[3:]]
-        row2.append(_btn("\u270d Custom", "amount:custom"))
-        keyboard = [row1, row2, [_btn("\u25c0 Back", "back")]]
+        row2.append(_btn("\u270d Свой", "amount:custom"))
+        keyboard = [row1, row2, [_btn("\u25c0 Назад", "back_settings")]]
         await self._n.edit_message_text(msg_id, html, keyboard)
 
     async def _cb_amount(self, cb_id: str, msg_id: int, amount: float) -> None:
@@ -600,16 +813,14 @@ class TelegramBot:
         self._apply_amount(amount)
         self._log(f"Amount changed to ${amount:.2f} via Telegram")
         self._notify("info", "Amount changed", f"Set to ${amount:.2f}")
-        html = f"\u2705 <b>Input amount set to ${amount:.2f}</b>"
-        keyboard = [[_btn("\u25c0 Back", "back")]]
-        await self._n.edit_message_text(msg_id, html, keyboard)
+        await self._show_settings_menu(msg_id, f"\u2705 Размер обновлён: <code>${amount:.2f}</code>")
 
     async def _cb_amount_custom(self, cb_id: str, msg_id: int, cb: dict) -> None:
         user_id = cb.get("from", {}).get("id")
         await self._n.answer_callback_query(cb_id)
         self._waiting_custom_amount_from = user_id
-        html = "\u270d <b>Enter custom amount</b>\nSend a number (USD), e.g. <code>15</code>"
-        keyboard = [[_btn("\u25c0 Cancel", "back")]]
+        html = "\u270d <b>Введите размер</b>\nОтправьте число в USD, например <code>15</code>"
+        keyboard = [[_btn("\u25c0 Отмена", "back_settings")]]
         await self._n.edit_message_text(msg_id, html, keyboard)
 
     async def _handle_custom_amount_text(self, msg: dict) -> None:
@@ -618,14 +829,14 @@ class TelegramBot:
         try:
             amount = float(text)
             if amount < 5:
-                raise ValueError("minimum $5")
+                raise ValueError("минимум $5")
             self._apply_amount(amount)
             self._log(f"Amount changed to ${amount:.2f} via Telegram (custom)")
             self._notify("info", "Amount changed", f"Set to ${amount:.2f}")
-            html = f"\u2705 <b>Input amount set to ${amount:.2f}</b>"
+            html = self._settings_menu_text(f"\u2705 Размер обновлён: <code>${amount:.2f}</code>")
         except (ValueError, TypeError) as e:
-            html = f"\u274c Invalid amount: {e}\nPlease use the menu to try again."
-        await self._n.send_with_keyboard(html, [[_btn("\u25c0 Menu", "back")]])
+            html = self._settings_menu_text(f"\u274c Некорректный размер: {e}")
+        await self._n.send_with_keyboard(html, self._settings_keyboard())
 
     # ---- Coin menu ----
 
@@ -633,7 +844,7 @@ class TelegramBot:
         await self._n.answer_callback_query(cb_id)
         params = self._load_settings()
         current_coin = params.get("coin", "BTC")
-        html = f"\U0001fa99 <b>Change Coin</b>\nCurrent: <code>{current_coin}</code>"
+        html = f"\U0001fa99 <b>Монета</b>\nТекущая: <code>{current_coin}</code>"
         keyboard = []
         coins = list(self._coin_timeframes.keys())
         # Show 3 per row: BTC, ETH, SOL (skip XRP for cleaner layout, but include all)
@@ -646,42 +857,47 @@ class TelegramBot:
                 row = []
         if row:
             keyboard.append(row)
-        keyboard.append([_btn("\u25c0 Back", "back")])
+        keyboard.append([_btn("\u25c0 Назад", "back_settings")])
         await self._n.edit_message_text(msg_id, html, keyboard)
 
     async def _cb_coin(self, cb_id: str, msg_id: int, coin: str) -> None:
         await self._n.answer_callback_query(cb_id)
         if coin not in self._coin_timeframes:
-            html = f"\u274c Unknown coin: {coin}"
-            keyboard = [[_btn("\u25c0 Back", "back")]]
+            html = f"\u274c Неизвестная монета: {coin}"
+            keyboard = [[_btn("\u25c0 Назад", "back_settings")]]
             await self._n.edit_message_text(msg_id, html, keyboard)
             return
 
         params = self._load_settings()
         old_coin = params.get("coin", "BTC")
+        old_tf = params.get("timeframe", "15m")
         params["coin"] = coin
 
         # If current timeframe is not available for new coin, reset to first available
         available_tfs = self._coin_timeframes[coin]
         if params.get("timeframe", "15m") not in available_tfs:
             params["timeframe"] = available_tfs[0]
+        new_tf = params.get("timeframe", "15m")
+        tf_adjusted = new_tf != old_tf
 
         self._save_settings(params)
         self._log(f"Coin changed to {coin} via Telegram (was {old_coin})")
         self._notify("info", "Coin changed", f"Set to {coin} (timeframe: {params['timeframe']})")
 
-        note = ""
-        if params.get("timeframe") != self._load_settings().get("timeframe"):
-            note = f"\nTimeframe adjusted to <code>{params['timeframe']}</code>"
+        notes: list[str] = [f"\u2705 Монета: <code>{coin}</code>"]
+        if tf_adjusted:
+            notes.append(f"\u2139\ufe0f Таймфрейм автоматически изменён на <code>{new_tf}</code>")
 
         session = self._get_session()
-        restart_hint = ""
-        if session and session.running:
-            restart_hint = "\n\n\u26a0\ufe0f <i>Restart the session to apply coin change.</i>"
+        was_running = bool(session and session.running)
+        restarted, restart_info = await self._restart_running_session(params)
+        if was_running:
+            if restarted:
+                notes.append(f"\U0001f504 Сессия перезапущена в режиме <code>{restart_info.upper()}</code>")
+            else:
+                notes.append(f"\u274c Ошибка автоперезапуска: <code>{restart_info}</code>")
 
-        html = f"\u2705 <b>Coin set to {coin}</b>{note}{restart_hint}"
-        keyboard = [[_btn("\u25c0 Back", "back")]]
-        await self._n.edit_message_text(msg_id, html, keyboard)
+        await self._show_settings_menu(msg_id, "\n".join(notes))
 
     # ---- Timeframe menu ----
 
@@ -692,7 +908,7 @@ class TelegramBot:
         current_tf = params.get("timeframe", "15m")
         available_tfs = self._coin_timeframes.get(current_coin, ["15m"])
 
-        html = f"\u23f1 <b>Change Timeframe</b>\nCoin: <code>{current_coin}</code> | Current: <code>{current_tf}</code>"
+        html = f"\u23f1 <b>Таймфрейм</b>\nМонета: <code>{current_coin}</code> | Текущий: <code>{current_tf}</code>"
         keyboard = []
         row = []
         for tf in available_tfs:
@@ -703,7 +919,7 @@ class TelegramBot:
                 row = []
         if row:
             keyboard.append(row)
-        keyboard.append([_btn("\u25c0 Back", "back")])
+        keyboard.append([_btn("\u25c0 Назад", "back_settings")])
         await self._n.edit_message_text(msg_id, html, keyboard)
 
     async def _cb_tf(self, cb_id: str, msg_id: int, tf: str) -> None:
@@ -713,8 +929,8 @@ class TelegramBot:
         available_tfs = self._coin_timeframes.get(current_coin, [])
 
         if tf not in available_tfs:
-            html = f"\u274c Timeframe <code>{tf}</code> not available for {current_coin}.\nAvailable: {', '.join(available_tfs)}"
-            keyboard = [[_btn("\u25c0 Back", "back")]]
+            html = f"\u274c Таймфрейм <code>{tf}</code> недоступен для {current_coin}.\nДоступно: {', '.join(available_tfs)}"
+            keyboard = [[_btn("\u25c0 Назад", "back_settings")]]
             await self._n.edit_message_text(msg_id, html, keyboard)
             return
 
@@ -724,24 +940,61 @@ class TelegramBot:
         self._log(f"Timeframe changed to {tf} via Telegram (was {old_tf})")
         self._notify("info", "Timeframe changed", f"Set to {tf}")
 
+        notes: list[str] = [f"\u2705 Таймфрейм: <code>{tf}</code>"]
         session = self._get_session()
-        restart_hint = ""
-        if session and session.running:
-            restart_hint = "\n\n\u26a0\ufe0f <i>Restart the session to apply timeframe change.</i>"
+        was_running = bool(session and session.running)
+        restarted, restart_info = await self._restart_running_session(params)
+        if was_running:
+            if restarted:
+                notes.append(f"\U0001f504 Сессия перезапущена в режиме <code>{restart_info.upper()}</code>")
+            else:
+                notes.append(f"\u274c Ошибка автоперезапуска: <code>{restart_info}</code>")
 
-        html = f"\u2705 <b>Timeframe set to {tf}</b>{restart_hint}"
-        keyboard = [[_btn("\u25c0 Back", "back")]]
-        await self._n.edit_message_text(msg_id, html, keyboard)
+        await self._show_settings_menu(msg_id, "\n".join(notes))
 
     # ---- Back (main menu) ----
 
     async def _cb_back(self, cb_id: str, msg_id: int) -> None:
         await self._n.answer_callback_query(cb_id)
         self._waiting_custom_amount_from = None
-        html = f"{self._status_line()}\nSelect an action:"
-        await self._n.edit_message_text(msg_id, html, self._main_keyboard())
+        await self._n.edit_message_text(msg_id, self._main_menu_text(), self._main_keyboard())
 
     # ---- helpers ----
+
+    def _feed_gate_block_reason(self, session: Any) -> str:
+        engine = getattr(session, "engine", None)
+        st = getattr(session, "feed_state", None)
+        if not engine or st is None:
+            return ""
+
+        now = time.time()
+        if not st.binance_ws_connected:
+            return "waiting Binance WS connection"
+        if not st.binance_ob_ready or st.mid <= 0:
+            return "waiting Binance orderbook"
+        if st.binance_ob_last_ok_ts <= 0:
+            return "waiting Binance orderbook"
+        if (now - st.binance_ob_last_ok_ts) > engine.cfg.binance_ob_stale_sec:
+            return "waiting Binance orderbook (stale)"
+        if not st.klines:
+            return "waiting Binance candles"
+        if not st.pm_connected:
+            return "waiting Polymarket WS connection"
+        if not st.pm_prices_ready:
+            return "waiting Polymarket prices"
+        return ""
+
+    def _position_display_price(self, session: Any, side: str, fallback: float = 0.0) -> float:
+        st = getattr(session, "feed_state", None)
+        if st is None:
+            return fallback
+
+        side_u = str(side or "").strip().upper()
+        if side_u in {"UP", "YES", "LONG"} and st.pm_up is not None:
+            return float(st.pm_up)
+        if side_u in {"DOWN", "NO", "SHORT"} and st.pm_dn is not None:
+            return float(st.pm_dn)
+        return float(fallback or 0.0)
 
     def _apply_amount(self, amount: float) -> None:
         session = self._get_session()

@@ -204,6 +204,29 @@ class TelegramNotifier:
         html += f"<i>{self._ts()}</i>"
         self._fire(html)
 
+    def notify_arb(
+        self,
+        coin: str,
+        timeframe: str,
+        up_price: float,
+        dn_price: float,
+        edge_pct: float,
+        size_usd: float,
+        status: str,
+        detail: str = "",
+    ) -> None:
+        detail_line = f"\n<b>Detail:</b> <code>{self._clip(self._esc(detail))}</code>" if detail else ""
+        html = (
+            f"\U0001f4b0 <b>ARB {status.upper()}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>{coin} {timeframe}</b>\n"
+            f"UP: <code>{up_price:.3f}</code> + DN: <code>{dn_price:.3f}</code> = <code>{up_price + dn_price:.3f}</code>\n"
+            f"Edge: <code>{edge_pct:+.2f}%</code> | Size: <code>${size_usd:.2f}</code>/leg\n"
+            f"Status: <code>{status}</code>{detail_line}\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
     def notify_window_exit(
         self,
         coin: str,

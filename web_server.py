@@ -121,6 +121,9 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "sl_pct": 6,
         "max_hold_sec": 1200,
         "reverse_exit_bias": 55,
+        "dynamic_sizing_enabled": True,
+        "min_size_usd": 5,
+        "max_size_usd": 15,
     },
     "aggressive": {
         "min_bias": 35,
@@ -134,21 +137,11 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "sl_pct": 7,
         "max_hold_sec": 900,
         "reverse_exit_bias": 45,
+        "dynamic_sizing_enabled": True,
+        "min_size_usd": 5,
+        "max_size_usd": 25,
     },
     "super_aggressive": {
-        "min_bias": 12,
-        "min_obi": 0.05,
-        "min_price": 0.10,
-        "max_price": 0.95,
-        "cooldown_sec": 5,
-        "max_trades_per_day": 300,
-        "eval_interval_sec": 1,
-        "tp_pct": 4,
-        "sl_pct": 7,
-        "max_hold_sec": 240,
-        "reverse_exit_bias": 20,
-    },
-    "mega_aggressive": {
         "min_bias": 12,
         "min_obi": 0.05,
         "min_price": 0.10,
@@ -301,7 +294,7 @@ def _sanitize_settings(raw: dict[str, Any] | None) -> dict[str, Any]:
         src.get("client_watchdog_enabled"), bool(settings["client_watchdog_enabled"])
     )
 
-    if settings["preset"] in {"super_aggressive", "mega_aggressive"} and settings["mode"] != "paper":
+    if settings["preset"] in {"super_aggressive"} and settings["mode"] != "paper":
         settings["mode"] = "paper"
 
     return settings
@@ -337,56 +330,6 @@ def _mask(value: str) -> str:
     if len(value) <= 10:
         return "*" * len(value)
     return f"{value[:6]}...{value[-4:]}"
-
-
-def _score_trend(st: feeds.State) -> tuple[int, str]:
-    score = 0
-
-    obi_v = ind.obi(st.bids, st.asks, st.mid) if st.mid else 0.0
-    if obi_v > config.OBI_THRESH:
-        score += 1
-    elif obi_v < -config.OBI_THRESH:
-        score -= 1
-
-    cvd5 = ind.cvd(st.trades, 300)
-    score += 1 if cvd5 > 0 else -1 if cvd5 < 0 else 0
-
-    rsi_v = ind.rsi(st.klines)
-    if rsi_v is not None:
-        if rsi_v > config.RSI_OB:
-            score -= 1
-        elif rsi_v < config.RSI_OS:
-            score += 1
-
-    _, _, hv = ind.macd(st.klines)
-    if hv is not None:
-        score += 1 if hv > 0 else -1
-
-    vwap_v = ind.vwap(st.klines)
-    if vwap_v and st.mid:
-        score += 1 if st.mid > vwap_v else -1
-
-    ema_s, ema_l = ind.emas(st.klines)
-    if ema_s is not None and ema_l is not None:
-        score += 1 if ema_s > ema_l else -1
-
-    bid_walls, ask_walls = ind.walls(st.bids, st.asks)
-    score += min(len(bid_walls), 2)
-    score -= min(len(ask_walls), 2)
-
-    ha = ind.heikin_ashi(st.klines)
-    if len(ha) >= 3:
-        tail = ha[-3:]
-        if all(c["green"] for c in tail):
-            score += 1
-        elif all(not c["green"] for c in tail):
-            score -= 1
-
-    if score >= 3:
-        return score, "BULLISH"
-    if score <= -3:
-        return score, "BEARISH"
-    return score, "NEUTRAL"
 
 
 def _bias_label(bias: float) -> str:
@@ -675,7 +618,7 @@ class SessionRuntime:
     def _validate_start(self, payload: StartRequest) -> trading.TradeMode:
         if payload.preset not in PRESETS:
             raise ValueError(f"unknown preset: {payload.preset}")
-        if payload.preset in {"mega_aggressive", "super_aggressive"} and payload.mode.lower().strip() != "paper":
+        if payload.preset in {"super_aggressive"} and payload.mode.lower().strip() != "paper":
             raise ValueError("SUPER AGGRESSIVE preset is paper-only")
 
         coin = payload.coin.upper()
@@ -771,6 +714,12 @@ class SessionRuntime:
                 reverse_exit_enabled=payload.reverse_exit_enabled,
                 reverse_exit_bias=max(1.0, payload.reverse_exit_bias),
             )
+            # Apply dynamic sizing from preset if present
+            preset_vals = PRESETS.get(payload.preset, {})
+            if preset_vals.get("dynamic_sizing_enabled"):
+                cfg.dynamic_sizing_enabled = True
+                cfg.min_size_usd = preset_vals.get("min_size_usd", 5)
+                cfg.max_size_usd = preset_vals.get("max_size_usd", 25)
 
             self.feed_state = feeds.State()
             self.feed_state.pm_up_id, self.feed_state.pm_dn_id = await asyncio.to_thread(
@@ -954,7 +903,9 @@ class SessionRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         st = self.feed_state
-        trend_score, trend_label = _score_trend(st)
+        trend_score, trend_label, _ = ind.score_trend(
+            st.bids, st.asks, st.mid, st.trades, st.klines
+        )
         bias = (
             ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
             if st.mid and st.klines

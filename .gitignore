@@ -4,3 +4,9 @@ src/__pycache__/
 .idea/
 executions.log.jsonl
 executions.*.jsonl
+node_modules/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/

@@ -108,6 +108,8 @@ class TradeRecord:
     order_id: str | None = None
     pnl_usd: float | None = None
     pnl_pct: float | None = None
+    fill_elapsed_ms: float | None = None
+    slippage_bps: float | None = None
 
 
 ENTRY_EXECUTION_STATUSES = {
@@ -190,6 +192,13 @@ class SessionStats:
     best_trade_pnl_usd: float = 0.0
     worst_trade_pnl_usd: float = 0.0
     pnl_series: list[float] = field(default_factory=list)
+    fill_attempts: int = 0      # Total entry attempts (posted orders)
+    fill_successes: int = 0     # Successfully filled entries
+    fill_partial: int = 0       # Partially filled entries
+    total_fill_time_ms: float = 0.0  # Sum of fill times for averaging
+    fill_count_timed: int = 0   # Number of fills with timing data
+    total_slippage_bps: float = 0.0  # Sum of slippage in basis points
+    slippage_count: int = 0     # Number of slippage measurements
 
     @property
     def win_rate(self) -> float:
@@ -210,6 +219,18 @@ class SessionStats:
         total_win = sum(p for p in self.pnl_series if p > 0)
         total_loss = sum(abs(p) for p in self.pnl_series if p < 0)
         return total_win / total_loss if total_loss > 0 else (99.99 if total_win > 0 else 0.0)
+
+    @property
+    def fill_ratio(self) -> float:
+        return self.fill_successes / self.fill_attempts if self.fill_attempts > 0 else 0.0
+
+    @property
+    def avg_fill_time_ms(self) -> float:
+        return self.total_fill_time_ms / self.fill_count_timed if self.fill_count_timed > 0 else 0.0
+
+    @property
+    def avg_slippage_bps(self) -> float:
+        return self.total_slippage_bps / self.slippage_count if self.slippage_count > 0 else 0.0
 
 
 class PaperExecutor:
@@ -383,6 +404,8 @@ class LiveExecutor:
         status = "failed"
         shares: float | None = None
         verify_note = ""
+        fill_elapsed_ms: float | None = None
+        slippage_bps: float | None = None
 
         try:
             min_size = self._get_min_order_size(decision.token_id)
@@ -399,6 +422,7 @@ class LiveExecutor:
                     side=BUY,
                 )
             )
+            _fill_start = time.monotonic()
             resp = self.client.post_order(signed_order, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("id")
             if not order_id:
@@ -407,11 +431,14 @@ class LiveExecutor:
                 status = "posted"
                 shares = size
             else:
-                outcome, state, matched, total, err = self._wait_for_fill(order_id)
+                outcome, state, matched, total, err, fill_price = self._wait_for_fill(order_id)
+                fill_elapsed_ms = (time.monotonic() - _fill_start) * 1000.0
                 verify_note = f"fill_check={state}"
                 if matched is not None:
                     denom = total if (total is not None and total > 0) else size
                     verify_note = f"{verify_note}, filled={matched:.2f}/{denom:.2f}"
+                if fill_price is not None and price > 0 and matched is not None and matched > 0:
+                    slippage_bps = (fill_price - price) / price * 10000.0
 
                 if outcome == "filled":
                     status = "filled"
@@ -459,6 +486,8 @@ class LiveExecutor:
             status=status,
             reason=reason,
             order_id=order_id,
+            fill_elapsed_ms=fill_elapsed_ms,
+            slippage_bps=slippage_bps,
         )
 
     def close_position(
@@ -601,7 +630,7 @@ class LiveExecutor:
                     status = "exit_failed"
                     continue
 
-                outcome, fill_state, matched, total, err = self._wait_for_fill(order_id)
+                outcome, fill_state, matched, total, err, _fill_price = self._wait_for_fill(order_id)
                 if matched is not None and matched > 0:
                     matched_shares = float(matched)
                 denom = total if (total is not None and total > 0) else sz
@@ -750,6 +779,22 @@ class LiveExecutor:
         )
         return size, matched, remaining
 
+    def _order_fill_price(self, payload) -> float | None:
+        order = self._normalize_order_payload(payload)
+        for key in (
+            "avg_price",
+            "average_price",
+            "average_fill_price",
+            "avg_fill_price",
+            "filled_avg_price",
+            "execution_price",
+            "executed_price",
+        ):
+            px = self._as_float(order.get(key))
+            if px is not None and px > 0:
+                return px
+        return None
+
     def _order_state(self, payload) -> tuple[str, str, float | None, float | None]:
         order = self._normalize_order_payload(payload)
         status_raw = str(
@@ -793,7 +838,7 @@ class LiveExecutor:
 
     def _wait_for_fill(
         self, order_id: str
-    ) -> tuple[str, str, float | None, float | None, str]:
+    ) -> tuple[str, str, float | None, float | None, str, float | None]:
         timeout = max(1.0, float(self.cfg.live_entry_fill_timeout_sec))
         poll = max(0.2, float(self.cfg.live_entry_fill_poll_sec))
         deadline = time.time() + timeout
@@ -802,30 +847,34 @@ class LiveExecutor:
         last_matched = None
         last_size = None
         last_err = ""
+        last_fill_price = None
         while time.time() < deadline:
             try:
                 payload = self.client.get_order(order_id)
                 state, state_desc, matched, size = self._order_state(payload)
+                fill_price = self._order_fill_price(payload)
                 if state_desc:
                     last_state = state_desc
                 if matched is not None:
                     last_matched = matched
                 if size is not None:
                     last_size = size
+                if fill_price is not None:
+                    last_fill_price = fill_price
                 if state == "filled":
-                    return "filled", last_state, last_matched, last_size, ""
+                    return "filled", last_state, last_matched, last_size, "", last_fill_price
                 if state == "partial_terminal":
-                    return "partial", last_state, last_matched, last_size, ""
+                    return "partial", last_state, last_matched, last_size, "", last_fill_price
                 if state == "terminal_unfilled":
-                    return "terminal_unfilled", last_state, last_matched, last_size, ""
+                    return "terminal_unfilled", last_state, last_matched, last_size, "", last_fill_price
             except Exception as e:
                 last_err = str(e)
             time.sleep(poll)
 
         timeout_state = f"timeout({int(timeout)}s):{last_state}"
         if last_matched is not None and last_matched > 0:
-            return "partial", timeout_state, last_matched, last_size, last_err
-        return "unfilled", timeout_state, last_matched, last_size, last_err
+            return "partial", timeout_state, last_matched, last_size, last_err, last_fill_price
+        return "unfilled", timeout_state, last_matched, last_size, last_err, last_fill_price
 
     @staticmethod
     def _allowances_positive(allowances) -> bool:
@@ -1118,6 +1167,33 @@ class TradingEngine:
         if fair > 0 and price > fair * (1 + config.PM_DIVERGENCE_MAX_PCT / 100.0):
             return None, f"PM-Binance divergence: PM {side} price={price:.3f} > fair={fair:.3f} +{config.PM_DIVERGENCE_MAX_PCT}%"
 
+        # PM depth quality gate — block entry if insufficient liquidity
+        if config.PM_MIN_DEPTH_USD > 0:
+            target_token_id = feed_state.pm_up_id if side == "Up" else feed_state.pm_dn_id
+            target_price = price
+            if target_token_id and target_price > 0:
+                try:
+                    import httpx
+
+                    url = f"https://clob.polymarket.com/book?token_id={target_token_id}"
+                    resp = httpx.get(url, timeout=3.0)
+                    if resp.is_success:
+                        book = resp.json()
+                        asks = book.get("asks", [])
+                        depth_usd = sum(
+                            float(a.get("price", 0)) * float(a.get("size", 0))
+                            for a in asks
+                            if float(a.get("price", 0)) <= target_price * 1.02
+                        )
+                        if depth_usd < config.PM_MIN_DEPTH_USD:
+                            return None, (
+                                f"PM depth too thin (${depth_usd:.1f} < "
+                                f"${config.PM_MIN_DEPTH_USD:.0f})"
+                            )
+                except Exception:
+                    # Fail-open on transient depth endpoint issues.
+                    pass
+
         computed_size = self._compute_position_size(bias)
         reason = f"bias={bias:+.1f}, obi={obi:+.3f}, px={price:.3f}"
         return TradeDecision(
@@ -1276,6 +1352,9 @@ class TradingEngine:
                 "profit_factor": min(self.state.session_stats.profit_factor, 99.99),
                 "best_trade_pnl_usd": self.state.session_stats.best_trade_pnl_usd,
                 "worst_trade_pnl_usd": self.state.session_stats.worst_trade_pnl_usd,
+                "fill_ratio": round(self.state.session_stats.fill_ratio, 3),
+                "avg_fill_time_ms": round(self.state.session_stats.avg_fill_time_ms, 1),
+                "avg_slippage_bps": round(self.state.session_stats.avg_slippage_bps, 2),
             },
             "cfg": {
                 "size_usd": self.cfg.size_usd,
@@ -1318,6 +1397,8 @@ class TradingEngine:
             "order_id": rec.order_id,
             "pnl_usd": rec.pnl_usd,
             "pnl_pct": rec.pnl_pct,
+            "fill_elapsed_ms": rec.fill_elapsed_ms,
+            "slippage_bps": rec.slippage_bps,
         }
         try:
             with open(path, "a", encoding="utf-8") as f:
@@ -1393,6 +1474,27 @@ class TradingEngine:
             }
         return status == "paper"
 
+    def _track_entry_fill_metrics(self, rec: TradeRecord):
+        if rec.mode != TradeMode.LIVE.value:
+            return
+
+        stats = self.state.session_stats
+        stats.fill_attempts += 1
+        status_lower = (rec.status or "").lower()
+        if "partial" in status_lower:
+            stats.fill_partial += 1
+        elif status_lower == "filled":
+            stats.fill_successes += 1
+
+        has_fill = "filled" in status_lower and "unfilled" not in status_lower
+        if rec.fill_elapsed_ms is not None and rec.fill_elapsed_ms >= 0 and has_fill:
+            stats.total_fill_time_ms += rec.fill_elapsed_ms
+            stats.fill_count_timed += 1
+
+        if rec.slippage_bps is not None:
+            stats.total_slippage_bps += rec.slippage_bps
+            stats.slippage_count += 1
+
     def _exit_success(self, status: str) -> bool:
         return status in {"paper_exit", "exit_filled", "exit_dust_cleared"}
 
@@ -1416,6 +1518,7 @@ class TradingEngine:
                 self.state.approval_armed = False
                 rec = self.executor.execute_entry(decision, coin, timeframe)
                 self.state.trades.append(rec)
+                self._track_entry_fill_metrics(rec)
 
                 if self._entry_success(rec.status):
                     self.state.last_trade_ts = time.time()
@@ -1520,6 +1623,7 @@ class TradingEngine:
 
         rec = self.executor.execute_entry(decision, coin, timeframe)
         self.state.trades.append(rec)
+        self._track_entry_fill_metrics(rec)
 
         if self._entry_success(rec.status):
             self.state.last_trade_ts = time.time()
@@ -1770,6 +1874,131 @@ class TradingEngine:
         )
 
 
+def _execute_complete_set_arb(
+    executor: "LiveExecutor",
+    up_token_id: str,
+    dn_token_id: str,
+    up_price: float,
+    dn_price: float,
+    max_size_usd: float,
+    cfg: TradingConfig,
+    log,
+) -> dict:
+    """Execute a complete-set arbitrage: buy both UP and DOWN tokens.
+
+    Returns dict with keys: ok, up_status, dn_status, edge_pct, detail
+    """
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+
+    _ = cfg  # reserved for future cfg-dependent arb controls
+
+    result = {
+        "ok": False,
+        "up_status": "not_started",
+        "dn_status": "not_started",
+        "edge_pct": 0.0,
+        "detail": "",
+    }
+
+    # Calculate edge
+    pm_sum = up_price + dn_price
+    net_edge_pct = (1.0 - pm_sum - 2 * config.PM_TAKER_FEE) * 100
+    result["edge_pct"] = net_edge_pct
+
+    if net_edge_pct < config.PM_ARB_MIN_EDGE_PCT:
+        result["detail"] = f"edge vanished: {net_edge_pct:.2f}% < {config.PM_ARB_MIN_EDGE_PCT}%"
+        log(f"  [ARB] aborted: {result['detail']}")
+        return result
+
+    # Size calculation (use same size for both legs)
+    size_usd = min(max_size_usd, 25.0)  # cap at $25 per leg
+    up_shares = round(size_usd / max(up_price, 0.01), 2)
+    dn_shares = round(size_usd / max(dn_price, 0.01), 2)
+
+    # Check min order sizes
+    up_min = executor._get_min_order_size(up_token_id)
+    dn_min = executor._get_min_order_size(dn_token_id)
+    if up_min and up_shares < up_min:
+        result["detail"] = f"UP shares {up_shares:.2f} < min {up_min:.2f}"
+        log(f"  [ARB] aborted: {result['detail']}")
+        return result
+    if dn_min and dn_shares < dn_min:
+        result["detail"] = f"DN shares {dn_shares:.2f} < min {dn_min:.2f}"
+        log(f"  [ARB] aborted: {result['detail']}")
+        return result
+
+    # Leg 1: Buy UP token
+    up_order_id = None
+    try:
+        signed = executor.client.create_order(
+            OrderArgs(token_id=up_token_id, price=round(up_price, 3), size=up_shares, side=BUY)
+        )
+        resp = executor.client.post_order(signed, OrderType.GTC)
+        up_order_id = resp.get("orderID") or resp.get("id")
+        if up_order_id:
+            result["up_status"] = "posted"
+            log(f"  [ARB] UP leg posted: order_id={up_order_id}, {up_shares} shares @ {up_price:.3f}")
+        else:
+            result["up_status"] = "failed"
+            result["detail"] = "UP order post returned no ID"
+            log("  [ARB] UP leg failed: no order ID in response")
+            return result
+    except Exception as e:
+        result["up_status"] = f"error: {e}"
+        result["detail"] = f"UP order error: {e}"
+        log(f"  [ARB] UP leg error: {e}")
+        return result
+
+    # Leg 2: Buy DOWN token
+    dn_order_id = None
+    try:
+        signed = executor.client.create_order(
+            OrderArgs(token_id=dn_token_id, price=round(dn_price, 3), size=dn_shares, side=BUY)
+        )
+        resp = executor.client.post_order(signed, OrderType.GTC)
+        dn_order_id = resp.get("orderID") or resp.get("id")
+        if dn_order_id:
+            result["dn_status"] = "posted"
+            log(f"  [ARB] DN leg posted: order_id={dn_order_id}, {dn_shares} shares @ {dn_price:.3f}")
+        else:
+            result["dn_status"] = "failed"
+            result["detail"] = "DN order post returned no ID"
+            # Try to cancel UP leg
+            if up_order_id:
+                try:
+                    executor.client.cancel(up_order_id)
+                    log("  [ARB] UP leg cancelled (rollback)")
+                except Exception:
+                    log("  [ARB] WARNING: UP leg cancel failed (rollback)")
+            return result
+    except Exception as e:
+        result["dn_status"] = f"error: {e}"
+        result["detail"] = f"DN order error: {e}"
+        log(f"  [ARB] DN leg error: {e}")
+        # Try to cancel UP leg
+        if up_order_id:
+            try:
+                executor.client.cancel(up_order_id)
+                log("  [ARB] UP leg cancelled (rollback)")
+            except Exception:
+                log("  [ARB] WARNING: UP leg cancel failed (rollback)")
+        return result
+
+    # Both legs posted successfully
+    result["ok"] = True
+    result["up_status"] = "posted"
+    result["dn_status"] = "posted"
+    result["detail"] = (
+        f"Both legs posted. UP: {up_shares} shares @ {up_price:.3f}, "
+        f"DN: {dn_shares} shares @ {dn_price:.3f}, "
+        f"edge={net_edge_pct:+.2f}%"
+    )
+    log(f"  [ARB] complete-set arb executed! {result['detail']}")
+
+    return result
+
+
 async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: str, log):
     def feeds_ready() -> tuple[bool, str]:
         now = time.time()
@@ -1806,6 +2035,7 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
     log(f"  [TRADER] {engine.control_help()}")
     last_gate_reason = ""
     last_window_start_ts = 0
+    _last_arb_ts = 0.0
 
     import window as window_mod
 
@@ -1871,15 +2101,58 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                 log("  [TRADER] feed gate: ready (Binance + Polymarket)")
                 last_gate_reason = ""
 
-            # Complete-set arbitrage detector
-            if feed_state.pm_up is not None and feed_state.pm_dn is not None:
+            # Complete-set arbitrage execution
+            if (
+                config.PM_ARB_ENABLED
+                and feed_state.pm_up is not None
+                and feed_state.pm_dn is not None
+                and feed_state.pm_up_id
+                and feed_state.pm_dn_id
+            ):
                 pm_sum = feed_state.pm_up + feed_state.pm_dn
-                if pm_sum < config.PM_COMPLETE_SET_ALERT:
-                    edge_pct = (1.0 - pm_sum - 2 * config.PM_TAKER_FEE) * 100
+                net_edge_pct = (1.0 - pm_sum - 2 * config.PM_TAKER_FEE) * 100
+
+                if net_edge_pct >= config.PM_ARB_MIN_EDGE_PCT:
+                    now = time.time()
+                    # Check cooldown
+                    if now - _last_arb_ts >= config.PM_ARB_COOLDOWN_SEC:
+                        # Check that engine is in live mode and has executor
+                        if engine.mode == TradeMode.LIVE and isinstance(engine.executor, LiveExecutor):
+                            log(
+                                f"  [ARB] executing complete-set arb! "
+                                f"UP={feed_state.pm_up:.3f} DN={feed_state.pm_dn:.3f} "
+                                f"sum={pm_sum:.3f} edge={net_edge_pct:+.2f}%"
+                            )
+
+                            def _do_arb():
+                                return _execute_complete_set_arb(
+                                    engine.executor,
+                                    feed_state.pm_up_id,
+                                    feed_state.pm_dn_id,
+                                    feed_state.pm_up,
+                                    feed_state.pm_dn,
+                                    config.PM_ARB_MAX_SIZE_USD,
+                                    engine.cfg,
+                                    log,
+                                )
+
+                            arb_result = await asyncio.to_thread(_do_arb)
+                            _last_arb_ts = now
+
+                            if engine._on_error:
+                                try:
+                                    if arb_result.get("ok"):
+                                        engine._on_error("ARB_SUCCESS", arb_result.get("detail", ""))
+                                    else:
+                                        engine._on_error("ARB_FAILED", arb_result.get("detail", ""))
+                                except Exception:
+                                    pass
+                elif pm_sum < config.PM_COMPLETE_SET_ALERT:
+                    # Log-only for near-misses
                     log(
-                        f"  [ARB] complete-set edge detected! "
+                        f"  [ARB] complete-set edge detected (below threshold)! "
                         f"UP={feed_state.pm_up:.3f} + DN={feed_state.pm_dn:.3f} = {pm_sum:.3f} "
-                        f"(net edge after fees: {edge_pct:+.1f}%)"
+                        f"(net edge: {net_edge_pct:+.1f}%, need ≥{config.PM_ARB_MIN_EDGE_PCT}%)"
                     )
 
             # Engine operations may perform blocking I/O (CLOB calls + fill polling + sleeps).

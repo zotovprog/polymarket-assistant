@@ -33,60 +33,6 @@ def _col(val):
     return "green" if val > 0 else "red"
 
 
-TREND_THRESH = 3
-
-
-def _score_trend(st):
-    score = 0
-
-    obi_v = ind.obi(st.bids, st.asks, st.mid) if st.mid else 0.0
-    if obi_v > config.OBI_THRESH:
-        score += 1
-    elif obi_v < -config.OBI_THRESH:
-        score -= 1
-
-    cvd5 = ind.cvd(st.trades, 300)
-    score += 1 if cvd5 > 0 else -1 if cvd5 < 0 else 0
-
-    rsi_v = ind.rsi(st.klines)
-    if rsi_v is not None:
-        if rsi_v > config.RSI_OB:
-            score -= 1
-        elif rsi_v < config.RSI_OS:
-            score += 1
-
-    _, _, hv = ind.macd(st.klines)
-    if hv is not None:
-        score += 1 if hv > 0 else -1
-
-    vwap_v = ind.vwap(st.klines)
-    if vwap_v and st.mid:
-        score += 1 if st.mid > vwap_v else -1
-
-    es, el = ind.emas(st.klines)
-    if es is not None and el is not None:
-        score += 1 if es > el else -1
-
-    bw, aw = ind.walls(st.bids, st.asks)
-    score += min(len(bw), 2)
-    score -= min(len(aw), 2)
-
-    ha = ind.heikin_ashi(st.klines)
-    if len(ha) >= 3:
-        last3 = ha[-3:]
-        if all(c["green"] for c in last3):
-            score += 1
-        elif all(not c["green"] for c in last3):
-            score -= 1
-
-    if score >= TREND_THRESH:
-        return score, "BULLISH",  "green"
-    elif score <= -TREND_THRESH:
-        return score, "BEARISH",  "red"
-    else:
-        return score, "NEUTRAL",  "yellow"
-
-
 def _bias_display(bias: float) -> tuple[str, str, str]:
     """Return (label, pct_str, color) for a bias score in [-100, +100]."""
     pct = abs(bias)
@@ -100,7 +46,7 @@ def _bias_display(bias: float) -> tuple[str, str, str]:
 
 
 def _header(st, coin, tf):
-    score, label, col = _score_trend(st)
+    score, label, col = ind.score_trend(st.bids, st.asks, st.mid, st.trades, st.klines)
     bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
     b_label, b_pct, b_col = _bias_display(bias)
 
@@ -327,7 +273,7 @@ def _signals_panel(st):
     if not sigs:
         sigs.append("[dim]No active signals[/dim]")
 
-    score, label, col = _score_trend(st)
+    score, label, col = ind.score_trend(st.bids, st.asks, st.mid, st.trades, st.klines)
     bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
     b_label, b_pct, b_col = _bias_display(bias)
 

@@ -254,3 +254,55 @@ def pm_fair_value(mid, klines, rsi_val=None, vwap_val=None):
 
     prob_up = max(0.10, min(0.90, prob_up))
     return prob_up, 1.0 - prob_up
+
+
+def score_trend(bids, asks, mid, trades, klines, trend_thresh: int = 3) -> tuple[int, str, str]:
+    """Unified trend scorer. Returns (score, label, color)."""
+    score = 0
+
+    obi_v = obi(bids, asks, mid) if mid else 0.0
+    if obi_v > config.OBI_THRESH:
+        score += 1
+    elif obi_v < -config.OBI_THRESH:
+        score -= 1
+
+    cvd5 = cvd(trades, 300)
+    score += 1 if cvd5 > 0 else -1 if cvd5 < 0 else 0
+
+    rsi_v = rsi(klines)
+    if rsi_v is not None:
+        if rsi_v > config.RSI_OB:
+            score -= 1
+        elif rsi_v < config.RSI_OS:
+            score += 1
+
+    _, _, hv = macd(klines)
+    if hv is not None:
+        score += 1 if hv > 0 else -1
+
+    vwap_v = vwap(klines)
+    if vwap_v and mid:
+        score += 1 if mid > vwap_v else -1
+
+    es, el = emas(klines)
+    if es is not None and el is not None:
+        score += 1 if es > el else -1
+
+    bw, aw = walls(bids, asks)
+    score += min(len(bw), 2)
+    score -= min(len(aw), 2)
+
+    ha = heikin_ashi(klines)
+    if len(ha) >= 3:
+        last3 = ha[-3:]
+        if all(c["green"] for c in last3):
+            score += 1
+        elif all(not c["green"] for c in last3):
+            score -= 1
+
+    if score >= trend_thresh:
+        return score, "BULLISH", "green"
+    elif score <= -trend_thresh:
+        return score, "BEARISH", "red"
+    else:
+        return score, "NEUTRAL", "yellow"

@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 
+import aiohttp
 import requests
 import websockets
 from datetime import datetime, timezone, timedelta
@@ -44,22 +45,58 @@ def _fetch_binance_depth(url: str, symbol: str) -> dict:
 
 
 async def ob_poller(symbol: str, state: State):
-    url = f"{config.BINANCE_REST}/depth"
-    print(f"  [Binance OB] polling {symbol} every {OB_POLL_INTERVAL}s")
+    rest_url = f"{config.BINANCE_REST}/depth"
+    ws_url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@depth20@1000ms"
+    print(f"  [Binance OB] streaming {symbol} via {ws_url}")
+
+    async def _apply_depth(bids_raw, asks_raw):
+        state.bids = [(float(p), float(q)) for p, q in bids_raw]
+        state.asks = [(float(p), float(q)) for p, q in asks_raw]
+        if state.bids and state.asks:
+            state.mid = (state.bids[0][0] + state.asks[0][0]) / 2
+            state.binance_ob_ready = True
+            state.binance_ob_last_ok_ts = time.time()
+
+    reconnect_delay = 1
     while True:
         try:
-            # Run blocking HTTP call off the event loop.
-            resp = await asyncio.to_thread(_fetch_binance_depth, url, symbol)
-            state.bids = [(float(p), float(q)) for p, q in resp["bids"]]
-            state.asks = [(float(p), float(q)) for p, q in resp["asks"]]
-            if state.bids and state.asks:
-                state.mid = (state.bids[0][0] + state.asks[0][0]) / 2
-                state.binance_ob_ready = True
-                state.binance_ob_last_ok_ts = time.time()
-        except Exception:
-            # Keep last good orderbook state; staleness is handled by trader gate.
-            pass
-        await asyncio.sleep(OB_POLL_INTERVAL)
+            # Fallback snapshot before opening stream, so we have initial OB quickly.
+            try:
+                resp = await asyncio.to_thread(_fetch_binance_depth, rest_url, symbol)
+                bids_raw = resp.get("bids", [])
+                asks_raw = resp.get("asks", [])
+                if bids_raw and asks_raw:
+                    await _apply_depth(bids_raw, asks_raw)
+            except Exception as e:
+                print(f"  [Binance OB] snapshot fallback failed: {e}")
+
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=70)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(ws_url, heartbeat=20, receive_timeout=70) as ws:
+                    print(f"  [Binance OB] connected – {symbol}")
+                    reconnect_delay = 1
+
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            bids_raw = data.get("bids") or data.get("b") or []
+                            asks_raw = data.get("asks") or data.get("a") or []
+                            if bids_raw and asks_raw:
+                                await _apply_depth(bids_raw, asks_raw)
+                        elif msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            raise ConnectionError("orderbook stream disconnected")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            delay = reconnect_delay or OB_POLL_INTERVAL
+            print(f"  [Binance OB] disconnected: {e}. Reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
+            reconnect_delay = min(max(delay * 2, 1), 30)
 
 
 async def binance_feed(symbol: str, kline_iv: str, state: State):
@@ -240,6 +277,52 @@ def fetch_pm_tokens(coin: str, tf: str) -> tuple:
     except Exception as e:
         print(f"  [PM] token extraction failed: {e}")
         return None, None
+
+
+async def fetch_pm_depth(token_id: str, price: float, side: str = "buy") -> float:
+    """Fetch available depth (in USD) at or better than `price` for a PM token.
+
+    Args:
+        token_id: The PM conditional token ID
+        price: The price threshold
+        side: "buy" or "sell"
+
+    Returns:
+        Total USD depth available at or better than price. Returns 0.0 on error.
+    """
+    try:
+        import httpx
+
+        url = f"https://clob.polymarket.com/book?token_id={token_id}"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(url)
+            if not resp.is_success:
+                return 0.0
+            data = resp.json()
+
+        # For BUY orders, we look at asks (we're buying from sellers)
+        # For SELL orders, we look at bids (we're selling to buyers)
+        if side == "buy":
+            levels = data.get("asks", [])
+            total = 0.0
+            for level in levels:
+                lvl_price = float(level.get("price", 0))
+                lvl_size = float(level.get("size", 0))
+                if lvl_price <= price:
+                    total += lvl_price * lvl_size
+            return total
+
+        levels = data.get("bids", [])
+        total = 0.0
+        for level in levels:
+            lvl_price = float(level.get("price", 0))
+            lvl_size = float(level.get("size", 0))
+            if lvl_price >= price:
+                total += lvl_price * lvl_size
+        return total
+    except Exception as e:
+        print(f"  [FEEDS] fetch_pm_depth error: {e}")
+        return 0.0
 
 
 async def pm_feed(state: State):
