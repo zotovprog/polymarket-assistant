@@ -190,16 +190,22 @@ class TelegramBot:
 
     def _is_mention(self, msg: dict) -> bool:
         """Check if the bot is mentioned in the message."""
-        # Check for thread_id match if configured
+        chat = msg.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+
+        # Check for thread_id match if configured (group with topics)
         if self._n.thread_id:
             if msg.get("message_thread_id") != self._n.thread_id:
                 return False
         else:
-            chat_id = str(msg.get("chat", {}).get("id", ""))
             if chat_id != str(self._n.chat_id):
                 return False
 
-        # Check entities for @mention
+        # In private chat, every message is directed at the bot
+        if chat.get("type") == "private":
+            return True
+
+        # Check entities for @mention (group chats)
         text = msg.get("text", "")
         for ent in msg.get("entities", []):
             if ent.get("type") == "mention":
