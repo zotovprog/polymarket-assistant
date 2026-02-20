@@ -184,7 +184,7 @@ def _default_settings() -> dict[str, Any]:
         "live_entry_fill_timeout_sec": 25,
         "live_entry_fill_poll_sec": 1.0,
         "keep_unfilled_entry_open": False,
-        "binance_ob_stale_sec": 12,
+        "binance_ob_stale_sec": 30,
         "executions_log_file": "",
         "auto_approve_live": False,
         "client_watchdog_enabled": DEFAULT_CLIENT_IDLE_FLATTEN,
@@ -368,47 +368,59 @@ def _profile_rows(klines: list[dict]) -> tuple[float, list[dict]]:
 
 
 def _signals(st: feeds.State, trend_label: str, trend_score: int, bias: float) -> list[str]:
-    out: list[str] = []
-    obi_v = ind.obi(st.bids, st.asks, st.mid) if st.mid else 0.0
-    if abs(obi_v) > config.OBI_THRESH:
-        out.append(f"OBI -> {'BULLISH' if obi_v > 0 else 'BEARISH'} ({obi_v * 100:+.1f}%)")
+    """Legacy wrapper — prefer _signals_safe with pre-copied data."""
+    return _signals_safe(list(st.bids), list(st.asks), st.mid, list(st.trades), list(st.klines),
+                         trend_label, trend_score, bias)
 
-    cvd5 = ind.cvd(st.trades, 300)
-    if cvd5:
-        out.append(
-            f"CVD 5m -> {'buy pressure' if cvd5 > 0 else 'sell pressure'} (${abs(cvd5):,.2f})"
-        )
 
-    rsi_v = ind.rsi(st.klines)
-    if rsi_v is not None:
-        if rsi_v > config.RSI_OB:
-            out.append(f"RSI -> overbought ({rsi_v:.0f})")
-        elif rsi_v < config.RSI_OS:
-            out.append(f"RSI -> oversold ({rsi_v:.0f})")
+def _signals_safe(
+    bids: list, asks: list, mid: float, trades: list, klines: list,
+    trend_label: str, trend_score: int, bias: float,
+) -> list[str]:
+    try:
+        out: list[str] = []
+        obi_v = ind.obi(bids, asks, mid) if mid else 0.0
+        if abs(obi_v) > config.OBI_THRESH:
+            out.append(f"OBI -> {'BULLISH' if obi_v > 0 else 'BEARISH'} ({obi_v * 100:+.1f}%)")
 
-    _, _, hv = ind.macd(st.klines)
-    if hv is not None:
-        out.append(f"MACD hist -> {'bullish' if hv > 0 else 'bearish'}")
+        cvd5 = ind.cvd(trades, 300)
+        if cvd5:
+            out.append(
+                f"CVD 5m -> {'buy pressure' if cvd5 > 0 else 'sell pressure'} (${abs(cvd5):,.2f})"
+            )
 
-    vwap_v = ind.vwap(st.klines)
-    if st.mid and vwap_v:
-        out.append(f"Price {'above' if st.mid > vwap_v else 'below'} VWAP")
+        rsi_v = ind.rsi(klines)
+        if rsi_v is not None:
+            if rsi_v > config.RSI_OB:
+                out.append(f"RSI -> overbought ({rsi_v:.0f})")
+            elif rsi_v < config.RSI_OS:
+                out.append(f"RSI -> oversold ({rsi_v:.0f})")
 
-    ema_s, ema_l = ind.emas(st.klines)
-    if ema_s is not None and ema_l is not None:
-        out.append(f"EMA -> {'golden' if ema_s > ema_l else 'death'} cross")
+        _, _, hv = ind.macd(klines)
+        if hv is not None:
+            out.append(f"MACD hist -> {'bullish' if hv > 0 else 'bearish'}")
 
-    ha = ind.heikin_ashi(st.klines)
-    if len(ha) >= 3:
-        tail = ha[-3:]
-        if all(c["green"] for c in tail):
-            out.append("HA -> 3+ green candles")
-        elif all(not c["green"] for c in tail):
-            out.append("HA -> 3+ red candles")
+        vwap_v = ind.vwap(klines)
+        if mid and vwap_v:
+            out.append(f"Price {'above' if mid > vwap_v else 'below'} VWAP")
 
-    out.append(f"TREND: {trend_label} ({trend_score:+d})")
-    out.append(f"BIAS: {_bias_label(bias)} ({bias:+.1f})")
-    return out
+        ema_s, ema_l = ind.emas(klines)
+        if ema_s is not None and ema_l is not None:
+            out.append(f"EMA -> {'golden' if ema_s > ema_l else 'death'} cross")
+
+        ha = ind.heikin_ashi(klines)
+        if len(ha) >= 3:
+            tail = ha[-3:]
+            if all(c["green"] for c in tail):
+                out.append("HA -> 3+ green candles")
+            elif all(not c["green"] for c in tail):
+                out.append("HA -> 3+ red candles")
+
+        out.append(f"TREND: {trend_label} ({trend_score:+d})")
+        out.append(f"BIAS: {_bias_label(bias)} ({bias:+.1f})")
+        return out
+    except Exception:
+        return [f"TREND: {trend_label} ({trend_score:+d})", f"BIAS: {_bias_label(bias)} ({bias:+.1f})"]
 
 
 class StartRequest(BaseModel):
@@ -436,7 +448,7 @@ class StartRequest(BaseModel):
     live_entry_fill_timeout_sec: int = 25
     live_entry_fill_poll_sec: float = 1.0
     keep_unfilled_entry_open: bool = False
-    binance_ob_stale_sec: int = 12
+    binance_ob_stale_sec: int = 30
     executions_log_file: str = ""
     auto_approve_live: bool = False
     client_watchdog_enabled: bool | None = None
@@ -940,27 +952,42 @@ class SessionRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         st = self.feed_state
-        trend_score, trend_label, _ = ind.score_trend(
-            st.bids, st.asks, st.mid, st.trades, st.klines
-        )
-        bias = (
-            ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
-            if st.mid and st.klines
-            else 0.0
-        )
-        obi_v = ind.obi(st.bids, st.asks, st.mid) if st.mid else 0.0
-        bid_walls, ask_walls = ind.walls(st.bids, st.asks)
-        depths = ind.depth_usd(st.bids, st.asks, st.mid) if st.mid else {}
-        rsi_v = ind.rsi(st.klines)
-        macd_v, sig_v, hist_v = ind.macd(st.klines)
-        vwap_v = ind.vwap(st.klines) if st.klines else 0.0
-        ema_s, ema_l = ind.emas(st.klines)
-        cvd1 = ind.cvd(st.trades, 60)
-        cvd3 = ind.cvd(st.trades, 180)
-        cvd5 = ind.cvd(st.trades, 300)
-        delta1 = ind.cvd(st.trades, config.DELTA_WINDOW)
-        poc, profile = _profile_rows(st.klines)
-        ha = ind.heikin_ashi(st.klines)
+        # Defensive copies — feed tasks may reassign these lists concurrently
+        bids = list(st.bids)
+        asks = list(st.asks)
+        mid = st.mid
+        trades = list(st.trades)
+        klines = list(st.klines)
+
+        try:
+            trend_score, trend_label, _ = ind.score_trend(bids, asks, mid, trades, klines)
+            bias = ind.bias_score(bids, asks, mid, trades, klines) if mid and klines else 0.0
+            obi_v = ind.obi(bids, asks, mid) if mid else 0.0
+            bid_walls, ask_walls = ind.walls(bids, asks)
+            depths = ind.depth_usd(bids, asks, mid) if mid else {}
+            rsi_v = ind.rsi(klines)
+            macd_v, sig_v, hist_v = ind.macd(klines)
+            vwap_v = ind.vwap(klines) if klines else 0.0
+            ema_s, ema_l = ind.emas(klines)
+            cvd1 = ind.cvd(trades, 60)
+            cvd3 = ind.cvd(trades, 180)
+            cvd5 = ind.cvd(trades, 300)
+            delta1 = ind.cvd(trades, config.DELTA_WINDOW)
+            poc, profile = _profile_rows(klines)
+            ha = ind.heikin_ashi(klines)
+        except Exception:
+            trend_score, trend_label = 0, "—"
+            bias = 0.0
+            obi_v = 0.0
+            bid_walls, ask_walls = [], []
+            depths = {}
+            rsi_v = None
+            macd_v, sig_v, hist_v = None, None, None
+            vwap_v = 0.0
+            ema_s, ema_l = None, None
+            cvd1 = cvd3 = cvd5 = delta1 = 0.0
+            poc, profile = 0.0, []
+            ha = []
 
         trader_state = self.engine.snapshot() if self.engine else None
         feed_gate = self._feed_gate()
@@ -1031,7 +1058,7 @@ class SessionRuntime:
                     "poc": poc,
                     "profile": profile,
                 },
-                "signals": _signals(st, trend_label, trend_score, bias),
+                "signals": _signals_safe(bids, asks, mid, trades, klines, trend_label, trend_score, bias),
             },
             "trader": trader_state,
             "logs": list(self.logs)[-200:],

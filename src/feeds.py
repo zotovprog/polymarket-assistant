@@ -98,7 +98,7 @@ async def ob_poller(symbol: str, state: State):
             delay = reconnect_delay or OB_POLL_INTERVAL
             print(f"  [Binance OB] disconnected: {e}. Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
-            reconnect_delay = min(max(delay * 2, 1), 30)
+            reconnect_delay = min(max(delay * 2, 1), 10)
 
 
 async def binance_feed(symbol: str, kline_iv: str, state: State):

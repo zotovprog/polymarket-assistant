@@ -38,7 +38,7 @@ class TradingConfig:
     approval_beep_enabled: bool = True
     approval_sound_command: str = ""
     executions_log_file: str = "executions.log.jsonl"
-    binance_ob_stale_sec: int = 12
+    binance_ob_stale_sec: int = 30
     live_manual_approval: bool = True
     pending_approval_ttl_sec: int = 30
     live_entry_require_fill: bool = True
