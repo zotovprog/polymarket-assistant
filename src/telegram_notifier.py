@@ -30,6 +30,11 @@ class TelegramNotifier:
         self._client: httpx.AsyncClient | None = None
         if self.enabled:
             self._client = httpx.AsyncClient(timeout=10.0)
+        self._main_loop: asyncio.AbstractEventLoop | None = None
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # Will be set later via set_loop()
 
     @property
     def base_url(self) -> str:
@@ -65,6 +70,11 @@ class TelegramNotifier:
         except Exception as e:
             print(f"  [TELEGRAM] send error: {e}")
 
+    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the main event loop for cross-thread notification dispatch."""
+        self._main_loop = loop
+        print(f"  [TELEGRAM] main loop captured (id={id(loop)})")
+
     def _fire(self, html: str) -> None:
         """Schedule _send as a background task with cleanup callback.
         Works both from async context and from worker threads (asyncio.to_thread).
@@ -79,14 +89,13 @@ class TelegramNotifier:
             task.add_done_callback(self._task_done)
         except RuntimeError:
             # Called from a worker thread (e.g. asyncio.to_thread).
-            # Schedule the coroutine on the main event loop.
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop.call_soon_threadsafe(self._schedule_from_thread, loop, html)
-                # else: no running loop at all, drop silently
-            except RuntimeError:
-                pass  # No event loop available at all
+            # Use the captured main event loop.
+            main = self._main_loop
+            if main is not None and main.is_running():
+                print(f"  [TELEGRAM] _fire: scheduling from worker thread (loop={id(self._main_loop)})")
+                main.call_soon_threadsafe(self._schedule_from_thread, main, html)
+            else:
+                print("  [TELEGRAM] _fire: no main loop available, message dropped")
 
     def _schedule_from_thread(self, loop: asyncio.AbstractEventLoop, html: str) -> None:
         """Create an async task from the main event loop thread."""

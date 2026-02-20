@@ -1171,6 +1171,10 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "web")), name="static"
 
 @app.on_event("startup")
 async def _startup():
+    # Capture the main event loop so TelegramNotifier can dispatch
+    # notifications from worker threads (asyncio.to_thread).
+    _telegram.set_loop(asyncio.get_running_loop())
+
     global _bot
     if _telegram.enabled and _BOT_USERNAME:
         _bot = TelegramBot(
