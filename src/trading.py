@@ -1447,8 +1447,8 @@ class TradingEngine:
                     if self._on_entry:
                         try:
                             self._on_entry(rec)
-                        except Exception:
-                            pass
+                        except Exception as _cb_err:
+                            print(f"  [TRADER] entry callback error: {_cb_err}")
                 else:
                     status_lower = rec.status.lower()
                     if "balance" in status_lower or "allowance" in status_lower:
@@ -1551,8 +1551,8 @@ class TradingEngine:
             if self._on_entry:
                 try:
                     self._on_entry(rec)
-                except Exception:
-                    pass
+                except Exception as _cb_err:
+                    print(f"  [TRADER] entry callback error: {_cb_err}")
         else:
             # Failed entry: apply cooldown to prevent rapid-fire retries.
             # For balance errors, use a long pause (10 min); otherwise use normal cooldown.
@@ -1715,16 +1715,16 @@ class TradingEngine:
             if self._on_exit:
                 try:
                     self._on_exit(rec)
-                except Exception:
-                    pass
+                except Exception as _cb_err:
+                    print(f"  [TRADER] exit callback error: {_cb_err}")
         else:
             if rec.status in {"exit_partial_cancelled", "exit_partial_open"}:
                 self._persist_execution(rec)
                 if self._on_exit:
                     try:
                         self._on_exit(rec)
-                    except Exception:
-                        pass
+                    except Exception as _cb_err:
+                        print(f"  [TRADER] exit callback error: {_cb_err}")
                 # Keep position open and shrink tracked shares by matched amount.
                 if rec.shares is not None and rec.shares > 0:
                     pos.shares = max(0.0, pos.shares - rec.shares)

@@ -66,13 +66,30 @@ class TelegramNotifier:
             print(f"  [TELEGRAM] send error: {e}")
 
     def _fire(self, html: str) -> None:
-        """Schedule _send as a background task with cleanup callback."""
+        """Schedule _send as a background task with cleanup callback.
+        Works both from async context and from worker threads (asyncio.to_thread).
+        """
         if not self.enabled:
             return
         try:
             loop = asyncio.get_running_loop()
+            # We're in an async context — create task directly
+            task = loop.create_task(self._send(html))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._task_done)
         except RuntimeError:
-            return
+            # Called from a worker thread (e.g. asyncio.to_thread).
+            # Schedule the coroutine on the main event loop.
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.call_soon_threadsafe(self._schedule_from_thread, loop, html)
+                # else: no running loop at all, drop silently
+            except RuntimeError:
+                pass  # No event loop available at all
+
+    def _schedule_from_thread(self, loop: asyncio.AbstractEventLoop, html: str) -> None:
+        """Create an async task from the main event loop thread."""
         task = loop.create_task(self._send(html))
         self._background_tasks.add(task)
         task.add_done_callback(self._task_done)
