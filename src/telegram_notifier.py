@@ -262,6 +262,20 @@ class TelegramNotifier:
         )
         self._fire(html)
 
+    def notify_error(self, source: str, message: str, detail: str = "") -> None:
+        detail_line = (
+            f"\n<b>Detail:</b> <code>{self._clip(self._esc(detail))}</code>"
+            if detail else ""
+        )
+        html = (
+            f"\U0001f6a8 <b>ERROR • {self._esc(source)}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Message:</b> <code>{self._clip(self._esc(message))}</code>"
+            f"{detail_line}\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
     # ---- Direct async API (for interactive bot) ----
 
     async def send_with_keyboard(

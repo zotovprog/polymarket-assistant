@@ -209,7 +209,7 @@ class SessionStats:
     def profit_factor(self) -> float:
         total_win = sum(p for p in self.pnl_series if p > 0)
         total_loss = sum(abs(p) for p in self.pnl_series if p < 0)
-        return total_win / total_loss if total_loss > 0 else float("inf")
+        return total_win / total_loss if total_loss > 0 else (99.99 if total_win > 0 else 0.0)
 
 
 class PaperExecutor:
@@ -937,12 +937,13 @@ class LiveExecutor:
 
 class TradingEngine:
     def __init__(self, mode: TradeMode, cfg: TradingConfig, runtime_env: dict[str, str] | None = None,
-                 timeframe: str = "15m", on_entry_callback=None, on_exit_callback=None):
+                 timeframe: str = "15m", on_entry_callback=None, on_exit_callback=None, on_error_callback=None):
         self.mode = mode
         self.cfg = cfg
         self.timeframe = timeframe
         self._on_entry = on_entry_callback
         self._on_exit = on_exit_callback
+        self._on_error = on_error_callback
         self.state = TraderState()
         self.executor = LiveExecutor(cfg, runtime_env=runtime_env) if mode == TradeMode.LIVE else PaperExecutor(cfg)
         self.control_file = os.path.abspath(cfg.control_file)
@@ -1272,7 +1273,7 @@ class TradingEngine:
                 "net_pnl_usd": self.state.session_stats.net_pnl_usd,
                 "avg_win_usd": self.state.session_stats.avg_win_usd,
                 "avg_loss_usd": self.state.session_stats.avg_loss_usd,
-                "profit_factor": self.state.session_stats.profit_factor,
+                "profit_factor": min(self.state.session_stats.profit_factor, 99.99),
                 "best_trade_pnl_usd": self.state.session_stats.best_trade_pnl_usd,
                 "worst_trade_pnl_usd": self.state.session_stats.worst_trade_pnl_usd,
             },
@@ -1862,6 +1863,11 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                         log("  [TRADER] WARNING: failed to fetch new PM tokens for this window")
                 except Exception as e:
                     log(f"  [TRADER] PM token refresh error: {e}")
+                    if engine._on_error:
+                        try:
+                            engine._on_error("PM TOKEN REFRESH", str(e))
+                        except Exception:
+                            pass
             last_window_start_ts = winfo.start_ts
 
             # Complete-set arbitrage detector
@@ -1885,4 +1891,9 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
             await asyncio.to_thread(_engine_cycle)
         except Exception as e:
             log(f"  [TRADER] loop error: {e}")
+            if engine._on_error:
+                try:
+                    engine._on_error("TRADING LOOP", str(e))
+                except Exception:
+                    pass
         await asyncio.sleep(engine.cfg.eval_interval_sec)

@@ -582,6 +582,7 @@ class SessionRuntime:
                 )
             except Exception as e:
                 self.log(f"[SYS] emergency flatten error: {e}")
+                _telegram.notify_error("EMERGENCY FLATTEN", str(e))
             await asyncio.sleep(max(0.5, min(2.0, float(self.engine.cfg.eval_interval_sec))))
 
         if self.engine.state.open_position is not None:
@@ -630,6 +631,7 @@ class SessionRuntime:
                 raise
             except Exception as e:
                 self.log(f"[SYS] client watchdog error: {e}")
+                _telegram.notify_error("CLIENT WATCHDOG", str(e))
 
     async def _stop_locked(self):
         if (
@@ -808,6 +810,9 @@ class SessionRuntime:
                         side=rec.side, remaining_sec=remaining,
                     )
 
+            def _on_error(source: str, message: str):
+                _telegram.notify_error(source, message)
+
             self.engine = None
             if self.mode != trading.TradeMode.OBSERVE:
                 self.engine = trading.TradingEngine(
@@ -815,6 +820,7 @@ class SessionRuntime:
                     timeframe=self.timeframe,
                     on_entry_callback=_on_entry,
                     on_exit_callback=_on_exit,
+                    on_error_callback=_on_error,
                 )
                 if self.mode == trading.TradeMode.LIVE:
                     if not preflight_report or not preflight_report.get("ok", False):
@@ -921,6 +927,7 @@ class SessionRuntime:
             return report
         except Exception as e:
             self.notify("error", "Credentials preflight failed", str(e))
+            _telegram.notify_error("CREDENTIALS PREFLIGHT", str(e))
             return {"ok": not strict, "checks": [{"name": "preflight", "status": "error", "detail": str(e)}]}
 
     def _feed_gate(self) -> dict[str, Any]:
