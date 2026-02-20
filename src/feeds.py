@@ -35,6 +35,8 @@ class State:
         self.pm_prices_ready: bool = False
         self.pm_last_update_ts: float = 0.0
         self.pm_reconnect_requested: bool = False
+        self.pm_all_filtered: bool = False
+        self.pm_all_filtered_ts: float = 0.0
 
 
 OB_POLL_INTERVAL = 2
@@ -347,8 +349,9 @@ async def pm_feed(state: State):
             async with websockets.connect(
                 config.PM_WS,
                 ping_interval=20,
-                ping_timeout=60,
-                close_timeout=10
+                ping_timeout=30,
+                close_timeout=5,
+                open_timeout=15,
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                 print(
@@ -423,6 +426,12 @@ def _pm_apply(asset, asks, bids, state):
         valid = [float(a["price"]) for a in asks if float(a["price"]) < 0.99]
         if valid:
             _pm_set(asset, min(valid), state)
+            state.pm_all_filtered = False  # reset — valid prices exist
+        elif asks:  # all asks >= 0.99
+            if not state.pm_all_filtered:
+                state.pm_all_filtered = True
+                state.pm_all_filtered_ts = time.time()
+                print(f"  [PM] all prices >= 0.99 for {(asset or '')[:12]}.. — market resolved?")
     if bids:
         valid_bids = [float(b["price"]) for b in bids if float(b["price"]) < 0.99]
         if valid_bids:

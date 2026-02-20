@@ -2067,6 +2067,10 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
     last_gate_reason = ""
     last_window_start_ts = 0
     _last_arb_ts = 0.0
+    feed_gate_start_ts: float = 0.0
+    feed_gate_last_log_ts: float = 0.0
+    FEED_GATE_TIMEOUT = 120
+    FEED_GATE_LOG_EVERY = 15
 
     import window as window_mod
 
@@ -2097,11 +2101,18 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                 feed_state.pm_up = None
                 feed_state.pm_dn = None
                 feed_state.pm_prices_ready = False
+                feed_state.pm_all_filtered = False
+                feed_state.pm_all_filtered_ts = 0.0
                 try:
                     import feeds as feeds_mod
-                    new_up, new_dn = await asyncio.to_thread(
-                        feeds_mod.fetch_pm_tokens, coin, timeframe
-                    )
+                    try:
+                        new_up, new_dn = await asyncio.wait_for(
+                            asyncio.to_thread(feeds_mod.fetch_pm_tokens, coin, timeframe),
+                            timeout=15.0,
+                        )
+                    except asyncio.TimeoutError:
+                        log("  [TRADER] WARNING: fetch_pm_tokens timed out (15s)")
+                        new_up, new_dn = None, None
                     if new_up and new_dn:
                         feed_state.pm_up_id = new_up
                         feed_state.pm_dn_id = new_dn
@@ -2123,14 +2134,59 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
 
             ready, gate_reason = feeds_ready()
             if not ready:
+                now_fg = time.time()
+                if feed_gate_start_ts == 0.0:
+                    feed_gate_start_ts = now_fg
+
+                elapsed = now_fg - feed_gate_start_ts
+
                 if gate_reason != last_gate_reason:
                     log(f"  [TRADER] feed gate: {gate_reason}")
                     last_gate_reason = gate_reason
+                    feed_gate_last_log_ts = now_fg
+                elif now_fg - feed_gate_last_log_ts >= FEED_GATE_LOG_EVERY:
+                    log(
+                        f"  [TRADER] feed gate: still waiting ({int(elapsed)}s) — {gate_reason} | "
+                        f"pm_conn={feed_state.pm_connected} up={feed_state.pm_up} dn={feed_state.pm_dn}"
+                        + (f" ALL_FILTERED" if getattr(feed_state, 'pm_all_filtered', False) else "")
+                    )
+                    feed_gate_last_log_ts = now_fg
+
+                if elapsed >= FEED_GATE_TIMEOUT:
+                    if feed_state.pm_connected and (
+                        not feed_state.pm_prices_ready
+                        or getattr(feed_state, 'pm_all_filtered', False)
+                    ):
+                        winfo_fg = window_mod.get_window_info(timeframe)
+                        sleep_sec = min(winfo_fg.remaining_sec + 5, 600)
+                        log(
+                            f"  [TRADER] feed gate TIMEOUT ({int(elapsed)}s): "
+                            f"market likely resolved. Sleeping {sleep_sec}s until next window."
+                        )
+                        if engine._on_error:
+                            try:
+                                engine._on_error("FEED GATE TIMEOUT", f"market resolved, sleep {sleep_sec}s")
+                            except Exception:
+                                pass
+                        await asyncio.sleep(sleep_sec)
+                    else:
+                        log(f"  [TRADER] feed gate TIMEOUT ({int(elapsed)}s): {gate_reason}. Resetting timer.")
+                        if engine._on_error:
+                            try:
+                                engine._on_error("FEED GATE TIMEOUT", f"{gate_reason} ({int(elapsed)}s)")
+                            except Exception:
+                                pass
+                    feed_gate_start_ts = 0.0
+                    feed_gate_last_log_ts = 0.0
+
                 await asyncio.sleep(engine.cfg.eval_interval_sec)
                 continue
+
             if last_gate_reason:
                 log("  [TRADER] feed gate: ready (Binance + Polymarket)")
                 last_gate_reason = ""
+                feed_gate_start_ts = 0.0
+                feed_gate_last_log_ts = 0.0
 
             # Complete-set arbitrage execution
             if (

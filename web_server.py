@@ -934,6 +934,8 @@ class SessionRuntime:
             return {"ready": False, "reason": "waiting Polymarket WS connection"}
         if not st.pm_prices_ready:
             return {"ready": False, "reason": "waiting Polymarket prices"}
+        if getattr(st, 'pm_all_filtered', False):
+            return {"ready": False, "reason": "Polymarket market resolved (prices >= 0.99)"}
         return {"ready": True, "reason": "ready (Binance + Polymarket)"}
 
     def snapshot(self) -> dict[str, Any]:
