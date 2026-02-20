@@ -1919,8 +1919,31 @@ def _execute_complete_set_arb(
         log(f"  [ARB] aborted: {result['detail']}")
         return result
 
-    # Size calculation (use same size for both legs)
-    size_usd = min(max_size_usd, 25.0)  # cap at $25 per leg
+    # Fetch available USDC balance before sizing
+    available_usd = None
+    try:
+        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=-1)
+        data = executor.client.get_balance_allowance(params)
+        bal_raw = str((data or {}).get("balance", "")).strip()
+        if bal_raw:
+            available_usd = float(bal_raw) / 1e6  # USDC has 6 decimals
+    except Exception as e:
+        log(f"  [ARB] WARNING: could not fetch balance: {e}")
+
+    # Size calculation: min of max_size, config cap, and half the available balance
+    # (need to buy 2 legs, so each leg gets at most balance/2 with 5% buffer)
+    size_usd = max_size_usd
+    if available_usd is not None:
+        safe_per_leg = available_usd * 0.95 / 2.0
+        size_usd = min(size_usd, safe_per_leg)
+        log(f"  [ARB] balance=${available_usd:.2f}, safe_per_leg=${safe_per_leg:.2f}, size=${size_usd:.2f}")
+
+    if size_usd < 1.0:
+        result["detail"] = f"insufficient balance for arb: ${available_usd:.2f}" if available_usd is not None else "size too small"
+        log(f"  [ARB] aborted: {result['detail']}")
+        return result
+
     up_shares = round(size_usd / max(up_price, 0.01), 2)
     dn_shares = round(size_usd / max(dn_price, 0.01), 2)
 

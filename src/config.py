@@ -43,7 +43,7 @@ PM_DIVERGENCE_MAX_PCT = 25.0  # block entry if PM price > fair value by this %
 
 # Complete-set arbitrage
 PM_ARB_MIN_EDGE_PCT = 0.5    # minimum net edge (after 2x taker fees) to execute arb
-PM_ARB_MAX_SIZE_USD = 25.0   # max USD size per arb trade per leg
+PM_ARB_MAX_SIZE_USD = 5.0    # max USD size per arb trade per leg
 PM_ARB_COOLDOWN_SEC = 30     # seconds between arb attempts
 PM_ARB_ENABLED = True         # master switch for arb execution
 
