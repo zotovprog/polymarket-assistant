@@ -33,7 +33,7 @@ class TradingConfig:
     max_price: float = 0.70
     cooldown_sec: int = 900
     max_trades_per_day: int = 20
-    eval_interval_sec: int = 5
+    eval_interval_sec: int = 2
     control_file: str = ".traderctl"
     approval_beep_enabled: bool = True
     approval_sound_command: str = ""
