@@ -1811,18 +1811,8 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
 
     while True:
         try:
-            ready, gate_reason = feeds_ready()
-            if not ready:
-                if gate_reason != last_gate_reason:
-                    log(f"  [TRADER] feed gate: {gate_reason}")
-                    last_gate_reason = gate_reason
-                await asyncio.sleep(engine.cfg.eval_interval_sec)
-                continue
-            if last_gate_reason:
-                log("  [TRADER] feed gate: ready (Binance + Polymarket)")
-                last_gate_reason = ""
-
-            # Window transition tracking + heartbeat
+            # Window transition MUST run before feed gate to avoid deadlock
+            # when PM prices are stale/resolved (all >= 0.99)
             winfo = window_mod.get_window_info(timeframe)
             if last_window_start_ts and winfo.start_ts != last_window_start_ts:
                 log(
@@ -1869,6 +1859,17 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                         except Exception:
                             pass
             last_window_start_ts = winfo.start_ts
+
+            ready, gate_reason = feeds_ready()
+            if not ready:
+                if gate_reason != last_gate_reason:
+                    log(f"  [TRADER] feed gate: {gate_reason}")
+                    last_gate_reason = gate_reason
+                await asyncio.sleep(engine.cfg.eval_interval_sec)
+                continue
+            if last_gate_reason:
+                log("  [TRADER] feed gate: ready (Binance + Polymarket)")
+                last_gate_reason = ""
 
             # Complete-set arbitrage detector
             if feed_state.pm_up is not None and feed_state.pm_dn is not None:
