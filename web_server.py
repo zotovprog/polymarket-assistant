@@ -780,6 +780,8 @@ class SessionRuntime:
             await feeds.bootstrap(binance_sym, kline_iv, self.feed_state)
 
             def _on_entry(rec):
+                if not trading.is_execution_status(rec.action, rec.status):
+                    return
                 _telegram.notify_entry(
                     mode=rec.mode, coin=rec.coin, timeframe=rec.timeframe,
                     side=rec.side, price=rec.price, size_usd=rec.size_usd,

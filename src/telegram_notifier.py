@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import time
 from datetime import datetime, timezone
@@ -51,7 +52,16 @@ class TelegramNotifier:
             }
             if self.thread_id:
                 payload["message_thread_id"] = self.thread_id
-            await self._client.post(self.api_url, json=payload)
+            resp = await self._client.post(self.api_url, json=payload)
+            if not resp.is_success:
+                print(f"  [TELEGRAM] send http {resp.status_code}: {resp.text[:300]}")
+                return
+            try:
+                data = resp.json()
+                if not data.get("ok", False):
+                    print(f"  [TELEGRAM] send api error: {data}")
+            except Exception:
+                pass
         except Exception as e:
             print(f"  [TELEGRAM] send error: {e}")
 
@@ -78,6 +88,25 @@ class TelegramNotifier:
     def _ts(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    @staticmethod
+    def _esc(value: Any) -> str:
+        return html.escape(str(value), quote=False)
+
+    @staticmethod
+    def _clip(value: str, max_len: int = 240) -> str:
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 1] + "…"
+
+    @staticmethod
+    def _short_order(order_id: str | None) -> str:
+        if not order_id:
+            return ""
+        s = str(order_id)
+        if len(s) <= 20:
+            return s
+        return f"{s[:10]}…{s[-8:]}"
+
     # ---- Public API ----
 
     def notify_entry(
@@ -92,15 +121,22 @@ class TelegramNotifier:
         reason: str,
         order_id: str | None = None,
     ) -> None:
-        emoji = "\U0001f7e2" if "filled" in status or status == "paper" else "\U0001f534"
+        status_l = status.lower()
+        is_ok = status_l in {"paper", "filled", "partial_filled", "partial_filled_cancelled", "partial_filled_open", "posted"}
+        emoji = "\U0001f7e2" if is_ok else "\U0001f534"
+        reason_txt = self._clip(self._esc(reason))
+        order_txt = self._short_order(order_id)
         html = (
-            f"{emoji} <b>ENTRY {mode.upper()}</b>\n"
-            f"<b>{coin} {timeframe}</b> | {side} @ <code>{price:.3f}</code>\n"
-            f"Size: <code>${size_usd:.2f}</code> | Status: <code>{status}</code>\n"
-            f"Reason: {reason}\n"
+            f"{emoji} <b>ENTRY • {self._esc(mode.upper())}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n"
+            f"<b>Side:</b> <code>{self._esc(side)}</code> @ <code>{price:.3f}</code>\n"
+            f"<b>Size:</b> <code>${size_usd:.2f}</code>\n"
+            f"<b>Status:</b> <code>{self._esc(status)}</code>\n"
+            f"<b>Reason:</b> <code>{reason_txt}</code>\n"
         )
-        if order_id:
-            html += f"Order: <code>{order_id}</code>\n"
+        if order_txt:
+            html += f"<b>Order:</b> <code>{self._esc(order_txt)}</code>\n"
         html += f"<i>{self._ts()}</i>"
         self._fire(html)
 
@@ -119,18 +155,26 @@ class TelegramNotifier:
         order_id: str | None = None,
     ) -> None:
         emoji = "\u2705" if pnl_pct is not None and pnl_pct >= 0 else "\u274c"
+        reason_txt = self._clip(self._esc(reason))
+        order_txt = self._short_order(order_id)
         pnl_line = ""
         if pnl_pct is not None and pnl_usd is not None:
-            pnl_line = f"PnL: <code>{pnl_pct:+.1f}%</code> (<code>${pnl_usd:+.2f}</code>)\n"
+            pnl_line = (
+                f"<b>PnL:</b> <code>{pnl_pct:+.1f}%</code> "
+                f"(<code>${pnl_usd:+.2f}</code>)\n"
+            )
         html = (
-            f"{emoji} <b>EXIT {mode.upper()}</b>\n"
-            f"<b>{coin} {timeframe}</b> | {side} @ <code>{price:.3f}</code>\n"
-            f"Size: <code>${size_usd:.2f}</code> | Status: <code>{status}</code>\n"
+            f"{emoji} <b>EXIT • {self._esc(mode.upper())}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n"
+            f"<b>Side:</b> <code>{self._esc(side)}</code> @ <code>{price:.3f}</code>\n"
+            f"<b>Size:</b> <code>${size_usd:.2f}</code>\n"
+            f"<b>Status:</b> <code>{self._esc(status)}</code>\n"
             f"{pnl_line}"
-            f"Reason: {reason}\n"
+            f"<b>Reason:</b> <code>{reason_txt}</code>\n"
         )
-        if order_id:
-            html += f"Order: <code>{order_id}</code>\n"
+        if order_txt:
+            html += f"<b>Order:</b> <code>{self._esc(order_txt)}</code>\n"
         html += f"<i>{self._ts()}</i>"
         self._fire(html)
 

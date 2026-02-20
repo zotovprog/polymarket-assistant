@@ -111,8 +111,6 @@ EXIT_EXECUTION_STATUSES = {
     "exit_filled",
     "exit_partial_cancelled",
     "exit_partial_open",
-    # Local state cleanup when residual size is below market minimum.
-    "exit_dust_cleared",
 }
 
 
@@ -1565,6 +1563,12 @@ class TradingEngine:
                     pass
         else:
             if rec.status in {"exit_partial_cancelled", "exit_partial_open"}:
+                self._persist_execution(rec)
+                if self._on_exit:
+                    try:
+                        self._on_exit(rec)
+                    except Exception:
+                        pass
                 # Keep position open and shrink tracked shares by matched amount.
                 if rec.shares is not None and rec.shares > 0:
                     pos.shares = max(0.0, pos.shares - rec.shares)
