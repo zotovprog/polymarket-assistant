@@ -24,6 +24,8 @@ class State:
         self.pm_dn_id:  str | None = None
         self.pm_up:     float | None = None
         self.pm_dn:     float | None = None
+        self.pm_up_bid: float | None = None
+        self.pm_dn_bid: float | None = None
 
         self.binance_ws_connected: bool = False
         self.binance_ob_ready: bool = False
@@ -309,12 +311,14 @@ async def pm_feed(state: State):
 
                         if isinstance(raw, list):
                             for entry in raw:
-                                _pm_apply(entry.get("asset_id"), entry.get("asks", []), state)
+                                _pm_apply(entry.get("asset_id"), entry.get("asks", []), entry.get("bids", []), state)
 
                         elif isinstance(raw, dict) and raw.get("event_type") == "price_change":
                             for ch in raw.get("price_changes", []):
                                 if ch.get("best_ask"):
                                     _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
+                                if ch.get("best_bid"):
+                                    _pm_set_bid(ch["asset_id"], float(ch["best_bid"]), state)
 
                     except asyncio.TimeoutError:
                         # No message in 30s — check reconnect flag and loop
@@ -331,11 +335,15 @@ async def pm_feed(state: State):
             await asyncio.sleep(5)
 
 
-def _pm_apply(asset, asks, state):
+def _pm_apply(asset, asks, bids, state):
     if asks:
         valid = [float(a["price"]) for a in asks if float(a["price"]) < 0.99]
         if valid:
             _pm_set(asset, min(valid), state)
+    if bids:
+        valid_bids = [float(b["price"]) for b in bids if float(b["price"]) < 0.99]
+        if valid_bids:
+            _pm_set_bid(asset, max(valid_bids), state)
 
 
 _pm_filter_log_ts = 0.0
@@ -356,3 +364,12 @@ def _pm_set(asset, price, state):
         state.pm_dn = price
     state.pm_last_update_ts = time.time()
     state.pm_prices_ready = state.pm_up is not None and state.pm_dn is not None
+
+
+def _pm_set_bid(asset, price, state):
+    if price >= 0.99:
+        return
+    if asset == state.pm_up_id:
+        state.pm_up_bid = price
+    elif asset == state.pm_dn_id:
+        state.pm_dn_bid = price

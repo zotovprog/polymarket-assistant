@@ -34,6 +34,12 @@ KLINE_BOOT   = 100         # candles fetched on startup
 # ── Polymarket ──────────────────────────────────────────────────
 PM_GAMMA = "https://gamma-api.polymarket.com/events"
 PM_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+PM_TAKER_FEE = 0.0022    # 0.22% taker fee on Polymarket CLOB
+PM_MAKER_FEE = 0.0       # 0% maker fee
+PM_MAX_SPREAD_PCT = 5.0     # max allowed (ask - bid) / ask * 100 to enter
+PM_MIN_DEPTH_USD = 10.0     # minimum depth (not used yet, placeholder)
+PM_COMPLETE_SET_ALERT = 0.98   # alert when UP + DN < this (implies arb edge)
+PM_DIVERGENCE_MAX_PCT = 25.0  # block entry if PM price > fair value by this %
 
 # ── Orderbook indicators ───────────────────────────────────────
 OBI_BAND_PCT = 1.0          # % band around mid for OBI calc

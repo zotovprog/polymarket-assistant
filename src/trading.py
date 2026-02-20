@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from queue import Empty, SimpleQueue
 
+import config
 import indicators as ind
 
 
@@ -52,6 +53,16 @@ class TradingConfig:
     max_hold_sec: int = 900
     reverse_exit_enabled: bool = True
     reverse_exit_bias: float = 60.0
+    max_daily_loss_usd: float = 50.0
+    max_consecutive_losses: int = 5
+    trailing_stop_enabled: bool = True
+    trailing_stop_activation_pct: float = 5.0
+    trailing_stop_distance_pct: float = 3.0
+    dynamic_sizing_enabled: bool = False
+    min_size_usd: float = 5.0
+    max_size_usd: float = 25.0
+    sizing_bias_floor: float = 50.0
+    sizing_bias_ceiling: float = 90.0
 
 
 @dataclass
@@ -63,6 +74,7 @@ class TradeDecision:
     obi: float
     reason: str
     ts: float
+    size_usd: float = 0.0
 
 
 @dataclass
@@ -75,6 +87,7 @@ class OpenPosition:
     entry_ts: float
     entry_bias: float
     entry_obi: float
+    high_water_mark_price: float = 0.0
     entry_order_id: str | None = None
 
 
@@ -126,6 +139,22 @@ def is_execution_status(action: str | None, status: str | None) -> bool:
     return False
 
 
+def pnl_with_fees(entry_price: float, exit_price: float, shares: float,
+                  entry_fee: float = None, exit_fee: float = None) -> tuple[float, float]:
+    """Calculate PnL accounting for entry and exit taker fees.
+    Returns (pnl_usd, pnl_pct). Both include fee deductions."""
+    import config
+    ef = entry_fee if entry_fee is not None else config.PM_TAKER_FEE
+    xf = exit_fee if exit_fee is not None else config.PM_TAKER_FEE
+    if entry_price <= 0 or shares <= 0:
+        return 0.0, 0.0
+    entry_cost = entry_price * shares * (1.0 + ef)
+    exit_proceeds = exit_price * shares * (1.0 - xf)
+    pnl_usd = exit_proceeds - entry_cost
+    pnl_pct = (exit_proceeds / entry_cost - 1.0) * 100.0 if entry_cost > 0 else 0.0
+    return pnl_usd, pnl_pct
+
+
 @dataclass
 class TraderState:
     trades: list[TradeRecord] = field(default_factory=list)
@@ -143,6 +172,44 @@ class TraderState:
     approval_armed: bool = False
     force_close_requested: bool = False
     next_exit_attempt_ts: float = 0.0
+    session_pnl_usd: float = 0.0
+    consecutive_losses: int = 0
+    circuit_breaker_active: bool = False
+    circuit_breaker_reason: str = ""
+    session_stats: "SessionStats" = field(default_factory=lambda: SessionStats())
+
+
+@dataclass
+class SessionStats:
+    total_trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    gross_pnl_usd: float = 0.0
+    total_fees_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+    best_trade_pnl_usd: float = 0.0
+    worst_trade_pnl_usd: float = 0.0
+    pnl_series: list[float] = field(default_factory=list)
+
+    @property
+    def win_rate(self) -> float:
+        return self.wins / self.total_trades if self.total_trades > 0 else 0.0
+
+    @property
+    def avg_win_usd(self) -> float:
+        wins = [p for p in self.pnl_series if p > 0]
+        return sum(wins) / len(wins) if wins else 0.0
+
+    @property
+    def avg_loss_usd(self) -> float:
+        losses = [p for p in self.pnl_series if p <= 0]
+        return sum(losses) / len(losses) if losses else 0.0
+
+    @property
+    def profit_factor(self) -> float:
+        total_win = sum(p for p in self.pnl_series if p > 0)
+        total_loss = sum(abs(p) for p in self.pnl_series if p < 0)
+        return total_win / total_loss if total_loss > 0 else float("inf")
 
 
 class PaperExecutor:
@@ -150,7 +217,8 @@ class PaperExecutor:
         self.cfg = cfg
 
     def execute_entry(self, decision: TradeDecision, coin: str, timeframe: str) -> TradeRecord:
-        shares = self.cfg.size_usd / max(decision.price, 0.01)
+        effective_size = decision.size_usd if decision.size_usd > 0 else self.cfg.size_usd
+        shares = effective_size / max(decision.price, 0.01)
         return TradeRecord(
             ts_iso=datetime.now(timezone.utc).isoformat(),
             action="entry",
@@ -160,7 +228,7 @@ class PaperExecutor:
             side=decision.side,
             token_id=decision.token_id,
             price=decision.price,
-            size_usd=self.cfg.size_usd,
+            size_usd=effective_size,
             shares=shares,
             status="paper",
             reason=decision.reason,
@@ -309,7 +377,8 @@ class LiveExecutor:
         from py_clob_client.order_builder.constants import BUY
 
         price = round(decision.price, 3)
-        size = round(self.cfg.size_usd / max(price, 0.01), 2)
+        effective_size = decision.size_usd if decision.size_usd > 0 else self.cfg.size_usd
+        size = round(effective_size / max(price, 0.01), 2)
         order_id = None
         status = "failed"
         shares: float | None = None
@@ -385,7 +454,7 @@ class LiveExecutor:
             side=decision.side,
             token_id=decision.token_id,
             price=price,
-            size_usd=self.cfg.size_usd,
+            size_usd=effective_size,
             shares=shares,
             status=status,
             reason=reason,
@@ -1033,6 +1102,22 @@ class TradingEngine:
             px_str = f"{price:.3f}" if price is not None else "N/A"
             return None, f"PM price out of range ({px_str} not in [{self.cfg.min_price}, {self.cfg.max_price}])"
 
+        # PM spread gate
+        bid = feed_state.pm_up_bid if side == "Up" else feed_state.pm_dn_bid
+        if bid is not None and price is not None and bid > 0:
+            spread_pct = (price - bid) / price * 100.0
+            if spread_pct > config.PM_MAX_SPREAD_PCT:
+                return None, f"PM spread too wide ({spread_pct:.1f}% > {config.PM_MAX_SPREAD_PCT}%)"
+
+        # Binance-PM divergence guard
+        rsi_val = ind.rsi(feed_state.klines)
+        vwap_val = ind.vwap(feed_state.klines)
+        fair_up, fair_dn = ind.pm_fair_value(feed_state.mid, feed_state.klines, rsi_val, vwap_val)
+        fair = fair_up if side == "Up" else fair_dn
+        if fair > 0 and price > fair * (1 + config.PM_DIVERGENCE_MAX_PCT / 100.0):
+            return None, f"PM-Binance divergence: PM {side} price={price:.3f} > fair={fair:.3f} +{config.PM_DIVERGENCE_MAX_PCT}%"
+
+        computed_size = self._compute_position_size(bias)
         reason = f"bias={bias:+.1f}, obi={obi:+.3f}, px={price:.3f}"
         return TradeDecision(
             side=side,
@@ -1042,6 +1127,7 @@ class TradingEngine:
             obi=obi,
             reason=reason,
             ts=time.time(),
+            size_usd=computed_size,
         ), ""
 
     def _allowed(self) -> tuple[bool, str]:
@@ -1054,6 +1140,10 @@ class TradingEngine:
         if winfo.entry_blocked:
             buf = window_mod.WINDOW_ENTRY_BUFFER.get(self.timeframe, 0)
             return False, f"window_entry_blocked: {winfo.remaining_sec}s remaining (buffer={buf}s)"
+
+        # Circuit breaker
+        if self.state.circuit_breaker_active:
+            return False, f"circuit_breaker: {self.state.circuit_breaker_reason}"
 
         if self.state.open_position is not None:
             return False, f"position already open: {self.state.open_position.side}"
@@ -1082,6 +1172,20 @@ class TradingEngine:
             return feed_state.pm_up
         return feed_state.pm_dn
 
+    def _compute_position_size(self, bias: float) -> float:
+        """Scale position size based on signal strength (bias magnitude)."""
+        if not self.cfg.dynamic_sizing_enabled:
+            return self.cfg.size_usd
+        abs_bias = abs(bias)
+        if abs_bias <= self.cfg.sizing_bias_floor:
+            return self.cfg.min_size_usd
+        if abs_bias >= self.cfg.sizing_bias_ceiling:
+            return self.cfg.max_size_usd
+        ratio = (abs_bias - self.cfg.sizing_bias_floor) / (
+            self.cfg.sizing_bias_ceiling - self.cfg.sizing_bias_floor
+        )
+        return self.cfg.min_size_usd + ratio * (self.cfg.max_size_usd - self.cfg.min_size_usd)
+
     def _current_bias(self, feed_state) -> float | None:
         if not feed_state.mid or not feed_state.klines:
             return None
@@ -1109,8 +1213,7 @@ class TradingEngine:
             mark = self._mark_price(feed_state, open_pos.side)
             hold = time.time() - open_pos.entry_ts
             if mark is not None and open_pos.entry_price > 0:
-                pnl_pct = (mark / open_pos.entry_price - 1.0) * 100.0
-                pnl_usd = open_pos.shares * (mark - open_pos.entry_price)
+                pnl_usd, pnl_pct = pnl_with_fees(open_pos.entry_price, mark, open_pos.shares)
                 log(
                     "  [TRADER] open | "
                     f"token={open_pos.token_id[:10]}.. "
@@ -1161,6 +1264,18 @@ class TradingEngine:
             "force_close_requested": self.state.force_close_requested,
             "next_exit_attempt_ts": self.state.next_exit_attempt_ts,
             "trades": [self._record_dict(t) for t in self.state.trades[-200:]],
+            "session_stats": {
+                "total_trades": self.state.session_stats.total_trades,
+                "wins": self.state.session_stats.wins,
+                "losses": self.state.session_stats.losses,
+                "win_rate": self.state.session_stats.win_rate,
+                "net_pnl_usd": self.state.session_stats.net_pnl_usd,
+                "avg_win_usd": self.state.session_stats.avg_win_usd,
+                "avg_loss_usd": self.state.session_stats.avg_loss_usd,
+                "profit_factor": self.state.session_stats.profit_factor,
+                "best_trade_pnl_usd": self.state.session_stats.best_trade_pnl_usd,
+                "worst_trade_pnl_usd": self.state.session_stats.worst_trade_pnl_usd,
+            },
             "cfg": {
                 "size_usd": self.cfg.size_usd,
                 "min_abs_bias": self.cfg.min_abs_bias,
@@ -1465,8 +1580,7 @@ class TradingEngine:
             self.state.force_close_requested = False
             if mark is None:
                 mark = pos.entry_price
-            pnl_pct = (mark / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else None
-            pnl_usd = pos.shares * (mark - pos.entry_price)
+            pnl_usd, pnl_pct = pnl_with_fees(pos.entry_price, mark, pos.shares)
             return "manual_close", mark, pnl_usd, pnl_pct
 
         # Window close safety (second highest priority after manual close)
@@ -1476,8 +1590,7 @@ class TradingEngine:
             mark = self._mark_price(feed_state, pos.side)
             if mark is None:
                 mark = pos.entry_price
-            pnl_pct = (mark / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else None
-            pnl_usd = pos.shares * (mark - pos.entry_price)
+            pnl_usd, pnl_pct = pnl_with_fees(pos.entry_price, mark, pos.shares)
             return (
                 f"window_close: {winfo.remaining_sec}s remaining in {self.timeframe} window",
                 mark,
@@ -1489,9 +1602,25 @@ class TradingEngine:
         if mark is None:
             return None
 
-        pnl_pct = (mark / pos.entry_price - 1.0) * 100.0 if pos.entry_price > 0 else None
-        pnl_usd = pos.shares * (mark - pos.entry_price)
+        pnl_usd, pnl_pct = pnl_with_fees(pos.entry_price, mark, pos.shares)
         hold_sec = time.time() - pos.entry_ts
+
+        if pos.high_water_mark_price <= 0:
+            pos.high_water_mark_price = pos.entry_price
+        if mark > pos.high_water_mark_price:
+            pos.high_water_mark_price = mark
+
+        # Trailing stop check
+        if self.cfg.trailing_stop_enabled and pos.entry_price > 0:
+            hwm_pnl_usd, hwm_pnl_pct = pnl_with_fees(pos.entry_price, pos.high_water_mark_price, pos.shares)
+            if hwm_pnl_pct >= self.cfg.trailing_stop_activation_pct:
+                trail_level = pos.high_water_mark_price * (1 - self.cfg.trailing_stop_distance_pct / 100.0)
+                if mark <= trail_level:
+                    return (
+                        f"trailing_stop: mark={mark:.3f} <= trail={trail_level:.3f} "
+                        f"(hwm={pos.high_water_mark_price:.3f}, peak_pnl={hwm_pnl_pct:+.1f}%)",
+                        mark, pnl_usd, pnl_pct,
+                    )
 
         if not self.cfg.auto_exit_enabled:
             return None
@@ -1554,6 +1683,33 @@ class TradingEngine:
         if self._exit_success(rec.status):
             self._clear_position_state()
             self.state.last_trade_ts = time.time()
+            # Circuit breaker tracking
+            if rec.pnl_usd is not None:
+                self.state.session_pnl_usd += rec.pnl_usd
+                # Session stats tracking
+                stats = self.state.session_stats
+                stats.total_trades += 1
+                stats.net_pnl_usd += rec.pnl_usd
+                stats.pnl_series.append(rec.pnl_usd)
+                if rec.pnl_usd > 0:
+                    stats.wins += 1
+                else:
+                    stats.losses += 1
+                if rec.pnl_usd > stats.best_trade_pnl_usd:
+                    stats.best_trade_pnl_usd = rec.pnl_usd
+                if rec.pnl_usd < stats.worst_trade_pnl_usd:
+                    stats.worst_trade_pnl_usd = rec.pnl_usd
+                if rec.pnl_usd < 0:
+                    self.state.consecutive_losses += 1
+                else:
+                    self.state.consecutive_losses = 0
+                # Check circuit breaker triggers
+                if self.state.session_pnl_usd <= -self.cfg.max_daily_loss_usd:
+                    self.state.circuit_breaker_active = True
+                    self.state.circuit_breaker_reason = f"daily loss ${self.state.session_pnl_usd:.2f} <= -${self.cfg.max_daily_loss_usd:.2f}"
+                elif self.state.consecutive_losses >= self.cfg.max_consecutive_losses:
+                    self.state.circuit_breaker_active = True
+                    self.state.circuit_breaker_reason = f"{self.state.consecutive_losses} consecutive losses"
             self.state.next_exit_attempt_ts = 0.0
             self._persist_execution(rec)
             if self._on_exit:
@@ -1707,6 +1863,17 @@ async def trading_loop(feed_state, engine: TradingEngine, coin: str, timeframe: 
                 except Exception as e:
                     log(f"  [TRADER] PM token refresh error: {e}")
             last_window_start_ts = winfo.start_ts
+
+            # Complete-set arbitrage detector
+            if feed_state.pm_up is not None and feed_state.pm_dn is not None:
+                pm_sum = feed_state.pm_up + feed_state.pm_dn
+                if pm_sum < config.PM_COMPLETE_SET_ALERT:
+                    edge_pct = (1.0 - pm_sum - 2 * config.PM_TAKER_FEE) * 100
+                    log(
+                        f"  [ARB] complete-set edge detected! "
+                        f"UP={feed_state.pm_up:.3f} + DN={feed_state.pm_dn:.3f} = {pm_sum:.3f} "
+                        f"(net edge after fees: {edge_pct:+.1f}%)"
+                    )
 
             # Engine operations may perform blocking I/O (CLOB calls + fill polling + sleeps).
             # Run them off the event loop to keep FastAPI/UI/Telegram responsive.

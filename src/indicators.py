@@ -137,25 +137,32 @@ def bias_score(bids, asks, mid, trades, klines) -> float:
     W  = config.BIAS_WEIGHTS
     total = 0.0
 
-    # ── EMA cross ───────────────────────────────────────────────
+    # ── EMA cross (gradient: proportional to separation) ───────
     es, el = emas(klines)
     if es is not None and el is not None:
-        total += W["ema"] if es > el else -W["ema"]
+        ema_mid = (es + el) / 2
+        if ema_mid > 0:
+            separation = (es - el) / ema_mid  # normalized separation
+            ema_factor = max(-1.0, min(1.0, separation / 0.005))  # 0.5% = full weight
+            total += ema_factor * W["ema"]
 
     # ── OBI (linear –1..+1 → –W..+W) ───────────────────────────
     if mid:
         obi_v = obi(bids, asks, mid)       # –1..+1
         total += obi_v * W["obi"]
 
-    # ── MACD histogram sign ──────────────────────────────────────
+    # ── MACD histogram (gradient: proportional to magnitude) ────
     _, _, hv = macd(klines)
-    if hv is not None:
-        total += W["macd"] if hv > 0 else -W["macd"]
+    if hv is not None and mid > 0:
+        macd_bps = hv / mid * 10000  # histogram in basis points relative to price
+        macd_factor = max(-1.0, min(1.0, macd_bps / 20.0))  # 20bps = full weight
+        total += macd_factor * W["macd"]
 
-    # ── CVD 5m sign ─────────────────────────────────────────────
+    # ── CVD 5m (gradient: proportional to volume) ──────────────
     cvd5 = cvd(trades, 300)
     if cvd5 != 0:
-        total += W["cvd"] if cvd5 > 0 else -W["cvd"]
+        cvd_factor = max(-1.0, min(1.0, cvd5 / 100000.0))  # $100K = full weight
+        total += cvd_factor * W["cvd"]
 
     # ── Heikin-Ashi streak (last 3 candles, 2 pts each) ─────────
     ha = heikin_ashi(klines)
@@ -175,10 +182,12 @@ def bias_score(bids, asks, mid, trades, klines) -> float:
         # streak ∈ {-3..+3}; scale to ±W
         total += max(-W["ha"], min(W["ha"], streak * (W["ha"] / 3)))
 
-    # ── Price vs VWAP ────────────────────────────────────────────
+    # ── Price vs VWAP (gradient: proportional to distance) ──────
     vwap_v = vwap(klines)
     if vwap_v and mid:
-        total += W["vwap"] if mid > vwap_v else -W["vwap"]
+        vwap_dist_pct = (mid - vwap_v) / vwap_v * 100  # % distance from VWAP
+        vwap_factor = max(-1.0, min(1.0, vwap_dist_pct / 0.5))  # 0.5% = full weight
+        total += vwap_factor * W["vwap"]
 
     # ── RSI overbought / oversold (linear mapping) ───────────────
     rsi_v = rsi(klines)
@@ -192,10 +201,12 @@ def bias_score(bids, asks, mid, trades, klines) -> float:
         else:
             total -= W["rsi"] * (rsi_v - 50) / 20     # 50→0, 70→–W
 
-    # ── Price vs POC ─────────────────────────────────────────────
+    # ── Price vs POC (gradient: proportional to distance) ───────
     poc, _ = vol_profile(klines)
-    if poc and mid:
-        total += W["poc"] if mid > poc else -W["poc"]
+    if poc and mid and poc > 0:
+        poc_dist_pct = (mid - poc) / poc * 100  # % distance from POC
+        poc_factor = max(-1.0, min(1.0, poc_dist_pct / 0.3))  # 0.3% = full weight
+        total += poc_factor * W["poc"]
 
     # ── Walls (bid walls bullish, ask walls bearish) ─────────────
     bw, aw = walls(bids, asks)
@@ -220,3 +231,26 @@ def heikin_ashi(klines):
             "green": c >= o,
         })
     return ha
+
+
+def pm_fair_value(mid, klines, rsi_val=None, vwap_val=None):
+    """Estimate fair probability for UP/DOWN based on Binance indicators.
+    Returns (prob_up, prob_dn) as floats in [0.1, 0.9].
+    Simple heuristic: base 0.5 adjusted by VWAP position and RSI.
+    """
+    prob_up = 0.5
+
+    # VWAP: above VWAP = slightly bullish, below = slightly bearish
+    if vwap_val and mid and vwap_val > 0:
+        vwap_dist = (mid - vwap_val) / vwap_val * 100  # % distance
+        prob_up += max(-0.15, min(0.15, vwap_dist / 1.0 * 0.15))
+
+    # RSI: overbought/oversold
+    if rsi_val is not None:
+        if rsi_val > 50:
+            prob_up += min(0.10, (rsi_val - 50) / 50 * 0.10)
+        else:
+            prob_up -= min(0.10, (50 - rsi_val) / 50 * 0.10)
+
+    prob_up = max(0.10, min(0.90, prob_up))
+    return prob_up, 1.0 - prob_up
