@@ -115,7 +115,7 @@ PRESETS: dict[str, dict[str, float | int]] = {
         "min_price": 0.40,
         "max_price": 0.68,
         "cooldown_sec": 420,
-        "max_trades_per_day": 4,
+        "max_trades_per_day": 20,
         "eval_interval_sec": 3,
         "tp_pct": 10,
         "sl_pct": 6,
@@ -480,7 +480,7 @@ class StartRequest(BaseModel):
     min_price: float = 0.40
     max_price: float = 0.68
     cooldown_sec: int = 420
-    max_trades_per_day: int = 4
+    max_trades_per_day: int = 20
     eval_interval_sec: int = 3
     tp_pct: float = 10.0
     sl_pct: float = 6.0

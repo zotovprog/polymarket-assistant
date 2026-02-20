@@ -90,7 +90,7 @@ def parse_args():
     parser.add_argument("--min-price", type=float, default=0.20, help="Minimum contract price.")
     parser.add_argument("--max-price", type=float, default=0.70, help="Maximum contract price.")
     parser.add_argument("--cooldown-sec", type=int, default=900, help="Minimum seconds between bets.")
-    parser.add_argument("--max-trades-per-day", type=int, default=3, help="Daily trade cap.")
+    parser.add_argument("--max-trades-per-day", type=int, default=20, help="Daily trade cap.")
     parser.add_argument("--eval-interval-sec", type=int, default=5, help="Signal evaluation interval.")
     parser.add_argument("--tp-pct", type=float, default=15.0, help="Take-profit in percent from entry.")
     parser.add_argument("--sl-pct", type=float, default=8.0, help="Stop-loss in percent from entry.")
