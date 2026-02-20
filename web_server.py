@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -516,12 +517,15 @@ class SessionRuntime:
             self.engine.state.force_close_requested = True
             try:
                 # maybe_close_position may perform blocking CLOB calls; keep event loop responsive.
-                await asyncio.to_thread(
-                    self.engine.maybe_close_position,
-                    self.feed_state,
-                    self.coin,
-                    self.timeframe,
-                    self.log,
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.engine.maybe_close_position,
+                        self.feed_state,
+                        self.coin,
+                        self.timeframe,
+                        self.log,
+                    ),
+                    timeout=15.0,
                 )
             except Exception as e:
                 self.log(f"[SYS] emergency flatten error: {e}")
@@ -604,8 +608,18 @@ class SessionRuntime:
         _telegram.notify_session_stop(coin=self.coin, timeframe=self.timeframe)
 
     async def stop(self):
-        async with self.lock:
-            await self._stop_locked()
+        try:
+            async with asyncio.timeout(45):
+                async with self.lock:
+                    await self._stop_locked()
+        except TimeoutError:
+            # Lock held too long (e.g. stuck start). Force-cancel tasks.
+            for task in self.tasks:
+                task.cancel()
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+            self.tasks = []
+            self.running = False
+            self.log("[SYS] stop forced after lock timeout (45s)")
 
     async def submit_command(self, command: str) -> bool:
         async with self.lock:
@@ -678,11 +692,28 @@ class SessionRuntime:
             # Notify credential state at startup for both PAPER and LIVE modes.
             preflight_report: dict[str, Any] | None = None
             if self.mode in {trading.TradeMode.PAPER, trading.TradeMode.LIVE}:
-                preflight_report = await asyncio.to_thread(
-                    self._run_live_credentials_preflight,
-                    runtime_env,
-                    self.mode == trading.TradeMode.LIVE,
-                )
+                try:
+                    preflight_report = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._run_live_credentials_preflight,
+                            runtime_env,
+                            self.mode == trading.TradeMode.LIVE,
+                        ),
+                        timeout=15.0,
+                    )
+                except asyncio.TimeoutError:
+                    self.log("[SYS] credentials preflight timed out (15s)")
+                    self.notify("warning", "Preflight timeout", "Credentials check timed out; proceeding")
+                    preflight_report = {
+                        "ok": False,
+                        "checks": [
+                            {
+                                "name": "preflight",
+                                "status": "timeout",
+                                "detail": "timed out",
+                            }
+                        ],
+                    }
 
             exec_log = payload.executions_log_file.strip()
             if not exec_log:
@@ -722,9 +753,13 @@ class SessionRuntime:
                 cfg.max_size_usd = preset_vals.get("max_size_usd", 25)
 
             self.feed_state = feeds.State()
-            self.feed_state.pm_up_id, self.feed_state.pm_dn_id = await asyncio.to_thread(
-                feeds.fetch_pm_tokens, self.coin, self.timeframe
-            )
+            try:
+                self.feed_state.pm_up_id, self.feed_state.pm_dn_id = await asyncio.wait_for(
+                    asyncio.to_thread(feeds.fetch_pm_tokens, self.coin, self.timeframe),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                raise ValueError("Failed to fetch Polymarket tokens (timeout 10s)")
 
             binance_sym = config.COIN_BINANCE[self.coin]
             kline_iv = config.TF_KLINE[self.timeframe]
@@ -1120,11 +1155,20 @@ app = FastAPI(title="Polymarket Assistant Web")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "web")), name="static")
 
 
+_MAIN_EXECUTOR = ThreadPoolExecutor(max_workers=16, thread_name_prefix="main")
+_TG_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tg")
+
+
 @app.on_event("startup")
 async def _startup():
+    # Use a larger explicit thread pool to prevent exhaustion from
+    # concurrent blocking CLOB API calls (_wait_for_fill, preflight, etc.)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(_MAIN_EXECUTOR)
+
     # Capture the main event loop so TelegramNotifier can dispatch
     # notifications from worker threads (asyncio.to_thread).
-    _telegram.set_loop(asyncio.get_running_loop())
+    _telegram.set_loop(loop)
 
     global _bot
     if _telegram.enabled and _BOT_USERNAME:
@@ -1252,5 +1296,8 @@ async def _shutdown():
         await _bot.stop()
     session = SESSIONS.get("primary")
     if session:
-        await session.stop()
+        try:
+            await asyncio.wait_for(session.stop(), timeout=30.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"[SHUTDOWN] stop timed out or failed: {e}")
     await _telegram.close()

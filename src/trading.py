@@ -1518,6 +1518,8 @@ class TradingEngine:
                 self.state.approval_armed = False
                 rec = self.executor.execute_entry(decision, coin, timeframe)
                 self.state.trades.append(rec)
+                if len(self.state.trades) > 500:
+                    self.state.trades = self.state.trades[-500:]
                 self._track_entry_fill_metrics(rec)
 
                 if self._entry_success(rec.status):
@@ -1623,6 +1625,8 @@ class TradingEngine:
 
         rec = self.executor.execute_entry(decision, coin, timeframe)
         self.state.trades.append(rec)
+        if len(self.state.trades) > 500:
+            self.state.trades = self.state.trades[-500:]
         self._track_entry_fill_metrics(rec)
 
         if self._entry_success(rec.status):
@@ -1784,6 +1788,8 @@ class TradingEngine:
             pnl_pct=pnl_pct,
         )
         self.state.trades.append(rec)
+        if len(self.state.trades) > 500:
+            self.state.trades = self.state.trades[-500:]
 
         if self._exit_success(rec.status):
             self._clear_position_state()
@@ -1796,6 +1802,8 @@ class TradingEngine:
                 stats.total_trades += 1
                 stats.net_pnl_usd += rec.pnl_usd
                 stats.pnl_series.append(rec.pnl_usd)
+                if len(stats.pnl_series) > 1000:
+                    stats.pnl_series = stats.pnl_series[-1000:]
                 if rec.pnl_usd > 0:
                     stats.wins += 1
                 else:

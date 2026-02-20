@@ -11,10 +11,13 @@ import json
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
 from telegram_notifier import TelegramNotifier
+
+_TG_BALANCE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tg-bal")
 
 
 def _fetch_polymarket_balance() -> float | None:
@@ -353,7 +356,13 @@ class TelegramBot:
 
         # Fetch real Polymarket balance in a thread (blocking I/O)
         loop = asyncio.get_running_loop()
-        pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+        try:
+            pm_balance = await asyncio.wait_for(
+                loop.run_in_executor(_TG_BALANCE_EXECUTOR, _fetch_polymarket_balance),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            pm_balance = None
 
         session = self._get_session()
         if not session or not session.running:
@@ -554,7 +563,13 @@ class TelegramBot:
             self._notify("success", "Quick start", f"LIVE {coin} {tf} | {preset} | ${size:.2f}")
 
             loop = asyncio.get_running_loop()
-            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            try:
+                pm_balance = await asyncio.wait_for(
+                    loop.run_in_executor(_TG_BALANCE_EXECUTOR, _fetch_polymarket_balance),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                pm_balance = None
             bal_line = f"\n\U0001f4b0 Баланс: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
 
             html = (
@@ -675,7 +690,13 @@ class TelegramBot:
 
             # Fetch balance in background thread
             loop = asyncio.get_running_loop()
-            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            try:
+                pm_balance = await asyncio.wait_for(
+                    loop.run_in_executor(_TG_BALANCE_EXECUTOR, _fetch_polymarket_balance),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                pm_balance = None
             bal_line = f"\n\U0001f4b0 Balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
 
             html = (
@@ -727,7 +748,13 @@ class TelegramBot:
 
             # Fetch balance in background thread
             loop = asyncio.get_running_loop()
-            pm_balance = await loop.run_in_executor(None, _fetch_polymarket_balance)
+            try:
+                pm_balance = await asyncio.wait_for(
+                    loop.run_in_executor(_TG_BALANCE_EXECUTOR, _fetch_polymarket_balance),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                pm_balance = None
             bal_line = f"\n\U0001f4b0 Balance: <code>${pm_balance:.2f}</code>" if pm_balance is not None else ""
 
             html = (
