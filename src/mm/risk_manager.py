@@ -1,0 +1,126 @@
+"""Risk Manager — inventory limits, PnL tracking, pause conditions."""
+from __future__ import annotations
+import time
+from .types import Inventory, Fill, MMState
+from .mm_config import MMConfig
+
+
+class RiskManager:
+    """Monitor risk limits and decide when to pause quoting."""
+
+    def __init__(self, config: MMConfig):
+        self.config = config
+        self._fills: list[Fill] = []
+        self._session_start: float = time.time()
+        self._vol_history: list[float] = []  # recent vol readings
+
+    def record_fill(self, fill: Fill) -> None:
+        """Record a fill for PnL tracking."""
+        self._fills.append(fill)
+
+    def record_vol(self, vol: float) -> None:
+        """Record a volatility reading."""
+        self._vol_history.append(vol)
+        # Keep last 100 readings
+        if len(self._vol_history) > 100:
+            self._vol_history = self._vol_history[-100:]
+
+    @property
+    def avg_volatility(self) -> float:
+        if not self._vol_history:
+            return 0.0
+        return sum(self._vol_history) / len(self._vol_history)
+
+    def check_inventory_limit(self, inventory: Inventory) -> bool:
+        """Return True if inventory is within limits."""
+        return (abs(inventory.up_shares) <= self.config.max_inventory_shares and
+                abs(inventory.dn_shares) <= self.config.max_inventory_shares)
+
+    def compute_pnl(self, inventory: Inventory,
+                    fv_up: float = 0.5, fv_dn: float = 0.5) -> dict:
+        """Compute realized and unrealized PnL.
+
+        Returns dict with:
+            realized_pnl: Sum of (sell_notional - buy_notional) for closed trades
+            unrealized_pnl: Mark-to-market of current inventory
+            total_fees: Sum of all fees paid
+            total_volume: Sum of all fill notionals
+            fill_count: Number of fills
+        """
+        total_fees = sum(f.fee for f in self._fills)
+        total_volume = sum(f.notional for f in self._fills)
+
+        # Realized PnL from fills
+        realized = 0.0
+        for f in self._fills:
+            if f.side == "SELL":
+                realized += f.notional - f.fee
+            else:
+                realized -= f.notional + f.fee
+
+        # Unrealized PnL: current inventory at fair value
+        unrealized = (inventory.up_shares * fv_up +
+                      inventory.dn_shares * fv_dn)
+
+        return {
+            "realized_pnl": round(realized, 4),
+            "unrealized_pnl": round(unrealized, 4),
+            "total_pnl": round(realized + unrealized, 4),
+            "total_fees": round(total_fees, 4),
+            "total_volume": round(total_volume, 4),
+            "fill_count": len(self._fills),
+        }
+
+    def should_pause(self, inventory: Inventory,
+                     current_vol: float = 0.0,
+                     fv_up: float = 0.5,
+                     fv_dn: float = 0.5) -> tuple[bool, str]:
+        """Check if MM should pause quoting.
+
+        Returns (should_pause, reason).
+        """
+        # Check inventory limit
+        if not self.check_inventory_limit(inventory):
+            return True, f"Inventory limit exceeded: UP={inventory.up_shares:.1f}, DN={inventory.dn_shares:.1f}"
+
+        # Check drawdown
+        pnl = self.compute_pnl(inventory, fv_up, fv_dn)
+        if pnl["total_pnl"] < -self.config.max_drawdown_usd:
+            return True, f"Max drawdown exceeded: PnL=${pnl['total_pnl']:.2f}"
+
+        # Check volatility spike
+        avg_vol = self.avg_volatility
+        if avg_vol > 0 and current_vol > avg_vol * self.config.volatility_pause_mult:
+            return True, f"Volatility spike: {current_vol:.4f} > {avg_vol * self.config.volatility_pause_mult:.4f}"
+
+        # Check if config disabled
+        if not self.config.enabled:
+            return True, "MM disabled via config"
+
+        return False, ""
+
+    def get_stats(self, inventory: Inventory,
+                  fv_up: float = 0.5, fv_dn: float = 0.5) -> dict:
+        """Get comprehensive risk/stats summary."""
+        pnl = self.compute_pnl(inventory, fv_up, fv_dn)
+        uptime = time.time() - self._session_start
+
+        return {
+            **pnl,
+            "uptime_sec": round(uptime, 1),
+            "avg_volatility": round(self.avg_volatility, 6),
+            "inventory_up": round(inventory.up_shares, 2),
+            "inventory_dn": round(inventory.dn_shares, 2),
+            "net_delta": round(inventory.net_delta, 2),
+            "usdc_balance": round(inventory.usdc, 2),
+        }
+
+    @property
+    def fills(self) -> list[Fill]:
+        return self._fills
+
+    def reset(self) -> None:
+        """Reset for new session."""
+        self._fills.clear()
+        self._vol_history.clear()
+        self._session_start = time.time()

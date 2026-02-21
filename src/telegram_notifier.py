@@ -11,7 +11,7 @@ import httpx
 
 
 class TelegramNotifier:
-    """Fire-and-forget Telegram notifications for trading events.
+    """Fire-and-forget Telegram notifications for market-making notifications.
     Uses httpx (already a project dependency) for HTTP calls.
     """
 
@@ -133,163 +133,129 @@ class TelegramNotifier:
             return s
         return f"{s[:10]}…{s[-8:]}"
 
-    # ---- Public API ----
+    # ---- Public API: Market Making notifications ----
 
-    def notify_entry(
+    def notify_mm_start(
         self,
+        coin: str,
+        timeframe: str,
         mode: str,
+        half_spread_bps: float,
+        order_size_usd: float,
+    ) -> None:
+        html = (
+            f"\U0001f680 <b>MM STARTED</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n"
+            f"<b>Mode:</b> <code>{self._esc(mode.upper())}</code>\n"
+            f"<b>Spread:</b> <code>{half_spread_bps:.0f} bps</code> half\n"
+            f"<b>Size:</b> <code>${order_size_usd:.2f}</code>/side\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
+    def notify_mm_stop(self, coin: str, timeframe: str, reason: str = "manual") -> None:
+        html = (
+            f"\U0001f6d1 <b>MM STOPPED</b>\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b>\n"
+            f"<b>Reason:</b> <code>{self._esc(reason)}</code>\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
+    def notify_fill(
+        self,
         coin: str,
         timeframe: str,
         side: str,
         price: float,
-        size_usd: float,
-        status: str,
+        size: float,
+        fee: float,
+        is_maker: bool,
+    ) -> None:
+        emoji = "\U0001f7e2" if side.upper() == "BUY" else "\U0001f534"
+        maker_tag = "MAKER" if is_maker else "TAKER"
+        html = (
+            f"{emoji} <b>FILL • {maker_tag}</b>\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b>\n"
+            f"<b>Side:</b> <code>{self._esc(side.upper())}</code> @ <code>{price:.4f}</code>\n"
+            f"<b>Size:</b> <code>{size:.2f}</code> shares\n"
+            f"<b>Fee:</b> <code>${fee:.4f}</code>\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
+    def notify_pnl_update(
+        self,
+        coin: str,
+        timeframe: str,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        total_fills: int,
+        net_delta: float,
+    ) -> None:
+        total = realized_pnl + unrealized_pnl
+        emoji = "\U0001f4c8" if total >= 0 else "\U0001f4c9"
+        html = (
+            f"{emoji} <b>PnL UPDATE</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b>\n"
+            f"<b>Realized:</b> <code>${realized_pnl:+.4f}</code>\n"
+            f"<b>Unrealized:</b> <code>${unrealized_pnl:+.4f}</code>\n"
+            f"<b>Total:</b> <code>${total:+.4f}</code>\n"
+            f"<b>Fills:</b> <code>{total_fills}</code> | "
+            f"<b>Delta:</b> <code>{net_delta:+.2f}</code>\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
+    def notify_risk_pause(
+        self,
+        coin: str,
+        timeframe: str,
         reason: str,
-        order_id: str | None = None,
+        net_delta: float,
+        drawdown_usd: float,
     ) -> None:
-        status_l = status.lower()
-        is_ok = status_l in {"paper", "filled", "partial_filled", "partial_filled_cancelled", "partial_filled_open", "posted"}
-        emoji = "\U0001f7e2" if is_ok else "\U0001f534"
-        reason_txt = self._clip(self._esc(reason))
-        order_txt = self._short_order(order_id)
         html = (
-            f"{emoji} <b>ENTRY • {self._esc(mode.upper())}</b>\n"
+            f"\u26a0\ufe0f <b>MM PAUSED</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n"
-            f"<b>Side:</b> <code>{self._esc(side)}</code> @ <code>{price:.3f}</code>\n"
-            f"<b>Size:</b> <code>${size_usd:.2f}</code>\n"
-            f"<b>Status:</b> <code>{self._esc(status)}</code>\n"
-            f"<b>Reason:</b> <code>{reason_txt}</code>\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b>\n"
+            f"<b>Reason:</b> <code>{self._esc(reason)}</code>\n"
+            f"<b>Net Delta:</b> <code>{net_delta:+.2f}</code>\n"
+            f"<b>Drawdown:</b> <code>${drawdown_usd:.2f}</code>\n"
+            f"<i>{self._ts()}</i>"
         )
-        if order_txt:
-            html += f"<b>Order:</b> <code>{self._esc(order_txt)}</code>\n"
-        html += f"<i>{self._ts()}</i>"
         self._fire(html)
 
-    def notify_exit(
+    def notify_rebate_update(
         self,
-        mode: str,
-        coin: str,
-        timeframe: str,
-        side: str,
-        price: float,
-        size_usd: float,
-        status: str,
-        reason: str,
-        pnl_usd: float | None = None,
-        pnl_pct: float | None = None,
-        order_id: str | None = None,
+        estimated_daily: float,
+        total_volume: float,
+        qualifying_orders: int,
     ) -> None:
-        emoji = "\u2705" if pnl_pct is not None and pnl_pct >= 0 else "\u274c"
-        reason_txt = self._clip(self._esc(reason))
-        order_txt = self._short_order(order_id)
-        pnl_line = ""
-        if pnl_pct is not None and pnl_usd is not None:
-            pnl_line = (
-                f"<b>PnL:</b> <code>{pnl_pct:+.1f}%</code> "
-                f"(<code>${pnl_usd:+.2f}</code>)\n"
-            )
         html = (
-            f"{emoji} <b>EXIT • {self._esc(mode.upper())}</b>\n"
+            f"\U0001f4b0 <b>REBATE UPDATE</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n"
-            f"<b>Side:</b> <code>{self._esc(side)}</code> @ <code>{price:.3f}</code>\n"
-            f"<b>Size:</b> <code>${size_usd:.2f}</code>\n"
-            f"<b>Status:</b> <code>{self._esc(status)}</code>\n"
-            f"{pnl_line}"
-            f"<b>Reason:</b> <code>{reason_txt}</code>\n"
-        )
-        if order_txt:
-            html += f"<b>Order:</b> <code>{self._esc(order_txt)}</code>\n"
-        html += f"<i>{self._ts()}</i>"
-        self._fire(html)
-
-    def notify_arb(
-        self,
-        coin: str,
-        timeframe: str,
-        up_price: float,
-        dn_price: float,
-        edge_pct: float,
-        size_usd: float,
-        status: str,
-        detail: str = "",
-    ) -> None:
-        detail_line = f"\n<b>Detail:</b> <code>{self._clip(self._esc(detail))}</code>" if detail else ""
-        html = (
-            f"\U0001f4b0 <b>ARB {status.upper()}</b>\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"<b>{coin} {timeframe}</b>\n"
-            f"UP: <code>{up_price:.3f}</code> + DN: <code>{dn_price:.3f}</code> = <code>{up_price + dn_price:.3f}</code>\n"
-            f"Edge: <code>{edge_pct:+.2f}%</code> | Size: <code>${size_usd:.2f}</code>/leg\n"
-            f"Status: <code>{status}</code>{detail_line}\n"
+            f"<b>Est. Daily:</b> <code>${estimated_daily:.4f}</code>\n"
+            f"<b>Volume:</b> <code>${total_volume:.2f}</code>\n"
+            f"<b>Qualifying:</b> <code>{qualifying_orders}</code> orders\n"
             f"<i>{self._ts()}</i>"
         )
         self._fire(html)
 
-    def notify_window_exit(
+    def notify_window_transition(
         self,
         coin: str,
         timeframe: str,
-        side: str,
-        remaining_sec: int,
+        old_window: str,
+        new_window: str,
     ) -> None:
         html = (
-            f"\u23f0 <b>WINDOW EXIT</b>\n"
-            f"<b>{coin} {timeframe}</b> | {side}\n"
-            f"Window closing in <code>{remaining_sec}s</code>. Forced exit triggered.\n"
-            f"<i>{self._ts()}</i>"
-        )
-        self._fire(html)
-
-    def notify_daily_summary(
-        self,
-        coin: str,
-        timeframe: str,
-        trades_today: int,
-        total_pnl_usd: float,
-        total_pnl_pct: float,
-        wins: int,
-        losses: int,
-        mode: str,
-    ) -> None:
-        winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0.0
-        html = (
-            f"\U0001f4ca <b>DAILY SUMMARY</b>\n"
-            f"<b>{coin} {timeframe}</b> | Mode: <code>{mode.upper()}</code>\n"
-            f"Trades: <code>{trades_today}</code> | "
-            f"W/L: <code>{wins}/{losses}</code> ({winrate:.0f}%)\n"
-            f"Total PnL: <code>{total_pnl_pct:+.1f}%</code> "
-            f"(<code>${total_pnl_usd:+.2f}</code>)\n"
-            f"<i>{self._ts()}</i>"
-        )
-        self._fire(html)
-
-    def notify_session_start(
-        self,
-        mode: str,
-        coin: str,
-        timeframe: str,
-        size_usd: float,
-        preset: str = "",
-        balance: float | None = None,
-    ) -> None:
-        strategy_line = f"Strategy: <code>{preset}</code>\n" if preset else ""
-        bal_line = f"\U0001f4b0 Balance: <code>${balance:.2f}</code>\n" if balance is not None else ""
-        html = (
-            f"\U0001f680 <b>SESSION STARTED</b>\n"
-            f"<b>{coin} {timeframe}</b> | Mode: <code>{mode.upper()}</code>\n"
-            f"Size: <code>${size_usd:.2f}</code>\n"
-            f"{strategy_line}"
-            f"{bal_line}"
-            f"<i>{self._ts()}</i>"
-        )
-        self._fire(html)
-
-    def notify_session_stop(self, coin: str, timeframe: str) -> None:
-        html = (
-            f"\U0001f6d1 <b>SESSION STOPPED</b>\n"
-            f"<b>{coin} {timeframe}</b>\n"
+            f"\U0001f504 <b>WINDOW TRANSITION</b>\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b>\n"
+            f"<code>{self._esc(old_window)}</code> \u2192 <code>{self._esc(new_window)}</code>\n"
+            f"Orders cancelled, re-quoting...\n"
             f"<i>{self._ts()}</i>"
         )
         self._fire(html)
@@ -304,6 +270,32 @@ class TelegramNotifier:
             f"━━━━━━━━━━━━━━━━\n"
             f"<b>Message:</b> <code>{self._clip(self._esc(message))}</code>"
             f"{detail_line}\n"
+            f"<i>{self._ts()}</i>"
+        )
+        self._fire(html)
+
+    def notify_daily_summary(
+        self,
+        coin: str,
+        timeframe: str,
+        total_fills: int,
+        realized_pnl: float,
+        rebates_earned: float,
+        avg_spread_bps: float,
+        uptime_pct: float,
+        mode: str,
+    ) -> None:
+        total = realized_pnl + rebates_earned
+        html = (
+            f"\U0001f4ca <b>DAILY MM SUMMARY</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>{self._esc(coin)} {self._esc(timeframe)}</b> | <code>{self._esc(mode.upper())}</code>\n"
+            f"<b>Fills:</b> <code>{total_fills}</code>\n"
+            f"<b>PnL:</b> <code>${realized_pnl:+.4f}</code>\n"
+            f"<b>Rebates:</b> <code>${rebates_earned:+.4f}</code>\n"
+            f"<b>Net:</b> <code>${total:+.4f}</code>\n"
+            f"<b>Avg Spread:</b> <code>{avg_spread_bps:.1f} bps</code>\n"
+            f"<b>Uptime:</b> <code>{uptime_pct:.1f}%</code>\n"
             f"<i>{self._ts()}</i>"
         )
         self._fire(html)

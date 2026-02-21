@@ -34,18 +34,6 @@ KLINE_BOOT   = 100         # candles fetched on startup
 # ── Polymarket ──────────────────────────────────────────────────
 PM_GAMMA = "https://gamma-api.polymarket.com/events"
 PM_WS    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-PM_TAKER_FEE = 0.0022    # 0.22% taker fee on Polymarket CLOB
-PM_MAKER_FEE = 0.0       # 0% maker fee
-PM_MAX_SPREAD_PCT = 5.0     # max allowed (ask - bid) / ask * 100 to enter
-PM_MIN_DEPTH_USD = 10.0     # Minimum liquidity depth required for entry
-PM_COMPLETE_SET_ALERT = 0.98   # alert when UP + DN < this (implies arb edge)
-PM_DIVERGENCE_MAX_PCT = 25.0  # block entry if PM price > fair value by this %
-
-# Complete-set arbitrage
-PM_ARB_MIN_EDGE_PCT = 0.5    # minimum net edge (after 2x taker fees) to execute arb
-PM_ARB_MAX_SIZE_USD = 5.0    # max USD size per arb trade per leg
-PM_ARB_COOLDOWN_SEC = 30     # seconds between arb attempts
-PM_ARB_ENABLED = True         # master switch for arb execution
 
 # ── Orderbook indicators ───────────────────────────────────────
 OBI_BAND_PCT = 1.0          # % band around mid for OBI calc
@@ -67,23 +55,20 @@ MACD_SIG   = 9
 EMA_S      = 5
 EMA_L      = 20
 
-# ── Bias Score weights (max absolute contribution of each indicator) ──
-BIAS_WEIGHTS = {
-    "ema":   10,   # EMA5/EMA20 cross  – strongest trend proxy
-    "obi":    8,   # Order Book Imbalance
-    "macd":   8,   # MACD histogram sign
-    "cvd":    7,   # CVD 5m sign
-    "ha":     6,   # Heikin-Ashi streak (up to 3 candles)
-    "vwap":   5,   # Price vs VWAP
-    "rsi":    5,   # RSI overbought/oversold
-    "poc":    3,   # Price vs POC
-    "walls":  4,   # bid walls − ask walls (capped ±4)
-}
-# sum of all weights = 56; bias = (raw_sum / 56) * 100, clamped to ±100
-
 # ── Dashboard ──────────────────────────────────────────────────
-HA_COUNT   = 8          # Heikin Ashi candles shown
-VP_BINS    = 30         # volume profile price buckets
-VP_SHOW    = 9          # VP rows visible
 REFRESH    = 10         # seconds between dashboard redraws
 REFRESH_5M = 3          # faster refresh for 5m timeframe (seconds)
+
+# ── Market Making ─────────────────────────────────────────────────
+MM_HALF_SPREAD_BPS   = 150       # 1.5% half-spread default
+MM_ORDER_SIZE_USD    = 10.0      # USD per side
+MM_MAX_INVENTORY     = 50.0      # max shares one-sided
+MM_SKEW_BPS_PER_UNIT = 5.0       # skew per share of net delta
+MM_REQUOTE_SEC       = 2.0       # seconds between requote checks
+MM_REQUOTE_THRESH_BPS = 5.0      # min price move to requote
+MM_GTD_DURATION_SEC  = 300       # GTD order lifetime (5 min)
+MM_HEARTBEAT_SEC     = 55        # heartbeat interval
+MM_MAX_DRAWDOWN_USD  = 50.0      # max session drawdown
+MM_VOL_PAUSE_MULT    = 3.0       # pause if vol > N × avg
+MM_USE_POST_ONLY     = True      # force post-only (maker) orders
+MM_USE_GTD           = True       # use GTD order type

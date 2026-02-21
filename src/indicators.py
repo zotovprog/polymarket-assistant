@@ -42,7 +42,7 @@ def cvd(trades, secs):
     )
 
 
-def vol_profile(klines):
+def vol_profile(klines, bins=20):
     if not klines:
         return 0.0, []
 
@@ -51,7 +51,7 @@ def vol_profile(klines):
     if hi == lo:
         return lo, [(lo, sum(k["v"] for k in klines))]
 
-    n   = config.VP_BINS
+    n   = bins
     bsz = (hi - lo) / n
     bins = [0.0] * n
 
@@ -129,95 +129,6 @@ def emas(klines):
     )
 
 
-def bias_score(bids, asks, mid, trades, klines) -> float:
-    """Return a bias score in [-100, +100].
-    Positive = bullish signal, negative = bearish signal.
-    Uses weighted sum of all key indicators, normalised to max possible weight.
-    """
-    W  = config.BIAS_WEIGHTS
-    total = 0.0
-
-    # ── EMA cross (gradient: proportional to separation) ───────
-    es, el = emas(klines)
-    if es is not None and el is not None:
-        ema_mid = (es + el) / 2
-        if ema_mid > 0:
-            separation = (es - el) / ema_mid  # normalized separation
-            ema_factor = max(-1.0, min(1.0, separation / 0.005))  # 0.5% = full weight
-            total += ema_factor * W["ema"]
-
-    # ── OBI (linear –1..+1 → –W..+W) ───────────────────────────
-    if mid:
-        obi_v = obi(bids, asks, mid)       # –1..+1
-        total += obi_v * W["obi"]
-
-    # ── MACD histogram (gradient: proportional to magnitude) ────
-    _, _, hv = macd(klines)
-    if hv is not None and mid > 0:
-        macd_bps = hv / mid * 10000  # histogram in basis points relative to price
-        macd_factor = max(-1.0, min(1.0, macd_bps / 20.0))  # 20bps = full weight
-        total += macd_factor * W["macd"]
-
-    # ── CVD 5m (gradient: proportional to volume) ──────────────
-    cvd5 = cvd(trades, 300)
-    if cvd5 != 0:
-        cvd_factor = max(-1.0, min(1.0, cvd5 / 100000.0))  # $100K = full weight
-        total += cvd_factor * W["cvd"]
-
-    # ── Heikin-Ashi streak (last 3 candles, 2 pts each) ─────────
-    ha = heikin_ashi(klines)
-    if ha:
-        streak = 0
-        for c in reversed(ha[-3:]):
-            if c["green"]:
-                if streak >= 0:
-                    streak += 1
-                else:
-                    break
-            else:
-                if streak <= 0:
-                    streak -= 1
-                else:
-                    break
-        # streak ∈ {-3..+3}; scale to ±W
-        total += max(-W["ha"], min(W["ha"], streak * (W["ha"] / 3)))
-
-    # ── Price vs VWAP (gradient: proportional to distance) ──────
-    vwap_v = vwap(klines)
-    if vwap_v and mid:
-        vwap_dist_pct = (mid - vwap_v) / vwap_v * 100  # % distance from VWAP
-        vwap_factor = max(-1.0, min(1.0, vwap_dist_pct / 0.5))  # 0.5% = full weight
-        total += vwap_factor * W["vwap"]
-
-    # ── RSI overbought / oversold (linear mapping) ───────────────
-    rsi_v = rsi(klines)
-    if rsi_v is not None:
-        if rsi_v <= 30:
-            total += W["rsi"]
-        elif rsi_v >= 70:
-            total -= W["rsi"]
-        elif rsi_v < 50:
-            total += W["rsi"] * (50 - rsi_v) / 20     # 30→+W, 50→0
-        else:
-            total -= W["rsi"] * (rsi_v - 50) / 20     # 50→0, 70→–W
-
-    # ── Price vs POC (gradient: proportional to distance) ───────
-    poc, _ = vol_profile(klines)
-    if poc and mid and poc > 0:
-        poc_dist_pct = (mid - poc) / poc * 100  # % distance from POC
-        poc_factor = max(-1.0, min(1.0, poc_dist_pct / 0.3))  # 0.3% = full weight
-        total += poc_factor * W["poc"]
-
-    # ── Walls (bid walls bullish, ask walls bearish) ─────────────
-    bw, aw = walls(bids, asks)
-    wall_pts = (min(len(bw), 2) - min(len(aw), 2)) * 2   # ±0/2/4
-    total += max(-W["walls"], min(W["walls"], wall_pts))
-
-    max_possible = sum(W.values())   # 56
-    raw = (total / max_possible) * 100
-    return max(-100.0, min(100.0, raw))
-
-
 def heikin_ashi(klines):
     ha = []
     for i, k in enumerate(klines):
@@ -255,54 +166,3 @@ def pm_fair_value(mid, klines, rsi_val=None, vwap_val=None):
     prob_up = max(0.10, min(0.90, prob_up))
     return prob_up, 1.0 - prob_up
 
-
-def score_trend(bids, asks, mid, trades, klines, trend_thresh: int = 3) -> tuple[int, str, str]:
-    """Unified trend scorer. Returns (score, label, color)."""
-    score = 0
-
-    obi_v = obi(bids, asks, mid) if mid else 0.0
-    if obi_v > config.OBI_THRESH:
-        score += 1
-    elif obi_v < -config.OBI_THRESH:
-        score -= 1
-
-    cvd5 = cvd(trades, 300)
-    score += 1 if cvd5 > 0 else -1 if cvd5 < 0 else 0
-
-    rsi_v = rsi(klines)
-    if rsi_v is not None:
-        if rsi_v > config.RSI_OB:
-            score -= 1
-        elif rsi_v < config.RSI_OS:
-            score += 1
-
-    _, _, hv = macd(klines)
-    if hv is not None:
-        score += 1 if hv > 0 else -1
-
-    vwap_v = vwap(klines)
-    if vwap_v and mid:
-        score += 1 if mid > vwap_v else -1
-
-    es, el = emas(klines)
-    if es is not None and el is not None:
-        score += 1 if es > el else -1
-
-    bw, aw = walls(bids, asks)
-    score += min(len(bw), 2)
-    score -= min(len(aw), 2)
-
-    ha = heikin_ashi(klines)
-    if len(ha) >= 3:
-        last3 = ha[-3:]
-        if all(c["green"] for c in last3):
-            score += 1
-        elif all(not c["green"] for c in last3):
-            score -= 1
-
-    if score >= trend_thresh:
-        return score, "BULLISH", "green"
-    elif score <= -trend_thresh:
-        return score, "BEARISH", "red"
-    else:
-        return score, "NEUTRAL", "yellow"

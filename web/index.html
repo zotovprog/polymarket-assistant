@@ -1,215 +1,241 @@
-<!doctype html>
-<html lang="ru">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Polymarket Assistant Web</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="/static/styles.css" />
-  </head>
-  <body>
-    <div id="authOverlay" class="auth-overlay hidden">
-      <div class="auth-card">
-        <h2>Access Key Required</h2>
-        <p>Enter your private web access key to unlock trading dashboard.</p>
-        <label>
-          <span>Access key</span>
-          <input id="authKeyInput" type="password" autocomplete="off" placeholder="Paste access key" />
-        </label>
-        <button id="authSubmitBtn" class="btn primary">Unlock</button>
-        <p id="authHint" class="auth-hint"></p>
-      </div>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket MM</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+    <!-- Auth Screen -->
+    <div id="auth-screen" class="auth-screen">
+        <div class="auth-box">
+            <h1><i class="fas fa-chart-line"></i> Polymarket MM</h1>
+            <p>Market Making Dashboard</p>
+            <input type="password" id="auth-key" placeholder="Access Key" autocomplete="off">
+            <button onclick="doLogin()">Login</button>
+            <div id="auth-error" class="error hidden"></div>
+        </div>
     </div>
 
-    <main class="optics-app">
-      <aside class="sidebar panel">
-        <div class="brand-block">
-          <p class="brand-kicker">@optics/trader</p>
-          <h1>Polymarket Assistant</h1>
-          <p class="brand-sub">Realtime monitoring and execution terminal</p>
-        </div>
-
-        <div class="command-fake">
-          <span>Search controls...</span>
-          <kbd>⌘ J</kbd>
-        </div>
-
-        <section class="controls">
-          <h2>Control</h2>
-
-          <div class="grid two">
-            <label>
-              <span>Mode</span>
-              <select id="mode">
-                <option value="observe">observe</option>
-                <option value="paper" selected>paper</option>
-                <option value="live">live</option>
-              </select>
-            </label>
-            <label>
-              <span>Preset</span>
-              <select id="preset">
-                <option value="safe">safe</option>
-                <option value="medium" selected>medium</option>
-                <option value="aggressive">aggressive</option>
-                <option value="super_aggressive">SUPER AGGRESSIVE (paper only)</option>
-                <option value="mega_aggressive">MEGA AGGRESSIVE (legacy, paper only)</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="grid two">
-            <label>
-              <span>Coin</span>
-              <select id="coin"></select>
-            </label>
-            <label>
-              <span>Timeframe</span>
-              <select id="timeframe"></select>
-            </label>
-          </div>
-
-          <h3>Strategy</h3>
-          <div class="grid two">
-            <label><span>Size USD</span><input id="size_usd" type="number" min="5" step="1" value="5" /></label>
-            <label><span>Min Bias</span><input id="min_bias" type="number" step="1" value="55" /></label>
-            <label><span>Min OBI</span><input id="min_obi" type="number" step="0.01" value="0.40" /></label>
-            <label><span>Cooldown sec</span><input id="cooldown_sec" type="number" step="1" value="420" /></label>
-            <label><span>Min Price</span><input id="min_price" type="number" step="0.01" value="0.40" /></label>
-            <label><span>Max Price</span><input id="max_price" type="number" step="0.01" value="0.68" /></label>
-            <label><span>TP %</span><input id="tp_pct" type="number" step="0.1" value="10" /></label>
-            <label><span>SL %</span><input id="sl_pct" type="number" step="0.1" value="6" /></label>
-            <label><span>Max Hold sec</span><input id="max_hold_sec" type="number" step="1" value="1200" /></label>
-            <label><span>Max trades/day</span><input id="max_trades_per_day" type="number" step="1" value="20" /></label>
-            <label><span>Eval sec</span><input id="eval_interval_sec" type="number" step="1" value="3" /></label>
-            <label><span>Reverse bias</span><input id="reverse_exit_bias" type="number" step="1" value="55" /></label>
-            <label><span>Fill timeout sec</span><input id="live_entry_fill_timeout_sec" type="number" step="1" value="25" /></label>
-            <label><span>Fill poll sec</span><input id="live_entry_fill_poll_sec" type="number" step="0.1" value="1" /></label>
-          </div>
-
-          <div class="switches">
-            <label><input id="auto_approve_live" type="checkbox" /> <span>AUTO APPROVE (LIVE)</span></label>
-            <label><input id="client_watchdog_enabled" type="checkbox" /> <span>Protect on UI disconnect</span></label>
-            <label><input id="auto_exit_enabled" type="checkbox" checked /> <span>Auto Exit</span></label>
-            <label><input id="reverse_exit_enabled" type="checkbox" checked /> <span>Reverse Exit</span></label>
-            <label><input id="live_entry_require_fill" type="checkbox" checked /> <span>Require Fill</span></label>
-            <label><input id="keep_unfilled_entry_open" type="checkbox" /> <span>Keep unfilled open</span></label>
-          </div>
-
-          <h3>Live Mode</h3>
-          <div class="cred-status" id="credStatus">
-            <span class="cred-dot" id="credDot"></span>
-            <span id="credLabel">Checking credentials...</span>
-          </div>
-          <div class="grid one">
-            <label><span>Live Confirm Token</span><input id="confirm_live_token" type="text" /></label>
-          </div>
-
-          <div class="actions">
-            <button id="startBtn" class="btn primary">Start</button>
-            <button id="stopBtn" class="btn">Stop</button>
-          </div>
-
-          <p id="errorBox" class="error"></p>
-        </section>
-      </aside>
-
-      <section class="workspace">
-        <header class="workspace-top panel">
-          <div>
-            <p class="workspace-kicker">Live Dashboard</p>
-            <h2 id="marketTitle">BTC 15m</h2>
-            <p id="gateText">feed gate: waiting</p>
-          </div>
-          <div id="statusBadge" class="badge idle">IDLE</div>
+    <!-- Main Dashboard -->
+    <div id="dashboard" class="hidden">
+        <!-- Top Bar -->
+        <header class="top-bar">
+            <div class="logo">
+                <i class="fas fa-chart-line"></i> Polymarket MM
+            </div>
+            <div class="controls">
+                <select id="coin-select">
+                    <option value="BTC">BTC</option>
+                    <option value="ETH">ETH</option>
+                    <option value="SOL">SOL</option>
+                    <option value="XRP">XRP</option>
+                </select>
+                <select id="tf-select">
+                    <option value="5m">5m</option>
+                    <option value="15m">15m</option>
+                    <option value="1h">1h</option>
+                    <option value="4h">4h</option>
+                    <option value="daily">Daily</option>
+                </select>
+                <label class="paper-toggle">
+                    <input type="checkbox" id="paper-mode" checked>
+                    <span>Paper</span>
+                </label>
+                <button id="btn-start" class="btn btn-start" onclick="toggleMM()">
+                    <i class="fas fa-play"></i> Start
+                </button>
+                <button id="btn-emergency" class="btn btn-danger" onclick="emergency()">
+                    <i class="fas fa-exclamation-triangle"></i>
+                </button>
+            </div>
+            <div class="status-bar">
+                <span id="status-indicator" class="status-dot offline"></span>
+                <span id="status-text">Offline</span>
+                <span id="uptime" class="stat-small"></span>
+            </div>
         </header>
 
-        <div id="toastContainer" class="toasts"></div>
-
-        <section class="panel board">
-          <div class="hero">
-            <div>
-              <p class="summary-title">Market Summary</p>
-              <p id="summaryText" class="summary">Market summary will appear here.</p>
+        <!-- Main Grid -->
+        <div class="grid-container">
+            <!-- Left Column: Charts -->
+            <div class="panel chart-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-chart-area"></i> Price & Fair Value</span>
+                    <span id="binance-price" class="price-display">—</span>
+                </div>
+                <div id="price-chart" class="chart-container"></div>
             </div>
-            <div class="hero-metrics">
-              <div><span>Price</span><strong id="priceText">-</strong></div>
-              <div><span>PM Up/Down</span><strong id="pmText">-</strong></div>
-              <div><span>Trend</span><strong id="trendText">-</strong></div>
-              <div><span>Bias</span><strong id="biasText">-</strong></div>
+
+            <div class="panel spread-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-arrows-left-right"></i> Spread</span>
+                    <span id="current-spread" class="value-accent">—</span>
+                </div>
+                <div id="spread-chart" class="chart-container-small"></div>
             </div>
-          </div>
 
-          <div id="windowBar" class="window-bar hidden">
-            <span class="window-label">Window</span>
-            <span id="windowTimer" class="window-timer">--:--</span>
-          </div>
-
-          <div class="metrics-grid">
-            <article>
-              <h3>Order Book</h3>
-              <ul id="orderbookList"></ul>
-            </article>
-            <article>
-              <h3>Flow</h3>
-              <ul id="flowList"></ul>
-            </article>
-            <article>
-              <h3>Technical</h3>
-              <ul id="techList"></ul>
-            </article>
-            <article>
-              <h3>Signals</h3>
-              <ul id="signalsList"></ul>
-            </article>
-          </div>
-
-          <article>
-            <h3>Trades</h3>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Time</th>
-                    <th>Action</th>
-                    <th>Side</th>
-                    <th>Price</th>
-                    <th>Size</th>
-                    <th>Status</th>
-                    <th>PnL</th>
-                  </tr>
-                </thead>
-                <tbody id="tradesBody"></tbody>
-              </table>
+            <!-- Center: Orderbook & Quotes -->
+            <div class="panel quotes-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-book"></i> Quotes & Fair Value</span>
+                </div>
+                <div class="quotes-grid">
+                    <div class="token-col">
+                        <h3 class="up-color">UP Token</h3>
+                        <div class="quote-row bid">
+                            <span class="label">BID</span>
+                            <span id="up-bid-price" class="price">—</span>
+                            <span id="up-bid-size" class="size">—</span>
+                        </div>
+                        <div class="fair-value-row">
+                            <span class="label">FV</span>
+                            <span id="fv-up" class="fv-price">—</span>
+                        </div>
+                        <div class="quote-row ask">
+                            <span class="label">ASK</span>
+                            <span id="up-ask-price" class="price">—</span>
+                            <span id="up-ask-size" class="size">—</span>
+                        </div>
+                        <div class="pm-price-row">
+                            <span class="label">PM</span>
+                            <span id="pm-up" class="pm-price">—</span>
+                        </div>
+                    </div>
+                    <div class="token-col">
+                        <h3 class="dn-color">DN Token</h3>
+                        <div class="quote-row bid">
+                            <span class="label">BID</span>
+                            <span id="dn-bid-price" class="price">—</span>
+                            <span id="dn-bid-size" class="size">—</span>
+                        </div>
+                        <div class="fair-value-row">
+                            <span class="label">FV</span>
+                            <span id="fv-dn" class="fv-price">—</span>
+                        </div>
+                        <div class="quote-row ask">
+                            <span class="label">ASK</span>
+                            <span id="dn-ask-price" class="price">—</span>
+                            <span id="dn-ask-size" class="size">—</span>
+                        </div>
+                        <div class="pm-price-row">
+                            <span class="label">PM</span>
+                            <span id="pm-dn" class="pm-price">—</span>
+                        </div>
+                    </div>
+                </div>
+                <!-- Inventory Gauge -->
+                <div class="inventory-section">
+                    <h4>Inventory</h4>
+                    <div class="inventory-bar-container">
+                        <span class="inv-label dn-color">DN</span>
+                        <div class="inventory-bar">
+                            <div id="inv-bar-fill" class="inv-fill"></div>
+                            <div id="inv-bar-center" class="inv-center"></div>
+                        </div>
+                        <span class="inv-label up-color">UP</span>
+                    </div>
+                    <div class="inventory-numbers">
+                        <span>UP: <b id="inv-up">0</b></span>
+                        <span>Net: <b id="inv-delta">0</b></span>
+                        <span>DN: <b id="inv-dn">0</b></span>
+                        <span>USDC: <b id="inv-usdc">0</b></span>
+                    </div>
+                </div>
             </div>
-          </article>
 
-          <article>
-            <h3>Runtime Logs
-              <span style="float:right; display:flex; gap:6px; font-size:0.75rem;">
-                <button class="btn" onclick="downloadLogs()" title="Download logs as .txt">⬇ Logs</button>
-                <button class="btn" onclick="downloadTrades()" title="Download trades as .csv">⬇ Trades</button>
-              </span>
-            </h3>
-            <pre id="logsBox" class="logs"></pre>
-          </article>
-        </section>
-      </section>
-    </main>
+            <!-- Right Column: PnL & Fills -->
+            <div class="panel pnl-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-dollar-sign"></i> PnL</span>
+                </div>
+                <div class="pnl-cards">
+                    <div class="pnl-card">
+                        <div class="pnl-label">Realized</div>
+                        <div id="pnl-realized" class="pnl-value">$0.00</div>
+                    </div>
+                    <div class="pnl-card">
+                        <div class="pnl-label">Unrealized</div>
+                        <div id="pnl-unrealized" class="pnl-value">$0.00</div>
+                    </div>
+                    <div class="pnl-card">
+                        <div class="pnl-label">Total</div>
+                        <div id="pnl-total" class="pnl-value total">$0.00</div>
+                    </div>
+                    <div class="pnl-card">
+                        <div class="pnl-label">Fees</div>
+                        <div id="pnl-fees" class="pnl-value">$0.00</div>
+                    </div>
+                </div>
+                <div id="pnl-chart" class="chart-container-small"></div>
+            </div>
 
-    <div id="modalOverlay" class="modal-overlay hidden">
-      <div class="modal-card">
-        <h3 id="modalTitle">Confirm</h3>
-        <p id="modalMessage">Are you sure?</p>
-        <div class="modal-actions">
-          <button id="modalConfirmBtn" class="btn danger">Confirm</button>
-          <button id="modalCancelBtn" class="btn">Cancel</button>
+            <div class="panel fills-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-exchange-alt"></i> Recent Fills</span>
+                    <span id="fill-count" class="stat-small">0</span>
+                </div>
+                <div class="fills-table-container">
+                    <table class="fills-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Size</th>
+                                <th>Type</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fills-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Bottom: Stats & Config -->
+            <div class="panel stats-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-info-circle"></i> Session Stats</span>
+                </div>
+                <div class="stats-grid">
+                    <div class="stat"><span class="stat-label">Volume</span><span id="stat-volume" class="stat-value">$0</span></div>
+                    <div class="stat"><span class="stat-label">Fills</span><span id="stat-fills" class="stat-value">0</span></div>
+                    <div class="stat"><span class="stat-label">Quotes</span><span id="stat-quotes" class="stat-value">0</span></div>
+                    <div class="stat"><span class="stat-label">Requotes</span><span id="stat-requotes" class="stat-value">0</span></div>
+                    <div class="stat"><span class="stat-label">Avg Spread</span><span id="stat-spread" class="stat-value">— bps</span></div>
+                    <div class="stat"><span class="stat-label">Volatility</span><span id="stat-vol" class="stat-value">—</span></div>
+                    <div class="stat"><span class="stat-label">Heartbeat</span><span id="stat-heartbeat" class="stat-value">—</span></div>
+                    <div class="stat"><span class="stat-label">Rebate Est.</span><span id="stat-rebate" class="stat-value">$0</span></div>
+                </div>
+            </div>
+
+            <div class="panel config-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-cog"></i> MM Config</span>
+                    <button class="btn btn-sm" onclick="saveConfig()">Apply</button>
+                </div>
+                <div class="config-grid">
+                    <label>Half Spread (bps) <input type="number" id="cfg-spread" value="150" step="10"></label>
+                    <label>Order Size ($) <input type="number" id="cfg-size" value="10" step="1"></label>
+                    <label>Max Inventory <input type="number" id="cfg-max-inv" value="50" step="5"></label>
+                    <label>Skew (bps/unit) <input type="number" id="cfg-skew" value="5" step="1"></label>
+                    <label>Requote (sec) <input type="number" id="cfg-requote" value="2" step="0.5"></label>
+                    <label>Max Drawdown ($) <input type="number" id="cfg-drawdown" value="50" step="5"></label>
+                </div>
+            </div>
         </div>
-      </div>
+
+        <!-- Market Info Bar -->
+        <footer class="market-bar">
+            <span id="market-info">No market selected</span>
+            <span id="market-strike">Strike: —</span>
+            <span id="market-time">Time: —</span>
+            <span id="risk-status" class="risk-ok"><i class="fas fa-shield-alt"></i> OK</span>
+        </footer>
     </div>
 
     <script src="/static/app.js"></script>
-  </body>
+</body>
 </html>
