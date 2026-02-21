@@ -10,3 +10,9 @@ node_modules/
 *.egg-info/
 dist/
 build/
+data/
+workspace/
+backtest/report.html
+backtest/report.json
+backtest/sweep_results*.json
+.venv/
