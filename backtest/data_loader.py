@@ -144,6 +144,74 @@ class DataLoader:
         log.info(f"Generated {n_ticks} synthetic ticks")
         return df
 
+    def generate_pm_synthetic(self, n_ticks: int = 10000,
+                              start_fv: float = 0.50,
+                              volatility: float = 0.01,
+                              spread_bps: float = 200,
+                              trade_size_mean: float = 15.0,
+                              seed: int = 42) -> "pd.DataFrame":
+        """Generate synthetic PM-like tick data in [0.01, 0.99] price space.
+
+        This simulates a Polymarket binary option token where:
+        - mid_price fluctuates around fair value (0.01-0.99)
+        - Trades cross the spread (aggressive orders)
+        - Trade sizes are in shares (typical PM range)
+
+        Args:
+            n_ticks: Number of ticks to generate
+            start_fv: Starting fair value (0.01-0.99)
+            volatility: Per-tick vol of the token price (e.g. 0.01 = 1%)
+            spread_bps: Market spread in bps (200 = 2 cents)
+            trade_size_mean: Mean trade size in shares
+            seed: Random seed
+
+        Returns DataFrame with: timestamp, mid_price, best_bid, best_ask,
+        trade_price, trade_size, is_buy
+        """
+        if np is None or pd is None:
+            raise ImportError("numpy and pandas required")
+
+        rng = np.random.RandomState(seed)
+
+        # Generate price path with mean-reversion around start_fv
+        prices = [start_fv]
+        for _ in range(n_ticks - 1):
+            # Mean-reverting random walk (Ornstein-Uhlenbeck-like)
+            reversion = 0.01 * (start_fv - prices[-1])  # Pull toward start
+            noise = rng.normal(0, volatility)
+            new_price = prices[-1] + reversion + noise
+            new_price = max(0.02, min(0.98, new_price))  # Keep in valid range
+            prices.append(new_price)
+
+        prices = np.array(prices)
+        half_spread = spread_bps / 10000.0 / 2  # Convert bps to price
+
+        bids = np.maximum(0.01, prices - half_spread)
+        asks = np.minimum(0.99, prices + half_spread)
+
+        # Trades: aggressive orders cross the spread
+        is_buy = rng.random(n_ticks) > 0.5
+        # Buy = taker hits the ask, Sell = taker hits the bid
+        trade_prices = np.where(is_buy, asks, bids)
+        trade_sizes = rng.exponential(trade_size_mean, n_ticks)
+
+        now = time.time()
+        timestamps = [now - (n_ticks - i) * 60 for i in range(n_ticks)]
+
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "mid_price": prices,
+            "best_bid": bids,
+            "best_ask": asks,
+            "trade_price": trade_prices,
+            "trade_size": trade_sizes,
+            "is_buy": is_buy,
+        })
+
+        log.info(f"Generated {n_ticks} PM-like ticks (FV={start_fv}, "
+                 f"spread={spread_bps}bps, range=[{prices.min():.3f}, {prices.max():.3f}])")
+        return df
+
     def align_data(self, pm_df: "pd.DataFrame",
                    binance_df: "pd.DataFrame") -> "pd.DataFrame":
         """Align Polymarket and Binance data by timestamp.
