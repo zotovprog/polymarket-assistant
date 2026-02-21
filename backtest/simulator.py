@@ -207,37 +207,41 @@ class MMSimulator:
             if ts_norm > 0:
                 # Buy trade crosses our ask (we SELL to them)
                 if is_buy and tp_norm >= ask.price and ask.price > 0:
-                    # Enforce inventory limit — don't sell if already too short
-                    if inventory.up_shares > -max_inv_limit:
-                        fill_size = min(ts_norm, ask.size)
-                        fill = Fill(
-                            ts=float(row.get("timestamp", 0)),
-                            side="SELL", token_id="backtest",
-                            price=ask.price, size=fill_size,
-                            fee=0.0, is_maker=True,
-                        )
-                        fills.append(fill)
-                        inventory.up_shares -= fill_size
-                        running_pnl += fill.notional  # Received USDC
-                        result.fill_count += 1
-                        result.total_volume += fill.notional
+                    # Enforce inventory limit — don't sell beyond max short
+                    max_sell = inventory.up_shares + max_inv_limit  # room to go short
+                    if max_sell > 0:
+                        fill_size = min(ts_norm, ask.size, max_sell)
+                        if fill_size > 0:
+                            fill = Fill(
+                                ts=float(row.get("timestamp", 0)),
+                                side="SELL", token_id="backtest",
+                                price=ask.price, size=fill_size,
+                                fee=0.0, is_maker=True,
+                            )
+                            fills.append(fill)
+                            inventory.up_shares -= fill_size
+                            running_pnl += fill.notional  # Received USDC
+                            result.fill_count += 1
+                            result.total_volume += fill.notional
 
                 # Sell trade crosses our bid (we BUY from them)
                 elif not is_buy and tp_norm <= bid.price and bid.price > 0:
-                    # Enforce inventory limit — don't buy if already too long
-                    if inventory.up_shares < max_inv_limit:
-                        fill_size = min(ts_norm, bid.size)
-                        fill = Fill(
-                            ts=float(row.get("timestamp", 0)),
-                            side="BUY", token_id="backtest",
-                            price=bid.price, size=fill_size,
-                            fee=0.0, is_maker=True,
-                        )
-                        fills.append(fill)
-                        inventory.up_shares += fill_size
-                        running_pnl -= fill.notional  # Spent USDC
-                        result.fill_count += 1
-                        result.total_volume += fill.notional
+                    # Enforce inventory limit — don't buy beyond max long
+                    max_buy = max_inv_limit - inventory.up_shares  # room to go long
+                    if max_buy > 0:
+                        fill_size = min(ts_norm, bid.size, max_buy)
+                        if fill_size > 0:
+                            fill = Fill(
+                                ts=float(row.get("timestamp", 0)),
+                                side="BUY", token_id="backtest",
+                                price=bid.price, size=fill_size,
+                                fee=0.0, is_maker=True,
+                            )
+                            fills.append(fill)
+                            inventory.up_shares += fill_size
+                            running_pnl -= fill.notional  # Spent USDC
+                            result.fill_count += 1
+                            result.total_volume += fill.notional
 
             # Mark-to-market: inventory value at current fair value
             unrealized = inventory.up_shares * fv

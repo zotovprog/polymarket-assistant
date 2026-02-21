@@ -248,7 +248,7 @@ class MMRuntime:
             )
             if tokens:
                 t3 = asyncio.create_task(
-                    feeds.pm_ws_feed(self.feed_state, tokens))
+                    feeds.pm_feed(self.feed_state))
                 self._feed_tasks.append(t3)
 
                 # Create market info from tokens
@@ -367,10 +367,15 @@ class MMRuntime:
     def _on_fill_telegram(self, fill, token_type: str) -> None:
         """Send fill notification via Telegram."""
         try:
-            asyncio.create_task(_telegram.send_message(
-                f"🔄 MM Fill: {fill.side} {fill.size:.1f} {token_type.upper()} "
-                f"@{fill.price:.2f} (fee={fill.fee:.4f})"
-            ))
+            _telegram.notify_fill(
+                coin=self._coin or "UNKNOWN",
+                timeframe=self._timeframe or "UNKNOWN",
+                side=fill.side,
+                price=fill.price,
+                size=fill.size,
+                fee=fill.fee,
+                is_maker=fill.is_maker,
+            )
         except Exception:
             pass
 
