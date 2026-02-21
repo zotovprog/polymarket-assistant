@@ -29,6 +29,7 @@ class OrderManager:
         """
         self.client = clob_client
         self.config = config
+        self._log = log
         self._active_orders: dict[str, Quote] = {}  # order_id -> Quote
         self._pending_cancels: set[str] = set()
 
@@ -39,6 +40,28 @@ class OrderManager:
     @property
     def active_orders(self) -> dict[str, Quote]:
         return dict(self._active_orders)
+
+    async def _retry(self, coro_func, *args, max_retries: int = 3,
+                     base_delay: float = 0.5, **kwargs):
+        """Execute async function with exponential backoff retry."""
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                return await asyncio.wait_for(
+                    coro_func(*args, **kwargs),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                last_exc = TimeoutError(f"Timeout after 10s on attempt {attempt + 1}")
+                self._log.warning(f"Timeout on attempt {attempt + 1}/{max_retries}")
+            except Exception as e:
+                last_exc = e
+                self._log.warning(f"Error on attempt {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                await asyncio.sleep(delay)
+        self._log.error(f"All {max_retries} retries failed: {last_exc}")
+        return None
 
     async def place_order(self, quote: Quote) -> Optional[str]:
         """Place a single post-only order.
@@ -64,10 +87,13 @@ class OrderManager:
             )
 
             # Post with post_only flag
-            resp = await asyncio.to_thread(
-                self.client.post_order,
-                signed_order,
-                "GTC" if not self.config.use_gtd else "GTD",
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.post_order,
+                    signed_order,
+                    "GTC" if not self.config.use_gtd else "GTD",
+                ),
+                timeout=10.0,
             )
 
             order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
@@ -99,7 +125,10 @@ class OrderManager:
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order."""
         try:
-            await asyncio.to_thread(self.client.cancel, order_id)
+            await asyncio.wait_for(
+                asyncio.to_thread(self.client.cancel, order_id),
+                timeout=10.0,
+            )
             self._active_orders.pop(order_id, None)
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
@@ -152,9 +181,13 @@ class OrderManager:
 
         for order_id, quote in self._active_orders.items():
             try:
-                order = await asyncio.to_thread(
-                    self.client.get_order, order_id
+                order = await self._retry(
+                    asyncio.to_thread,
+                    self.client.get_order,
+                    order_id,
                 )
+                if order is None:
+                    continue
                 status = order.get("status", "")
                 size_matched = float(order.get("size_matched", 0))
 

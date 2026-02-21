@@ -45,6 +45,7 @@ class MarketMaker:
         """
         self.feed_state = feed_state
         self.config = config
+        self._log = log
 
         # Sub-engines
         self.fair_value = FairValueEngine()
@@ -142,7 +143,10 @@ class MarketMaker:
         try:
             while self._running:
                 try:
-                    await self._tick()
+                    try:
+                        await asyncio.wait_for(self._tick(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        self._log.warning("_tick() timed out after 5s, skipping iteration")
                 except asyncio.CancelledError:
                     break
                 except Exception as e:

@@ -6,6 +6,9 @@ services:
       - PM_WEB_ACCESS_KEY=${PM_WEB_ACCESS_KEY:?set PM_WEB_ACCESS_KEY}
       - PM_PRIVATE_KEY=${PM_PRIVATE_KEY:-}
       - PM_FUNDER=${PM_FUNDER:-}
+      - PM_API_KEY=${PM_API_KEY:-}
+      - PM_API_SECRET=${PM_API_SECRET:-}
+      - PM_API_PASSPHRASE=${PM_API_PASSPHRASE:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_THREAD_ID=${TELEGRAM_THREAD_ID:-}
@@ -13,3 +16,9 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
