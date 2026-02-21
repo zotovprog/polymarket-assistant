@@ -236,8 +236,8 @@ class MMRuntime:
         symbol = config.COIN_BINANCE[coin]
         kline_interval = config.TF_KLINE[timeframe]
 
-        t1 = asyncio.create_task(feeds.ob_poller(self.feed_state, symbol))
-        t2 = asyncio.create_task(feeds.binance_feed(self.feed_state, symbol, kline_interval))
+        t1 = asyncio.create_task(feeds.ob_poller(symbol, self.feed_state))
+        t2 = asyncio.create_task(feeds.binance_feed(symbol, kline_interval, self.feed_state))
         self._feed_tasks = [t1, t2]
 
         # Start PM price feeds
@@ -246,14 +246,22 @@ class MMRuntime:
                 asyncio.to_thread(feeds.fetch_pm_tokens, coin, timeframe),
                 timeout=15.0,
             )
-            if tokens:
+            if tokens and tokens[0] and tokens[1]:
+                up_id, dn_id = tokens
+                # Set token IDs on feed state so pm_feed can subscribe
+                self.feed_state.pm_up_id = up_id
+                self.feed_state.pm_dn_id = dn_id
+                log.info(f"PM tokens: UP={up_id[:20]}... DN={dn_id[:20]}...")
+
                 t3 = asyncio.create_task(
                     feeds.pm_feed(self.feed_state))
                 self._feed_tasks.append(t3)
 
-                # Create market info from tokens
-                market = self._build_market_info(coin, timeframe, tokens)
+                # Build market info from token IDs
+                market = self._build_market_info_from_tokens(
+                    coin, timeframe, up_id, dn_id)
             else:
+                log.warning("PM tokens not found, using placeholder")
                 market = self._build_placeholder_market(coin, timeframe)
         except Exception as e:
             log.warning(f"PM token fetch failed: {e}")
@@ -349,6 +357,22 @@ class MMRuntime:
             strike=strike,
             window_start=now,
             window_end=window_end,
+        )
+
+    def _build_market_info_from_tokens(self, coin: str, timeframe: str,
+                                       up_id: str, dn_id: str) -> MarketInfo:
+        """Build MarketInfo from fetched PM token ID tuple."""
+        now = time.time()
+        tf_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "daily": 1440}
+        window_duration = tf_minutes.get(timeframe, 60) * 60
+        return MarketInfo(
+            coin=coin,
+            timeframe=timeframe,
+            up_token_id=up_id,
+            dn_token_id=dn_id,
+            strike=0.0,
+            window_start=now,
+            window_end=now + window_duration,
         )
 
     def _build_placeholder_market(self, coin: str, timeframe: str) -> MarketInfo:
