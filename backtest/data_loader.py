@@ -212,6 +212,172 @@ class DataLoader:
                  f"spread={spread_bps}bps, range=[{prices.min():.3f}, {prices.max():.3f}])")
         return df
 
+    def load_real_polymarket(self, path: str, market_id: str,
+                             max_rows: int = 0) -> "pd.DataFrame":
+        """Load real Polymarket trades from AiYa1729 Parquet dataset.
+
+        Uses pyarrow predicate pushdown for efficient filtering of the 3.8GB file.
+
+        Args:
+            path: Path to the parquet file
+            market_id: Full market address string (e.g., '0x9a5b16b2...')
+            max_rows: Limit number of rows (0 = no limit)
+
+        Returns:
+            DataFrame with columns: timestamp, mid_price, trade_price, trade_size,
+            is_buy, best_bid, best_ask, and _maker_pnl, _total_maker_pnl, _end_price
+            for validation.
+        """
+        if pd is None:
+            raise ImportError("pandas is required: pip install pandas pyarrow")
+
+        import pyarrow.parquet as pq
+
+        # Columns to load (column pruning for memory efficiency)
+        columns = [
+            "timeStamp", "price", "fill_price", "volume",
+            "taker_side", "maker_price", "taker_price",
+            "maker_pnl", "taker_pnl", "total_maker_pnl",
+            "tx_value", "end_price", "market"
+        ]
+
+        # Predicate pushdown: only read rows matching market_id
+        filters = [("market", "=", market_id)]
+        log.info(f"Loading market {market_id[:24]}... from {path}")
+
+        table = pq.read_table(path, columns=columns, filters=filters)
+        df = table.to_pandas()
+        log.info(f"Read {len(df)} rows for market {market_id[:24]}...")
+
+        if len(df) == 0:
+            raise ValueError(f"No data found for market_id={market_id}")
+
+        # Sort by timestamp
+        df = df.sort_values("timeStamp").reset_index(drop=True)
+
+        # Map columns to simulator schema
+        # Convert timestamps to unix float (simulator expects float or numeric)
+        ts_unix = df["timeStamp"].astype("int64") / 1e9  # nanoseconds to seconds
+        result = pd.DataFrame({
+            "timestamp": ts_unix.values,
+            "mid_price": df["price"].values,
+            "trade_price": df["fill_price"].values,
+            "trade_size": df["volume"].values,
+            "is_buy": (df["taker_side"] == 1).values,
+        })
+
+        # Estimate best_bid / best_ask from maker_price by side
+        # When taker_side=1 (buy), the maker was offering the ask
+        # When taker_side=0 (sell), the maker was offering the bid
+        last_bid = df["maker_price"].where(df["taker_side"] == 0).ffill()
+        last_ask = df["maker_price"].where(df["taker_side"] == 1).ffill()
+        result["best_bid"] = last_bid.fillna(df["price"] - 0.01).values
+        result["best_ask"] = last_ask.fillna(df["price"] + 0.01).values
+
+        # Fix outlier fill_prices: replace values outside [0.001, 0.999] with mid_price
+        mask = (result["trade_price"] < 0.001) | (result["trade_price"] > 0.999)
+        outlier_count = mask.sum()
+        if outlier_count > 0:
+            result.loc[mask, "trade_price"] = result.loc[mask, "mid_price"]
+            log.info(f"Fixed {outlier_count} outlier fill_price values ({outlier_count/len(result)*100:.2f}%)")
+
+        # Preserve validation columns
+        result["_maker_pnl"] = df["maker_pnl"].values
+        result["_total_maker_pnl"] = df["total_maker_pnl"].values
+        result["_end_price"] = df["end_price"].values
+        result["_tx_value"] = df["tx_value"].values
+        result["_market"] = df["market"].values
+
+        # Drop rows with NaN in critical columns
+        before = len(result)
+        result = result.dropna(subset=["mid_price", "trade_price", "trade_size"])
+        after = len(result)
+        if before != after:
+            log.info(f"Dropped {before - after} rows with NaN values")
+
+        # Apply row limit
+        if max_rows > 0:
+            result = result.head(max_rows).reset_index(drop=True)
+            log.info(f"Limited to {max_rows} rows")
+
+        log.info(f"Loaded {len(result)} real PM ticks, "
+                 f"price range [{result['mid_price'].min():.4f}, {result['mid_price'].max():.4f}], "
+                 f"time span: {result['timestamp'].iloc[0]} to {result['timestamp'].iloc[-1]}")
+
+        return result
+
+    @staticmethod
+    def list_markets(path: str, top_n: int = 20) -> "pd.DataFrame":
+        """List top markets by trade count from parquet file.
+
+        Uses pyarrow compute for efficient aggregation without loading full dataset.
+
+        Args:
+            path: Path to the parquet file
+            top_n: Number of top markets to return
+
+        Returns:
+            DataFrame with columns: market_id, trade_count
+        """
+        if pd is None:
+            raise ImportError("pandas is required")
+
+        import pyarrow.parquet as pq
+        import pyarrow.compute as pc
+
+        log.info(f"Scanning markets in {path}...")
+        table = pq.read_table(path, columns=["market"])
+        vc = pc.value_counts(table.column("market"))
+
+        records = []
+        for entry in vc:
+            py = entry.as_py()
+            records.append((py["values"], py["counts"]))
+
+        records.sort(key=lambda x: x[1], reverse=True)
+
+        df = pd.DataFrame(records[:top_n], columns=["market_id", "trade_count"])
+        log.info(f"Found {len(records)} unique markets, showing top {top_n}")
+        return df
+
+    def market_summary(self, path: str, market_id: str) -> dict:
+        """Get summary statistics for a specific market.
+
+        Args:
+            path: Path to the parquet file
+            market_id: Market address string
+
+        Returns:
+            Dict with market stats (trade_count, dates, prices, volume, etc.)
+        """
+        if pd is None:
+            raise ImportError("pandas is required")
+
+        import pyarrow.parquet as pq
+
+        cols = ["timeStamp", "price", "volume", "taker_side", "tx_value", "end_price"]
+        filters = [("market", "=", market_id)]
+        table = pq.read_table(path, columns=cols, filters=filters)
+        df = table.to_pandas()
+
+        if len(df) == 0:
+            return {"market_id": market_id, "trade_count": 0}
+
+        return {
+            "market_id": market_id,
+            "trade_count": len(df),
+            "time_start": str(df["timeStamp"].min()),
+            "time_end": str(df["timeStamp"].max()),
+            "duration_days": (df["timeStamp"].max() - df["timeStamp"].min()).days,
+            "price_min": float(df["price"].min()),
+            "price_max": float(df["price"].max()),
+            "price_mean": float(df["price"].mean()),
+            "total_volume_usd": float(df["tx_value"].sum()),
+            "avg_trade_size": float(df["volume"].mean()),
+            "buy_ratio": float((df["taker_side"] == 1).mean()),
+            "end_price": float(df["end_price"].iloc[-1]) if not df["end_price"].isna().all() else None,
+        }
+
     def align_data(self, pm_df: "pd.DataFrame",
                    binance_df: "pd.DataFrame") -> "pd.DataFrame":
         """Align Polymarket and Binance data by timestamp.
