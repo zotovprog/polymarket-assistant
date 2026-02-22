@@ -1,3 +1,9 @@
+import os
+
+# ── MongoDB ──────────────────────────────────────────────────────
+MONGO_URI = os.environ.get("MONGO_URI", "")   # mongodb://user:pass@host:27017/?authSource=admin
+MONGO_DB  = os.environ.get("MONGO_DB", "pm_bot")
+
 # ── Coins ───────────────────────────────────────────────────────
 COINS = ["BTC", "ETH", "SOL", "XRP"]
 

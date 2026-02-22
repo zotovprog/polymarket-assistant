@@ -133,6 +133,16 @@ class ConfigUpdateRequest(BaseModel):
     max_loss_per_fill_usd: Optional[float] = None
     take_profit_usd: Optional[float] = None
     trailing_stop_pct: Optional[float] = None
+    max_one_sided_ticks: Optional[int] = None
+    close_window_sec: Optional[float] = None
+    auto_next_window: Optional[bool] = None
+    resolution_wait_sec: Optional[float] = None
+    liq_price_floor_enabled: Optional[bool] = None
+    liq_gradual_chunks: Optional[int] = None
+    liq_chunk_interval_sec: Optional[float] = None
+    liq_taker_threshold_sec: Optional[float] = None
+    liq_max_discount_from_fv: Optional[float] = None
+    liq_abandon_below_floor: Optional[bool] = None
     enabled: Optional[bool] = None
 
 
@@ -226,13 +236,20 @@ class MockClobClient:
         order = self._orders.pop(order_id, None)
         if (order and order.get("status") == "LIVE"
                 and order.get("side") == "BUY"):
-            self._usdc_balance += float(order.get("collateral", 0.0))
+            # Refund only unfilled portion's collateral
+            filled = float(order.get("size_matched", 0))
+            unfilled = max(0.0, order["size"] - filled)
+            refund = unfilled * order["price"]
+            self._usdc_balance += refund
         return {"success": True}
 
     def cancel_all(self) -> dict:
         for order in self._orders.values():
             if order.get("status") == "LIVE" and order.get("side") == "BUY":
-                self._usdc_balance += float(order.get("collateral", 0.0))
+                filled = float(order.get("size_matched", 0))
+                unfilled = max(0.0, order["size"] - filled)
+                refund = unfilled * order["price"]
+                self._usdc_balance += refund
         self._orders.clear()
         return {"success": True}
 
@@ -404,6 +421,8 @@ class MMRuntime:
         self._paper_mode: bool = True
         self._initial_usdc: float = 1000.0
         self._next_window_at: float = 0.0  # timestamp when next window starts
+        self._mongo = None  # MongoLogger (if MONGO_URI set)
+        self._mongo_log_handler = None  # MongoLogHandler (if active)
 
     @property
     def is_running(self) -> bool:
@@ -516,11 +535,11 @@ class MMRuntime:
                 timeout=15.0,
             )
             if tokens and tokens[0] and tokens[1]:
-                up_id, dn_id = tokens
+                up_id, dn_id, cond_id = tokens
                 # Set token IDs on feed state so pm_feed can subscribe
                 self.feed_state.pm_up_id = up_id
                 self.feed_state.pm_dn_id = dn_id
-                log.info(f"PM tokens: UP={up_id[:20]}... DN={dn_id[:20]}...")
+                log.info(f"PM tokens: UP={up_id[:20]}... DN={dn_id[:20]}... cond={cond_id[:20]}..." if cond_id else f"PM tokens: UP={up_id[:20]}... DN={dn_id[:20]}...")
 
                 t3 = asyncio.create_task(
                     feeds.pm_feed(self.feed_state))
@@ -528,7 +547,7 @@ class MMRuntime:
 
                 # Build market info from token IDs
                 market = self._build_market_info_from_tokens(
-                    coin, timeframe, up_id, dn_id)
+                    coin, timeframe, up_id, dn_id, condition_id=cond_id)
             else:
                 log.warning("PM tokens not found, using placeholder")
                 market = self._build_placeholder_market(coin, timeframe)
@@ -557,12 +576,36 @@ class MMRuntime:
             self.mm.inventory.usdc = initial_usdc
         self.mm.set_market(market)
 
+        # Set private key for live merge operations
+        if not paper_mode and PM_PRIVATE_KEY:
+            self.mm._private_key = PM_PRIVATE_KEY
+
         # Register fill callback for telegram
         if _telegram.enabled:
             self.mm.on_fill(self._on_fill_telegram)
 
         await self.mm.start()
         self._running = True
+
+        # MongoDB logger (fills, snapshots, Python logs)
+        if config.MONGO_URI:
+            try:
+                from mm.mongo_logger import MongoLogger, MongoLogHandler
+                self._mongo = MongoLogger(config.MONGO_URI, config.MONGO_DB)
+                await self._mongo.start()
+                # Fill callback
+                self.mm.on_fill(lambda fill, tt: self._mongo.log_fill(
+                    fill, tt, self._fill_context()))
+                # Snapshot callback
+                self.mm.on_snapshot(self._mongo.log_snapshot)
+                # Python log handler
+                self._mongo_log_handler = MongoLogHandler(self._mongo)
+                self._mongo_log_handler.setLevel(logging.INFO)
+                logging.getLogger().addHandler(self._mongo_log_handler)
+                log.info("MongoLogger attached")
+            except Exception as e:
+                log.warning(f"MongoLogger init failed (continuing without): {e}")
+                self._mongo = None
 
         # Monitor for window expiry and handle auto-next-window
         asyncio.create_task(self._monitor_window_expiry())
@@ -612,7 +655,7 @@ class MMRuntime:
                                 timeout=15.0,
                             )
                             if tokens and tokens[0] and tokens[1]:
-                                up_id, dn_id = tokens
+                                up_id, dn_id, _cond_id = tokens
                                 strike, _ws, _we = await asyncio.wait_for(
                                     asyncio.to_thread(feeds.fetch_pm_strike, self._coin, self._timeframe),
                                     timeout=15.0,
@@ -689,6 +732,17 @@ class MMRuntime:
             t.cancel()
         self._feed_tasks.clear()
 
+        # Tear down MongoLogger
+        if self._mongo_log_handler:
+            logging.getLogger().removeHandler(self._mongo_log_handler)
+            self._mongo_log_handler = None
+        if self._mongo:
+            try:
+                await self._mongo.stop()
+            except Exception:
+                pass
+            self._mongo = None
+
         self._running = False
         log.info("MM stopped")
         return snap
@@ -757,7 +811,8 @@ class MMRuntime:
         )
 
     def _build_market_info_from_tokens(self, coin: str, timeframe: str,
-                                       up_id: str, dn_id: str) -> MarketInfo:
+                                       up_id: str, dn_id: str,
+                                       condition_id: str = "") -> MarketInfo:
         """Build MarketInfo from fetched PM token ID tuple.
 
         Fetches the actual strike price from Binance candle open
@@ -786,6 +841,7 @@ class MMRuntime:
             strike=strike,
             window_start=window_start,
             window_end=window_end,
+            condition_id=condition_id,
         )
 
     def _build_placeholder_market(self, coin: str, timeframe: str) -> MarketInfo:
@@ -815,6 +871,24 @@ class MMRuntime:
             )
         except Exception:
             pass
+
+    def _fill_context(self) -> dict:
+        """Build context dict for MongoLogger fill records."""
+        mm = self.mm
+        if not mm:
+            return {}
+        snap = mm.snapshot()
+        return {
+            "market": snap.get("market"),
+            "inventory": snap.get("inventory"),
+            "fair_value": snap.get("fair_value"),
+            "pnl": {
+                "realized": snap.get("realized_pnl", 0),
+                "unrealized": snap.get("unrealized_pnl", 0),
+                "total": snap.get("total_pnl", 0),
+            },
+            "paper_mode": self._paper_mode,
+        }
 
 
 # ── Singleton runtime ───────────────────────────────────────────

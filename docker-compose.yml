@@ -13,6 +13,8 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TELEGRAM_THREAD_ID=${TELEGRAM_THREAD_ID:-}
       - TELEGRAM_BOT_USERNAME=${TELEGRAM_BOT_USERNAME:-}
+      - MONGO_URI=${MONGO_URI:-}
+      - MONGO_DB=${MONGO_DB:-pm_bot}
     ports:
       - "8000:8000"
     restart: unless-stopped

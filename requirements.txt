@@ -11,6 +11,9 @@ aiohttp>=3.9
 # Polymarket CLOB
 py-clob-client>=0.1.0
 
+# MongoDB (async)
+motor>=3.0
+
 # Backtesting & Data
 pandas>=2.2
 pyarrow>=17.0

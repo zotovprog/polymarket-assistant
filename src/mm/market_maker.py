@@ -74,6 +74,7 @@ class MarketMaker:
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
         self._one_sided_counter: int = 0
+        self._private_key: str = ""
 
         # Current quotes (for dashboard)
         self._current_quotes: dict[str, tuple[Optional[Quote], Optional[Quote]]] = {
@@ -90,6 +91,7 @@ class MarketMaker:
         # Callbacks
         self._on_fill_callbacks: list = []
         self._on_state_change_callbacks: list = []
+        self._on_snapshot_callbacks: list = []
 
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
@@ -102,6 +104,10 @@ class MarketMaker:
     def on_fill(self, callback) -> None:
         """Register callback for fill events: callback(fill, token_type)."""
         self._on_fill_callbacks.append(callback)
+
+    def on_snapshot(self, callback) -> None:
+        """Register callback for periodic snapshots: callback(state_dict)."""
+        self._on_snapshot_callbacks.append(callback)
 
     async def start(self) -> None:
         """Start the market maker."""
@@ -124,6 +130,10 @@ class MarketMaker:
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
         self._one_sided_counter = 0
+
+        # Set budget cap on order manager (enforced at placement time)
+        self.order_mgr._session_budget = self.inventory.initial_usdc
+        self.order_mgr._session_spent = 0.0
 
         # Start heartbeat
         self.heartbeat.start()
@@ -197,6 +207,18 @@ class MarketMaker:
         if not self.market:
             return
         self._tick_count += 1
+
+        # ── Periodic snapshot (every 10 ticks ≈ 20s) ────────────
+        if self._on_snapshot_callbacks and self._tick_count % 10 == 0:
+            try:
+                snap = self.snapshot()
+                for cb in self._on_snapshot_callbacks:
+                    try:
+                        cb(snap)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
         # ── End-of-window management ─────────────────────────────
         time_left = self.market.time_remaining
@@ -392,12 +414,18 @@ class MarketMaker:
                 log.debug(f"Quality check error: {e}")
 
         # 6. Generate quotes (with USDC budget cap)
+        order_collateral = sum(
+            self.order_mgr.required_collateral(q)
+            for q in self.order_mgr.active_orders.values()
+            if q.side == "BUY"
+        )
         all_quotes = self.quote_engine.generate_all_quotes(
             fv_up, fv_dn,
             self.market.up_token_id, self.market.dn_token_id,
             self.inventory,
             vol, self.risk_mgr.avg_volatility,
             usdc_budget=self.inventory.initial_usdc,
+            order_collateral=order_collateral,
         )
 
         self._quote_count += 1
@@ -502,8 +530,10 @@ class MarketMaker:
         )
 
     async def _liquidate_inventory(self) -> None:
-        """Smart 3-phase liquidation with price floor and gradual exit.
+        """Smart liquidation with merge + 3-phase SELL exit.
 
+        Phase 0 (Merge): Merge YES+NO pairs → $1 USDC via CTF contract.
+            - Instant, no slippage, only gas cost.
         Phase 1 (Gradual Limit): time_left > taker_threshold
             - Sell in chunks (position / remaining_chunks)
             - Price = max(floor, FV - discount), improved to best_bid if higher
@@ -515,6 +545,36 @@ class MarketMaker:
         """
         if not self.market:
             return
+
+        # ── Phase 0: Merge YES+NO pairs → USDC ──────────────────
+        up_bal = await self.order_mgr.get_token_balance(self.market.up_token_id)
+        dn_bal = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+        merge_amount = min(up_bal, dn_bal)
+
+        if merge_amount >= 1.0 and self.market.condition_id:
+            try:
+                result = await self.order_mgr.merge_positions(
+                    self.market.condition_id, merge_amount, self._private_key)
+            except Exception as e:
+                log.warning("Merge exception: %s", e)
+                result = {"success": False, "error": str(e)}
+            if result.get("success"):
+                log.info(
+                    "MERGE: %.2f pairs → $%.2f USDC",
+                    merge_amount, merge_amount,
+                )
+                self.inventory.up_shares = max(0.0, self.inventory.up_shares - merge_amount)
+                self.inventory.dn_shares = max(0.0, self.inventory.dn_shares - merge_amount)
+                self.inventory.usdc += merge_amount
+                self.inventory.up_cost.record_sell(merge_amount)
+                self.inventory.dn_cost.record_sell(merge_amount)
+                # Sync mock token balances for paper mode
+                if hasattr(self.order_mgr.client, "_orders"):
+                    for tid in [self.market.up_token_id, self.market.dn_token_id]:
+                        cur = self.order_mgr._mock_token_balances.get(tid, 0.0)
+                        self.order_mgr._mock_token_balances[tid] = max(0.0, cur - merge_amount)
+            else:
+                log.warning("Merge failed: %s", result.get("error", "unknown"))
 
         time_left = self.market.time_remaining
         cfg = self.config
