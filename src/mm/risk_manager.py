@@ -1,8 +1,20 @@
 """Risk Manager — inventory limits, PnL tracking, pause conditions."""
 from __future__ import annotations
 import time
+from dataclasses import dataclass
 from .types import Inventory, Fill, MMState
 from .mm_config import MMConfig
+
+
+@dataclass
+class LiquidationLock:
+    """Snapshot of prices at the moment liquidation is triggered."""
+    triggered_at: float = 0.0
+    trigger_pnl: float = 0.0
+    up_avg_entry: float = 0.5
+    dn_avg_entry: float = 0.5
+    min_sell_price_up: float = 0.01
+    min_sell_price_dn: float = 0.01
 
 
 class RiskManager:
@@ -14,6 +26,7 @@ class RiskManager:
         self._session_start: float = time.time()
         self._vol_history: list[float] = []  # recent vol readings
         self._peak_pnl: float = 0.0
+        self._liquidation_lock: LiquidationLock | None = None
 
     def record_fill(self, fill: Fill) -> None:
         """Record a fill for PnL tracking."""
@@ -136,9 +149,29 @@ class RiskManager:
     def fills(self) -> list[Fill]:
         return self._fills
 
+    def lock_pnl(self, inventory: Inventory, fv_up: float, fv_dn: float,
+                 margin: float = 0.01) -> LiquidationLock:
+        """Snapshot prices at liquidation trigger time."""
+        pnl = self.compute_pnl(inventory, fv_up, fv_dn)
+        lock = LiquidationLock(
+            triggered_at=time.time(),
+            trigger_pnl=pnl["total_pnl"],
+            up_avg_entry=inventory.up_cost.avg_entry_price,
+            dn_avg_entry=inventory.dn_cost.avg_entry_price,
+            min_sell_price_up=max(0.01, inventory.up_cost.avg_entry_price + margin),
+            min_sell_price_dn=max(0.01, inventory.dn_cost.avg_entry_price + margin),
+        )
+        self._liquidation_lock = lock
+        return lock
+
+    @property
+    def liquidation_lock(self) -> LiquidationLock | None:
+        return self._liquidation_lock
+
     def reset(self) -> None:
         """Reset for new session."""
         self._fills.clear()
         self._vol_history.clear()
         self._peak_pnl = 0.0
+        self._liquidation_lock = None
         self._session_start = time.time()

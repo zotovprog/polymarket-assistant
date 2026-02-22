@@ -6,6 +6,36 @@ import time
 
 
 @dataclass
+class CostBasis:
+    """Track average entry price for a token position."""
+    total_cost: float = 0.0
+    total_shares: float = 0.0
+
+    @property
+    def avg_entry_price(self) -> float:
+        if self.total_shares <= 0:
+            return 0.5
+        return self.total_cost / self.total_shares
+
+    def record_buy(self, price: float, size: float, fee: float) -> None:
+        self.total_cost += price * size + fee
+        self.total_shares += size
+
+    def record_sell(self, size: float) -> None:
+        if self.total_shares <= 0:
+            self.total_cost = 0.0
+            self.total_shares = 0.0
+            return
+        fraction = min(size / self.total_shares, 1.0)
+        self.total_cost *= (1.0 - fraction)
+        self.total_shares = max(0.0, self.total_shares - size)
+
+    def reset(self) -> None:
+        self.total_cost = 0.0
+        self.total_shares = 0.0
+
+
+@dataclass
 class Quote:
     """A single quote (bid or ask) to be placed on Polymarket CLOB."""
     side: str              # "BUY" or "SELL"
@@ -44,6 +74,8 @@ class Inventory:
     dn_shares: float = 0.0
     usdc: float = 0.0
     initial_usdc: float = 0.0  # Starting balance for PnL calc
+    up_cost: CostBasis = field(default_factory=CostBasis)
+    dn_cost: CostBasis = field(default_factory=CostBasis)
 
     @property
     def net_delta(self) -> float:
@@ -59,23 +91,29 @@ class Inventory:
         """Update inventory after a fill.
         token_type: 'up' or 'dn'
         """
+        cost = self.up_cost if token_type == "up" else self.dn_cost
         if fill.side == "BUY":
             if token_type == "up":
                 self.up_shares += fill.size
             else:
                 self.dn_shares += fill.size
             self.usdc -= fill.notional + fill.fee
+            cost.record_buy(fill.price, fill.size, fill.fee)
         else:  # SELL
             if token_type == "up":
                 self.up_shares -= fill.size
             else:
                 self.dn_shares -= fill.size
             self.usdc += fill.notional - fill.fee
+            cost.record_sell(fill.size)
 
-    def reconcile(self, real_up: float, real_dn: float) -> None:
-        """Update shares to match actual PM balance."""
+    def reconcile(self, real_up: float, real_dn: float,
+                  real_usdc: float | None = None) -> None:
+        """Update shares (and optionally USDC) to match actual PM balance."""
         self.up_shares = real_up
         self.dn_shares = real_dn
+        if real_usdc is not None:
+            self.usdc = real_usdc
 
 
 @dataclass

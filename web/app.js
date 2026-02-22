@@ -217,6 +217,22 @@ function updateUI(s) {
         setText('inv-delta', s.inventory.net_delta);
         setText('inv-usdc', '$' + (s.inventory.usdc || 0).toFixed(2));
         updateInventoryBar(s.inventory);
+        // Avg entry prices
+        setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '—');
+        setText('inv-dn-avg', s.inventory.dn_avg_entry != null ? s.inventory.dn_avg_entry.toFixed(4) : '—');
+    }
+
+    // Liquidation lock
+    const lockInfo = document.getElementById('liq-lock-info');
+    if (lockInfo && s.liquidation_lock) {
+        if (s.liquidation_lock.active) {
+            lockInfo.classList.remove('hidden');
+            setText('liq-up-floor', s.liquidation_lock.up_floor.toFixed(2));
+            setText('liq-dn-floor', s.liquidation_lock.dn_floor.toFixed(2));
+            setText('liq-chunk', s.liquidation_lock.chunk_index + '/' + s.liquidation_lock.total_chunks);
+        } else {
+            lockInfo.classList.add('hidden');
+        }
     }
 
     // PnL

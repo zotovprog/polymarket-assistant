@@ -40,6 +40,15 @@ class MMConfig:
     take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)
     trailing_stop_pct: float = 0.0     # Exit if PnL drops this fraction from peak (0 = disabled)
 
+    # ── Liquidation ─────────────────────────────────────────
+    liq_price_floor_enabled: bool = True       # Don't sell below avg entry
+    liq_price_floor_margin: float = 0.01       # Min margin above cost basis (1 cent)
+    liq_gradual_chunks: int = 3                # Split liquidation into N chunks
+    liq_chunk_interval_sec: float = 5.0        # Interval between chunks
+    liq_taker_threshold_sec: float = 20.0      # Switch to taker when < N seconds left
+    liq_max_discount_from_fv: float = 0.03     # Max discount from FV for limit orders
+    liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
+
     # ── Window Management ────────────────────────────────────────
     close_window_sec: float = 120.0   # Seconds before expiry: enter closing mode
     auto_next_window: bool = True    # Auto-restart for next window after resolution
