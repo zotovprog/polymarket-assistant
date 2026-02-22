@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any
 
 log = logging.getLogger("mm.heartbeat")
@@ -30,6 +31,7 @@ class HeartbeatManager:
         self._last_heartbeat: float = 0.0
         self._heartbeat_count: int = 0
         self._error_count: int = 0
+        self._heartbeat_id: str = str(uuid.uuid4())  # Stable ID for session
 
     @property
     def is_running(self) -> bool:
@@ -50,9 +52,19 @@ class HeartbeatManager:
         }
 
     async def _send_heartbeat(self) -> bool:
-        """Send a single heartbeat."""
+        """Send a single heartbeat.
+
+        Real ClobClient requires heartbeat_id parameter.
+        MockClobClient accepts no args (handled gracefully).
+        """
         try:
-            await asyncio.to_thread(self.client.post_heartbeat)
+            is_mock = hasattr(self.client, '_orders')
+            if is_mock:
+                await asyncio.to_thread(self.client.post_heartbeat)
+            else:
+                await asyncio.to_thread(
+                    self.client.post_heartbeat, self._heartbeat_id
+                )
             self._last_heartbeat = time.time()
             self._heartbeat_count += 1
             return True

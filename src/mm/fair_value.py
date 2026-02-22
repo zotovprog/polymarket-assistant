@@ -35,20 +35,23 @@ def _norm_cdf(x: float) -> float:
 class FairValueEngine:
     """Compute fair value for UP/DN tokens based on Binance data."""
 
-    def __init__(self, vol_window: int = 20, vol_floor: float = 0.005,
-                 vol_cap: float = 0.10, signal_weight: float = 0.03):
+    def __init__(self, vol_window: int = 20, vol_floor: float = 0.0001,
+                 vol_cap: float = 0.01, signal_weight: float = 0.03):
         """
         Args:
             vol_window: Number of klines for realized vol calculation
-            vol_floor: Minimum annualized vol (prevents FV collapsing to 0/1)
-            vol_cap: Maximum annualized vol
+            vol_floor: Minimum per-kline vol (prevents FV collapsing to 0/1)
+            vol_cap: Maximum per-kline vol
             signal_weight: Max adjustment from TA signals (±3%)
+
+        Note: vol is per-kline (typically per-minute for 1m klines).
+        Typical BTC per-minute vol: 0.0003-0.0006.
         """
         self.vol_window = vol_window
         self.vol_floor = vol_floor
         self.vol_cap = vol_cap
         self.signal_weight = signal_weight
-        self._last_vol: float = 0.02  # fallback vol
+        self._last_vol: float = 0.0005  # fallback vol (typical BTC per-minute)
 
     def realized_vol(self, klines: list[dict]) -> float:
         """Compute realized volatility from kline closes.

@@ -181,6 +181,7 @@ class OrderManager:
             raise RuntimeError(f"No order_id in response: {resp}")
 
         quote.order_id = order_id
+        quote.placed_at = time.time()
         self._active_orders[order_id] = quote
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
@@ -265,6 +266,62 @@ class OrderManager:
             log.debug(f"Failed to get book for {token_id[:12]}...: {e}")
             return {"best_bid": None, "best_ask": None}
 
+    async def get_full_book(self, token_id: str) -> dict:
+        """Full order book depth for a token.
+
+        Returns:
+            {'bids': [{'price': float, 'size': float}, ...],  # desc by price
+             'asks': [{'price': float, 'size': float}, ...],  # asc by price
+             'best_bid': float|None, 'best_ask': float|None,
+             'bid_depth_usd': float, 'ask_depth_usd': float,
+             'num_bids': int, 'num_asks': int}
+        """
+        empty = {"bids": [], "asks": [], "best_bid": None, "best_ask": None,
+                 "bid_depth_usd": 0.0, "ask_depth_usd": 0.0,
+                 "num_bids": 0, "num_asks": 0}
+        try:
+            is_mock = hasattr(self.client, "_orders")
+            if is_mock:
+                return empty
+
+            book = await asyncio.to_thread(self.client.get_order_book, token_id)
+            if not book:
+                return empty
+
+            bids = []
+            asks = []
+            bid_depth = 0.0
+            ask_depth = 0.0
+
+            if hasattr(book, "bids") and book.bids:
+                for entry in book.bids:
+                    p = float(entry.price)
+                    s = float(entry.size)
+                    bids.append({"price": p, "size": s})
+                    bid_depth += p * s
+                bids.sort(key=lambda x: x["price"], reverse=True)
+
+            if hasattr(book, "asks") and book.asks:
+                for entry in book.asks:
+                    p = float(entry.price)
+                    s = float(entry.size)
+                    asks.append({"price": p, "size": s})
+                    ask_depth += p * s
+                asks.sort(key=lambda x: x["price"])
+
+            best_bid = bids[0]["price"] if bids else None
+            best_ask = asks[0]["price"] if asks else None
+
+            return {
+                "bids": bids, "asks": asks,
+                "best_bid": best_bid, "best_ask": best_ask,
+                "bid_depth_usd": bid_depth, "ask_depth_usd": ask_depth,
+                "num_bids": len(bids), "num_asks": len(asks),
+            }
+        except Exception as e:
+            log.debug(f"Failed to get full book for {token_id[:12]}...: {e}")
+            return empty
+
     async def get_token_balance(self, token_id: str) -> float:
         """Fetch real PM token balance in shares for a conditional token."""
         try:
@@ -284,6 +341,22 @@ class OrderManager:
             return float(result["balance"]) / 1e6
         except Exception as e:
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
+            return 0.0
+
+    async def get_usdc_balance(self) -> float:
+        """Fetch real USDC (collateral) balance on Polymarket."""
+        try:
+            if hasattr(self.client, "_orders"):
+                return float(getattr(self.client, '_usdc_balance', 0.0))
+            if not _HAS_CLOB_TYPES:
+                return 0.0
+            result = await asyncio.to_thread(
+                self.client.get_balance_allowance,
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+            return float(result.get("balance", 0)) / 1e6
+        except Exception as e:
+            log.debug(f"Failed to fetch USDC balance: {e}")
             return 0.0
 
     async def get_all_token_balances(self, up_token_id: str, dn_token_id: str) -> tuple[float, float]:
@@ -434,3 +507,35 @@ class OrderManager:
             "active_bids": sum(1 for q in self._active_orders.values() if q.side == "BUY"),
             "active_asks": sum(1 for q in self._active_orders.values() if q.side == "SELL"),
         }
+
+    def get_active_orders_detail(self, liquidation_ids: set[str] | None = None,
+                                  up_token_id: str = "",
+                                  dn_token_id: str = "") -> list[dict]:
+        """Get details of all active orders for dashboard display.
+
+        Returns list of dicts with: order_id, side, price, size, notional,
+        token (UP/DN/??), age_sec, type (quote/liquidation).
+        """
+        liq_ids = liquidation_ids or set()
+        now = time.time()
+        result = []
+        for oid, quote in self._active_orders.items():
+            if quote.token_id == up_token_id:
+                token_label = "UP"
+            elif quote.token_id == dn_token_id:
+                token_label = "DN"
+            else:
+                token_label = "??"
+            age = now - quote.placed_at if quote.placed_at > 0 else 0.0
+            order_type = "liquidation" if oid in liq_ids else "quote"
+            result.append({
+                "order_id": oid[:12] + "..." if len(oid) > 12 else oid,
+                "side": quote.side,
+                "price": quote.price,
+                "size": quote.size,
+                "notional": round(quote.price * quote.size, 2),
+                "token": token_label,
+                "age_sec": round(age, 1),
+                "type": order_type,
+            })
+        return result

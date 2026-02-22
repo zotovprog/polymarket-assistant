@@ -37,6 +37,20 @@ class MMConfig:
     max_drawdown_usd: float = app_config.MM_MAX_DRAWDOWN_USD
     volatility_pause_mult: float = app_config.MM_VOL_PAUSE_MULT
     max_loss_per_fill_usd: float = 5.0  # Max acceptable loss on single fill
+    take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)
+    trailing_stop_pct: float = 0.0     # Exit if PnL drops this fraction from peak (0 = disabled)
+
+    # ── Window Management ────────────────────────────────────────
+    close_window_sec: float = 120.0   # Seconds before expiry: enter closing mode
+    auto_next_window: bool = True    # Auto-restart for next window after resolution
+    resolution_wait_sec: float = 90.0 # Seconds to wait after expiry before restarting
+
+    # ── Market Quality ─────────────────────────────────────────
+    min_market_quality_score: float = 0.3   # Min overall score to enter window
+    min_entry_depth_usd: float = 50.0       # Min book depth to enter
+    max_entry_spread_bps: float = 800.0     # Max spread to enter
+    exit_liquidity_threshold: float = 0.15  # Exit if liquidity_score drops below
+    quality_check_interval: int = 5         # Check every N ticks
 
     # ── Enabled ──────────────────────────────────────────────────
     enabled: bool = True  # Master switch

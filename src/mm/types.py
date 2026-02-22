@@ -13,6 +13,7 @@ class Quote:
     price: float           # Quote price (0.01 - 0.99)
     size: float            # Size in shares
     order_id: Optional[str] = None  # Filled after placement
+    placed_at: float = 0.0       # Unix timestamp when placed on exchange
 
     @property
     def notional(self) -> float:
@@ -70,6 +71,11 @@ class Inventory:
             else:
                 self.dn_shares -= fill.size
             self.usdc += fill.notional - fill.fee
+
+    def reconcile(self, real_up: float, real_dn: float) -> None:
+        """Update shares to match actual PM balance."""
+        self.up_shares = real_up
+        self.dn_shares = real_dn
 
 
 @dataclass

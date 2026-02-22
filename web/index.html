@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Polymarket MM</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="/static/styles.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -12,11 +15,11 @@
     <!-- Auth Screen -->
     <div id="auth-screen" class="auth-screen">
         <div class="auth-box">
-            <h1><i class="fas fa-chart-line"></i> Polymarket MM</h1>
-            <p>Market Making Dashboard</p>
+            <div class="logo"><i class="fas fa-chart-line"></i> Polymarket MM</div>
+            <p class="subtitle">Market Making Dashboard</p>
             <input type="password" id="auth-key" placeholder="Access Key" autocomplete="off">
-            <button onclick="doLogin()">Login</button>
-            <div id="auth-error" class="error hidden"></div>
+            <button class="btn btn-default" onclick="doLogin()">Login</button>
+            <div id="auth-error" class="auth-error hidden"></div>
         </div>
     </div>
 
@@ -45,12 +48,30 @@
                     <input type="checkbox" id="paper-mode" checked>
                     <span>Paper</span>
                 </label>
+                <label class="stake-input" title="Session stake (USDC)">
+                    <span>$</span>
+                    <input type="number" id="stake-usdc" value="10" min="5" max="10000" step="5">
+                </label>
                 <button id="btn-start" class="btn btn-start" onclick="toggleMM()">
                     <i class="fas fa-play"></i> Start
                 </button>
-                <button id="btn-emergency" class="btn btn-danger" onclick="emergency()">
+                <button id="btn-emergency" class="btn btn-destructive" onclick="emergency()" aria-label="Emergency stop">
                     <i class="fas fa-exclamation-triangle"></i>
                 </button>
+                <button id="btn-kill" class="btn btn-kill" onclick="killAll()"
+                        aria-label="Kill all and sell" title="Stop, sell everything, don't restart">
+                    <i class="fas fa-skull-crossbones"></i> KILL
+                </button>
+                <button class="btn btn-ghost" onclick="openLogs()" aria-label="View logs">
+                    <i class="fas fa-terminal"></i>
+                </button>
+                <span id="cred-status" class="cred-badge" title="API credential status">
+                    <i class="fas fa-key"></i> <span id="cred-status-text">—</span>
+                </span>
+                <span class="balance-display" title="PM USDC balance / session limit">
+                    <i class="fas fa-wallet"></i>
+                    <span id="pm-balance">—</span> / <span id="session-limit">—</span>
+                </span>
             </div>
             <div class="status-bar">
                 <span id="status-indicator" class="status-dot offline"></span>
@@ -64,7 +85,7 @@
             <!-- Left Column: Charts -->
             <div class="panel chart-panel">
                 <div class="panel-header">
-                    <span><i class="fas fa-chart-area"></i> Price & Fair Value</span>
+                    <span><i class="fas fa-chart-area"></i> Fair Value & PM Prices</span>
                     <span id="binance-price" class="price-display">—</span>
                 </div>
                 <div id="price-chart" class="chart-container"></div>
@@ -85,64 +106,64 @@
                 </div>
                 <div class="quotes-grid">
                     <div class="token-col">
-                        <h3 class="up-color">UP Token</h3>
+                        <div class="token-title up">UP Token</div>
                         <div class="quote-row bid">
-                            <span class="label">BID</span>
-                            <span id="up-bid-price" class="price">—</span>
-                            <span id="up-bid-size" class="size">—</span>
+                            <span class="quote-label">BID</span>
+                            <span id="up-bid-price" class="quote-price">—</span>
+                            <span id="up-bid-size" class="quote-size">—</span>
                         </div>
-                        <div class="fair-value-row">
-                            <span class="label">FV</span>
-                            <span id="fv-up" class="fv-price">—</span>
+                        <div class="fv-row">
+                            <span class="fv-label">FV</span>
+                            <span id="fv-up" class="fv-value">—</span>
                         </div>
                         <div class="quote-row ask">
-                            <span class="label">ASK</span>
-                            <span id="up-ask-price" class="price">—</span>
-                            <span id="up-ask-size" class="size">—</span>
+                            <span class="quote-label">ASK</span>
+                            <span id="up-ask-price" class="quote-price">—</span>
+                            <span id="up-ask-size" class="quote-size">—</span>
                         </div>
-                        <div class="pm-price-row">
-                            <span class="label">PM</span>
-                            <span id="pm-up" class="pm-price">—</span>
+                        <div class="pm-row">
+                            <span class="pm-label">PM</span>
+                            <span id="pm-up" class="pm-value">—</span>
                         </div>
                     </div>
                     <div class="token-col">
-                        <h3 class="dn-color">DN Token</h3>
+                        <div class="token-title dn">DN Token</div>
                         <div class="quote-row bid">
-                            <span class="label">BID</span>
-                            <span id="dn-bid-price" class="price">—</span>
-                            <span id="dn-bid-size" class="size">—</span>
+                            <span class="quote-label">BID</span>
+                            <span id="dn-bid-price" class="quote-price">—</span>
+                            <span id="dn-bid-size" class="quote-size">—</span>
                         </div>
-                        <div class="fair-value-row">
-                            <span class="label">FV</span>
-                            <span id="fv-dn" class="fv-price">—</span>
+                        <div class="fv-row">
+                            <span class="fv-label">FV</span>
+                            <span id="fv-dn" class="fv-value">—</span>
                         </div>
                         <div class="quote-row ask">
-                            <span class="label">ASK</span>
-                            <span id="dn-ask-price" class="price">—</span>
-                            <span id="dn-ask-size" class="size">—</span>
+                            <span class="quote-label">ASK</span>
+                            <span id="dn-ask-price" class="quote-price">—</span>
+                            <span id="dn-ask-size" class="quote-size">—</span>
                         </div>
-                        <div class="pm-price-row">
-                            <span class="label">PM</span>
-                            <span id="pm-dn" class="pm-price">—</span>
+                        <div class="pm-row">
+                            <span class="pm-label">PM</span>
+                            <span id="pm-dn" class="pm-value">—</span>
                         </div>
                     </div>
                 </div>
                 <!-- Inventory Gauge -->
                 <div class="inventory-section">
-                    <h4>Inventory</h4>
-                    <div class="inventory-bar-container">
-                        <span class="inv-label dn-color">DN</span>
-                        <div class="inventory-bar">
-                            <div id="inv-bar-fill" class="inv-fill"></div>
-                            <div id="inv-bar-center" class="inv-center"></div>
+                    <div class="section-title">Inventory</div>
+                    <div class="inv-bar-container">
+                        <span class="inv-bar-label" style="color:var(--destructive)">DN</span>
+                        <div class="inv-bar">
+                            <div id="inv-bar-fill" class="inv-bar-fill"></div>
+                            <div id="inv-bar-center" class="inv-bar-center"></div>
                         </div>
-                        <span class="inv-label up-color">UP</span>
+                        <span class="inv-bar-label" style="color:var(--success)">UP</span>
                     </div>
-                    <div class="inventory-numbers">
-                        <span>UP: <b id="inv-up">0</b></span>
-                        <span>Net: <b id="inv-delta">0</b></span>
-                        <span>DN: <b id="inv-dn">0</b></span>
-                        <span>USDC: <b id="inv-usdc">0</b></span>
+                    <div class="inv-numbers">
+                        <span>UP: <strong id="inv-up">0</strong></span>
+                        <span>Net: <strong id="inv-delta">0</strong></span>
+                        <span>DN: <strong id="inv-dn">0</strong></span>
+                        <span>USDC: <strong id="inv-usdc">0</strong></span>
                     </div>
                 </div>
             </div>
@@ -154,16 +175,25 @@
                 </div>
                 <div class="pnl-cards">
                     <div class="pnl-card">
+                        <div class="pnl-label">Total PnL</div>
+                        <div id="pnl-total" class="pnl-value total">$0.00</div>
+                        <div id="pnl-pct" class="pnl-pct">0%</div>
+                    </div>
+                    <div class="pnl-card">
+                        <div class="pnl-label">Peak</div>
+                        <div id="peak-pnl" class="pnl-value">$0.00</div>
+                    </div>
+                    <div class="pnl-card">
                         <div class="pnl-label">Realized</div>
                         <div id="pnl-realized" class="pnl-value">$0.00</div>
                     </div>
                     <div class="pnl-card">
-                        <div class="pnl-label">Unrealized</div>
+                        <div class="pnl-label">Position Value</div>
                         <div id="pnl-unrealized" class="pnl-value">$0.00</div>
                     </div>
                     <div class="pnl-card">
-                        <div class="pnl-label">Total</div>
-                        <div id="pnl-total" class="pnl-value total">$0.00</div>
+                        <div class="pnl-label">USDC Balance</div>
+                        <div id="pnl-usdc" class="pnl-value">$0.00</div>
                     </div>
                     <div class="pnl-card">
                         <div class="pnl-label">Fees</div>
@@ -178,7 +208,7 @@
                     <span><i class="fas fa-exchange-alt"></i> Recent Fills</span>
                     <span id="fill-count" class="stat-small">0</span>
                 </div>
-                <div class="fills-table-container">
+                <div class="fills-container">
                     <table class="fills-table">
                         <thead>
                             <tr>
@@ -191,6 +221,66 @@
                         </thead>
                         <tbody id="fills-body"></tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- Active Orders -->
+            <div class="panel orders-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-list-ol"></i> Active Orders</span>
+                    <span id="orders-count" class="stat-small">0</span>
+                </div>
+                <div class="orders-container">
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Token</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Size</th>
+                                <th>$</th>
+                                <th>Age</th>
+                                <th>Type</th>
+                            </tr>
+                        </thead>
+                        <tbody id="orders-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Market Quality -->
+            <div class="panel quality-panel">
+                <div class="panel-header">
+                    <span><i class="fas fa-signal"></i> Market Quality</span>
+                    <span id="quality-badge" class="quality-badge">—</span>
+                </div>
+                <div class="quality-content">
+                    <div class="quality-score-bar">
+                        <div class="quality-label">Overall</div>
+                        <div class="quality-bar">
+                            <div id="quality-bar-fill" class="quality-bar-fill"></div>
+                        </div>
+                        <span id="quality-score-value" class="quality-score-val">—</span>
+                    </div>
+                    <div class="quality-details">
+                        <div class="quality-stat">
+                            <span class="quality-stat-label">Liquidity</span>
+                            <span id="quality-liquidity" class="quality-stat-value">—</span>
+                        </div>
+                        <div class="quality-stat">
+                            <span class="quality-stat-label">Spread</span>
+                            <span id="quality-spread-bps" class="quality-stat-value">— bps</span>
+                        </div>
+                        <div class="quality-stat">
+                            <span class="quality-stat-label">Bid Depth</span>
+                            <span id="quality-bid-depth" class="quality-stat-value">$—</span>
+                        </div>
+                        <div class="quality-stat">
+                            <span class="quality-stat-label">Ask Depth</span>
+                            <span id="quality-ask-depth" class="quality-stat-value">$—</span>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -214,15 +304,74 @@
             <div class="panel config-panel">
                 <div class="panel-header">
                     <span><i class="fas fa-cog"></i> MM Config</span>
-                    <button class="btn btn-sm" onclick="saveConfig()">Apply</button>
+                    <div class="config-actions">
+                        <button class="btn-toggle" id="cfg-enabled-btn" onclick="toggleEnabled()">Enabled</button>
+                        <button class="btn btn-secondary btn-sm" onclick="saveConfig()">Apply All</button>
+                    </div>
                 </div>
-                <div class="config-grid">
-                    <label>Half Spread (bps) <input type="number" id="cfg-spread" value="150" step="10"></label>
-                    <label>Order Size ($) <input type="number" id="cfg-size" value="10" step="1"></label>
-                    <label>Max Inventory <input type="number" id="cfg-max-inv" value="50" step="5"></label>
-                    <label>Skew (bps/unit) <input type="number" id="cfg-skew" value="5" step="1"></label>
-                    <label>Requote (sec) <input type="number" id="cfg-requote" value="2" step="0.5"></label>
-                    <label>Max Drawdown ($) <input type="number" id="cfg-drawdown" value="50" step="5"></label>
+                <div class="config-sections">
+                    <!-- Spread Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-arrows-left-right"></i> Spread</h5>
+                        <div class="config-grid">
+                            <label>Half Spread (bps) <input type="number" id="cfg-spread" value="150" step="10" min="1"></label>
+                            <label>Min Spread (bps) <input type="number" id="cfg-min-spread" value="50" step="5" min="1"></label>
+                            <label>Max Spread (bps) <input type="number" id="cfg-max-spread" value="500" step="10" min="10"></label>
+                            <label>Vol Multiplier <input type="number" id="cfg-vol-mult" value="1.5" step="0.1" min="0.1"></label>
+                        </div>
+                    </div>
+                    <!-- Sizing Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-layer-group"></i> Sizing</h5>
+                        <div class="config-grid">
+                            <label>Order Size ($) <input type="number" id="cfg-size" value="10" step="1" min="1"></label>
+                            <label>Min Size ($) <input type="number" id="cfg-min-size" value="2" step="1" min="1"></label>
+                            <label>Max Size ($) <input type="number" id="cfg-max-size" value="100" step="5" min="1"></label>
+                        </div>
+                    </div>
+                    <!-- Inventory Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-warehouse"></i> Inventory</h5>
+                        <div class="config-grid">
+                            <label>Max Inventory <input type="number" id="cfg-max-inv" value="50" step="5" min="1"></label>
+                            <label>Skew (bps/unit) <input type="number" id="cfg-skew" value="5" step="1" min="0"></label>
+                        </div>
+                    </div>
+                    <!-- Requoting Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-sync"></i> Requoting</h5>
+                        <div class="config-grid">
+                            <label>Interval (sec) <input type="number" id="cfg-requote" value="2" step="0.5" min="0.5"></label>
+                            <label>Threshold (bps) <input type="number" id="cfg-requote-thresh" value="5" step="1" min="1"></label>
+                        </div>
+                    </div>
+                    <!-- Order Types Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-file-signature"></i> Order Types</h5>
+                        <div class="config-grid">
+                            <label>GTD Duration (sec) <input type="number" id="cfg-gtd-dur" value="300" step="30" min="30"></label>
+                            <label>Heartbeat (sec) <input type="number" id="cfg-heartbeat" value="55" step="5" min="10"></label>
+                            <label class="toggle-label">
+                                <span>Post Only</span>
+                                <input type="checkbox" id="cfg-post-only" checked>
+                            </label>
+                            <label class="toggle-label">
+                                <span>Use GTD</span>
+                                <input type="checkbox" id="cfg-use-gtd" checked>
+                            </label>
+                        </div>
+                    </div>
+                    <!-- Risk Section -->
+                    <div class="config-section">
+                        <h5><i class="fas fa-shield-alt"></i> Risk</h5>
+                        <div class="config-grid">
+                            <label>Max Drawdown ($) <input type="number" id="cfg-drawdown" value="50" step="5" min="1"></label>
+                            <label>Vol Pause Mult <input type="number" id="cfg-vol-pause" value="3" step="0.5" min="1"></label>
+                            <label>Max Loss/Fill ($) <input type="number" id="cfg-max-loss" value="5" step="1" min="0.5"></label>
+                            <label>Take Profit ($) <input type="number" id="cfg-take-profit" value="0" step="1" min="0" title="0 = disabled"></label>
+                            <label>Trail Stop (%) <input type="number" id="cfg-trail-stop" value="0" step="5" min="0" max="100" title="0 = disabled"></label>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -232,8 +381,35 @@
             <span id="market-info">No market selected</span>
             <span id="market-strike">Strike: —</span>
             <span id="market-time">Time: —</span>
+            <span id="window-state"></span>
             <span id="risk-status" class="risk-ok"><i class="fas fa-shield-alt"></i> OK</span>
         </footer>
+
+        <!-- Window Progress Bar -->
+        <div id="window-progress-wrap" style="display:none; position:fixed; bottom:40px; left:0; right:0; height:4px; z-index:100;">
+            <div id="window-progress-bar" style="height:4px; background:var(--accent); width:100%; transition:width 1s linear;"></div>
+        </div>
+    </div>
+
+    <!-- Logs Modal -->
+    <div id="logs-modal" class="modal-overlay hidden" onclick="closeLogs(event)">
+        <div class="modal-box">
+            <div class="modal-header">
+                <span><i class="fas fa-terminal"></i> Server Logs</span>
+                <div class="modal-actions">
+                    <select id="log-level-filter" onchange="refreshLogs()">
+                        <option value="">All</option>
+                        <option value="ERROR">Errors</option>
+                        <option value="WARNING">Warnings</option>
+                        <option value="INFO">Info</option>
+                    </select>
+                    <button class="btn btn-secondary btn-sm" onclick="refreshLogs()">Refresh</button>
+                    <button class="btn btn-secondary btn-sm" onclick="copyLogs()">Copy</button>
+                    <button class="btn btn-ghost btn-sm" onclick="closeLogs()" aria-label="Close">&times;</button>
+                </div>
+            </div>
+            <pre id="logs-content" class="logs-pre">Loading...</pre>
+        </div>
     </div>
 
     <script src="/static/app.js"></script>

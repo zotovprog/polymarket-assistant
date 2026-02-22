@@ -62,8 +62,8 @@ REFRESH_5M = 3          # faster refresh for 5m timeframe (seconds)
 # ── Market Making ─────────────────────────────────────────────────
 MM_HALF_SPREAD_BPS   = 150       # 1.5% half-spread default
 MM_ORDER_SIZE_USD    = 10.0      # USD per side
-MM_MAX_INVENTORY     = 50.0      # max shares one-sided
-MM_SKEW_BPS_PER_UNIT = 5.0       # skew per share of net delta
+MM_MAX_INVENTORY     = 25.0      # max shares one-sided (reduced to limit liquidation losses)
+MM_SKEW_BPS_PER_UNIT = 15.0      # skew per share of net delta (aggressive rebalancing)
 MM_REQUOTE_SEC       = 2.0       # seconds between requote checks
 MM_REQUOTE_THRESH_BPS = 5.0      # min price move to requote
 MM_GTD_DURATION_SEC  = 300       # GTD order lifetime (5 min)

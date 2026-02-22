@@ -13,6 +13,7 @@ class RiskManager:
         self._fills: list[Fill] = []
         self._session_start: float = time.time()
         self._vol_history: list[float] = []  # recent vol readings
+        self._peak_pnl: float = 0.0
 
     def record_fill(self, fill: Fill) -> None:
         """Record a fill for PnL tracking."""
@@ -88,6 +89,21 @@ class RiskManager:
         if pnl["total_pnl"] < -self.config.max_drawdown_usd:
             return True, f"Max drawdown exceeded: PnL=${pnl['total_pnl']:.2f}"
 
+        # Check take-profit
+        if self.config.take_profit_usd > 0 and pnl["total_pnl"] >= self.config.take_profit_usd:
+            return True, f"Take profit hit: PnL=${pnl['total_pnl']:.2f} >= ${self.config.take_profit_usd:.2f}"
+
+        # Trailing stop — only activates after peak PnL reaches a meaningful level
+        if pnl["total_pnl"] > self._peak_pnl:
+            self._peak_pnl = pnl["total_pnl"]
+        if self.config.trailing_stop_pct > 0 and self._peak_pnl > 0:
+            # Min peak: 25% of take_profit or $2, whichever is larger
+            min_peak = max(2.0, self.config.take_profit_usd * 0.25) if self.config.take_profit_usd > 0 else 2.0
+            if self._peak_pnl >= min_peak:
+                trail_threshold = self._peak_pnl * (1 - self.config.trailing_stop_pct)
+                if pnl["total_pnl"] < trail_threshold:
+                    return True, f"Trailing stop: PnL=${pnl['total_pnl']:.2f} dropped from peak ${self._peak_pnl:.2f}"
+
         # Check volatility spike
         avg_vol = self.avg_volatility
         if avg_vol > 0 and current_vol > avg_vol * self.config.volatility_pause_mult:
@@ -107,6 +123,7 @@ class RiskManager:
 
         return {
             **pnl,
+            "peak_pnl": round(self._peak_pnl, 4),
             "uptime_sec": round(uptime, 1),
             "avg_volatility": round(self.avg_volatility, 6),
             "inventory_up": round(inventory.up_shares, 2),
@@ -123,4 +140,5 @@ class RiskManager:
         """Reset for new session."""
         self._fills.clear()
         self._vol_history.clear()
+        self._peak_pnl = 0.0
         self._session_start = time.time()

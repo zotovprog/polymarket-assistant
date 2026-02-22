@@ -33,6 +33,7 @@ def _run_pm_backtest(
         "half_spread_bps": 100.0,
         "order_size_usd": 10.0,
         "max_inventory_shares": 50.0,
+        "skew_bps_per_unit": 5.0,
     }
     config_kwargs.update(config_overrides)
 

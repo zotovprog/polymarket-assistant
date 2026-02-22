@@ -123,7 +123,8 @@ def test_mock_clob_client_lifecycle() -> None:
     web_server = importlib.import_module("web_server")
     MockClobClient = web_server.MockClobClient
 
-    client = MockClobClient()
+    # Use fill_prob=0 to test basic lifecycle without random fills
+    client = MockClobClient(fill_prob=0.0)
 
     signed = client.create_and_sign_order(
         {
@@ -144,6 +145,36 @@ def test_mock_clob_client_lifecycle() -> None:
 
     cancelled_order = client.get_order(order_id)
     assert cancelled_order["status"] == "CANCELLED"
+
+
+def test_mock_clob_client_fills() -> None:
+    """Test that MockClobClient simulates fills with fill_prob=1.0."""
+    import importlib
+    import types
+
+    if "aiohttp" not in sys.modules:
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    MockClobClient = web_server.MockClobClient
+
+    # 100% fill probability for deterministic test
+    client = MockClobClient(fill_prob=1.0)
+
+    signed = client.create_and_sign_order(
+        {
+            "token_id": "token-1",
+            "price": 0.50,
+            "size": 15.0,
+            "side": "BUY",
+        }
+    )
+    resp = client.post_order(signed, order_type="GTC")
+    order_id = resp["orderID"]
+
+    order = client.get_order(order_id)
+    assert order["status"] == "MATCHED", f"Expected MATCHED, got {order['status']}"
+    assert order["size_matched"] == 15.0, f"Expected 15.0, got {order['size_matched']}"
 
 
 def test_mm_config_update() -> None:

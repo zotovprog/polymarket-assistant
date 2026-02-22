@@ -281,6 +281,67 @@ def fetch_pm_tokens(coin: str, tf: str) -> tuple:
         return None, None
 
 
+def fetch_pm_strike(coin: str, tf: str) -> tuple[float, float, float]:
+    """Fetch strike price and window timing from PM event + Binance.
+
+    For Up/Down markets, strike = Binance candle open price.
+
+    Returns:
+        (strike, window_start, window_end) — strike is the Binance open price,
+        window_start/end are Unix timestamps.
+        Returns (0.0, 0, 0) on failure.
+    """
+    event_data = fetch_pm_event_data(coin, tf)
+    if event_data is None:
+        return 0.0, 0, 0
+
+    try:
+        from datetime import datetime, timezone, timedelta
+
+        end_date_str = event_data.get("endDate", "")
+        if not end_date_str:
+            return 0.0, 0, 0
+
+        # Parse end date
+        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+
+        # Candle duration from timeframe
+        tf_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "daily": 1440}
+        duration_min = tf_minutes.get(tf, 60)
+
+        # Open time = end - duration
+        open_dt = end_dt - timedelta(minutes=duration_min)
+
+        window_start = open_dt.timestamp()
+        window_end = end_dt.timestamp()
+
+        # Fetch Binance kline to get the candle open price
+        symbol = config.COIN_BINANCE.get(coin, "BTCUSDT")
+        kline_interval = config.TF_KLINE.get(tf, "1h")
+        open_ms = int(window_start * 1000)
+
+        url = "https://api.binance.com/api/v3/klines"
+        resp = requests.get(url, params={
+            "symbol": symbol,
+            "interval": kline_interval,
+            "startTime": open_ms,
+            "limit": 1,
+        }, timeout=5)
+
+        klines = resp.json()
+        if not klines:
+            print(f"  [PM] No Binance kline found for strike calc")
+            return 0.0, window_start, window_end
+
+        strike = float(klines[0][1])  # [1] = open price
+        print(f"  [PM] Strike={strike:.2f} (Binance {symbol} {kline_interval} open at {open_dt})")
+        return strike, window_start, window_end
+
+    except Exception as e:
+        print(f"  [PM] strike fetch failed: {e}")
+        return 0.0, 0, 0
+
+
 async def fetch_pm_depth(token_id: str, price: float, side: str = "buy") -> float:
     """Fetch available depth (in USD) at or better than `price` for a PM token.
 

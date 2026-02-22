@@ -91,6 +91,11 @@ class QuoteEngine:
         # Size in shares = USD / price
         bid_size = self.config.order_size_usd / bid_price if bid_price > 0 else 0
         ask_size = self.config.order_size_usd / ask_price if ask_price > 0 else 0
+        max_shares = self.config.max_inventory_shares
+        if bid_size > max_shares:
+            bid_size = max_shares
+        if ask_size > max_shares:
+            ask_size = max_shares
 
         bid = Quote(side="BUY", token_id=token_id,
                     price=bid_price, size=round(bid_size, 2))
@@ -99,11 +104,38 @@ class QuoteEngine:
 
         return bid, ask
 
-    def should_requote(self, current: Quote, new: Quote) -> bool:
+    @staticmethod
+    def clamp_to_book(
+        bid: Quote | None,
+        ask: Quote | None,
+        best_bid: float | None,
+        best_ask: float | None,
+    ) -> tuple[Quote | None, Quote | None]:
+        """Adjust quotes to avoid crossing the Polymarket orderbook.
+
+        Post-only rules:
+        - BUY order must have price < best_ask (otherwise it crosses)
+        - SELL order must have price > best_bid (otherwise it crosses)
+
+        If we would cross, pull our price back to 1 tick away from the book edge.
+        """
+        tick = 0.01
+
+        if bid is not None and best_ask is not None and bid.price >= best_ask:
+            bid.price = _round_price(best_ask - tick)
+
+        if ask is not None and best_bid is not None and ask.price <= best_bid:
+            ask.price = _round_price(best_bid + tick)
+
+        return bid, ask
+
+    def should_requote(self, current: Quote | None, new: Quote | None) -> bool:
         """Check if price moved enough to justify cancel-replace.
 
         Returns True if price difference exceeds threshold.
         """
+        if new is None:
+            return False
         if current is None:
             return True
         if current.order_id is None:
@@ -116,7 +148,7 @@ class QuoteEngine:
                             up_token_id: str, dn_token_id: str,
                             inventory: Inventory,
                             volatility: float = 0.0,
-                            avg_volatility: float = 0.0) -> dict[str, tuple[Quote, Quote]]:
+                            avg_volatility: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
 
         Returns dict with keys 'up' and 'dn', each containing (bid, ask).
@@ -125,6 +157,24 @@ class QuoteEngine:
             fv_up, up_token_id, inventory, volatility, avg_volatility)
         dn_bid, dn_ask = self.generate_quotes(
             fv_dn, dn_token_id, inventory, volatility, avg_volatility)
+
+        # Cap BUY size by remaining inventory room per token.
+        max_shares = self.config.max_inventory_shares
+        up_room = max(0.0, max_shares - inventory.up_shares)
+        dn_room = max(0.0, max_shares - inventory.dn_shares)
+
+        up_bid_size = round(min(up_bid.size, up_room), 2)
+        dn_bid_size = round(min(dn_bid.size, dn_room), 2)
+
+        if up_bid_size <= 0:
+            up_bid = None
+        else:
+            up_bid.size = up_bid_size
+
+        if dn_bid_size <= 0:
+            dn_bid = None
+        else:
+            dn_bid.size = dn_bid_size
 
         return {
             "up": (up_bid, up_ask),

@@ -6,14 +6,17 @@ let pollTimer = null;
 
 // Charts
 let priceChart = null;
-let priceSeries = null;
-let fvSeries = null;
+let fvUpSeries = null;
+let fvDnSeries = null;
+let pmUpSeries = null;
+let pmDnSeries = null;
 let spreadChart = null;
 let spreadSeries = null;
 let pnlChart = null;
 let pnlSeries = null;
 let pnlData = [];
 let spreadData = [];
+let lastStartedAt = 0;
 
 // ── Auth ──────────────────────────────────────────────
 async function checkAuth() {
@@ -57,20 +60,23 @@ function showDashboard() {
 // ── Charts Init ──────────────────────────────────────
 function initCharts() {
     const chartOpts = {
-        layout: { background: { type: 'solid', color: '#1a1f2e' }, textColor: '#94a3b8' },
-        grid: { vertLines: { color: '#1e293b' }, horzLines: { color: '#1e293b' } },
+        layout: { background: { type: 'solid', color: '#18181b' }, textColor: '#a1a1aa' },
+        grid: { vertLines: { color: '#27272a' }, horzLines: { color: '#27272a' } },
         timeScale: { timeVisible: true, secondsVisible: false },
         crosshair: { mode: 0 },
     };
 
-    // Price chart
+    // Fair Value & PM Prices chart (all 0–1 range)
     const priceEl = document.getElementById('price-chart');
     if (priceEl && typeof LightweightCharts !== 'undefined') {
         priceChart = LightweightCharts.createChart(priceEl, {
             ...chartOpts, width: priceEl.clientWidth, height: 242,
+            rightPriceScale: { autoScale: true, scaleMargins: { top: 0.05, bottom: 0.05 } },
         });
-        priceSeries = priceChart.addLineSeries({ color: '#3b82f6', lineWidth: 2 });
-        fvSeries = priceChart.addLineSeries({ color: '#06b6d4', lineWidth: 1, lineStyle: 2 });
+        fvUpSeries = priceChart.addLineSeries({ color: '#3b82f6', lineWidth: 2, title: 'FV UP' });
+        fvDnSeries = priceChart.addLineSeries({ color: '#06b6d4', lineWidth: 2, title: 'FV DN' });
+        pmUpSeries = priceChart.addLineSeries({ color: '#22c55e', lineWidth: 1, lineStyle: 2, title: 'PM UP' });
+        pmDnSeries = priceChart.addLineSeries({ color: '#f97316', lineWidth: 1, lineStyle: 2, title: 'PM DN' });
     }
 
     // Spread chart
@@ -91,8 +97,8 @@ function initCharts() {
             ...chartOpts, width: pnlEl.clientWidth, height: 142,
         });
         pnlSeries = pnlChart.addAreaSeries({
-            topColor: 'rgba(34, 197, 94, 0.3)', bottomColor: 'rgba(34, 197, 94, 0.0)',
-            lineColor: '#22c55e', lineWidth: 2,
+            topColor: 'rgba(16, 185, 129, 0.3)', bottomColor: 'rgba(16, 185, 129, 0.0)',
+            lineColor: '#10b981', lineWidth: 2,
         });
     }
 
@@ -133,6 +139,23 @@ async function pollState() {
 // ── UI Update ────────────────────────────────────────
 function updateUI(s) {
     isRunning = s.is_running || false;
+
+    // Sync paper mode toggle with backend only while running
+    const paperToggle = document.getElementById('paper-mode');
+    if (paperToggle && isRunning && s.paper_mode !== undefined) {
+        paperToggle.checked = s.paper_mode;
+    }
+
+    // PM balance & session limit
+    const pmBal = s.usdc_balance_pm;
+    setText('pm-balance', pmBal != null ? '$' + pmBal.toFixed(2) : '—');
+    const stakeInput = document.getElementById('stake-usdc');
+    if (s.session_limit) {
+        setText('session-limit', '$' + s.session_limit.toFixed(0));
+        if (isRunning && stakeInput) stakeInput.value = s.session_limit;
+    } else {
+        setText('session-limit', stakeInput ? '$' + stakeInput.value : '—');
+    }
 
     // Status
     const statusDot = document.getElementById('status-indicator');
@@ -200,10 +223,19 @@ function updateUI(s) {
     const realized = s.realized_pnl || 0;
     const unrealized = s.unrealized_pnl || 0;
     const total = s.total_pnl || (realized + unrealized);
+    const stake = s.session_limit || 1;
+    const pnlPct = (total / stake * 100).toFixed(1);
     setPnl('pnl-realized', realized);
     setPnl('pnl-unrealized', unrealized);
     setPnl('pnl-total', total);
+    const pctEl = document.getElementById('pnl-pct');
+    if (pctEl) {
+        pctEl.textContent = (total >= 0 ? '+' : '') + pnlPct + '%';
+        pctEl.className = 'pnl-pct ' + (total >= 0 ? 'positive' : 'negative');
+    }
+    setPnl('peak-pnl', s.peak_pnl || 0);
     setText('pnl-fees', '$' + (s.total_fees || 0).toFixed(4));
+    setText('pnl-usdc', s.usdc_balance_pm != null ? '$' + s.usdc_balance_pm.toFixed(2) : '—');
 
     // Stats
     setText('stat-volume', '$' + (s.total_volume || 0).toFixed(2));
@@ -226,12 +258,54 @@ function updateUI(s) {
         setText('fill-count', s.fill_count || s.recent_fills.length);
     }
 
-    // Market info
+    // Active Orders
+    updateActiveOrders(s.active_orders_detail);
+
+    // Market Quality
+    updateMarketQuality(s.market_quality);
+
+    // Market info + window progress
     if (s.market) {
         setText('market-info', `${s.market.coin || ''} ${s.market.timeframe || ''}`);
         setText('market-strike', 'Strike: ' + (s.market.strike ? '$' + s.market.strike.toLocaleString() : '—'));
         const tr = s.market.time_remaining || 0;
-        setText('market-time', 'Time: ' + Math.floor(tr / 60) + 'm ' + Math.floor(tr % 60) + 's');
+        const mins = Math.floor(tr / 60), secs = Math.floor(tr % 60);
+        setText('market-time', tr > 0 ? `${mins}m ${secs}s` : 'Expired');
+
+        // Window state badge
+        const wsEl = document.getElementById('window-state');
+        const nwi = s.next_window_in || 0;
+        if (wsEl) {
+            if (nwi > 0) {
+                const nwSec = Math.ceil(nwi);
+                wsEl.innerHTML = '<span style="color:#8b5cf6;font-weight:700">⏳ Next window in ' + nwSec + 's</span>';
+            } else if (s.is_closing) {
+                wsEl.innerHTML = '<span style="color:#f59e0b;font-weight:700;animation:pulse 0.8s infinite">⚠ CLOSING</span>';
+            } else if (tr <= 0) {
+                wsEl.innerHTML = '<span style="color:#6b7280">⏳ RESOLVING</span>';
+            } else if (tr <= 30) {
+                wsEl.innerHTML = '<span style="color:#ef4444;font-weight:700">⏰ ' + secs + 's</span>';
+            } else {
+                wsEl.textContent = '';
+            }
+        }
+
+        // Progress bar: fraction of window remaining
+        const progressWrap = document.getElementById('window-progress-wrap');
+        const progressBar = document.getElementById('window-progress-bar');
+        if (progressBar && isRunning && tr > 0) {
+            progressWrap.style.display = 'block';
+            const tfSec = {'5m':300,'15m':900,'1h':3600,'4h':14400,'daily':86400};
+            const total = tfSec[s.market.timeframe] || 300;
+            const pct = Math.min(100, Math.max(0, (tr / total) * 100));
+            progressBar.style.width = pct + '%';
+            // Color: green → yellow → red as time runs out
+            if (pct > 40) progressBar.style.background = 'var(--accent)';
+            else if (pct > 15) progressBar.style.background = '#f59e0b';
+            else progressBar.style.background = '#ef4444';
+        } else if (progressWrap) {
+            progressWrap.style.display = 'none';
+        }
     }
 
     // Risk status
@@ -239,6 +313,9 @@ function updateUI(s) {
     if (s.is_paused) {
         risk.className = 'risk-danger';
         risk.innerHTML = '<i class="fas fa-shield-alt"></i> ' + (s.pause_reason || 'PAUSED');
+    } else if (s.is_closing) {
+        risk.className = 'risk-warn';
+        risk.innerHTML = '<i class="fas fa-hourglass-end"></i> CLOSING';
     } else if (isRunning) {
         risk.className = 'risk-ok';
         risk.innerHTML = '<i class="fas fa-shield-alt"></i> OK';
@@ -250,11 +327,37 @@ function updateUI(s) {
     // Update config inputs (only if not focused)
     if (s.config) {
         setConfigIfNotFocused('cfg-spread', s.config.half_spread_bps);
+        setConfigIfNotFocused('cfg-min-spread', s.config.min_spread_bps);
+        setConfigIfNotFocused('cfg-max-spread', s.config.max_spread_bps);
+        setConfigIfNotFocused('cfg-vol-mult', s.config.vol_spread_mult);
         setConfigIfNotFocused('cfg-size', s.config.order_size_usd);
+        setConfigIfNotFocused('cfg-min-size', s.config.min_order_size_usd);
+        setConfigIfNotFocused('cfg-max-size', s.config.max_order_size_usd);
         setConfigIfNotFocused('cfg-max-inv', s.config.max_inventory_shares);
         setConfigIfNotFocused('cfg-skew', s.config.skew_bps_per_unit);
         setConfigIfNotFocused('cfg-requote', s.config.requote_interval_sec);
+        setConfigIfNotFocused('cfg-requote-thresh', s.config.requote_threshold_bps);
+        setConfigIfNotFocused('cfg-gtd-dur', s.config.gtd_duration_sec);
+        setConfigIfNotFocused('cfg-heartbeat', s.config.heartbeat_interval_sec);
+        setCheckboxIfNotFocused('cfg-post-only', s.config.use_post_only);
+        setCheckboxIfNotFocused('cfg-use-gtd', s.config.use_gtd);
         setConfigIfNotFocused('cfg-drawdown', s.config.max_drawdown_usd);
+        setConfigIfNotFocused('cfg-vol-pause', s.config.volatility_pause_mult);
+        setConfigIfNotFocused('cfg-max-loss', s.config.max_loss_per_fill_usd);
+        setConfigIfNotFocused('cfg-take-profit', s.config.take_profit_usd);
+        setConfigIfNotFocused('cfg-trail-stop', (s.config.trailing_stop_pct || 0) * 100);
+
+        // Update enabled button state
+        const enabledBtn = document.getElementById('cfg-enabled-btn');
+        if (enabledBtn) {
+            if (s.config.enabled) {
+                enabledBtn.classList.add('active');
+                enabledBtn.textContent = 'Enabled';
+            } else {
+                enabledBtn.classList.remove('active');
+                enabledBtn.textContent = 'Disabled';
+            }
+        }
     }
 
     // Charts
@@ -292,6 +395,13 @@ function setConfigIfNotFocused(id, val) {
     }
 }
 
+function setCheckboxIfNotFocused(id, val) {
+    const el = document.getElementById(id);
+    if (el && document.activeElement !== el) {
+        el.checked = !!val;
+    }
+}
+
 function updateInventoryBar(inv) {
     const bar = document.getElementById('inv-bar-fill');
     if (!bar) return;
@@ -300,7 +410,7 @@ function updateInventoryBar(inv) {
     const pct = ratio * 100;
     bar.style.width = pct + '%';
     bar.style.left = '0';
-    bar.style.background = pct > 55 ? 'var(--green)' : pct < 45 ? 'var(--red)' : 'var(--accent)';
+    bar.style.background = pct > 55 ? 'var(--success)' : pct < 45 ? 'var(--destructive)' : 'var(--accent)';
 }
 
 function updateFills(fills) {
@@ -319,16 +429,95 @@ function updateFills(fills) {
     }).join('');
 }
 
+function updateActiveOrders(orders) {
+    const body = document.getElementById('orders-body');
+    if (!body) return;
+    const countEl = document.getElementById('orders-count');
+    if (countEl) countEl.textContent = orders ? orders.length : 0;
+    if (!orders || orders.length === 0) {
+        body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No active orders</td></tr>';
+        return;
+    }
+    body.innerHTML = orders.map(o => {
+        const sideCls = o.side === 'BUY' ? 'order-buy' : 'order-sell';
+        const typeBadge = o.type === 'liquidation'
+            ? '<span class="liq-badge">LIQ</span>'
+            : '';
+        const age = o.age_sec < 60
+            ? o.age_sec.toFixed(0) + 's'
+            : (o.age_sec / 60).toFixed(1) + 'm';
+        return `<tr class="${o.type === 'liquidation' ? 'liq-row' : ''}">
+            <td>${o.order_id}</td>
+            <td>${o.token}</td>
+            <td class="${sideCls}">${o.side}</td>
+            <td>${o.price.toFixed(2)}</td>
+            <td>${o.size.toFixed(1)}</td>
+            <td>$${o.notional.toFixed(2)}</td>
+            <td>${age}</td>
+            <td>${typeBadge || o.type}</td>
+        </tr>`;
+    }).join('');
+}
+
+function updateMarketQuality(mq) {
+    const badge = document.getElementById('quality-badge');
+    const barFill = document.getElementById('quality-bar-fill');
+    const scoreVal = document.getElementById('quality-score-value');
+
+    if (!mq || mq.overall_score == null) {
+        if (badge) badge.textContent = '—';
+        if (barFill) barFill.style.width = '0%';
+        if (scoreVal) scoreVal.textContent = '—';
+        setText('quality-liquidity', '—');
+        setText('quality-spread-bps', '— bps');
+        setText('quality-bid-depth', '$—');
+        setText('quality-ask-depth', '$—');
+        return;
+    }
+
+    const score = mq.overall_score;
+    const pct = Math.round(score * 100);
+
+    if (scoreVal) scoreVal.textContent = pct + '%';
+    if (barFill) {
+        barFill.style.width = pct + '%';
+        barFill.style.background = score >= 0.6 ? 'var(--success)' :
+                                    score >= 0.3 ? 'var(--warning)' : 'var(--destructive)';
+    }
+    if (badge) {
+        if (mq.tradeable) {
+            badge.textContent = 'GOOD';
+            badge.className = 'quality-badge quality-good';
+        } else {
+            badge.textContent = 'POOR';
+            badge.className = 'quality-badge quality-poor';
+        }
+    }
+
+    setText('quality-liquidity', (mq.liquidity_score * 100).toFixed(0) + '%');
+    setText('quality-spread-bps', (mq.spread_bps || 0).toFixed(0) + ' bps');
+    setText('quality-bid-depth', '$' + (mq.bid_depth_usd || 0).toFixed(0));
+    setText('quality-ask-depth', '$' + (mq.ask_depth_usd || 0).toFixed(0));
+}
+
 function updateCharts(s) {
+    // Clear chart data on new session
+    if (s.started_at && s.started_at !== lastStartedAt) {
+        lastStartedAt = s.started_at;
+        pnlData = [];
+        spreadData = [];
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
-    // Price chart
-    if (priceSeries && s.fair_value && s.fair_value.binance_mid) {
-        priceSeries.update({ time: now, value: s.fair_value.binance_mid });
+    // Fair Value & PM Prices chart (all 0–1 range)
+    if (s.fair_value) {
+        if (fvUpSeries && s.fair_value.up) fvUpSeries.update({ time: now, value: s.fair_value.up });
+        if (fvDnSeries && s.fair_value.dn) fvDnSeries.update({ time: now, value: s.fair_value.dn });
     }
-    if (fvSeries && s.fair_value && s.fair_value.up) {
-        // Show FV as scaled value for overlay
-        fvSeries.update({ time: now, value: s.fair_value.up * 100 });
+    if (s.pm_prices) {
+        if (pmUpSeries && s.pm_prices.up) pmUpSeries.update({ time: now, value: s.pm_prices.up });
+        if (pmDnSeries && s.pm_prices.dn) pmDnSeries.update({ time: now, value: s.pm_prices.dn });
     }
 
     // Spread chart
@@ -346,9 +535,9 @@ function updateCharts(s) {
         pnlSeries.setData(pnlData);
         // Color based on PnL
         pnlSeries.applyOptions({
-            topColor: total >= 0 ? 'rgba(34, 197, 94, 0.3)' : 'rgba(239, 68, 68, 0.3)',
-            bottomColor: total >= 0 ? 'rgba(34, 197, 94, 0.0)' : 'rgba(239, 68, 68, 0.0)',
-            lineColor: total >= 0 ? '#22c55e' : '#ef4444',
+            topColor: total >= 0 ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)',
+            bottomColor: total >= 0 ? 'rgba(16, 185, 129, 0.0)' : 'rgba(239, 68, 68, 0.0)',
+            lineColor: total >= 0 ? '#10b981' : '#ef4444',
         });
     }
 }
@@ -361,11 +550,17 @@ async function toggleMM() {
         const coin = document.getElementById('coin-select').value;
         const tf = document.getElementById('tf-select').value;
         const paper = document.getElementById('paper-mode').checked;
-        await fetch(`${API_BASE}/api/mm/start`, {
+        const stake = parseFloat(document.getElementById('stake-usdc').value) || 10;
+        const r = await fetch(`${API_BASE}/api/mm/start`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ coin, timeframe: tf, paper_mode: paper }),
+            body: JSON.stringify({ coin, timeframe: tf, paper_mode: paper, initial_usdc: stake }),
         });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({ detail: 'Failed to start MM' }));
+            showToast(err.detail || 'Failed to start', 'error');
+            return;
+        }
     }
     setTimeout(pollState, 500);
 }
@@ -377,26 +572,171 @@ async function emergency() {
     }
 }
 
+async function killAll() {
+    if (!confirm('KILL ALL: Stop trading, sell all positions, disable auto-restart. Continue?')) return;
+    try {
+        const r = await fetch(`${API_BASE}/api/mm/kill`, { method: 'POST' });
+        if (r.ok) {
+            showToast('Kill All executed — all positions liquidated', 'warning');
+        } else {
+            showToast('Kill All failed', 'error');
+        }
+    } catch (e) {
+        showToast('Kill All error: ' + e.message, 'error');
+    }
+    setTimeout(pollState, 500);
+}
+
 async function saveConfig() {
     const cfg = {
         half_spread_bps: parseFloat(document.getElementById('cfg-spread').value),
+        min_spread_bps: parseFloat(document.getElementById('cfg-min-spread').value),
+        max_spread_bps: parseFloat(document.getElementById('cfg-max-spread').value),
+        vol_spread_mult: parseFloat(document.getElementById('cfg-vol-mult').value),
         order_size_usd: parseFloat(document.getElementById('cfg-size').value),
+        min_order_size_usd: parseFloat(document.getElementById('cfg-min-size').value),
+        max_order_size_usd: parseFloat(document.getElementById('cfg-max-size').value),
         max_inventory_shares: parseFloat(document.getElementById('cfg-max-inv').value),
         skew_bps_per_unit: parseFloat(document.getElementById('cfg-skew').value),
         requote_interval_sec: parseFloat(document.getElementById('cfg-requote').value),
+        requote_threshold_bps: parseFloat(document.getElementById('cfg-requote-thresh').value),
+        gtd_duration_sec: parseInt(document.getElementById('cfg-gtd-dur').value),
+        heartbeat_interval_sec: parseInt(document.getElementById('cfg-heartbeat').value),
+        use_post_only: document.getElementById('cfg-post-only').checked,
+        use_gtd: document.getElementById('cfg-use-gtd').checked,
         max_drawdown_usd: parseFloat(document.getElementById('cfg-drawdown').value),
+        volatility_pause_mult: parseFloat(document.getElementById('cfg-vol-pause').value),
+        max_loss_per_fill_usd: parseFloat(document.getElementById('cfg-max-loss').value),
+        take_profit_usd: parseFloat(document.getElementById('cfg-take-profit').value) || 0,
+        trailing_stop_pct: (parseFloat(document.getElementById('cfg-trail-stop').value) || 0) / 100,
     };
-    await fetch(`${API_BASE}/api/mm/config`, {
+    const r = await fetch(`${API_BASE}/api/mm/config`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(cfg),
     });
+    if (r.ok) {
+        showToast('Config updated');
+    } else {
+        showToast('Config update failed', 'error');
+    }
     setTimeout(pollState, 300);
+}
+
+async function toggleEnabled() {
+    const btn = document.getElementById('cfg-enabled-btn');
+    const nowEnabled = btn.classList.contains('active');
+    const r = await fetch(`${API_BASE}/api/mm/config`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ enabled: !nowEnabled }),
+    });
+    if (r.ok) {
+        showToast(nowEnabled ? 'MM Disabled' : 'MM Enabled');
+    }
+    setTimeout(pollState, 300);
+}
+
+function showToast(msg, type = 'success') {
+    document.querySelectorAll('.toast').forEach(t => t.remove());
+    const toast = document.createElement('div');
+    toast.className = 'toast ' + type;
+    toast.textContent = msg;
+    document.body.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add('show'));
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+// ── Logs ─────────────────────────────────────────────
+async function openLogs() {
+    document.getElementById('logs-modal').classList.remove('hidden');
+    await refreshLogs();
+}
+
+function closeLogs(e) {
+    if (!e || e.target === e.currentTarget) {
+        document.getElementById('logs-modal').classList.add('hidden');
+    }
+}
+
+async function refreshLogs() {
+    const level = document.getElementById('log-level-filter').value;
+    const url = `${API_BASE}/api/logs?limit=300` + (level ? `&level=${level}` : '');
+    try {
+        const r = await fetch(url);
+        if (!r.ok) { document.getElementById('logs-content').textContent = 'Auth error'; return; }
+        const d = await r.json();
+        const lines = d.logs.map(e =>
+            `${e.time} [${e.level.padEnd(7)}] [${e.name}] ${e.msg}`
+        ).join('\n');
+        const pre = document.getElementById('logs-content');
+        pre.textContent = lines || '(no logs)';
+        pre.scrollTop = pre.scrollHeight;
+    } catch(err) {
+        document.getElementById('logs-content').textContent = 'Connection error: ' + err.message;
+    }
+}
+
+async function copyLogs() {
+    const text = document.getElementById('logs-content').textContent;
+    try {
+        await navigator.clipboard.writeText(text);
+        showToast('Logs copied');
+    } catch(e) {
+        // Fallback
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+        showToast('Logs copied');
+    }
+}
+
+// ── Credentials ──────────────────────────────────────
+async function validateCredentials() {
+    const badge = document.getElementById('cred-status');
+    const text = document.getElementById('cred-status-text');
+    if (!badge || !text) return;
+    badge.className = 'cred-badge checking';
+    text.textContent = 'Checking...';
+    try {
+        const r = await fetch(`${API_BASE}/api/mm/validate-credentials`, { method: 'POST' });
+        const d = await r.json();
+        if (d.valid) {
+            badge.className = 'cred-badge valid';
+            text.textContent = 'Valid';
+        } else {
+            badge.className = 'cred-badge invalid';
+            text.textContent = d.detail || 'Invalid';
+            showToast(d.detail || 'Invalid API credentials', 'error');
+        }
+    } catch (e) {
+        badge.className = 'cred-badge invalid';
+        text.textContent = 'Error';
+    }
 }
 
 // ── Enter key login ──────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     checkAuth();
+    const paperToggle = document.getElementById('paper-mode');
+    if (paperToggle) {
+        paperToggle.addEventListener('change', function() {
+            if (!this.checked) {
+                validateCredentials();
+            } else {
+                const badge = document.getElementById('cred-status');
+                const text = document.getElementById('cred-status-text');
+                if (badge) badge.className = 'cred-badge';
+                if (text) text.textContent = '—';
+            }
+        });
+    }
     const input = document.getElementById('auth-key');
     if (input) {
         input.addEventListener('keydown', e => {

@@ -29,6 +29,7 @@ from .order_manager import OrderManager
 from .risk_manager import RiskManager
 from .heartbeat import HeartbeatManager
 from .rebate_tracker import RebateTracker
+from .market_quality import MarketQualityAnalyzer, MarketQuality
 
 log = logging.getLogger("mm.engine")
 
@@ -54,6 +55,7 @@ class MarketMaker:
         self.risk_mgr = RiskManager(config)
         self.heartbeat = HeartbeatManager(clob_client, config.heartbeat_interval_sec)
         self.rebate = RebateTracker(clob_client)
+        self.quality_analyzer = MarketQualityAnalyzer(config)
 
         # State
         self.inventory = Inventory()
@@ -66,6 +68,8 @@ class MarketMaker:
         self._is_closing = False
         self._liquidation_attempted = False
         self._liquidation_order_ids: set[str] = set()
+        self._cached_usdc_balance: float = 0.0
+        self._last_quality: MarketQuality | None = None
 
         # Current quotes (for dashboard)
         self._current_quotes: dict[str, tuple[Optional[Quote], Optional[Quote]]] = {
@@ -120,8 +124,8 @@ class MarketMaker:
         self._task = asyncio.create_task(self._run_loop())
         log.info("MarketMaker started")
 
-    async def stop(self) -> None:
-        """Graceful shutdown: cancel all orders, stop heartbeat."""
+    async def stop(self, liquidate: bool = True) -> None:
+        """Graceful shutdown: liquidate inventory, cancel orders, stop heartbeat."""
         if not self._running:
             return
 
@@ -136,9 +140,24 @@ class MarketMaker:
             except asyncio.CancelledError:
                 pass
 
-        # Cancel all orders
+        # Cancel all orders first
         cancelled = await self.order_mgr.cancel_all()
         log.info(f"Cancelled {cancelled} orders on shutdown")
+
+        # Liquidate remaining inventory before full stop
+        if liquidate and self.market:
+            self._liquidation_order_ids = set()
+            for attempt in range(3):
+                await self._liquidate_inventory()
+                if not self._liquidation_order_ids:
+                    break
+                # Wait for fills
+                log.info(f"Stop liquidation attempt {attempt+1}/3, waiting for fills...")
+                await asyncio.sleep(3.0)
+                await self.order_mgr.check_fills()
+
+        # Final cancel of any remaining orders
+        await self.order_mgr.cancel_all()
 
         # Stop heartbeat
         await self.heartbeat.stop()
@@ -216,6 +235,7 @@ class MarketMaker:
                 self.market.up_token_id,
                 self.market.dn_token_id,
             )
+            self._cached_usdc_balance = await self.order_mgr.get_usdc_balance()
             up_diff = abs(real_up - self.inventory.up_shares)
             dn_diff = abs(real_dn - self.inventory.dn_shares)
             if up_diff > 1.0 or dn_diff > 1.0:
@@ -265,6 +285,13 @@ class MarketMaker:
             self.inventory, vol, fv_up, fv_dn)
 
         if should_pause and not self._paused:
+            # Take-profit / trailing stop → go to closing mode, not just pause
+            if "Take profit" in reason or "Trailing stop" in reason:
+                log.warning(f"Profit exit: {reason}")
+                self._is_closing = True
+                await self.order_mgr.cancel_all()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
             self._paused = True
             self._pause_reason = reason
             await self.order_mgr.cancel_all()
@@ -277,6 +304,26 @@ class MarketMaker:
 
         if self._paused:
             return
+
+        # ── Market quality check (every N ticks, live only) ─────────
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        if is_live and self._tick_count % self.config.quality_check_interval == 0:
+            try:
+                up_book = await self.order_mgr.get_full_book(self.market.up_token_id)
+                dn_book = await self.order_mgr.get_full_book(self.market.dn_token_id)
+                self._last_quality = self.quality_analyzer.analyze(
+                    up_book, dn_book, fv_up, fv_dn)
+
+                should_exit, reason = self.quality_analyzer.check_exit_conditions(
+                    up_book, dn_book, fv_up, fv_dn, self.inventory)
+                if should_exit:
+                    log.warning(f"Early exit: {reason}")
+                    self._is_closing = True
+                    await self.order_mgr.cancel_all()
+                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                    return
+            except Exception as e:
+                log.debug(f"Quality check error: {e}")
 
         # 6. Generate quotes
         all_quotes = self.quote_engine.generate_all_quotes(
@@ -371,31 +418,65 @@ class MarketMaker:
             if len(self._spread_samples) > 1000:
                 self._spread_samples = self._spread_samples[-500:]
 
+    def _compute_fv(self) -> tuple[float, float]:
+        """Compute current fair values from feed state. Returns (fv_up, fv_dn)."""
+        st = self.feed_state
+        mid = st.mid if st.mid and st.mid > 0 else 0
+        if mid <= 0 or not self.market:
+            return 0.5, 0.5
+        klines = list(st.klines) if st.klines else []
+        bids = list(st.bids) if st.bids else []
+        asks = list(st.asks) if st.asks else []
+        trades = list(st.trades) if st.trades else []
+        return self.fair_value.compute(
+            mid, self.market.strike,
+            self.market.time_remaining, klines,
+            bids, asks, trades,
+        )
+
     async def _liquidate_inventory(self) -> None:
         """Sell remaining inventory (called each tick in closing mode).
 
-        Key design: does NOT cancel_all each tick. Instead tracks liquidation
-        order IDs and waits for them to fill before placing new ones.
-        Uses sell price cascade to avoid $0.01 in empty books.
+        Two-phase liquidation:
+        - Phase 1 (time_remaining > 30s): limit orders at FV - small discount (maker)
+        - Phase 2 (time_remaining <= 30s): aggressive taker at best_bid
+
+        Does NOT cancel_all each tick. Tracks liquidation order IDs and waits
+        for fills. When switching from phase 1 to phase 2, cancels limit orders
+        and replaces with taker orders.
         """
         if not self.market:
             return
+
+        time_left = self.market.time_remaining
+        use_taker = time_left <= 30
 
         # 1. Prune filled/cancelled liquidation orders
         active = set(self.order_mgr.active_order_ids)
         self._liquidation_order_ids &= active
 
-        # 2. If liquidation orders are still live, let them work
-        if self._liquidation_order_ids:
-            log.info("Liquidation orders still active (%d), waiting for fills",
+        # 2. If switching to taker phase, cancel existing limit orders first
+        if use_taker and self._liquidation_order_ids:
+            log.info("Switching to taker liquidation — cancelling %d limit orders",
                      len(self._liquidation_order_ids))
+            for oid in list(self._liquidation_order_ids):
+                await self.order_mgr.cancel_order(oid)
+            self._liquidation_order_ids.clear()
+
+        # 3. If liquidation orders are still live (limit phase), let them work
+        if self._liquidation_order_ids:
+            log.info("Liquidation limit orders active (%d), waiting for fills (%.0fs left)",
+                     len(self._liquidation_order_ids), time_left)
             return
 
-        # 3. Pre-flight: ensure allowance (one-time, cached)
+        # 4. Pre-flight: ensure allowance (one-time, cached)
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live:
             await self.order_mgr.ensure_sell_allowance(self.market.up_token_id)
             await self.order_mgr.ensure_sell_allowance(self.market.dn_token_id)
+
+        # 5. Compute fair values for pricing
+        fv_up, fv_dn = self._compute_fv()
 
         has_real_balance = False
 
@@ -409,34 +490,35 @@ class MarketMaker:
                 continue
 
             has_real_balance = True
+            fv = fv_up if token_id == self.market.up_token_id else fv_dn
             book = await self.order_mgr.get_book_summary(token_id)
-
-            # Sell price cascade (fix for $0.01 in empty books)
             best_bid = book["best_bid"]
             best_ask = book["best_ask"]
-            if best_bid:
-                sell_price = best_bid
-            elif best_ask:
-                sell_price = best_ask - 0.01
-            else:
-                # Empty book — use fair value as anchor
-                st = self.feed_state
-                mid = st.mid if st.mid and st.mid > 0 else 0
-                if mid > 0:
-                    klines = list(st.klines) if st.klines else []
-                    bids = list(st.bids) if st.bids else []
-                    asks = list(st.asks) if st.asks else []
-                    trades = list(st.trades) if st.trades else []
-                    fv_up, fv_dn = self.fair_value.compute(
-                        mid, self.market.strike,
-                        self.market.time_remaining, klines,
-                        bids, asks, trades,
-                    )
-                    fv = fv_up if token_id == self.market.up_token_id else fv_dn
+
+            if use_taker:
+                # Phase 2: aggressive taker — sell into best bid
+                if best_bid:
+                    sell_price = best_bid
+                elif best_ask:
+                    sell_price = best_ask - 0.01
+                elif fv > 0.05:
                     sell_price = fv * 0.5
                 else:
-                    sell_price = 0.01  # last resort fallback
-            sell_price = max(0.01, min(0.99, sell_price))
+                    sell_price = 0.01
+                post_only = False
+                phase = "TAKER"
+            else:
+                # Phase 1: limit order at FV - small discount
+                # Discount: 2 cents below FV, but not below best_bid
+                sell_price = fv - 0.02
+                if best_bid and sell_price < best_bid:
+                    sell_price = best_bid  # don't undercut below best bid
+                if sell_price < 0.03:
+                    sell_price = fv * 0.8 if fv > 0.05 else 0.03
+                post_only = True
+                phase = "LIMIT"
+
+            sell_price = round(max(0.01, min(0.99, sell_price)), 2)
 
             # Sell size from real balance, leave small dust
             sell_size = round(max(0, real_balance - 0.5), 2)
@@ -450,10 +532,11 @@ class MarketMaker:
                 size=sell_size,
                 token_id=token_id,
             )
-            order_id = await self.order_mgr.place_order(sell_quote, post_only=False)
+            order_id = await self.order_mgr.place_order(sell_quote, post_only=post_only)
             if order_id:
                 self._liquidation_order_ids.add(order_id)
-                log.info(f"Liquidating {label}: SELL {sell_size:.1f}@{sell_price:.2f} (taker)")
+                log.info(f"Liquidating {label}: SELL {sell_size:.1f}@{sell_price:.2f} "
+                         f"({phase}, FV={fv:.2f}, {time_left:.0f}s left)")
             else:
                 log.warning(f"Liquidation {label} failed ({real_balance:.1f} shares) — retrying next tick")
 
@@ -592,5 +675,27 @@ class MarketMaker:
             "pm_prices": {
                 "up": st.pm_up if hasattr(st, "pm_up") else 0,
                 "dn": st.pm_dn if hasattr(st, "pm_dn") else 0,
+            },
+
+            # Real USDC balance on Polymarket
+            "usdc_balance_pm": round(self._cached_usdc_balance, 2),
+
+            # Active orders detail
+            "active_orders_detail": self.order_mgr.get_active_orders_detail(
+                liquidation_ids=self._liquidation_order_ids,
+                up_token_id=self.market.up_token_id if self.market else "",
+                dn_token_id=self.market.dn_token_id if self.market else "",
+            ),
+
+            # Market quality
+            "market_quality": {
+                "overall_score": round(self._last_quality.overall_score, 3) if self._last_quality else None,
+                "liquidity_score": round(self._last_quality.liquidity_score, 3) if self._last_quality else None,
+                "spread_score": round(self._last_quality.spread_score, 3) if self._last_quality else None,
+                "spread_bps": round(self._last_quality.spread_bps, 1) if self._last_quality else None,
+                "bid_depth_usd": round(self._last_quality.bid_depth_usd, 2) if self._last_quality else None,
+                "ask_depth_usd": round(self._last_quality.ask_depth_usd, 2) if self._last_quality else None,
+                "tradeable": self._last_quality.tradeable if self._last_quality else None,
+                "reason": self._last_quality.reason if self._last_quality else "",
             },
         }
