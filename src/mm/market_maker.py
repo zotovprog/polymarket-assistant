@@ -63,6 +63,9 @@ class MarketMaker:
         self._pause_reason = ""
         self._task: Optional[asyncio.Task] = None
         self._started_at: float = 0.0
+        self._is_closing = False
+        self._liquidation_attempted = False
+        self._liquidation_order_ids: set[str] = set()
 
         # Current quotes (for dashboard)
         self._current_quotes: dict[str, tuple[Optional[Quote], Optional[Quote]]] = {
@@ -73,6 +76,7 @@ class MarketMaker:
         # Stats
         self._quote_count: int = 0
         self._requote_count: int = 0
+        self._tick_count: int = 0
         self._spread_samples: list[float] = []
 
         # Callbacks
@@ -104,6 +108,10 @@ class MarketMaker:
         self._started_at = time.time()
         self._paused = False
         self._pause_reason = ""
+        self._tick_count = 0
+        self._is_closing = False
+        self._liquidation_attempted = False
+        self._liquidation_order_ids = set()
 
         # Start heartbeat
         self.heartbeat.start()
@@ -159,7 +167,70 @@ class MarketMaker:
 
     async def _tick(self) -> None:
         """Single iteration of the quote loop."""
-        if not self.market or self.market.is_expired:
+        if not self.market:
+            return
+        self._tick_count += 1
+
+        # ── End-of-window management ─────────────────────────────
+        time_left = self.market.time_remaining
+
+        if time_left <= 0:
+            # Window expired — liquidate and stop
+            if not self._is_closing:
+                self._is_closing = True
+                await self.order_mgr.cancel_all()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                log.info("Window expired — cancelled all orders, liquidating inventory")
+                await self._liquidate_inventory()
+            self._running = False
+            return
+
+        # Adaptive close window: min(config, 40% of window) — so 5m=120s, 15m=120s, 1h=120s
+        window_dur = self.market.window_end - self.market.window_start
+        close_sec = min(self.config.close_window_sec, window_dur * 0.4)
+
+        if time_left <= close_sec and not self._is_closing:
+            self._is_closing = True
+            log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders")
+            await self.order_mgr.cancel_all()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+
+        # 2. Check for fills (always, including closing mode)
+        fills = await self.order_mgr.check_fills()
+        for fill in fills:
+            token_type = "up" if fill.token_id == self.market.up_token_id else "dn"
+            self.inventory.update_from_fill(fill, token_type)
+            self.risk_mgr.record_fill(fill)
+            log.info(f"FILL: {fill.side} {fill.size:.1f}@{fill.price:.2f} "
+                     f"({token_type.upper()}) fee={fill.fee:.4f}")
+            for cb in self._on_fill_callbacks:
+                try:
+                    cb(fill, token_type)
+                except Exception:
+                    pass
+
+        # Live mode: periodically reconcile internal shares with PM balances.
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        if is_live and self._tick_count % 5 == 0:
+            real_up, real_dn = await self.order_mgr.get_all_token_balances(
+                self.market.up_token_id,
+                self.market.dn_token_id,
+            )
+            up_diff = abs(real_up - self.inventory.up_shares)
+            dn_diff = abs(real_dn - self.inventory.dn_shares)
+            if up_diff > 1.0 or dn_diff > 1.0:
+                log.warning(
+                    "Inventory reconcile: internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                    self.inventory.up_shares,
+                    self.inventory.dn_shares,
+                    real_up,
+                    real_dn,
+                )
+                self.inventory.reconcile(real_up, real_dn)
+
+        if self._is_closing:
+            # Continuously try to sell remaining inventory each tick
+            await self._liquidate_inventory()
             return
 
         st = self.feed_state
@@ -173,20 +244,6 @@ class MarketMaker:
 
         if not mid or mid <= 0:
             return
-
-        # 2. Check for fills
-        fills = await self.order_mgr.check_fills()
-        for fill in fills:
-            token_type = "up" if fill.token_id == self.market.up_token_id else "dn"
-            self.inventory.update_from_fill(fill, token_type)
-            self.risk_mgr.record_fill(fill)
-            log.info(f"FILL: {fill.side} {fill.size:.1f}@{fill.price:.2f} "
-                     f"({token_type.upper()}) fee={fill.fee:.4f}")
-            for cb in self._on_fill_callbacks:
-                try:
-                    cb(fill, token_type)
-                except Exception:
-                    pass
 
         # 3. Compute fair value
         fv_up, fv_dn = self.fair_value.compute(
@@ -231,21 +288,66 @@ class MarketMaker:
 
         self._quote_count += 1
 
+        # 6b. Fetch Polymarket book and clamp quotes to avoid crossing.
+        for token_key, token_id in [
+            ("up", self.market.up_token_id),
+            ("dn", self.market.dn_token_id),
+        ]:
+            book = await self.order_mgr.get_book_summary(token_id)
+            bid, ask = all_quotes[token_key]
+            bid, ask = self.quote_engine.clamp_to_book(
+                bid, ask, book["best_bid"], book["best_ask"]
+            )
+            # Re-apply max inventory cap after clamping (safety net)
+            max_sh = self.config.max_inventory_shares
+            if bid is not None and bid.size > max_sh:
+                bid.size = round(max_sh, 2)
+            if ask is not None and ask.size > max_sh:
+                ask.size = round(max_sh, 2)
+            all_quotes[token_key] = (bid, ask)
+
         # 7. Place or update orders
+        # On Polymarket: SELL requires token inventory. Use BUY-only strategy:
+        #   BUY UP @ bid_up  +  BUY DN @ bid_dn
+        # BUY DN @ P implicitly provides ask-side for UP at (1 - P).
+        # When both fill: hold UP+DN = $1, paid bid_up+bid_dn < $1 → profit.
         for token_key in ("up", "dn"):
             new_bid, new_ask = all_quotes[token_key]
             cur_bid, cur_ask = self._current_quotes.get(token_key, (None, None))
 
             need_bid = self.quote_engine.should_requote(cur_bid, new_bid)
-            need_ask = self.quote_engine.should_requote(cur_ask, new_ask)
+            bid_notional = (new_bid.size * new_bid.price) if new_bid else 0.0
+            if need_bid and bid_notional < self.config.min_order_size_usd:
+                need_bid = False
 
-            if need_bid or need_ask:
+            # Cancel stale bid when new bid is too small or None
+            stale_bid = (not need_bid and cur_bid and cur_bid.order_id
+                         and (new_bid is None
+                              or bid_notional < self.config.min_order_size_usd))
+
+            # SELL: cap size at available inventory (partial sells OK)
+            token_bal = (self.inventory.up_shares if token_key == "up"
+                         else self.inventory.dn_shares)
+            if new_ask and token_bal > 0:
+                new_ask.size = round(min(new_ask.size, token_bal), 2)
+            ask_size = new_ask.size if new_ask else 0
+            ask_price = new_ask.price if new_ask else 0
+            need_ask = (self.quote_engine.should_requote(cur_ask, new_ask)
+                        and token_bal > 0 and new_ask is not None)
+            if need_ask and (ask_size * ask_price) < self.config.min_order_size_usd:
+                need_ask = False
+
+            # Also cancel stale ask if we no longer have inventory
+            stale_ask = (cur_ask and cur_ask.order_id
+                         and token_bal <= 0 and not need_ask)
+
+            if need_bid or need_ask or stale_bid or stale_ask:
                 self._requote_count += 1
                 # Cancel old orders
                 old_ids = []
-                if need_bid and cur_bid and cur_bid.order_id:
+                if (need_bid or stale_bid) and cur_bid and cur_bid.order_id:
                     old_ids.append(cur_bid.order_id)
-                if need_ask and cur_ask and cur_ask.order_id:
+                if (need_ask or stale_ask) and cur_ask and cur_ask.order_id:
                     old_ids.append(cur_ask.order_id)
 
                 new_quotes = []
@@ -257,8 +359,8 @@ class MarketMaker:
                 new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
 
                 # Update current quotes tracking
-                updated_bid = new_bid if need_bid else cur_bid
-                updated_ask = new_ask if need_ask else cur_ask
+                updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
+                updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                 self._current_quotes[token_key] = (updated_bid, updated_ask)
 
         # 8. Track spread for stats
@@ -268,6 +370,95 @@ class MarketMaker:
             self._spread_samples.append(spread_bps)
             if len(self._spread_samples) > 1000:
                 self._spread_samples = self._spread_samples[-500:]
+
+    async def _liquidate_inventory(self) -> None:
+        """Sell remaining inventory (called each tick in closing mode).
+
+        Key design: does NOT cancel_all each tick. Instead tracks liquidation
+        order IDs and waits for them to fill before placing new ones.
+        Uses sell price cascade to avoid $0.01 in empty books.
+        """
+        if not self.market:
+            return
+
+        # 1. Prune filled/cancelled liquidation orders
+        active = set(self.order_mgr.active_order_ids)
+        self._liquidation_order_ids &= active
+
+        # 2. If liquidation orders are still live, let them work
+        if self._liquidation_order_ids:
+            log.info("Liquidation orders still active (%d), waiting for fills",
+                     len(self._liquidation_order_ids))
+            return
+
+        # 3. Pre-flight: ensure allowance (one-time, cached)
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        if is_live:
+            await self.order_mgr.ensure_sell_allowance(self.market.up_token_id)
+            await self.order_mgr.ensure_sell_allowance(self.market.dn_token_id)
+
+        has_real_balance = False
+
+        for label, token_id in [
+            ("UP", self.market.up_token_id),
+            ("DN", self.market.dn_token_id),
+        ]:
+            real_balance = await self.order_mgr.get_token_balance(token_id)
+            if real_balance <= 0.1:
+                log.info(f"No real balance for {label}")
+                continue
+
+            has_real_balance = True
+            book = await self.order_mgr.get_book_summary(token_id)
+
+            # Sell price cascade (fix for $0.01 in empty books)
+            best_bid = book["best_bid"]
+            best_ask = book["best_ask"]
+            if best_bid:
+                sell_price = best_bid
+            elif best_ask:
+                sell_price = best_ask - 0.01
+            else:
+                # Empty book — use fair value as anchor
+                st = self.feed_state
+                mid = st.mid if st.mid and st.mid > 0 else 0
+                if mid > 0:
+                    klines = list(st.klines) if st.klines else []
+                    bids = list(st.bids) if st.bids else []
+                    asks = list(st.asks) if st.asks else []
+                    trades = list(st.trades) if st.trades else []
+                    fv_up, fv_dn = self.fair_value.compute(
+                        mid, self.market.strike,
+                        self.market.time_remaining, klines,
+                        bids, asks, trades,
+                    )
+                    fv = fv_up if token_id == self.market.up_token_id else fv_dn
+                    sell_price = fv * 0.5
+                else:
+                    sell_price = 0.01  # last resort fallback
+            sell_price = max(0.01, min(0.99, sell_price))
+
+            # Sell size from real balance, leave small dust
+            sell_size = round(max(0, real_balance - 0.5), 2)
+            if sell_size < 1.0:
+                log.info(f"{label}: real_balance={real_balance:.1f} too small to liquidate")
+                continue
+
+            sell_quote = Quote(
+                side="SELL",
+                price=sell_price,
+                size=sell_size,
+                token_id=token_id,
+            )
+            order_id = await self.order_mgr.place_order(sell_quote, post_only=False)
+            if order_id:
+                self._liquidation_order_ids.add(order_id)
+                log.info(f"Liquidating {label}: SELL {sell_size:.1f}@{sell_price:.2f} (taker)")
+            else:
+                log.warning(f"Liquidation {label} failed ({real_balance:.1f} shares) — retrying next tick")
+
+        if not has_real_balance:
+            log.info("Liquidation complete — no inventory remaining")
 
     async def on_window_transition(self, new_market: MarketInfo) -> None:
         """Handle window transition — cancel all, switch tokens, resume."""
@@ -373,6 +564,7 @@ class MarketMaker:
             "avg_spread_bps": round(avg_spread, 1),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
+            "is_closing": self._is_closing,
             "is_running": self._running,
 
             # Orders
