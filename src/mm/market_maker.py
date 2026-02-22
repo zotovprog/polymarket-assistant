@@ -508,6 +508,7 @@ class MarketMaker:
         fv_up, fv_dn = self._compute_fv()
 
         has_real_balance = False
+        placed_any = False
 
         for label, token_id in [
             ("UP", self.market.up_token_id),
@@ -584,6 +585,7 @@ class MarketMaker:
             order_id = await self.order_mgr.place_order(sell_quote, post_only=post_only)
             if order_id:
                 self._liquidation_order_ids.add(order_id)
+                placed_any = True
                 log.info(
                     f"Liquidating {label}: SELL {sell_size:.1f}@{sell_price:.2f} "
                     f"({phase}, FV={fv:.2f}, floor={floor:.2f}, "
@@ -591,9 +593,10 @@ class MarketMaker:
             else:
                 log.warning(f"Liquidation {label} failed ({real_balance:.1f} shares) — retrying next tick")
 
-        # Advance chunk counter (for gradual limit phase)
-        if not use_taker and has_real_balance:
-            self._liq_chunk_index += 1
+        # Advance chunk counter only when we actually placed orders
+        if not use_taker and placed_any:
+            self._liq_chunk_index = min(self._liq_chunk_index + 1,
+                                        cfg.liq_gradual_chunks)
             self._liq_last_chunk_time = now
 
         if not has_real_balance:
