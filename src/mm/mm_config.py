@@ -49,6 +49,9 @@ class MMConfig:
     liq_max_discount_from_fv: float = 0.03     # Max discount from FV for limit orders
     liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
 
+    # ── One-Sided Exposure ─────────────────────────────────
+    max_one_sided_ticks: int = 5  # Close if one-sided exposure for this many consecutive ticks
+
     # ── Window Management ────────────────────────────────────────
     close_window_sec: float = 120.0   # Seconds before expiry: enter closing mode
     auto_next_window: bool = True    # Auto-restart for next window after resolution

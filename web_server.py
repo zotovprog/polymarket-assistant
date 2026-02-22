@@ -139,14 +139,28 @@ class ConfigUpdateRequest(BaseModel):
 # ── Mock CLOB Client (for paper trading) ────────────────────────
 import random
 
-class MockClobClient:
-    """Mock CLOB client for paper trading with fill simulation.
+class _MockOrderSummary:
+    """Mimics py_clob_client OrderSummary with .price and .size attributes."""
+    def __init__(self, price: float, size: float):
+        self.price = str(price)
+        self.size = str(size)
 
-    Simulates order fills based on probability + price proximity to fair value.
-    When get_order() is called, each LIVE order has a chance of being filled:
-    - Base fill probability per check: ~15%
-    - Orders closer to fair value are more likely to fill
-    - Simulates realistic paper trading behavior
+
+class _MockOrderBook:
+    """Mimics py_clob_client OrderBookSummary with .bids and .asks lists."""
+    def __init__(self, bids: list, asks: list):
+        self.bids = bids  # sorted ascending by price
+        self.asks = asks  # sorted descending by price
+
+
+class MockClobClient:
+    """Mock CLOB client for paper trading with realistic fill simulation.
+
+    Features:
+    - Price-dependent fill probability (closer to FV = more likely to fill)
+    - Partial fills (50-100% of order size)
+    - Simulated order book around fair value
+    - FV sync from MarketMaker for realistic pricing
     """
 
     def __init__(self, fill_prob: float = 0.15, usdc_balance: float = 1000.0):
@@ -155,6 +169,8 @@ class MockClobClient:
         self._fill_prob = fill_prob  # Base fill probability per get_order call
         self._tick_count = 0  # Count calls for time-based fill logic
         self._usdc_balance = usdc_balance
+        # Fair values per token_id, set by market_maker via set_fair_values()
+        self._fair_values: dict[str, float] = {}
 
     @property
     def balance(self) -> float:
@@ -162,6 +178,12 @@ class MockClobClient:
 
     def get_balance(self) -> float:
         return self._usdc_balance
+
+    def set_fair_values(self, fv_up: float, fv_dn: float, market) -> None:
+        """Sync fair values from MarketMaker for realistic fill simulation."""
+        if market:
+            self._fair_values[market.up_token_id] = fv_up
+            self._fair_values[market.dn_token_id] = fv_dn
 
     @staticmethod
     def _required_collateral(side: str, size: float, price: float) -> float:
@@ -177,6 +199,7 @@ class MockClobClient:
         price = float(signed.get("price", 0.5))
         size = float(signed.get("size", 10))
         side = str(signed.get("side", "BUY")).upper()
+        token_id = signed.get("token_id", "")
         collateral = self._required_collateral(side, size, price)
 
         if side == "BUY" and self._usdc_balance < collateral:
@@ -192,6 +215,7 @@ class MockClobClient:
             "price": price,
             "size": size,
             "side": side,
+            "token_id": token_id,
             "collateral": collateral,
             "fill_credit_applied": False,
             "created_tick": self._tick_count,
@@ -212,10 +236,47 @@ class MockClobClient:
         self._orders.clear()
         return {"success": True}
 
-    def get_order(self, order_id: str) -> dict:
-        """Check order status. Simulates fills probabilistically.
+    def _compute_fill_prob(self, order: dict) -> float:
+        """Compute fill probability based on price distance from fair value.
 
-        Orders that have been live for more ticks are more likely to fill.
+        BUY closer to (or above) FV → more likely to fill.
+        SELL closer to (or below) FV → more likely to fill.
+        Age bonus capped at 2x base probability.
+        """
+        age = self._tick_count - order.get("created_tick", 0)
+        price = order["price"]
+        side = order["side"]
+        token_id = order.get("token_id", "")
+        fv = self._fair_values.get(token_id)
+
+        if fv is None or fv <= 0:
+            # No FV info — fall back to age-based only
+            age_mult = min(2.0, 1.0 + age * 0.1)
+            return min(0.60, self._fill_prob * age_mult)
+
+        distance = abs(price - fv) / max(fv, 0.01)
+
+        if side == "BUY":
+            # BUY at or above FV → high prob; BUY far below FV → low prob
+            if price >= fv:
+                base = 0.80
+            else:
+                base = max(0.02, self._fill_prob * (1.0 - distance * 5))
+        else:
+            # SELL at or below FV → high prob; SELL far above FV → low prob
+            if price <= fv:
+                base = 0.80
+            else:
+                base = max(0.02, self._fill_prob * (1.0 - distance * 5))
+
+        # Age bonus: max 2x, capped at 0.85
+        age_mult = min(2.0, 1.0 + age * 0.08)
+        return min(0.85, base * age_mult)
+
+    def get_order(self, order_id: str) -> dict:
+        """Check order status. Simulates fills with price-dependent probability.
+
+        Supports partial fills (50-100% of order size).
         """
         self._tick_count += 1
         order = self._orders.get(order_id)
@@ -225,20 +286,38 @@ class MockClobClient:
         if order["status"] != "LIVE":
             return order
 
-        # Calculate fill probability based on age
-        age = self._tick_count - order.get("created_tick", 0)
-        # Probability increases with age: starts at fill_prob, grows ~2x over 10 ticks
-        prob = min(0.95, self._fill_prob * (1 + age * 0.1))
+        prob = self._compute_fill_prob(order)
 
         if random.random() < prob:
-            # Fill the order (full fill)
-            order["status"] = "MATCHED"
-            order["size_matched"] = order["size"]
+            # Partial fill: 50-100% of remaining size
+            fill_frac = random.uniform(0.5, 1.0)
+            already_matched = float(order.get("size_matched", 0))
+            remaining = order["size"] - already_matched
+            fill_size = round(remaining * fill_frac, 2)
+
+            if fill_size < 0.5:
+                fill_size = remaining  # Fill the rest if too small to split
+
+            order["size_matched"] = round(already_matched + fill_size, 2)
+
+            if order["size_matched"] >= order["size"] - 0.01:
+                # Fully filled
+                order["status"] = "MATCHED"
+                order["size_matched"] = order["size"]
+
             if order["side"] == "SELL" and not order.get("fill_credit_applied"):
-                self._usdc_balance += order["size"] * order["price"]
+                self._usdc_balance += order["size_matched"] * order["price"]
                 order["fill_credit_applied"] = True
-            log.info(f"[MOCK] Simulated fill: {order['side']} "
-                     f"{order['size']:.1f}@{order['price']:.2f}")
+            elif (order["side"] == "SELL" and order.get("fill_credit_applied")
+                  and order["status"] == "MATCHED"):
+                # Additional credit for partial → full transition
+                prev_credit = (order["size_matched"] - fill_size) * order["price"]
+                total_credit = order["size"] * order["price"]
+                self._usdc_balance += total_credit - prev_credit
+
+            log.info(f"[MOCK] Fill: {order['side']} "
+                     f"{order['size_matched']:.1f}/{order['size']:.1f}"
+                     f"@{order['price']:.2f} (prob={prob:.2f})")
 
         return order
 
@@ -248,8 +327,32 @@ class MockClobClient:
     def is_order_scoring(self, params: dict) -> dict:
         return {"scoring": True}
 
-    def get_order_book(self, token_id: str) -> dict:
-        return {"bids": [], "asks": [], "min_order_size": 5.0}
+    def get_order_book(self, token_id: str) -> _MockOrderBook:
+        """Return simulated order book around fair value.
+
+        Generates 5 levels of bids and asks around FV with random sizes.
+        Returns _MockOrderBook with .bids (ascending) and .asks (descending)
+        matching py_clob_client OrderBookSummary format.
+        """
+        fv = self._fair_values.get(token_id, 0.50)
+        fv = max(0.05, min(0.95, fv))
+
+        bids = []
+        asks = []
+        for i in range(5):
+            bid_price = round(max(0.01, fv - 0.01 * (i + 1)), 2)
+            ask_price = round(min(0.99, fv + 0.01 * (i + 1)), 2)
+            bid_size = round(random.uniform(10, 50), 1)
+            ask_size = round(random.uniform(10, 50), 1)
+            bids.append(_MockOrderSummary(bid_price, bid_size))
+            asks.append(_MockOrderSummary(ask_price, ask_size))
+
+        # bids sorted ascending by price (lowest first, highest last)
+        bids.sort(key=lambda x: float(x.price))
+        # asks sorted descending by price (highest first, lowest last)
+        asks.sort(key=lambda x: float(x.price), reverse=True)
+
+        return _MockOrderBook(bids, asks)
 
 
 # ── CLOB Client Factory ────────────────────────────────────────
@@ -448,9 +551,10 @@ class MMRuntime:
 
         # Create and start market maker
         self.mm = MarketMaker(self.feed_state, clob, self.mm_config)
+        # Always set session budget limit for USDC cap enforcement
+        self.mm.inventory.initial_usdc = initial_usdc
         if paper_mode:
             self.mm.inventory.usdc = initial_usdc
-            self.mm.inventory.initial_usdc = initial_usdc
         self.mm.set_market(market)
 
         # Register fill callback for telegram

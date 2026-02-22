@@ -9,9 +9,12 @@ Inventory skew pushes quotes to reduce net delta.
 Prices are rounded to PM's 0.01 increment.
 """
 from __future__ import annotations
+import logging
 import math
 from .types import Quote, Inventory
 from .mm_config import MMConfig
+
+log = logging.getLogger("mm.quotes")
 
 
 def _round_price(price: float) -> float:
@@ -148,8 +151,12 @@ class QuoteEngine:
                             up_token_id: str, dn_token_id: str,
                             inventory: Inventory,
                             volatility: float = 0.0,
-                            avg_volatility: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
+                            avg_volatility: float = 0.0,
+                            usdc_budget: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
+
+        Args:
+            usdc_budget: Session USDC limit (initial_usdc). 0 = no limit.
 
         Returns dict with keys 'up' and 'dn', each containing (bid, ask).
         """
@@ -165,6 +172,23 @@ class QuoteEngine:
 
         up_bid_size = round(min(up_bid.size, up_room), 2)
         dn_bid_size = round(min(dn_bid.size, dn_room), 2)
+
+        # Cap BUY size by remaining USDC budget.
+        if usdc_budget > 0:
+            up_locked = inventory.up_shares * inventory.up_cost.avg_entry_price
+            dn_locked = inventory.dn_shares * inventory.dn_cost.avg_entry_price
+            remaining = max(0.0, usdc_budget - up_locked - dn_locked)
+            half_remaining = remaining / 2.0
+
+            if up_bid_size > 0 and up_bid.price > 0:
+                max_up_shares = half_remaining / up_bid.price
+                if up_bid_size > max_up_shares:
+                    up_bid_size = round(max(0.0, max_up_shares), 2)
+
+            if dn_bid_size > 0 and dn_bid.price > 0:
+                max_dn_shares = half_remaining / dn_bid.price
+                if dn_bid_size > max_dn_shares:
+                    dn_bid_size = round(max(0.0, max_dn_shares), 2)
 
         if up_bid_size <= 0:
             up_bid = None

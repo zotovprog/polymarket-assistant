@@ -73,6 +73,7 @@ class MarketMaker:
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
+        self._one_sided_counter: int = 0
 
         # Current quotes (for dashboard)
         self._current_quotes: dict[str, tuple[Optional[Quote], Optional[Quote]]] = {
@@ -122,6 +123,7 @@ class MarketMaker:
         self._liq_lock = None
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
+        self._one_sided_counter = 0
 
         # Start heartbeat
         self.heartbeat.start()
@@ -203,6 +205,12 @@ class MarketMaker:
             # Window expired — liquidate and stop
             if not self._is_closing:
                 self._is_closing = True
+                fv_up, fv_dn = self._compute_fv()
+                self._liq_lock = self.risk_mgr.lock_pnl(
+                    self.inventory, fv_up, fv_dn,
+                    self.config.liq_price_floor_margin)
+                self._liq_chunk_index = 0
+                self._liq_last_chunk_time = 0.0
                 await self.order_mgr.cancel_all()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 log.info("Window expired — cancelled all orders, liquidating inventory")
@@ -216,7 +224,14 @@ class MarketMaker:
 
         if time_left <= close_sec and not self._is_closing:
             self._is_closing = True
-            log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders")
+            fv_up_close, fv_dn_close = self._compute_fv()
+            self._liq_lock = self.risk_mgr.lock_pnl(
+                self.inventory, fv_up_close, fv_dn_close,
+                self.config.liq_price_floor_margin)
+            self._liq_chunk_index = 0
+            self._liq_last_chunk_time = 0.0
+            log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders "
+                     f"(lock: pnl=${self._liq_lock.trigger_pnl:.2f})")
             await self.order_mgr.cancel_all()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
 
@@ -282,6 +297,10 @@ class MarketMaker:
             trades=trades,
         )
 
+        # 3b. Sync FV to mock client for realistic paper trading
+        if hasattr(self.order_mgr.client, 'set_fair_values'):
+            self.order_mgr.client.set_fair_values(fv_up, fv_dn, self.market)
+
         # 4. Compute volatility
         vol = self.fair_value.realized_vol(klines)
         self.risk_mgr.record_vol(vol)
@@ -291,9 +310,9 @@ class MarketMaker:
             self.inventory, vol, fv_up, fv_dn)
 
         if should_pause and not self._paused:
-            # Take-profit / trailing stop → go to closing mode, not just pause
-            if "Take profit" in reason or "Trailing stop" in reason:
-                log.warning(f"Profit exit: {reason}")
+            # Take-profit / trailing stop / max drawdown → go to closing mode, not just pause
+            if "Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason:
+                log.warning(f"Exit trigger: {reason}")
                 # Lock prices at trigger time
                 self._liq_lock = self.risk_mgr.lock_pnl(
                     self.inventory, fv_up, fv_dn,
@@ -324,6 +343,29 @@ class MarketMaker:
         if self._paused:
             return
 
+        # ── One-sided exposure check ──────────────────────────────
+        up_sh = self.inventory.up_shares
+        dn_sh = self.inventory.dn_shares
+        has_position = (up_sh > 0.5 or dn_sh > 0.5)
+        is_one_sided = has_position and (up_sh < 0.5 or dn_sh < 0.5)
+
+        if is_one_sided:
+            self._one_sided_counter += 1
+            if self._one_sided_counter >= self.config.max_one_sided_ticks:
+                log.warning(
+                    f"One-sided exposure for {self._one_sided_counter} ticks: "
+                    f"UP={up_sh:.1f} DN={dn_sh:.1f} — early close")
+                self._liq_lock = self.risk_mgr.lock_pnl(
+                    self.inventory, fv_up, fv_dn, self.config.liq_price_floor_margin)
+                self._liq_chunk_index = 0
+                self._liq_last_chunk_time = 0.0
+                self._is_closing = True
+                await self.order_mgr.cancel_all()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
+        else:
+            self._one_sided_counter = 0
+
         # ── Market quality check (every N ticks, live only) ─────────
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live and self._tick_count % self.config.quality_check_interval == 0:
@@ -337,6 +379,11 @@ class MarketMaker:
                     up_book, dn_book, fv_up, fv_dn, self.inventory)
                 if should_exit:
                     log.warning(f"Early exit: {reason}")
+                    self._liq_lock = self.risk_mgr.lock_pnl(
+                        self.inventory, fv_up, fv_dn,
+                        self.config.liq_price_floor_margin)
+                    self._liq_chunk_index = 0
+                    self._liq_last_chunk_time = 0.0
                     self._is_closing = True
                     await self.order_mgr.cancel_all()
                     self._current_quotes = {"up": (None, None), "dn": (None, None)}
@@ -344,12 +391,13 @@ class MarketMaker:
             except Exception as e:
                 log.debug(f"Quality check error: {e}")
 
-        # 6. Generate quotes
+        # 6. Generate quotes (with USDC budget cap)
         all_quotes = self.quote_engine.generate_all_quotes(
             fv_up, fv_dn,
             self.market.up_token_id, self.market.dn_token_id,
             self.inventory,
             vol, self.risk_mgr.avg_volatility,
+            usdc_budget=self.inventory.initial_usdc,
         )
 
         self._quote_count += 1
@@ -485,18 +533,20 @@ class MarketMaker:
                 await self.order_mgr.cancel_order(oid)
             self._liquidation_order_ids.clear()
 
-        # 3. If limit orders are still live, let them work
-        if self._liquidation_order_ids:
-            log.info("Liquidation limit orders active (%d), waiting for fills (%.0fs left)",
-                     len(self._liquidation_order_ids), time_left)
-            return
-
-        # 4. Gradual limit: throttle by chunk interval
+        # 3. If limit orders are still live, wait for chunk interval then cancel & re-place
         now = time.time()
-        if not use_taker and self._liq_last_chunk_time > 0:
-            elapsed = now - self._liq_last_chunk_time
+        if self._liquidation_order_ids and not use_taker:
+            elapsed = now - self._liq_last_chunk_time if self._liq_last_chunk_time else 0
             if elapsed < cfg.liq_chunk_interval_sec:
+                log.info("Liquidation limit orders active (%d), waiting (%.0fs left, %.1fs since last)",
+                         len(self._liquidation_order_ids), time_left, elapsed)
                 return
+            # Stale limit orders — cancel and re-place with updated price
+            log.info("Cancelling %d stale liq orders after %.1fs, re-placing",
+                     len(self._liquidation_order_ids), elapsed)
+            for oid in list(self._liquidation_order_ids):
+                await self.order_mgr.cancel_order(oid)
+            self._liquidation_order_ids.clear()
 
         # 5. Pre-flight: ensure allowance (one-time, cached)
         is_live = not hasattr(self.order_mgr.client, "_orders")
@@ -534,6 +584,16 @@ class MarketMaker:
                 cost = self.inventory.up_cost if is_up else self.inventory.dn_cost
                 floor = max(0.01, cost.avg_entry_price + cfg.liq_price_floor_margin)
 
+            # Adaptive floor decay: floor → 0.01 as time_left → 0
+            base_floor = floor
+            window_dur = self.market.window_end - self.market.window_start
+            close_sec = min(cfg.close_window_sec, window_dur * 0.4)
+            decay_ratio = max(0.0, min(1.0, time_left / close_sec)) if close_sec > 0 else 0.0
+            floor = max(0.01, base_floor * decay_ratio)
+            if floor != base_floor:
+                log.info(f"{label}: adaptive floor {base_floor:.2f} → {floor:.2f} "
+                         f"(decay={decay_ratio:.2f}, {time_left:.0f}s left)")
+
             if use_taker:
                 # ── Phase 2: Taker ──
                 if not best_bid or best_bid <= 0:
@@ -541,17 +601,27 @@ class MarketMaker:
                     continue
 
                 if best_bid < floor and cfg.liq_abandon_below_floor:
-                    # ── Phase 3: Abandon ──
-                    log.warning(
-                        f"{label} ABANDON: best_bid={best_bid:.2f} < floor={floor:.2f} "
-                        f"— letting expire ({real_balance:.1f} shares)")
-                    continue
-
-                sell_price = best_bid
-                post_only = False
-                phase = "TAKER"
-                # Sell everything remaining
-                sell_size = round(max(0, real_balance - 0.5), 2)
+                    if time_left > 5:
+                        # Still time — wait for price recovery
+                        log.warning(
+                            f"{label}: best_bid={best_bid:.2f} < floor={floor:.2f}, "
+                            f"waiting ({time_left:.0f}s left, {real_balance:.1f} shares)")
+                        continue
+                    else:
+                        # < 5 seconds — force sell to avoid frozen tokens
+                        log.warning(
+                            f"{label} FORCE SELL: best_bid={best_bid:.2f} < floor={floor:.2f}, "
+                            f"but only {time_left:.0f}s left ({real_balance:.1f} shares)")
+                        sell_price = best_bid
+                        post_only = False
+                        phase = "FORCE_TAKER"
+                        sell_size = round(real_balance, 2)
+                else:
+                    sell_price = best_bid
+                    post_only = False
+                    phase = "TAKER"
+                    # Sell everything remaining (no buffer in taker mode)
+                    sell_size = round(real_balance, 2)
             else:
                 # ── Phase 1: Gradual Limit ──
                 # Price: max(floor, FV - discount), improve to best_bid if higher
@@ -572,8 +642,10 @@ class MarketMaker:
 
             sell_price = round(max(0.01, min(0.99, sell_price)), 2)
 
-            if sell_size < 1.0:
-                log.info(f"{label}: sell_size={sell_size:.1f} too small to liquidate")
+            # Min sell: notional >= $0.50 (for small sessions like $10)
+            min_sell = max(0.5, 0.50 / sell_price) if sell_price > 0 else 1.0
+            if sell_size < min_sell:
+                log.info(f"{label}: sell_size={sell_size:.1f} (notional=${sell_size*sell_price:.2f}) too small")
                 continue
 
             sell_quote = Quote(
@@ -618,6 +690,7 @@ class MarketMaker:
         self._liq_last_chunk_time = 0.0
         self._is_closing = False
         self._liquidation_order_ids.clear()
+        self._one_sided_counter = 0
 
         # Update market info
         self.market = new_market

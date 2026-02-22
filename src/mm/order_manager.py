@@ -200,6 +200,19 @@ class OrderManager:
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
 
+        # Log warning if collateral exceeds available USDC
+        collateral = self.required_collateral(quote)
+        if is_mock:
+            usdc_avail = float(getattr(self.client, '_usdc_balance', 0.0))
+        else:
+            usdc_avail = 0.0  # Can't check synchronously for live
+        if usdc_avail > 0 and collateral > usdc_avail:
+            log.warning(
+                "Collateral warning: %s %s %.1f@%.2f needs $%.2f but only $%.2f USDC available",
+                quote.side, quote.token_id[:8], quote.size, quote.price,
+                collateral, usdc_avail,
+            )
+
         # Ensure allowance for SELL orders on conditional tokens
         if quote.side == "SELL" and not is_mock:
             if not await self.ensure_sell_allowance(quote.token_id):
@@ -248,10 +261,12 @@ class OrderManager:
         """
         try:
             is_mock = hasattr(self.client, "_orders")
-            if is_mock:
-                return {"best_bid": None, "best_ask": None}
+            book = None
 
-            book = await asyncio.to_thread(self.client.get_order_book, token_id)
+            if is_mock:
+                book = self.client.get_order_book(token_id)
+            else:
+                book = await asyncio.to_thread(self.client.get_order_book, token_id)
             best_bid = None
             best_ask = None
 
@@ -282,9 +297,9 @@ class OrderManager:
         try:
             is_mock = hasattr(self.client, "_orders")
             if is_mock:
-                return empty
-
-            book = await asyncio.to_thread(self.client.get_order_book, token_id)
+                book = self.client.get_order_book(token_id)
+            else:
+                book = await asyncio.to_thread(self.client.get_order_book, token_id)
             if not book:
                 return empty
 
