@@ -181,8 +181,8 @@ function updateUI(s) {
     if (paperToggle && isRunning && s.paper_mode !== undefined) {
         paperToggle.checked = s.paper_mode;
     }
-    // Sync coin & timeframe selects with backend
-    if (s.market) {
+    // Sync coin & timeframe selects with backend (only when session is running)
+    if (isRunning && s.market) {
         const coinSelect = document.getElementById('coin-select');
         if (coinSelect && s.market.coin && coinSelect.value !== s.market.coin) {
             coinSelect.value = s.market.coin;
