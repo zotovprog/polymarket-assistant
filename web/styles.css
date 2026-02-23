@@ -195,6 +195,31 @@ body {
     white-space: nowrap;
 }
 
+.feed-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    margin-left: var(--sp-2);
+    padding-left: var(--sp-2);
+    border-left: 1px solid var(--border);
+}
+.feed-dots .fd {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.feed-dots .fd .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--text-dimmed);
+}
+.feed-dots .fd .dot.ok { background: var(--success); }
+.feed-dots .fd .dot.warn { background: var(--warning, #f59e0b); }
+.feed-dots .fd .dot.err { background: var(--error); }
+
 .header-actions {
     display: flex;
     align-items: center;

@@ -455,6 +455,7 @@ function updateUI(s) {
 
     // Feed status
     updateFeedStatus(s.feeds);
+    updateHeaderFeeds(s.feeds);
 
     // Charts
     updateCharts(s);
@@ -643,6 +644,27 @@ function updateFeedStatus(feeds) {
         html += indicator('PM WS', pm.connected, pm.msg_count, pm.error_count, pm.last_update_ms_ago);
     }
     container.innerHTML = html;
+}
+
+function updateHeaderFeeds(feeds) {
+    const el = document.getElementById('header-feeds');
+    if (!el) return;
+    if (!feeds || Object.keys(feeds).length === 0) {
+        el.innerHTML = '';
+        return;
+    }
+    function dot(label, ok, warnCond) {
+        const cls = ok ? (warnCond ? 'warn' : 'ok') : 'err';
+        return `<span class="fd"><span class="dot ${cls}"></span>${label}</span>`;
+    }
+    const bws = feeds.binance_ws;
+    const bob = feeds.binance_ob;
+    const pm = feeds.polymarket;
+    let h = '';
+    if (bws) h += dot('BN', bws.connected, bws.latency_ms > 5000);
+    if (bob) h += dot('OB', bob.ready, bob.last_update_ms_ago > 5000);
+    if (pm) h += dot('PM', pm.connected, pm.last_update_ms_ago > 5000);
+    el.innerHTML = h;
 }
 
 function updateCharts(s) {
