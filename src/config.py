@@ -30,8 +30,11 @@ COIN_TIMEFRAMES = {
 TF_KLINE = {"5m": "1m", "15m": "1m", "1h": "1m", "4h": "15m", "daily": "1h"}
 
 # ── Binance ─────────────────────────────────────────────────────
-BINANCE_WS   = "wss://stream.binance.com/stream"
-BINANCE_REST = "https://api.binance.com/api/v3"
+BINANCE_WS   = os.environ.get("BINANCE_WS", "wss://stream.binance.com/stream")
+BINANCE_REST = os.environ.get("BINANCE_REST", "https://api.binance.com/api/v3")
+# Fallback endpoints (Binance.us for US-based servers like Railway)
+BINANCE_WS_FALLBACK   = "wss://stream.binance.us:9443/stream"
+BINANCE_REST_FALLBACK = "https://api.binance.us/api/v3"
 OB_LEVELS    = 20          # depth levels in stream (Binance: 5 / 10 / 20)
 TRADE_TTL    = 600         # keep 10 min of trades
 KLINE_MAX    = 150         # max candles in memory

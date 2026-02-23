@@ -58,9 +58,38 @@ def _fetch_binance_depth(url: str, symbol: str) -> dict:
     return requests.get(url, params={"symbol": symbol, "limit": 20}, timeout=3).json()
 
 
+def _pick_binance_rest() -> str:
+    """Test primary Binance REST, fall back to .us if blocked."""
+    for base in [config.BINANCE_REST, config.BINANCE_REST_FALLBACK]:
+        try:
+            r = requests.get(f"{base}/ping", timeout=3)
+            if r.status_code == 200:
+                print(f"  [Binance] REST endpoint OK: {base}")
+                return base
+        except Exception:
+            pass
+    print("  [Binance] WARNING: no REST endpoint reachable, using fallback")
+    return config.BINANCE_REST_FALLBACK
+
+
+def _pick_binance_ws() -> str:
+    """Return primary or fallback WS base URL."""
+    # Quick test: try REST ping on .com — if blocked, assume WS is too
+    try:
+        r = requests.get(f"{config.BINANCE_REST}/ping", timeout=3)
+        if r.status_code == 200:
+            return config.BINANCE_WS
+    except Exception:
+        pass
+    print("  [Binance] WS falling back to binance.us")
+    return config.BINANCE_WS_FALLBACK
+
+
 async def ob_poller(symbol: str, state: State):
-    rest_url = f"{config.BINANCE_REST}/depth"
-    ws_url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@depth20@1000ms"
+    binance_rest = _pick_binance_rest()
+    rest_url = f"{binance_rest}/depth"
+    ws_base = "wss://stream.binance.us:9443" if "binance.us" in binance_rest else "wss://stream.binance.com:9443"
+    ws_url = f"{ws_base}/ws/{symbol.lower()}@depth20@1000ms"
     print(f"  [Binance OB] streaming {symbol} via {ws_url}")
 
     async def _apply_depth(bids_raw, asks_raw):
@@ -116,12 +145,13 @@ async def ob_poller(symbol: str, state: State):
 
 
 async def binance_feed(symbol: str, kline_iv: str, state: State):
+    ws_base = _pick_binance_ws()
     sym = symbol.lower()
     streams = "/".join([
         f"{sym}@trade",
         f"{sym}@kline_{kline_iv}",
     ])
-    url = f"{config.BINANCE_WS}?streams={streams}"
+    url = f"{ws_base}?streams={streams}"
 
     while True:
         try:
@@ -360,22 +390,26 @@ def _fetch_pm_strike_once(coin: str, tf: str) -> tuple[float, float, float]:
         kline_interval = config.TF_KLINE.get(tf, "1h")
         open_ms = int(window_start * 1000)
 
-        url = "https://api.binance.com/api/v3/klines"
-        resp = requests.get(url, params={
-            "symbol": symbol,
-            "interval": kline_interval,
-            "startTime": open_ms,
-            "limit": 1,
-        }, timeout=5)
+        # Try primary and fallback Binance REST endpoints
+        for base_url in [config.BINANCE_REST, config.BINANCE_REST_FALLBACK]:
+            try:
+                url = f"{base_url}/klines"
+                resp = requests.get(url, params={
+                    "symbol": symbol,
+                    "interval": kline_interval,
+                    "startTime": open_ms,
+                    "limit": 1,
+                }, timeout=5)
+                klines = resp.json()
+                if klines and isinstance(klines, list) and len(klines) > 0:
+                    strike = float(klines[0][1])  # [1] = open price
+                    print(f"  [PM] Strike={strike:.2f} (Binance {symbol} {kline_interval} open at {open_dt}) via {base_url}")
+                    return strike, window_start, window_end
+            except Exception as e:
+                print(f"  [PM] Binance kline fetch failed ({base_url}): {e}")
 
-        klines = resp.json()
-        if not klines:
-            print(f"  [PM] No Binance kline found for strike calc")
-            return 0.0, window_start, window_end
-
-        strike = float(klines[0][1])  # [1] = open price
-        print(f"  [PM] Strike={strike:.2f} (Binance {symbol} {kline_interval} open at {open_dt})")
-        return strike, window_start, window_end
+        print(f"  [PM] No Binance kline found for strike calc (all endpoints failed)")
+        return 0.0, window_start, window_end
 
     except Exception as e:
         print(f"  [PM] strike fetch failed: {e}")
