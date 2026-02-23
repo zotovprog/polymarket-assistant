@@ -473,6 +473,7 @@ class MMRuntime:
         self._mongo_log_handler = None  # MongoLogHandler (if active)
         self._pnl_history: list[tuple[float, float]] = []  # [(timestamp, session_pnl), ...]
         self._watching = False
+        self._start_balance: float = 0.0  # PM USDC balance at session start
 
     @property
     def is_running(self) -> bool:
@@ -649,6 +650,12 @@ class MMRuntime:
         await self.mm.start()
         self._running = True
 
+        # Snapshot starting balance for real PnL calc in Telegram summary
+        try:
+            self._start_balance = await self.mm.order_mgr.get_usdc_balance()
+        except Exception:
+            self._start_balance = self._initial_usdc
+
         # MongoDB logger (fills, snapshots, Python logs)
         if config.MONGO_URI:
             try:
@@ -687,7 +694,7 @@ class MMRuntime:
                 log.info(f"Monitor: mm._running=False, _is_closing={mm._is_closing}")
             if not mm._running and (mm._is_closing or (mm.market and mm.market.time_remaining <= 0)):
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
-                self._send_window_summary()
+                await self._send_window_summary()
                 self._running = False
                 for t in self._feed_tasks:
                     t.cancel()
@@ -798,7 +805,7 @@ class MMRuntime:
     async def stop(self) -> dict:
         """Stop market maker and feeds."""
         snap = self.snapshot()
-        self._send_window_summary()
+        await self._send_window_summary()
 
         if self.mm:
             await self.mm.stop()
@@ -1091,32 +1098,35 @@ class MMRuntime:
         except Exception:
             pass
 
-    def _send_window_summary(self) -> None:
-        """Send window PnL summary to Telegram."""
+    async def _send_window_summary(self) -> None:
+        """Send window PnL summary to Telegram based on real balance change."""
         if not _telegram.enabled or not self.mm:
             return
         try:
-            snap = self.mm.snapshot()
-            session_pnl = snap.get("session_pnl", 0)
             mode = "PAPER" if self._paper_mode else "LIVE"
+
+            # Fetch current USDC balance (after positions closed)
+            if self._paper_mode:
+                client = self.mm.order_mgr.client
+                end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
+            else:
+                try:
+                    end_balance = await self.mm.order_mgr.get_usdc_balance()
+                except Exception:
+                    snap = self.mm.snapshot()
+                    end_balance = snap.get("usdc_balance_pm") or snap.get("inventory", {}).get("usdc", 0)
+
+            # Real PnL = balance now minus balance at session start
+            session_pnl = end_balance - self._start_balance if self._start_balance else 0.0
 
             # Record PnL for 1h/24h aggregation
             now = time.time()
             self._pnl_history.append((now, session_pnl))
-            # Prune entries older than 24h
             cutoff_24h = now - 86400
             self._pnl_history = [(t, p) for t, p in self._pnl_history if t >= cutoff_24h]
 
             pnl_1h = sum(p for t, p in self._pnl_history if t >= now - 3600)
             pnl_24h = sum(p for t, p in self._pnl_history)
-
-            usdc_balance = self._initial_usdc
-            if self._paper_mode:
-                client = self.mm.order_mgr.client
-                if hasattr(client, "balance"):
-                    usdc_balance = float(client.balance)
-            else:
-                usdc_balance = snap.get("usdc_balance_pm") or snap.get("inventory", {}).get("usdc", 0)
 
             _telegram.notify_window_summary(
                 coin=self._coin or "UNKNOWN",
@@ -1125,8 +1135,11 @@ class MMRuntime:
                 session_pnl=session_pnl,
                 pnl_1h=pnl_1h,
                 pnl_24h=pnl_24h,
-                usdc_balance=usdc_balance,
+                usdc_balance=end_balance,
             )
+
+            # Update start_balance for next window
+            self._start_balance = end_balance
         except Exception as e:
             log.warning(f"Failed to send window summary to Telegram: {e}")
 
