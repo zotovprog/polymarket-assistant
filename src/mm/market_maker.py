@@ -712,16 +712,27 @@ class MarketMaker:
                 # Chunk sizing: split remaining balance
                 remaining_chunks = max(1, cfg.liq_gradual_chunks - self._liq_chunk_index)
                 chunk_size = round(max(0, real_balance - 0.5) / remaining_chunks, 2)
+                # PM minimum order size = 5 shares; if chunk < min, sell all at once
+                pm_min_size = self.market.min_order_size if self.market else 5.0
+                if chunk_size < pm_min_size and real_balance >= pm_min_size:
+                    chunk_size = round(real_balance, 2)
+                    log.info(f"{label}: chunk {chunk_size:.1f} < PM min {pm_min_size}, selling all at once")
                 sell_size = chunk_size
                 phase = f"LIMIT_CHUNK_{self._liq_chunk_index + 1}/{cfg.liq_gradual_chunks}"
 
             sell_price = round(max(0.01, min(0.99, sell_price)), 2)
 
-            # Min sell: notional >= $0.50 (for small sessions like $10)
-            min_sell = max(0.5, 0.50 / sell_price) if sell_price > 0 else 1.0
+            # Min sell: PM minimum order size (5 shares) or notional >= $0.50
+            pm_min_size = self.market.min_order_size if self.market else 5.0
+            min_sell = max(pm_min_size, 0.50 / sell_price) if sell_price > 0 else pm_min_size
             if sell_size < min_sell:
-                log.info(f"{label}: sell_size={sell_size:.1f} (notional=${sell_size*sell_price:.2f}) too small")
-                continue
+                if real_balance >= pm_min_size:
+                    # Bump up to full balance to meet PM minimum
+                    sell_size = round(real_balance, 2)
+                    log.info(f"{label}: bumped sell_size to {sell_size:.1f} to meet PM min {pm_min_size}")
+                else:
+                    log.info(f"{label}: sell_size={sell_size:.1f} < PM min {pm_min_size} and balance too low — skipping")
+                    continue
 
             sell_quote = Quote(
                 side="SELL",
