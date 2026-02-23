@@ -25,12 +25,33 @@
 
     <!-- Main Dashboard -->
     <div id="dashboard" class="hidden">
-        <!-- Top Bar -->
+        <!-- 1. Slim Header: logo + status + emergency buttons -->
         <header class="top-bar">
             <div class="logo">
                 <i class="fas fa-chart-line"></i> Polymarket MM
             </div>
-            <div class="controls">
+            <div class="status-bar">
+                <span id="status-indicator" class="status-dot offline"></span>
+                <span id="status-text">Offline</span>
+                <span id="uptime" class="stat-small"></span>
+            </div>
+            <div class="header-actions">
+                <button id="btn-emergency" class="btn btn-destructive" onclick="emergency()" aria-label="Emergency stop">
+                    <i class="fas fa-exclamation-triangle"></i>
+                </button>
+                <button id="btn-kill" class="btn btn-kill" onclick="killAll()"
+                        aria-label="Kill all and sell" title="Stop, sell everything, don't restart">
+                    <i class="fas fa-skull-crossbones"></i> KILL
+                </button>
+                <button class="btn btn-ghost" onclick="openLogs()" aria-label="View logs">
+                    <i class="fas fa-terminal"></i>
+                </button>
+            </div>
+        </header>
+
+        <!-- 2. Settings Panel (full width, most prominent) -->
+        <div class="settings-panel">
+            <div class="settings-row-1">
                 <select id="coin-select">
                     <option value="BTC">BTC</option>
                     <option value="ETH">ETH</option>
@@ -52,37 +73,77 @@
                     <span>$</span>
                     <input type="number" id="stake-usdc" value="10" min="5" max="10000" step="5">
                 </label>
-                <button id="btn-start" class="btn btn-start" onclick="toggleMM()">
+                <button id="btn-start" class="btn btn-start btn-start-big" onclick="toggleMM()">
                     <i class="fas fa-play"></i> Start
                 </button>
-                <button id="btn-emergency" class="btn btn-destructive" onclick="emergency()" aria-label="Emergency stop">
-                    <i class="fas fa-exclamation-triangle"></i>
-                </button>
-                <button id="btn-kill" class="btn btn-kill" onclick="killAll()"
-                        aria-label="Kill all and sell" title="Stop, sell everything, don't restart">
-                    <i class="fas fa-skull-crossbones"></i> KILL
-                </button>
-                <button class="btn btn-ghost" onclick="openLogs()" aria-label="View logs">
-                    <i class="fas fa-terminal"></i>
-                </button>
+            </div>
+            <div class="settings-row-2">
                 <span id="cred-status" class="cred-badge" title="API credential status">
                     <i class="fas fa-key"></i> <span id="cred-status-text">—</span>
                 </span>
-                <span class="balance-display" title="PM USDC balance / session limit">
+                <span class="balance-display" title="PM USDC balance">
                     <i class="fas fa-wallet"></i>
-                    <span id="pm-balance">—</span> / <span id="session-limit">—</span>
+                    <span id="pm-balance">—</span>
                 </span>
+                <span class="session-limit-display" title="Session limit">
+                    Limit: <strong id="session-limit">—</strong>
+                </span>
+                <span id="window-time-display" class="window-time-display">
+                    <i class="fas fa-clock"></i> <span id="window-remaining">—</span>
+                </span>
+                <div id="window-progress-inline" class="window-progress-inline">
+                    <div id="window-progress-bar-inline" class="window-progress-bar-inline"></div>
+                </div>
             </div>
-            <div class="status-bar">
-                <span id="status-indicator" class="status-dot offline"></span>
-                <span id="status-text">Offline</span>
-                <span id="uptime" class="stat-small"></span>
-            </div>
-        </header>
+        </div>
 
-        <!-- Main Grid -->
-        <div class="grid-container">
-            <!-- Left Column: Charts -->
+        <!-- 3. PnL Section (full width, simplified) -->
+        <div class="pnl-section">
+            <div class="pnl-big-cards">
+                <div class="pnl-big-card pnl-main-card">
+                    <div class="pnl-big-label">Session PnL</div>
+                    <div id="pnl-session" class="pnl-big-value">$0.00</div>
+                    <div id="pnl-pct" class="pnl-pct">0%</div>
+                </div>
+                <div class="pnl-big-card">
+                    <div class="pnl-big-label">Positions Worth</div>
+                    <div id="pnl-positions-worth" class="pnl-big-value secondary">$0.00</div>
+                </div>
+                <div class="pnl-big-card">
+                    <div class="pnl-big-label">Free USDC</div>
+                    <div id="pnl-free-usdc" class="pnl-big-value secondary">$0.00</div>
+                </div>
+            </div>
+            <div id="pnl-chart" class="chart-container-small"></div>
+        </div>
+
+        <!-- 4. Active Orders (full width) -->
+        <div class="panel orders-panel-new">
+            <div class="panel-header">
+                <span><i class="fas fa-list-ol"></i> Active Orders</span>
+                <span id="orders-count" class="stat-small">0</span>
+            </div>
+            <div class="orders-container">
+                <table class="orders-table">
+                    <thead>
+                        <tr>
+                            <th>Token</th>
+                            <th>Side</th>
+                            <th>Price</th>
+                            <th>Size</th>
+                            <th>$</th>
+                            <th>Distance</th>
+                            <th>Age</th>
+                            <th>Type</th>
+                        </tr>
+                    </thead>
+                    <tbody id="orders-body"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- 5. Price Chart + Quotes (2 columns) -->
+        <div class="two-col-row">
             <div class="panel chart-panel">
                 <div class="panel-header">
                     <span><i class="fas fa-chart-area"></i> Fair Value & PM Prices</span>
@@ -91,15 +152,6 @@
                 <div id="price-chart" class="chart-container"></div>
             </div>
 
-            <div class="panel spread-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-arrows-left-right"></i> Spread</span>
-                    <span id="current-spread" class="value-accent">—</span>
-                </div>
-                <div id="spread-chart" class="chart-container-small"></div>
-            </div>
-
-            <!-- Center: Orderbook & Quotes -->
             <div class="panel quotes-panel">
                 <div class="panel-header">
                     <span><i class="fas fa-book"></i> Quotes & Fair Value</span>
@@ -176,47 +228,34 @@
                     </div>
                 </div>
             </div>
+        </div>
 
-            <!-- Right Column: PnL & Fills -->
-            <div class="panel pnl-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-dollar-sign"></i> PnL</span>
-                </div>
-                <div class="pnl-cards">
-                    <div class="pnl-card">
-                        <div class="pnl-label">Total PnL</div>
-                        <div id="pnl-total" class="pnl-value total">$0.00</div>
-                        <div id="pnl-pct" class="pnl-pct">0%</div>
-                    </div>
-                    <div class="pnl-card">
-                        <div class="pnl-label">Peak</div>
-                        <div id="peak-pnl" class="pnl-value">$0.00</div>
-                    </div>
-                    <div class="pnl-card">
-                        <div class="pnl-label">Realized</div>
-                        <div id="pnl-realized" class="pnl-value">$0.00</div>
-                    </div>
-                    <div class="pnl-card">
-                        <div class="pnl-label">Position Value</div>
-                        <div id="pnl-unrealized" class="pnl-value">$0.00</div>
-                    </div>
-                    <div class="pnl-card">
-                        <div class="pnl-label">USDC Balance</div>
-                        <div id="pnl-usdc" class="pnl-value">$0.00</div>
-                    </div>
-                    <div class="pnl-card">
-                        <div class="pnl-label">Fees</div>
-                        <div id="pnl-fees" class="pnl-value">$0.00</div>
-                    </div>
-                </div>
-                <div id="pnl-chart" class="chart-container-small"></div>
+        <!-- 6. Collapsible Sections -->
+
+        <!-- Spread Chart -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-arrows-left-right"></i> Spread Chart</span>
+                <span class="collapsible-right">
+                    <span id="current-spread" class="value-accent">—</span>
+                    <span class="chevron">▸</span>
+                </span>
             </div>
+            <div class="collapsible-content collapsed">
+                <div id="spread-chart" class="chart-container-small"></div>
+            </div>
+        </div>
 
-            <div class="panel fills-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-exchange-alt"></i> Recent Fills</span>
+        <!-- Recent Fills -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-exchange-alt"></i> Recent Fills</span>
+                <span class="collapsible-right">
                     <span id="fill-count" class="stat-small">0</span>
-                </div>
+                    <span class="chevron">▸</span>
+                </span>
+            </div>
+            <div class="collapsible-content collapsed">
                 <div class="fills-container">
                     <table class="fills-table">
                         <thead>
@@ -232,38 +271,18 @@
                     </table>
                 </div>
             </div>
+        </div>
 
-            <!-- Active Orders -->
-            <div class="panel orders-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-list-ol"></i> Active Orders</span>
-                    <span id="orders-count" class="stat-small">0</span>
-                </div>
-                <div class="orders-container">
-                    <table class="orders-table">
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Token</th>
-                                <th>Side</th>
-                                <th>Price</th>
-                                <th>Size</th>
-                                <th>$</th>
-                                <th>Age</th>
-                                <th>Type</th>
-                            </tr>
-                        </thead>
-                        <tbody id="orders-body"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Market Quality -->
-            <div class="panel quality-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-signal"></i> Market Quality</span>
+        <!-- Market Quality -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-signal"></i> Market Quality</span>
+                <span class="collapsible-right">
                     <span id="quality-badge" class="quality-badge">—</span>
-                </div>
+                    <span class="chevron">▸</span>
+                </span>
+            </div>
+            <div class="collapsible-content collapsed">
                 <div class="quality-content">
                     <div class="quality-score-bar">
                         <div class="quality-label">Overall</div>
@@ -292,12 +311,20 @@
                     </div>
                 </div>
             </div>
+        </div>
 
-            <!-- Bottom: Stats & Config -->
-            <div class="panel stats-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-info-circle"></i> Session Stats</span>
-                </div>
+        <!-- Feed Status -->
+        <div class="feed-status-bar" id="feed-status">
+            <span style="color:var(--text-muted)">No feed data</span>
+        </div>
+
+        <!-- Session Stats (includes old PnL details) -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-info-circle"></i> Session Stats</span>
+                <span class="collapsible-right"><span class="chevron">▸</span></span>
+            </div>
+            <div class="collapsible-content collapsed">
                 <div class="stats-grid">
                     <div class="stat"><span class="stat-label">Volume</span><span id="stat-volume" class="stat-value">$0</span></div>
                     <div class="stat"><span class="stat-label">Fills</span><span id="stat-fills" class="stat-value">0</span></div>
@@ -307,17 +334,27 @@
                     <div class="stat"><span class="stat-label">Volatility</span><span id="stat-vol" class="stat-value">—</span></div>
                     <div class="stat"><span class="stat-label">Heartbeat</span><span id="stat-heartbeat" class="stat-value">—</span></div>
                     <div class="stat"><span class="stat-label">Rebate Est.</span><span id="stat-rebate" class="stat-value">$0</span></div>
+                    <div class="stat"><span class="stat-label">Peak PnL</span><span id="peak-pnl" class="stat-value">$0.00</span></div>
+                    <div class="stat"><span class="stat-label">Realized</span><span id="pnl-realized" class="stat-value">$0.00</span></div>
+                    <div class="stat"><span class="stat-label">Unrealized</span><span id="pnl-unrealized" class="stat-value">$0.00</span></div>
+                    <div class="stat"><span class="stat-label">Fees</span><span id="pnl-fees" class="stat-value">$0.00</span></div>
                 </div>
             </div>
+        </div>
 
-            <div class="panel config-panel">
-                <div class="panel-header">
-                    <span><i class="fas fa-cog"></i> MM Config</span>
-                    <div class="config-actions">
-                        <button class="btn-toggle" id="cfg-enabled-btn" onclick="toggleEnabled()">Enabled</button>
-                        <button class="btn btn-secondary btn-sm" onclick="saveConfig()">Apply All</button>
-                    </div>
-                </div>
+        <!-- MM Config -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-cog"></i> MM Config</span>
+                <span class="collapsible-right">
+                    <span class="config-actions-inline">
+                        <button class="btn-toggle" id="cfg-enabled-btn" onclick="event.stopPropagation(); toggleEnabled()">Enabled</button>
+                        <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); saveConfig()">Apply All</button>
+                    </span>
+                    <span class="chevron">▸</span>
+                </span>
+            </div>
+            <div class="collapsible-content collapsed">
                 <div class="config-sections">
                     <!-- Spread Section -->
                     <div class="config-section">
@@ -393,11 +430,6 @@
             <span id="window-state"></span>
             <span id="risk-status" class="risk-ok"><i class="fas fa-shield-alt"></i> OK</span>
         </footer>
-
-        <!-- Window Progress Bar -->
-        <div id="window-progress-wrap" style="display:none; position:fixed; bottom:40px; left:0; right:0; height:4px; z-index:100;">
-            <div id="window-progress-bar" style="height:4px; background:var(--accent); width:100%; transition:width 1s linear;"></div>
-        </div>
     </div>
 
     <!-- Logs Modal -->

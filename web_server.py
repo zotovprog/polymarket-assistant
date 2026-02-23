@@ -204,6 +204,9 @@ class MockClobClient:
         self._usdc_balance = usdc_balance
         # Fair values per token_id, set by market_maker via set_fair_values()
         self._fair_values: dict[str, float] = {}
+        self._pm_prices: dict = {}  # {"up": mid, "dn": mid} from real PM WS feed
+        self._up_token: str | None = None
+        self._dn_token: str | None = None
 
     @property
     def balance(self) -> float:
@@ -212,11 +215,21 @@ class MockClobClient:
     def get_balance(self) -> float:
         return self._usdc_balance
 
-    def set_fair_values(self, fv_up: float, fv_dn: float, market) -> None:
+    def set_fair_values(
+        self,
+        fv_up: float,
+        fv_dn: float,
+        market,
+        pm_prices: dict | None = None,
+    ) -> None:
         """Sync fair values from MarketMaker for realistic fill simulation."""
         if market:
             self._fair_values[market.up_token_id] = fv_up
             self._fair_values[market.dn_token_id] = fv_dn
+            self._up_token = market.up_token_id
+            self._dn_token = market.dn_token_id
+        if pm_prices:
+            self._pm_prices = pm_prices
 
     @staticmethod
     def _required_collateral(side: str, size: float, price: float) -> float:
@@ -289,22 +302,34 @@ class MockClobClient:
         token_id = order.get("token_id", "")
         fv = self._fair_values.get(token_id)
 
-        if fv is None or fv <= 0:
-            # No FV info — fall back to age-based only
+        # Use PM mid price as reference instead of own FV (avoids self-referential simulation)
+        if token_id == self._up_token:
+            ref_price = self._pm_prices.get("up")
+            if ref_price is None:
+                ref_price = fv
+        elif token_id == self._dn_token:
+            ref_price = self._pm_prices.get("dn")
+            if ref_price is None:
+                ref_price = fv
+        else:
+            ref_price = fv
+
+        if ref_price is None or ref_price <= 0:
+            # No price reference info — fall back to age-based only
             age_mult = min(2.0, 1.0 + age * 0.1)
             return min(0.60, self._fill_prob * age_mult)
 
-        distance = abs(price - fv) / max(fv, 0.01)
+        distance = abs(price - ref_price) / max(ref_price, 0.01)
 
         if side == "BUY":
             # BUY at or above FV → high prob; BUY far below FV → low prob
-            if price >= fv:
+            if price >= ref_price:
                 base = 0.80
             else:
                 base = max(0.02, self._fill_prob * (1.0 - distance * 5))
         else:
             # SELL at or below FV → high prob; SELL far above FV → low prob
-            if price <= fv:
+            if price <= ref_price:
                 base = 0.80
             else:
                 base = max(0.02, self._fill_prob * (1.0 - distance * 5))
@@ -446,6 +471,8 @@ class MMRuntime:
         self._next_window_at: float = 0.0  # timestamp when next window starts
         self._mongo = None  # MongoLogger (if MONGO_URI set)
         self._mongo_log_handler = None  # MongoLogHandler (if active)
+        self._pnl_history: list[tuple[float, float]] = []  # [(timestamp, session_pnl), ...]
+        self._watching = False
 
     @property
     def is_running(self) -> bool:
@@ -510,6 +537,9 @@ class MMRuntime:
         """Start feeds and market maker."""
         if self._running:
             raise HTTPException(status_code=400, detail="Already running")
+
+        if self._watching:
+            await self.stop_watch()
 
         initial_usdc = float(initial_usdc)
         self._coin = coin
@@ -596,6 +626,10 @@ class MMRuntime:
             initial_usdc=initial_usdc,
         )
 
+        # Enrich MarketInfo with tick_size, market_type, resolution_source from PM API
+        if market and market.up_token_id and not market.up_token_id.startswith("placeholder"):
+            await self._enrich_market_info(market, coin, timeframe)
+
         # Create and start market maker
         self.mm = MarketMaker(self.feed_state, clob, self.mm_config)
         # Always set session budget limit for USDC cap enforcement
@@ -608,9 +642,9 @@ class MMRuntime:
         if not paper_mode and PM_PRIVATE_KEY:
             self.mm._private_key = PM_PRIVATE_KEY
 
-        # Register fill callback for telegram
-        if _telegram.enabled:
-            self.mm.on_fill(self._on_fill_telegram)
+        # Telegram fill notifications disabled — only window summary is sent
+        # if _telegram.enabled:
+        #     self.mm.on_fill(self._on_fill_telegram)
 
         await self.mm.start()
         self._running = True
@@ -648,9 +682,12 @@ class MMRuntime:
             mm = self.mm
             if not mm:
                 break
-            # MM stopped itself due to window expiry
-            if not mm._running and mm._is_closing:
+            # MM stopped itself (window expiry or other reason)
+            if not mm._running:
+                log.info(f"Monitor: mm._running=False, _is_closing={mm._is_closing}")
+            if not mm._running and (mm._is_closing or (mm.market and mm.market.time_remaining <= 0)):
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
+                self._send_window_summary()
                 self._running = False
                 for t in self._feed_tasks:
                     t.cancel()
@@ -761,6 +798,7 @@ class MMRuntime:
     async def stop(self) -> dict:
         """Stop market maker and feeds."""
         snap = self.snapshot()
+        self._send_window_summary()
 
         if self.mm:
             await self.mm.stop()
@@ -795,9 +833,10 @@ class MMRuntime:
                 client = self.mm.order_mgr.client
                 if hasattr(client, "balance"):
                     snap["mock_usdc_balance"] = float(client.balance)
+            snap["feeds"] = self._build_feeds_dict()
             return snap
 
-        return {
+        result = {
             "is_running": False,
             "paper_mode": self._paper_mode,
             "next_window_in": max(0, self._next_window_at - time.time()) if self._next_window_at else 0,
@@ -808,6 +847,89 @@ class MMRuntime:
             "recent_fills": [],
             "config": self.mm_config.to_dict(),
         }
+        result["feeds"] = self._build_feeds_dict()
+        if self._watching and self.feed_state:
+            st = self.feed_state
+            result["fair_value"]["binance_mid"] = st.mid
+            if st.pm_up is not None:
+                result["pm_prices"] = {"up": st.pm_up, "dn": st.pm_dn}
+        return result
+
+    def _build_feeds_dict(self) -> dict:
+        """Build feed health metrics dict for API response."""
+        st = self.feed_state
+        if not st:
+            return {}
+        now = time.time()
+        return {
+            "binance_ws": {
+                "connected": st.binance_ws_connected,
+                "msg_count": st.binance_ws_msg_count,
+                "error_count": st.binance_ws_error_count,
+                "latency_ms": round((now - st.binance_ob_last_ok_ts) * 1000) if st.binance_ob_last_ok_ts else None,
+                "uptime_sec": round(now - st.binance_ws_connected_at) if st.binance_ws_connected_at else 0,
+            },
+            "binance_ob": {
+                "ready": st.binance_ob_ready,
+                "msg_count": st.binance_ob_msg_count,
+                "error_count": st.binance_ob_error_count,
+                "last_update_ms_ago": round((now - st.binance_ob_last_ok_ts) * 1000) if st.binance_ob_last_ok_ts else None,
+            },
+            "polymarket": {
+                "connected": st.pm_connected,
+                "prices_ready": st.pm_prices_ready,
+                "msg_count": st.pm_msg_count,
+                "error_count": st.pm_error_count,
+                "last_update_ms_ago": round((now - st.pm_last_update_ts) * 1000) if st.pm_last_update_ts else None,
+                "uptime_sec": round(now - st.pm_connected_at) if st.pm_connected_at else 0,
+            },
+        }
+
+    async def start_watch(self, coin: str, timeframe: str) -> dict:
+        """Start feeds only (no trading) for live price monitoring."""
+        if self._running:
+            return {"detail": "Session running, feeds already active"}
+        if self._watching:
+            await self.stop_watch()
+
+        self._coin = coin
+        self._timeframe = timeframe
+        self.feed_state = feeds.State()
+
+        symbol = config.COIN_BINANCE.get(coin, "BTCUSDT")
+        kline_interval = config.TF_KLINE.get(timeframe, "5m")
+
+        self._feed_tasks.append(asyncio.create_task(
+            feeds.ob_poller(symbol, self.feed_state)))
+        self._feed_tasks.append(asyncio.create_task(
+            feeds.binance_feed(symbol, kline_interval, self.feed_state)))
+
+        try:
+            tokens = await asyncio.wait_for(
+                asyncio.to_thread(feeds.fetch_pm_tokens, coin, timeframe),
+                timeout=15.0,
+            )
+            if tokens and tokens[0] and tokens[1]:
+                up_id, dn_id, _ = tokens
+                self.feed_state.pm_up_id = up_id
+                self.feed_state.pm_dn_id = dn_id
+                self._feed_tasks.append(asyncio.create_task(
+                    feeds.pm_feed(self.feed_state)))
+        except Exception as e:
+            log.warning(f"Watch: PM tokens not available: {e}")
+
+        self._watching = True
+        log.info(f"Watch mode started: {coin}/{timeframe}")
+        return {"ok": True, "coin": coin, "timeframe": timeframe}
+
+    async def stop_watch(self):
+        """Stop watch mode feeds."""
+        for t in self._feed_tasks:
+            t.cancel()
+        self._feed_tasks.clear()
+        self._watching = False
+        self.feed_state = None
+        log.info("Watch mode stopped")
 
     def update_config(self, **kwargs) -> dict:
         """Update MM config at runtime."""
@@ -885,6 +1007,62 @@ class MMRuntime:
             condition_id=condition_id,
         )
 
+    async def _enrich_market_info(self, market: MarketInfo,
+                                    coin: str, timeframe: str) -> None:
+        """Fetch tick_size from PM book and detect market_type/resolution_source."""
+        import requests as _req
+
+        # 1. tick_size + min_order_size from PM order book API
+        try:
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": market.up_token_id},
+                    timeout=10,
+                )
+            )
+            if resp.ok:
+                data = resp.json()
+                if "tick_size" in data:
+                    market.tick_size = float(data["tick_size"])
+                if "min_order_size" in data:
+                    market.min_order_size = float(data["min_order_size"])
+                log.info(
+                    "PM book params: tick_size=%s, min_order_size=%s",
+                    market.tick_size, market.min_order_size,
+                )
+        except Exception as e:
+            log.warning("Failed to fetch tick_size from PM: %s — using default %s", e, market.tick_size)
+
+        # 2. market_type + resolution_source from PM event description
+        try:
+            event_data = await asyncio.to_thread(
+                feeds.fetch_pm_event_data, coin, timeframe,
+            )
+            if event_data:
+                title = (event_data.get("title", "") or "").lower()
+                desc = (event_data.get("description", "") or "").lower()
+                text = title + " " + desc
+
+                if "above" in text or "below" in text:
+                    market.market_type = "above_below"
+                else:
+                    market.market_type = "up_down"
+
+                if "chainlink" in text:
+                    market.resolution_source = "chainlink"
+                elif "binance" in text:
+                    market.resolution_source = "binance"
+                else:
+                    market.resolution_source = "unknown"
+
+                log.info(
+                    "Market classification: type=%s, resolution=%s",
+                    market.market_type, market.resolution_source,
+                )
+        except Exception as e:
+            log.warning("Failed to detect market type: %s", e)
+
     def _build_placeholder_market(self, coin: str, timeframe: str) -> MarketInfo:
         """Placeholder market when PM tokens aren't available yet."""
         now = time.time()
@@ -912,6 +1090,45 @@ class MMRuntime:
             )
         except Exception:
             pass
+
+    def _send_window_summary(self) -> None:
+        """Send window PnL summary to Telegram."""
+        if not _telegram.enabled or not self.mm:
+            return
+        try:
+            snap = self.mm.snapshot()
+            session_pnl = snap.get("session_pnl", 0)
+            mode = "PAPER" if self._paper_mode else "LIVE"
+
+            # Record PnL for 1h/24h aggregation
+            now = time.time()
+            self._pnl_history.append((now, session_pnl))
+            # Prune entries older than 24h
+            cutoff_24h = now - 86400
+            self._pnl_history = [(t, p) for t, p in self._pnl_history if t >= cutoff_24h]
+
+            pnl_1h = sum(p for t, p in self._pnl_history if t >= now - 3600)
+            pnl_24h = sum(p for t, p in self._pnl_history)
+
+            usdc_balance = self._initial_usdc
+            if self._paper_mode:
+                client = self.mm.order_mgr.client
+                if hasattr(client, "balance"):
+                    usdc_balance = float(client.balance)
+            else:
+                usdc_balance = snap.get("inventory", {}).get("usdc", 0)
+
+            _telegram.notify_window_summary(
+                coin=self._coin or "UNKNOWN",
+                timeframe=self._timeframe or "UNKNOWN",
+                mode=mode,
+                session_pnl=session_pnl,
+                pnl_1h=pnl_1h,
+                pnl_24h=pnl_24h,
+                usdc_balance=usdc_balance,
+            )
+        except Exception as e:
+            log.warning(f"Failed to send window summary to Telegram: {e}")
 
     def _fill_context(self) -> dict:
         """Build context dict for MongoLogger fill records."""
@@ -1035,6 +1252,23 @@ async def mm_kill(request: Request):
     _runtime.mm_config.enabled = False
     snap = await _runtime.stop()
     return {"ok": True, "state": snap}
+
+
+@app.post("/api/mm/watch")
+async def mm_watch(request: Request, body: dict):
+    """Start feeds without trading for live price monitoring."""
+    _require_auth(request)
+    coin = body.get("coin", "BTC")
+    timeframe = body.get("timeframe", "5m")
+    return await _runtime.start_watch(coin, timeframe)
+
+
+@app.post("/api/mm/watch/stop")
+async def mm_watch_stop(request: Request):
+    """Stop watch mode feeds."""
+    _require_auth(request)
+    await _runtime.stop_watch()
+    return {"ok": True}
 
 
 @app.post("/api/mm/validate-credentials")

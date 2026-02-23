@@ -8,9 +8,11 @@ Uses py_clob_client for:
 """
 from __future__ import annotations
 import asyncio
+import json
 import logging
 import time
 from typing import Any, Optional
+import websockets
 
 from .types import Quote, Fill
 from .mm_config import MMConfig
@@ -43,6 +45,7 @@ class OrderManager:
         self.config = config
         self._log = log
         self._active_orders: dict[str, Quote] = {}  # order_id -> Quote
+        self._order_post_only: dict[str, bool] = {}  # order_id -> placement post_only flag
         self._filled_order_ids: set[str] = set()
         self._partial_fill_reported: dict[str, float] = {}  # order_id -> last reported size_matched
         self._pending_cancels: set[str] = set()
@@ -51,6 +54,9 @@ class OrderManager:
         self._session_budget: float = 0.0  # Hard USDC budget cap (0 = no limit)
         self._session_spent: float = 0.0   # Total USDC committed to BUY orders this session
         self._warn_cooldowns: dict[str, float] = {}
+        self._fill_ws_task: asyncio.Task | None = None
+        self._fill_ws_running = False
+        self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
 
     def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
         """Log a warning at most once per cooldown period."""
@@ -194,6 +200,7 @@ class OrderManager:
         quote.order_id = order_id
         quote.placed_at = time.time()
         self._active_orders[order_id] = quote
+        self._order_post_only[order_id] = post_only
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
         return order_id
@@ -470,6 +477,7 @@ class OrderManager:
                 timeout=10.0,
             )
             self._active_orders.pop(order_id, None)
+            self._order_post_only.pop(order_id, None)
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
         except Exception as e:
@@ -488,6 +496,7 @@ class OrderManager:
             await asyncio.to_thread(self.client.cancel_all)
             cancelled = len(ids)
             self._active_orders.clear()
+            self._order_post_only.clear()
             log.info(f"Batch cancelled {cancelled} orders")
         except Exception as e:
             log.warning(f"Batch cancel failed: {e}, trying individual...")
@@ -511,6 +520,75 @@ class OrderManager:
         # Place new orders
         return await self.place_quotes(*new_quotes)
 
+    async def start_fill_ws(self, api_key: str = "", api_secret: str = "",
+                            api_passphrase: str = "") -> None:
+        """Start WebSocket connection for real-time fill notifications.
+
+        This supplements polling — fills detected via WS are queued and
+        consumed by check_fills() on next call. Polling remains as reconciliation.
+        """
+        if self._fill_ws_running:
+            return
+        self._fill_ws_running = True
+        self._fill_ws_task = asyncio.ensure_future(
+            self._fill_ws_loop(api_key, api_secret, api_passphrase))
+
+    async def _fill_ws_loop(self, api_key: str, api_secret: str,
+                            api_passphrase: str) -> None:
+        """Background loop for user WebSocket channel."""
+        url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+        log.info("Fill WS: connecting to %s", url)
+        while self._fill_ws_running:
+            try:
+                async with websockets.connect(url, ping_interval=10) as ws:
+                    auth = {}
+                    if api_key:
+                        auth = {
+                            "apiKey": api_key,
+                            "secret": api_secret,
+                            "passphrase": api_passphrase,
+                        }
+                    sub_msg = {
+                        "type": "subscribe",
+                        "channel": "user",
+                        "auth": auth,
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    log.info("Fill WS: subscribed to user channel")
+
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                            event_type = msg.get("event_type", "")
+                            if event_type == "trade":
+                                await self._ws_fills_queue.put(msg)
+                                log.info(
+                                    "Fill WS: trade event — order=%s size=%s price=%s",
+                                    str(msg.get("order_id", ""))[:12],
+                                    msg.get("size", "?"),
+                                    msg.get("price", "?"),
+                                )
+                            elif event_type == "order" and msg.get("status") in ("MATCHED", "CLOSED"):
+                                await self._ws_fills_queue.put(msg)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                if self._fill_ws_running:
+                    log.warning("Fill WS disconnected: %s — reconnecting in 5s", e)
+                    await asyncio.sleep(5)
+        log.info("Fill WS: stopped")
+
+    async def stop_fill_ws(self) -> None:
+        """Stop the fill WebSocket."""
+        self._fill_ws_running = False
+        if self._fill_ws_task:
+            self._fill_ws_task.cancel()
+            try:
+                await self._fill_ws_task
+            except asyncio.CancelledError:
+                pass
+            self._fill_ws_task = None
+
     async def check_fills(self) -> list[Fill]:
         """Poll for fills on active orders.
 
@@ -518,10 +596,30 @@ class OrderManager:
         Tracks previously reported size_matched per order to emit
         incremental fill events for partial fills.
         """
+        # Drain WS fill events — collect order IDs that definitely have updates
+        ws_priority_ids: set[str] = set()
+        while not self._ws_fills_queue.empty():
+            try:
+                ws_msg = self._ws_fills_queue.get_nowait()
+                oid = ws_msg.get("order_id", "")
+                if oid and oid in self._active_orders:
+                    ws_priority_ids.add(oid)
+            except asyncio.QueueEmpty:
+                break
+        if ws_priority_ids:
+            log.info("Fill WS: %d orders with pending updates", len(ws_priority_ids))
+
         fills = []
         to_remove = []
 
-        for order_id, quote in self._active_orders.items():
+        # Check WS-notified orders first, then remaining active orders
+        check_order = list(ws_priority_ids)
+        check_order.extend(oid for oid in self._active_orders if oid not in ws_priority_ids)
+
+        for order_id in check_order:
+            quote = self._active_orders.get(order_id)
+            if not quote:
+                continue
             try:
                 order = await self._retry(
                     asyncio.to_thread,
@@ -538,15 +636,18 @@ class OrderManager:
                 new_fill_size = size_matched - prev_matched
 
                 if new_fill_size >= 0.01:
+                    is_maker = self._order_post_only.get(order_id, True)
+                    notional = quote.price * new_fill_size
+                    fee = 0.0 if is_maker else notional * self.config.taker_fee_rate
                     fill = Fill(
                         ts=time.time(),
                         side=quote.side,
                         token_id=quote.token_id,
                         price=quote.price,
                         size=round(new_fill_size, 4),
-                        fee=0.0,  # Maker fee = 0%
+                        fee=fee,
                         order_id=order_id,
-                        is_maker=True,
+                        is_maker=is_maker,
                     )
                     fills.append(fill)
                     self._partial_fill_reported[order_id] = size_matched
@@ -554,6 +655,8 @@ class OrderManager:
                     # Track session spending for budget cap
                     if quote.side == "BUY":
                         self._session_spent += new_fill_size * quote.price
+                    elif quote.side == "SELL":
+                        self._session_spent = max(0.0, self._session_spent - new_fill_size * quote.price)
 
                     # Mock balance tracking mirrors fill-side share movements.
                     if hasattr(self.client, "_orders"):
@@ -574,6 +677,7 @@ class OrderManager:
 
         for oid in to_remove:
             self._active_orders.pop(oid, None)
+            self._order_post_only.pop(oid, None)
 
         return fills
 
@@ -609,6 +713,7 @@ class OrderManager:
     def reset(self) -> None:
         """Clear tracked order state between windows."""
         self._active_orders.clear()
+        self._order_post_only.clear()
         self._filled_order_ids.clear()
         self._partial_fill_reported.clear()
         self._mock_token_balances.clear()

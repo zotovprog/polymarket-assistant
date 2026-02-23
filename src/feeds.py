@@ -38,6 +38,18 @@ class State:
         self.pm_all_filtered: bool = False
         self.pm_all_filtered_ts: float = 0.0
 
+        # ── Feed health metrics ────────────────────────
+        self.binance_ws_msg_count: int = 0
+        self.binance_ws_error_count: int = 0
+        self.binance_ws_connected_at: float = 0.0
+
+        self.binance_ob_msg_count: int = 0
+        self.binance_ob_error_count: int = 0
+
+        self.pm_msg_count: int = 0
+        self.pm_error_count: int = 0
+        self.pm_connected_at: float = 0.0
+
 
 OB_POLL_INTERVAL = 2
 
@@ -58,6 +70,7 @@ async def ob_poller(symbol: str, state: State):
             state.mid = (state.bids[0][0] + state.asks[0][0]) / 2
             state.binance_ob_ready = True
             state.binance_ob_last_ok_ts = time.time()
+            state.binance_ob_msg_count += 1
 
     reconnect_delay = 1
     while True:
@@ -95,6 +108,7 @@ async def ob_poller(symbol: str, state: State):
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            state.binance_ob_error_count += 1
             delay = reconnect_delay or OB_POLL_INTERVAL
             print(f"  [Binance OB] disconnected: {e}. Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
@@ -119,12 +133,14 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
             ) as ws:
                 print(f"  [Binance WS] connected – {symbol}")
                 state.binance_ws_connected = True
+                state.binance_ws_connected_at = time.time()
 
                 while True:
                     try:
                         data   = json.loads(await ws.recv())
                         stream = data.get("stream", "")
                         pay    = data["data"]
+                        state.binance_ws_msg_count += 1
 
                         if "@trade" in stream:
                             state.trades.append({
@@ -151,11 +167,13 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                                 state.klines = state.klines[-config.KLINE_MAX:]
 
                     except websockets.exceptions.ConnectionClosed:
+                        state.binance_ws_error_count += 1
                         print(f"  [Binance WS] connection closed, reconnecting...")
                         state.binance_ws_connected = False
                         break
 
         except Exception as e:
+            state.binance_ws_error_count += 1
             print(f"  [Binance WS] connection error: {e}, reconnecting in 5s...")
             state.binance_ws_connected = False
             await asyncio.sleep(5)
@@ -416,7 +434,6 @@ async def pm_feed(state: State):
         return
 
     _last_msg_log_ts = 0.0
-    _msg_count = 0
 
     while True:
         # Pick up current token IDs (may have been updated by trading_loop)
@@ -442,7 +459,8 @@ async def pm_feed(state: State):
                     f"(up={assets[0][:12]}.. dn={assets[1][:12]}..)"
                 )
                 state.pm_connected = True
-                _msg_count = 0
+                state.pm_connected_at = time.time()
+                state.pm_msg_count = 0
 
                 while True:
                     # Check if trading_loop requested reconnect (new window = new tokens)
@@ -454,7 +472,7 @@ async def pm_feed(state: State):
 
                     try:
                         raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-                        _msg_count += 1
+                        state.pm_msg_count += 1
 
                         # Throttled debug log: show message stats every 60s
                         now = time.time()
@@ -463,18 +481,18 @@ async def pm_feed(state: State):
                                 print(
                                     f"  [PM] snapshot: {len(raw)} entries, "
                                     f"pm_up={state.pm_up}, pm_dn={state.pm_dn} "
-                                    f"(msgs={_msg_count})"
+                                    f"(msgs={state.pm_msg_count})"
                                 )
                             elif isinstance(raw, dict):
                                 print(
                                     f"  [PM] event: {raw.get('event_type', '?')}, "
                                     f"pm_up={state.pm_up}, pm_dn={state.pm_dn} "
-                                    f"(msgs={_msg_count})"
+                                    f"(msgs={state.pm_msg_count})"
                                 )
                             else:
                                 print(
                                     f"  [PM] heartbeat: pm_up={state.pm_up}, "
-                                    f"pm_dn={state.pm_dn} (msgs={_msg_count})"
+                                    f"pm_dn={state.pm_dn} (msgs={state.pm_msg_count})"
                                 )
                             _last_msg_log_ts = now
 
@@ -494,11 +512,13 @@ async def pm_feed(state: State):
                         continue
 
                     except websockets.exceptions.ConnectionClosed:
-                        print(f"  [PM] connection closed after {_msg_count} msgs, reconnecting...")
+                        state.pm_error_count += 1
+                        print(f"  [PM] connection closed after {state.pm_msg_count} msgs, reconnecting...")
                         state.pm_connected = False
                         break
 
         except Exception as e:
+            state.pm_error_count += 1
             print(f"  [PM] connection error: {e}, reconnecting in 5s...")
             state.pm_connected = False
             await asyncio.sleep(5)

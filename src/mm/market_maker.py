@@ -53,7 +53,11 @@ class MarketMaker:
         self.quote_engine = QuoteEngine(config)
         self.order_mgr = OrderManager(clob_client, config)
         self.risk_mgr = RiskManager(config)
-        self.heartbeat = HeartbeatManager(clob_client, config.heartbeat_interval_sec)
+        self.heartbeat = HeartbeatManager(
+            clob_client,
+            config.heartbeat_interval_sec,
+            on_failure=self._on_heartbeat_failure,
+        )
         self.rebate = RebateTracker(clob_client)
         self.quality_analyzer = MarketQualityAnalyzer(config)
 
@@ -102,6 +106,13 @@ class MarketMaker:
             self._warn_cooldowns[key] = now
             log.warning(msg)
 
+    def _on_heartbeat_failure(self) -> None:
+        log.warning("Heartbeat lost — orders likely cancelled by PM")
+        self._current_quotes = {
+            "up": (None, None),
+            "dn": (None, None),
+        }
+
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
         self.market = market
@@ -131,8 +142,10 @@ class MarketMaker:
         # Snapshot starting USDC for real session PnL
         try:
             self._starting_usdc_pm = await self.order_mgr.get_usdc_balance()
+            self._cached_usdc_balance = self._starting_usdc_pm
         except Exception:
             self._starting_usdc_pm = 0.0
+            self._cached_usdc_balance = 0.0
         self._started_at = time.time()
         self._paused = False
         self._pause_reason = ""
@@ -151,6 +164,19 @@ class MarketMaker:
 
         # Start heartbeat
         self.heartbeat.start()
+
+        # Start user WebSocket for real-time fill detection (live only)
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        if is_live:
+            creds = getattr(self.order_mgr.client, 'creds', None)
+            if creds and hasattr(creds, 'api_key'):
+                await self.order_mgr.start_fill_ws(
+                    api_key=creds.api_key,
+                    api_secret=creds.api_secret,
+                    api_passphrase=getattr(creds, 'api_passphrase', ''),
+                )
+            else:
+                log.info("No API creds for fill WS — using polling only")
 
         # Start main loop
         self._task = asyncio.create_task(self._run_loop())
@@ -190,6 +216,9 @@ class MarketMaker:
 
         # Final cancel of any remaining orders
         await self.order_mgr.cancel_all()
+
+        # Stop fill WebSocket
+        await self.order_mgr.stop_fill_ws()
 
         # Stop heartbeat
         await self.heartbeat.stop()
@@ -335,7 +364,16 @@ class MarketMaker:
 
         # 3b. Sync FV to mock client for realistic paper trading
         if hasattr(self.order_mgr.client, 'set_fair_values'):
-            self.order_mgr.client.set_fair_values(fv_up, fv_dn, self.market)
+            pm_prices = (
+                {"up": self.feed_state.pm_up, "dn": self.feed_state.pm_dn}
+                if hasattr(self.feed_state, "pm_up") else None
+            )
+            self.order_mgr.client.set_fair_values(
+                fv_up,
+                fv_dn,
+                self.market,
+                pm_prices=pm_prices,
+            )
 
         # 4. Compute volatility
         vol = self.fair_value.realized_vol(klines)
@@ -345,27 +383,30 @@ class MarketMaker:
         should_pause, reason = self.risk_mgr.should_pause(
             self.inventory, vol, fv_up, fv_dn)
 
+        # Exit triggers (TP, trailing stop, drawdown) ALWAYS take priority — even if already paused
+        if should_pause and ("Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason):
+            log.warning(f"Exit trigger: {reason}")
+            self._paused = False
+            self._pause_reason = ""
+            # Lock prices at trigger time
+            self._liq_lock = self.risk_mgr.lock_pnl(
+                self.inventory, fv_up, fv_dn,
+                self.config.liq_price_floor_margin)
+            log.info(
+                "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
+                "UP_floor=%.2f DN_floor=%.2f",
+                self._liq_lock.trigger_pnl,
+                self._liq_lock.up_avg_entry, self._liq_lock.dn_avg_entry,
+                self._liq_lock.min_sell_price_up, self._liq_lock.min_sell_price_dn,
+            )
+            self._liq_chunk_index = 0
+            self._liq_last_chunk_time = 0.0
+            self._is_closing = True
+            await self.order_mgr.cancel_all()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
+
         if should_pause and not self._paused:
-            # Take-profit / trailing stop / max drawdown → go to closing mode, not just pause
-            if "Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason:
-                log.warning(f"Exit trigger: {reason}")
-                # Lock prices at trigger time
-                self._liq_lock = self.risk_mgr.lock_pnl(
-                    self.inventory, fv_up, fv_dn,
-                    self.config.liq_price_floor_margin)
-                log.info(
-                    "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
-                    "UP_floor=%.2f DN_floor=%.2f",
-                    self._liq_lock.trigger_pnl,
-                    self._liq_lock.up_avg_entry, self._liq_lock.dn_avg_entry,
-                    self._liq_lock.min_sell_price_up, self._liq_lock.min_sell_price_dn,
-                )
-                self._liq_chunk_index = 0
-                self._liq_last_chunk_time = 0.0
-                self._is_closing = True
-                await self.order_mgr.cancel_all()
-                self._current_quotes = {"up": (None, None), "dn": (None, None)}
-                return
             self._paused = True
             self._pause_reason = reason
             await self.order_mgr.cancel_all()
@@ -387,12 +428,19 @@ class MarketMaker:
 
         if is_one_sided:
             self._one_sided_counter += 1
-            # Only trigger one-sided close after bot has been running for a minimum time
+            # Only trigger one-sided close after:
+            # 1. Bot has been running for a minimum time (120s warmup)
+            # 2. Less than 50% of window remains (don't close too early)
             min_run_time = 120.0  # seconds — give bot time to fill both sides
             elapsed = time.time() - self._started_at
-            if self._one_sided_counter >= self.config.max_one_sided_ticks and elapsed >= min_run_time:
+            window_dur = (self.market.window_end - self.market.window_start) if self.market else 900
+            time_left = self.market.time_remaining if self.market else 0
+            past_halfway = time_left < (window_dur * 0.5)
+            if (self._one_sided_counter >= self.config.max_one_sided_ticks
+                    and elapsed >= min_run_time and past_halfway):
                 log.warning(
-                    f"One-sided exposure for {self._one_sided_counter} ticks: "
+                    f"One-sided exposure for {self._one_sided_counter} ticks "
+                    f"({time_left:.0f}s left): "
                     f"UP={up_sh:.1f} DN={dn_sh:.1f} — early close")
                 self._liq_lock = self.risk_mgr.lock_pnl(
                     self.inventory, fv_up, fv_dn, self.config.liq_price_floor_margin)
@@ -443,9 +491,20 @@ class MarketMaker:
             vol, self.risk_mgr.avg_volatility,
             usdc_budget=self.inventory.initial_usdc,
             order_collateral=order_collateral,
+            tick_size=self.market.tick_size if self.market else 0.01,
         )
 
         self._quote_count += 1
+
+        # 6a. Skip quoting sides where FV is too extreme (market already decided)
+        min_fv = self.config.min_fv_to_quote
+        if min_fv > 0:
+            if fv_up < min_fv and all_quotes["up"][0] is not None:
+                log.info(f"Skipping UP bid: FV={fv_up:.3f} < min_fv={min_fv}")
+                all_quotes["up"] = (None, all_quotes["up"][1])
+            if fv_dn < min_fv and all_quotes["dn"][0] is not None:
+                log.info(f"Skipping DN bid: FV={fv_dn:.3f} < min_fv={min_fv}")
+                all_quotes["dn"] = (None, all_quotes["dn"][1])
 
         # 6b. Fetch Polymarket book and clamp quotes to avoid crossing.
         for token_key, token_id in [
@@ -455,7 +514,8 @@ class MarketMaker:
             book = await self.order_mgr.get_book_summary(token_id)
             bid, ask = all_quotes[token_key]
             bid, ask = self.quote_engine.clamp_to_book(
-                bid, ask, book["best_bid"], book["best_ask"]
+                bid, ask, book["best_bid"], book["best_ask"],
+                tick_size=self.market.tick_size,
             )
             # Re-apply max inventory cap after clamping (safety net)
             max_sh = self.config.max_inventory_shares
@@ -671,6 +731,10 @@ class MarketMaker:
                 log.info(f"{label}: adaptive floor {base_floor:.2f} → {floor:.2f} "
                          f"(decay={decay_ratio:.2f}, {time_left:.0f}s left)")
 
+            # Adjust floor for taker fee when in taker mode
+            if use_taker:
+                floor = floor + self.config.taker_fee_rate * floor
+
             if use_taker:
                 # ── Phase 2: Taker ──
                 if not best_bid or best_bid <= 0:
@@ -771,6 +835,27 @@ class MarketMaker:
 
         if not has_real_balance:
             log.info("Liquidation complete — no inventory remaining")
+            self._is_closing = False
+            return
+
+        # Check if all remaining balances are "dust" — below PM minimum, can't sell
+        if has_real_balance and not placed_any and not self._liquidation_order_ids:
+            pm_min = self.market.min_order_size if self.market else 5.0
+            up_rem = await self.order_mgr.get_token_balance(self.market.up_token_id)
+            dn_rem = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+            all_dust = (up_rem < pm_min and dn_rem < pm_min)
+            if all_dust:
+                fv_up_d, fv_dn_d = self._compute_fv()
+                dust_value = up_rem * fv_up_d + dn_rem * fv_dn_d
+                self._throttled_warn(
+                    "liq_dust",
+                    f"Liquidation dust: UP={up_rem:.2f} DN={dn_rem:.2f} "
+                    f"(all < PM min {pm_min}). ~${dust_value:.2f} locked. "
+                    f"Waiting for expiry.",
+                    cooldown=30.0,
+                )
+                # Stay in _is_closing=True so bot doesn't resume quoting,
+                # but stop spamming sell attempts — just wait for window end
 
     async def on_window_transition(self, new_market: MarketInfo) -> None:
         """Handle window transition — cancel all, switch tokens, resume."""
@@ -863,6 +948,10 @@ class MarketMaker:
                 "time_remaining": self.market.time_remaining if self.market else 0,
                 "up_token": self.market.up_token_id[:12] + "..." if self.market else "",
                 "dn_token": self.market.dn_token_id[:12] + "..." if self.market else "",
+                "tick_size": self.market.tick_size if self.market else 0.01,
+                "min_order_size": self.market.min_order_size if self.market else 5.0,
+                "market_type": self.market.market_type if self.market else "up_down",
+                "resolution_source": self.market.resolution_source if self.market else "unknown",
             },
 
             # Fair value

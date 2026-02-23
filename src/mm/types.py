@@ -173,7 +173,10 @@ class MarketInfo:
     window_end: float       # Unix timestamp
     condition_id: str = ""
     question: str = ""
+    market_type: str = "up_down"      # "up_down" | "above_below"
+    resolution_source: str = "binance"  # "binance" | "chainlink" | "unknown"
     min_order_size: float = 5.0  # Default PM minimum
+    tick_size: float = 0.01  # Price tick size from PM API (0.1/0.01/0.001/0.0001)
 
     @property
     def time_remaining(self) -> float:

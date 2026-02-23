@@ -6,7 +6,7 @@ Core logic:
 
 Spread is widened during high volatility.
 Inventory skew pushes quotes to reduce net delta.
-Prices are rounded to PM's 0.01 increment.
+Prices are rounded to PM's configured tick increment.
 """
 from __future__ import annotations
 import logging
@@ -17,9 +17,10 @@ from .mm_config import MMConfig
 log = logging.getLogger("mm.quotes")
 
 
-def _round_price(price: float) -> float:
-    """Round to Polymarket's cent increment, clamp to [0.01, 0.99]."""
-    return max(0.01, min(0.99, round(price, 2)))
+def _round_price(price: float, tick_size: float = 0.01) -> float:
+    """Round to Polymarket's tick increment, clamp to valid range."""
+    rounded = round(round(price / tick_size) * tick_size, 10)
+    return max(tick_size, min(1.0 - tick_size, rounded))
 
 
 def _bps_to_price(bps: float) -> float:
@@ -65,7 +66,8 @@ class QuoteEngine:
                         token_id: str,
                         inventory: Inventory,
                         volatility: float = 0.0,
-                        avg_volatility: float = 0.0) -> tuple[Quote, Quote]:
+                        avg_volatility: float = 0.0,
+                        tick_size: float = 0.01) -> tuple[Quote, Quote]:
         """Generate a bid and ask quote for a single token.
 
         Args:
@@ -82,14 +84,14 @@ class QuoteEngine:
         half_spread = _bps_to_price(half_spread_bps)
         skew = self._inventory_skew(inventory)
 
-        bid_price = _round_price(fair_value - half_spread - skew)
-        ask_price = _round_price(fair_value + half_spread - skew)
+        bid_price = _round_price(fair_value - half_spread - skew, tick_size)
+        ask_price = _round_price(fair_value + half_spread - skew, tick_size)
 
-        # Ensure bid < ask (at least 0.01 apart)
+        # Ensure bid < ask (at least 1 tick apart)
         if bid_price >= ask_price:
             mid = (bid_price + ask_price) / 2.0
-            bid_price = _round_price(mid - 0.01)
-            ask_price = _round_price(mid + 0.01)
+            bid_price = _round_price(mid - tick_size, tick_size)
+            ask_price = _round_price(mid + tick_size, tick_size)
 
         # Size in shares = USD / price
         bid_size = self.config.order_size_usd / bid_price if bid_price > 0 else 0
@@ -113,6 +115,7 @@ class QuoteEngine:
         ask: Quote | None,
         best_bid: float | None,
         best_ask: float | None,
+        tick_size: float = 0.01,
     ) -> tuple[Quote | None, Quote | None]:
         """Adjust quotes to avoid crossing the Polymarket orderbook.
 
@@ -122,13 +125,13 @@ class QuoteEngine:
 
         If we would cross, pull our price back to 1 tick away from the book edge.
         """
-        tick = 0.01
+        tick = tick_size
 
         if bid is not None and best_ask is not None and bid.price >= best_ask:
-            bid.price = _round_price(best_ask - tick)
+            bid.price = _round_price(best_ask - tick, tick_size)
 
         if ask is not None and best_bid is not None and ask.price <= best_bid:
-            ask.price = _round_price(best_bid + tick)
+            ask.price = _round_price(best_bid + tick, tick_size)
 
         return bid, ask
 
@@ -153,7 +156,8 @@ class QuoteEngine:
                             volatility: float = 0.0,
                             avg_volatility: float = 0.0,
                             usdc_budget: float = 0.0,
-                            order_collateral: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
+                            order_collateral: float = 0.0,
+                            tick_size: float = 0.01) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
 
         Args:
@@ -163,9 +167,9 @@ class QuoteEngine:
         Returns dict with keys 'up' and 'dn', each containing (bid, ask).
         """
         up_bid, up_ask = self.generate_quotes(
-            fv_up, up_token_id, inventory, volatility, avg_volatility)
+            fv_up, up_token_id, inventory, volatility, avg_volatility, tick_size=tick_size)
         dn_bid, dn_ask = self.generate_quotes(
-            fv_dn, dn_token_id, inventory, volatility, avg_volatility)
+            fv_dn, dn_token_id, inventory, volatility, avg_volatility, tick_size=tick_size)
 
         # Cap BUY size by remaining inventory room per token.
         max_shares = self.config.max_inventory_shares

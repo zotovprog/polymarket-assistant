@@ -93,18 +93,17 @@ class RiskManager:
 
         Returns (should_pause, reason).
         """
-        # Check inventory limit
-        if not self.check_inventory_limit(inventory):
-            return True, f"Inventory limit exceeded: UP={inventory.up_shares:.1f}, DN={inventory.dn_shares:.1f}"
-
-        # Check drawdown
+        # Check PnL-based exits FIRST (take profit, drawdown, trailing stop)
+        # These must run before inventory limit — inventory pause must not block profit-taking
         pnl = self.compute_pnl(inventory, fv_up, fv_dn)
-        if pnl["total_pnl"] < -self.config.max_drawdown_usd:
-            return True, f"Max drawdown exceeded: PnL=${pnl['total_pnl']:.2f}"
 
         # Check take-profit
         if self.config.take_profit_usd > 0 and pnl["total_pnl"] >= self.config.take_profit_usd:
             return True, f"Take profit hit: PnL=${pnl['total_pnl']:.2f} >= ${self.config.take_profit_usd:.2f}"
+
+        # Check drawdown
+        if pnl["total_pnl"] < -self.config.max_drawdown_usd:
+            return True, f"Max drawdown exceeded: PnL=${pnl['total_pnl']:.2f}"
 
         # Trailing stop — only activates after peak PnL reaches a meaningful level
         if pnl["total_pnl"] > self._peak_pnl:
@@ -116,6 +115,10 @@ class RiskManager:
                 trail_threshold = self._peak_pnl * (1 - self.config.trailing_stop_pct)
                 if pnl["total_pnl"] < trail_threshold:
                     return True, f"Trailing stop: PnL=${pnl['total_pnl']:.2f} dropped from peak ${self._peak_pnl:.2f}"
+
+        # Check inventory limit (after PnL exits)
+        if not self.check_inventory_limit(inventory):
+            return True, f"Inventory limit exceeded: UP={inventory.up_shares:.1f}, DN={inventory.dn_shares:.1f}"
 
         # Check volatility spike
         avg_vol = self.avg_volatility

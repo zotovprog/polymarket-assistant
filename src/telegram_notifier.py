@@ -260,6 +260,34 @@ class TelegramNotifier:
         )
         self._fire(html)
 
+    def notify_window_summary(
+        self,
+        coin: str,
+        timeframe: str,
+        mode: str,
+        session_pnl: float,
+        pnl_1h: float,
+        pnl_24h: float,
+        usdc_balance: float,
+    ) -> None:
+        """Summary sent after each window closes."""
+        emoji = "\U0001f3c6" if session_pnl >= 0 else "\U0001f4a8"
+        is_paper = mode.upper() == "PAPER"
+        header = f"{emoji} <b>WINDOW CLOSED</b>"
+        if is_paper:
+            header += "  \u2139\ufe0f <i>[TEST MODE]</i>"
+        html = (
+            f"{header}\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"<b>Market:</b> <code>{self._esc(coin)} {self._esc(timeframe)}</code>\n\n"
+            f"<b>PnL</b>\n"
+            f"  Last window: <code>${session_pnl:+.2f}</code>\n"
+            f"  1h: <code>${pnl_1h:+.2f}</code>\n"
+            f"  24h: <code>${pnl_24h:+.2f}</code>\n\n"
+            f"\U0001f4b0 <b>Balance:</b> <code>${usdc_balance:.2f}</code> USDC"
+        )
+        self._fire(html)
+
     def notify_error(self, source: str, message: str, detail: str = "") -> None:
         detail_line = (
             f"\n<b>Detail:</b> <code>{self._clip(self._esc(detail))}</code>"

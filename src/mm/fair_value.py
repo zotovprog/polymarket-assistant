@@ -171,6 +171,9 @@ class FairValueEngine:
 
         Returns (fair_value_up, fair_value_dn).
         """
+        # NOTE: Current model assumes "up_down" market type (digital option: P(S_T > K))
+        # For "above_below" markets, K is fixed (not window-based). Model works for both
+        # as long as strike is set correctly in MarketInfo.
         base = self.binary_fair_value(mid, strike, time_remaining_sec, klines)
 
         if bids and asks and trades:

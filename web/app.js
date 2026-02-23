@@ -1,7 +1,8 @@
-/* Polymarket MM Dashboard — Frontend App */
+/* Polymarket MM Dashboard — Frontend App v2 */
 
 const API_BASE = '';
 let isRunning = false;
+let isWatching = false;
 let pollTimer = null;
 
 // Charts
@@ -17,6 +18,18 @@ let pnlSeries = null;
 let pnlData = [];
 let spreadData = [];
 let lastStartedAt = 0;
+
+// Last known state for order distance calc
+let lastState = {};
+
+// ── Collapsible Sections ─────────────────────────────
+function toggleSection(el) {
+    const content = el.nextElementSibling;
+    if (!content) return;
+    const isCollapsed = content.classList.toggle('collapsed');
+    const chevron = el.querySelector('.chevron');
+    if (chevron) chevron.textContent = isCollapsed ? '\u25b8' : '\u25be';
+}
 
 // ── Auth ──────────────────────────────────────────────
 async function checkAuth() {
@@ -55,6 +68,27 @@ function showDashboard() {
     document.getElementById('dashboard').classList.remove('hidden');
     initCharts();
     startPolling();
+    // Auto-start watch mode for live feed data when no session is running
+    autoWatch();
+}
+
+async function autoWatch() {
+    try {
+        const r = await fetch(`${API_BASE}/api/mm/state`);
+        if (!r.ok) return;
+        const s = await r.json();
+        if (s.is_running) return; // Session active, no need for watch
+        // Start watch mode for live feeds
+        const coin = document.getElementById('coin-select')?.value || 'BTC';
+        const tf = document.getElementById('tf-select')?.value || '5m';
+        await fetch(`${API_BASE}/api/mm/watch`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ coin, timeframe: tf }),
+        });
+    } catch(e) {
+        // Silent fail — watch is optional
+    }
 }
 
 // ── Charts Init ──────────────────────────────────────
@@ -66,7 +100,7 @@ function initCharts() {
         crosshair: { mode: 0 },
     };
 
-    // Fair Value & PM Prices chart (all 0–1 range)
+    // Fair Value & PM Prices chart (all 0-1 range)
     const priceEl = document.getElementById('price-chart');
     if (priceEl && typeof LightweightCharts !== 'undefined') {
         priceChart = LightweightCharts.createChart(priceEl, {
@@ -104,9 +138,9 @@ function initCharts() {
 
     // Resize observer
     const ro = new ResizeObserver(() => {
-        if (priceChart) priceChart.applyOptions({ width: priceEl.clientWidth });
-        if (spreadChart) spreadChart.applyOptions({ width: spreadEl.clientWidth });
-        if (pnlChart) pnlChart.applyOptions({ width: pnlEl.clientWidth });
+        if (priceChart && priceEl) priceChart.applyOptions({ width: priceEl.clientWidth });
+        if (spreadChart && spreadEl) spreadChart.applyOptions({ width: spreadEl.clientWidth });
+        if (pnlChart && pnlEl) pnlChart.applyOptions({ width: pnlEl.clientWidth });
     });
     if (priceEl) ro.observe(priceEl);
     if (spreadEl) ro.observe(spreadEl);
@@ -129,6 +163,7 @@ async function pollState() {
             return;
         }
         const s = await r.json();
+        lastState = s;
         updateUI(s);
     } catch(e) {
         document.getElementById('status-text').textContent = 'Connection error';
@@ -139,6 +174,7 @@ async function pollState() {
 // ── UI Update ────────────────────────────────────────
 function updateUI(s) {
     isRunning = s.is_running || false;
+    isWatching = !isRunning && s.feeds && Object.keys(s.feeds).length > 0;
 
     // Sync paper mode toggle with backend only while running
     const paperToggle = document.getElementById('paper-mode');
@@ -157,7 +193,7 @@ function updateUI(s) {
         }
     }
 
-    // PM balance & session limit
+    // PM balance & session limit (settings row 2)
     const pmBal = s.usdc_balance_pm;
     setText('pm-balance', pmBal != null ? '$' + pmBal.toFixed(2) : '—');
     const stakeInput = document.getElementById('stake-usdc');
@@ -183,6 +219,11 @@ function updateUI(s) {
         }
         btn.innerHTML = '<i class="fas fa-stop"></i> Stop';
         btn.classList.add('running');
+    } else if (isWatching) {
+        statusDot.className = 'status-dot watching';
+        statusText.textContent = 'Watching';
+        btn.innerHTML = '<i class="fas fa-play"></i> Start';
+        btn.classList.remove('running');
     } else {
         statusDot.className = 'status-dot offline';
         statusText.textContent = 'Stopped';
@@ -246,23 +287,46 @@ function updateUI(s) {
         }
     }
 
-    // PnL
-    const realized = s.realized_pnl || 0;
-    const unrealized = s.unrealized_pnl || 0;
-    const total = s.session_pnl != null ? s.session_pnl : (s.total_pnl || (realized + unrealized));
+    // ── PnL (simplified: 3 big numbers) ──────────────
+    const sessionPnl = s.session_pnl != null ? s.session_pnl : (s.total_pnl || 0);
+    const positionsWorth = (s.inventory?.up_shares || 0) * (s.pm_prices?.up || 0)
+                         + (s.inventory?.dn_shares || 0) * (s.pm_prices?.dn || 0);
+    const freeUsdc = s.usdc_balance_pm || 0;
     const stake = s.session_limit || 1;
-    const pnlPct = (total / stake * 100).toFixed(1);
-    setPnl('pnl-realized', realized);
-    setPnl('pnl-unrealized', unrealized);
-    setPnl('pnl-total', total);
+    const pnlPct = (sessionPnl / stake * 100).toFixed(1);
+
+    // Session PnL (big)
+    const pnlSessionEl = document.getElementById('pnl-session');
+    if (pnlSessionEl) {
+        pnlSessionEl.textContent = '$' + sessionPnl.toFixed(4);
+        pnlSessionEl.classList.remove('pnl-positive', 'pnl-negative');
+        pnlSessionEl.classList.add(sessionPnl >= 0 ? 'pnl-positive' : 'pnl-negative');
+    }
     const pctEl = document.getElementById('pnl-pct');
     if (pctEl) {
-        pctEl.textContent = (total >= 0 ? '+' : '') + pnlPct + '%';
-        pctEl.className = 'pnl-pct ' + (total >= 0 ? 'positive' : 'negative');
+        pctEl.textContent = (sessionPnl >= 0 ? '+' : '') + pnlPct + '%';
+        pctEl.className = 'pnl-pct ' + (sessionPnl >= 0 ? 'positive' : 'negative');
     }
-    setPnl('peak-pnl', s.peak_pnl || 0);
+
+    // Positions worth
+    const posEl = document.getElementById('pnl-positions-worth');
+    if (posEl) {
+        posEl.textContent = '$' + positionsWorth.toFixed(2);
+    }
+
+    // Free USDC
+    const freeEl = document.getElementById('pnl-free-usdc');
+    if (freeEl) {
+        freeEl.textContent = '$' + freeUsdc.toFixed(2);
+    }
+
+    // Session Stats (collapsed section) — detailed PnL + stats
+    const realized = s.realized_pnl || 0;
+    const unrealized = s.unrealized_pnl || 0;
+    setText('pnl-realized', '$' + realized.toFixed(4));
+    setText('pnl-unrealized', '$' + unrealized.toFixed(4));
+    setText('peak-pnl', '$' + (s.peak_pnl || 0).toFixed(4));
     setText('pnl-fees', '$' + (s.total_fees || 0).toFixed(4));
-    setText('pnl-usdc', s.usdc_balance_pm != null ? '$' + s.usdc_balance_pm.toFixed(2) : '—');
 
     // Stats
     setText('stat-volume', '$' + (s.total_volume || 0).toFixed(2));
@@ -271,6 +335,8 @@ function updateUI(s) {
     setText('stat-requotes', s.requote_count || 0);
     setText('stat-spread', (s.avg_spread_bps || 0).toFixed(0) + ' bps');
     setText('stat-vol', s.fair_value ? (s.fair_value.volatility * 100).toFixed(3) + '%' : '—');
+    // Current spread in collapsible header
+    setText('current-spread', (s.avg_spread_bps || 0).toFixed(0) + ' bps');
 
     if (s.heartbeat) {
         setText('stat-heartbeat', s.heartbeat.running ? 'OK (' + s.heartbeat.heartbeat_count + ')' : 'OFF');
@@ -285,8 +351,8 @@ function updateUI(s) {
         setText('fill-count', s.fill_count || s.recent_fills.length);
     }
 
-    // Active Orders
-    updateActiveOrders(s.active_orders_detail);
+    // Active Orders (with distance)
+    updateActiveOrders(s.active_orders_detail, s);
 
     // Market Quality
     updateMarketQuality(s.market_quality);
@@ -299,39 +365,39 @@ function updateUI(s) {
         const mins = Math.floor(tr / 60), secs = Math.floor(tr % 60);
         setText('market-time', tr > 0 ? `${mins}m ${secs}s` : 'Expired');
 
+        // Window remaining in settings panel
+        setText('window-remaining', tr > 0 ? `${mins}m ${secs}s` : 'Expired');
+
         // Window state badge
         const wsEl = document.getElementById('window-state');
         const nwi = s.next_window_in || 0;
         if (wsEl) {
             if (nwi > 0) {
                 const nwSec = Math.ceil(nwi);
-                wsEl.innerHTML = '<span style="color:#8b5cf6;font-weight:700">⏳ Next window in ' + nwSec + 's</span>';
+                wsEl.innerHTML = '<span style="color:#8b5cf6;font-weight:700">\u23f3 Next window in ' + nwSec + 's</span>';
             } else if (s.is_closing) {
-                wsEl.innerHTML = '<span style="color:#f59e0b;font-weight:700;animation:pulse 0.8s infinite">⚠ CLOSING</span>';
+                wsEl.innerHTML = '<span style="color:#f59e0b;font-weight:700;animation:pulse 0.8s infinite">\u26a0 CLOSING</span>';
             } else if (tr <= 0) {
-                wsEl.innerHTML = '<span style="color:#6b7280">⏳ RESOLVING</span>';
+                wsEl.innerHTML = '<span style="color:#6b7280">\u23f3 RESOLVING</span>';
             } else if (tr <= 30) {
-                wsEl.innerHTML = '<span style="color:#ef4444;font-weight:700">⏰ ' + secs + 's</span>';
+                wsEl.innerHTML = '<span style="color:#ef4444;font-weight:700">\u23f0 ' + secs + 's</span>';
             } else {
                 wsEl.textContent = '';
             }
         }
 
-        // Progress bar: fraction of window remaining
-        const progressWrap = document.getElementById('window-progress-wrap');
-        const progressBar = document.getElementById('window-progress-bar');
+        // Inline progress bar in settings panel
+        const progressBar = document.getElementById('window-progress-bar-inline');
         if (progressBar && isRunning && tr > 0) {
-            progressWrap.style.display = 'block';
             const tfSec = {'5m':300,'15m':900,'1h':3600,'4h':14400,'daily':86400};
-            const total = tfSec[s.market.timeframe] || 300;
-            const pct = Math.min(100, Math.max(0, (tr / total) * 100));
+            const totalSec = tfSec[s.market.timeframe] || 300;
+            const pct = Math.min(100, Math.max(0, (tr / totalSec) * 100));
             progressBar.style.width = pct + '%';
-            // Color: green → yellow → red as time runs out
             if (pct > 40) progressBar.style.background = 'var(--accent)';
             else if (pct > 15) progressBar.style.background = '#f59e0b';
             else progressBar.style.background = '#ef4444';
-        } else if (progressWrap) {
-            progressWrap.style.display = 'none';
+        } else if (progressBar) {
+            progressBar.style.width = '0%';
         }
     }
 
@@ -387,6 +453,9 @@ function updateUI(s) {
         }
     }
 
+    // Feed status
+    updateFeedStatus(s.feeds);
+
     // Charts
     updateCharts(s);
 }
@@ -405,14 +474,6 @@ function setQuote(prefix, data) {
         setText(prefix + '-price', '—');
         setText(prefix + '-size', '—');
     }
-}
-
-function setPnl(id, val) {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = '$' + val.toFixed(4);
-    el.classList.remove('pnl-positive', 'pnl-negative');
-    el.classList.add(val >= 0 ? 'pnl-positive' : 'pnl-negative');
 }
 
 function setConfigIfNotFocused(id, val) {
@@ -456,7 +517,7 @@ function updateFills(fills) {
     }).join('');
 }
 
-function updateActiveOrders(orders) {
+function updateActiveOrders(orders, s) {
     const body = document.getElementById('orders-body');
     if (!body) return;
     const countEl = document.getElementById('orders-count');
@@ -473,13 +534,23 @@ function updateActiveOrders(orders) {
         const age = o.age_sec < 60
             ? o.age_sec.toFixed(0) + 's'
             : (o.age_sec / 60).toFixed(1) + 'm';
+
+        // Distance from PM mid price
+        const pmMid = o.token === 'UP'
+            ? (s && s.pm_prices && s.pm_prices.up ? s.pm_prices.up : 0.5)
+            : (s && s.pm_prices && s.pm_prices.dn ? s.pm_prices.dn : 0.5);
+        const distCents = Math.abs(o.price - pmMid) * 100;
+        let distCls = 'dist-far';
+        if (distCents <= 3) distCls = 'dist-close';
+        else if (distCents <= 8) distCls = 'dist-mid';
+
         return `<tr class="${o.type === 'liquidation' ? 'liq-row' : ''}">
-            <td>${o.order_id}</td>
             <td>${o.token}</td>
             <td class="${sideCls}">${o.side}</td>
             <td>${o.price.toFixed(2)}</td>
             <td>${o.size.toFixed(1)}</td>
             <td>$${o.notional.toFixed(2)}</td>
+            <td class="${distCls}">${distCents.toFixed(1)}\u00a2</td>
             <td>${age}</td>
             <td>${typeBadge || o.type}</td>
         </tr>`;
@@ -527,6 +598,53 @@ function updateMarketQuality(mq) {
     setText('quality-ask-depth', '$' + (mq.ask_depth_usd || 0).toFixed(0));
 }
 
+function updateFeedStatus(feeds) {
+    const container = document.getElementById('feed-status');
+    if (!container) return;
+    if (!feeds || Object.keys(feeds).length === 0) {
+        container.innerHTML = '<span style="color:var(--text-muted)">No feed data</span>';
+        return;
+    }
+
+    const now = Date.now();
+
+    function indicator(label, connected, msgCount, errCount, latencyMs) {
+        let color = '#ef4444'; // red
+        let icon = '\u25cf';
+        if (connected) {
+            if (latencyMs != null && latencyMs > 5000) {
+                color = '#f59e0b'; // yellow
+            } else {
+                color = '#22c55e'; // green
+            }
+        }
+        const latStr = latencyMs != null ? latencyMs + 'ms' : '—';
+        return `<span class="feed-ind" style="margin-right:16px">` +
+            `<span style="color:${color};font-size:12px">${icon}</span> ` +
+            `<b>${label}</b> ${msgCount} msgs | ${errCount} err | ${latStr}` +
+            `</span>`;
+    }
+
+    let html = '';
+    const bws = feeds.binance_ws;
+    if (bws) {
+        html += indicator('Binance WS', bws.connected, bws.msg_count, bws.error_count, bws.latency_ms);
+    }
+    const bob = feeds.binance_ob;
+    if (bob) {
+        const readyLabel = bob.ready ? 'ready' : 'waiting';
+        html += `<span class="feed-ind" style="margin-right:16px">` +
+            `<span style="color:${bob.ready ? '#22c55e' : '#ef4444'};font-size:12px">\u25cf</span> ` +
+            `<b>Binance OB</b> ${readyLabel} | ${bob.msg_count} msgs | ${bob.error_count} err` +
+            `</span>`;
+    }
+    const pm = feeds.polymarket;
+    if (pm) {
+        html += indicator('PM WS', pm.connected, pm.msg_count, pm.error_count, pm.last_update_ms_ago);
+    }
+    container.innerHTML = html;
+}
+
 function updateCharts(s) {
     // Clear chart data on new session
     if (s.started_at && s.started_at !== lastStartedAt) {
@@ -537,7 +655,7 @@ function updateCharts(s) {
 
     const now = Math.floor(Date.now() / 1000);
 
-    // Fair Value & PM Prices chart (all 0–1 range)
+    // Fair Value & PM Prices chart (all 0-1 range)
     if (s.fair_value) {
         if (fvUpSeries && s.fair_value.up) fvUpSeries.update({ time: now, value: s.fair_value.up });
         if (fvDnSeries && s.fair_value.dn) fvDnSeries.update({ time: now, value: s.fair_value.dn });
@@ -593,7 +711,7 @@ async function toggleMM() {
 }
 
 async function emergency() {
-    if (confirm('Emergency stop — cancel all orders?')) {
+    if (confirm('Emergency stop \u2014 cancel all orders?')) {
         await fetch(`${API_BASE}/api/mm/emergency`, { method: 'POST' });
         setTimeout(pollState, 500);
     }
@@ -604,7 +722,7 @@ async function killAll() {
     try {
         const r = await fetch(`${API_BASE}/api/mm/kill`, { method: 'POST' });
         if (r.ok) {
-            showToast('Kill All executed — all positions liquidated', 'warning');
+            showToast('Kill All executed \u2014 all positions liquidated', 'warning');
         } else {
             showToast('Kill All failed', 'error');
         }

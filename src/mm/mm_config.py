@@ -1,7 +1,6 @@
 """Market Making configuration with runtime-adjustable parameters."""
 from __future__ import annotations
 from dataclasses import dataclass, asdict
-import config as app_config
 
 
 @dataclass
@@ -9,36 +8,37 @@ class MMConfig:
     """All MM parameters — can be updated at runtime via API."""
 
     # ── Spread ───────────────────────────────────────────────────
-    half_spread_bps: float = app_config.MM_HALF_SPREAD_BPS
-    min_spread_bps: float = 50.0     # Absolute minimum half-spread
-    max_spread_bps: float = 500.0    # Absolute maximum half-spread
-    vol_spread_mult: float = 1.5     # Widen spread by this factor in high-vol
+    half_spread_bps: float = 150.0       # 1.5% half-spread default
+    min_spread_bps: float = 50.0         # Absolute minimum half-spread
+    max_spread_bps: float = 500.0        # Absolute maximum half-spread
+    vol_spread_mult: float = 1.5         # Widen spread by this factor in high-vol
 
     # ── Sizing ───────────────────────────────────────────────────
-    order_size_usd: float = app_config.MM_ORDER_SIZE_USD
-    min_order_size_usd: float = 2.0  # Below this, don't quote
+    order_size_usd: float = 10.0         # USD per side
+    min_order_size_usd: float = 2.0      # Below this, don't quote
     max_order_size_usd: float = 100.0
 
     # ── Inventory ────────────────────────────────────────────────
-    max_inventory_shares: float = app_config.MM_MAX_INVENTORY
-    skew_bps_per_unit: float = app_config.MM_SKEW_BPS_PER_UNIT
+    max_inventory_shares: float = 25.0   # max shares one-sided
+    skew_bps_per_unit: float = 15.0      # skew per share of net delta
 
     # ── Requoting ────────────────────────────────────────────────
-    requote_interval_sec: float = app_config.MM_REQUOTE_SEC
-    requote_threshold_bps: float = app_config.MM_REQUOTE_THRESH_BPS
+    requote_interval_sec: float = 2.0    # seconds between requote checks
+    requote_threshold_bps: float = 5.0   # min price move to requote
 
     # ── Order Types ──────────────────────────────────────────────
-    gtd_duration_sec: int = app_config.MM_GTD_DURATION_SEC
-    heartbeat_interval_sec: int = app_config.MM_HEARTBEAT_SEC
-    use_post_only: bool = app_config.MM_USE_POST_ONLY
-    use_gtd: bool = app_config.MM_USE_GTD
+    gtd_duration_sec: int = 300          # GTD order lifetime (5 min)
+    heartbeat_interval_sec: int = 5      # heartbeat interval (PM timeout ~10s)
+    use_post_only: bool = True           # force post-only (maker) orders
+    use_gtd: bool = True                 # use GTD order type
 
     # ── Risk ─────────────────────────────────────────────────────
-    max_drawdown_usd: float = app_config.MM_MAX_DRAWDOWN_USD
-    volatility_pause_mult: float = app_config.MM_VOL_PAUSE_MULT
-    max_loss_per_fill_usd: float = 5.0  # Max acceptable loss on single fill
+    max_drawdown_usd: float = 50.0       # max session drawdown
+    volatility_pause_mult: float = 3.0   # pause if vol > N × avg
+    max_loss_per_fill_usd: float = 5.0   # Max acceptable loss on single fill
     take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)
     trailing_stop_pct: float = 0.0     # Exit if PnL drops this fraction from peak (0 = disabled)
+    taker_fee_rate: float = 0.02  # Taker fee rate (2% safe default for PM crypto markets)
 
     # ── Liquidation ─────────────────────────────────────────
     liq_price_floor_enabled: bool = True       # Don't sell below avg entry
@@ -50,7 +50,8 @@ class MMConfig:
     liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
 
     # ── One-Sided Exposure ─────────────────────────────────
-    max_one_sided_ticks: int = 30  # Close if one-sided exposure for this many consecutive ticks
+    max_one_sided_ticks: int = 90  # Close if one-sided exposure for this many consecutive ticks (~3min at 2s ticks)
+    min_fv_to_quote: float = 0.15  # Don't quote a side if its FV < this (market already decided)
 
     # ── Window Management ────────────────────────────────────────
     close_window_sec: float = 30.0    # Seconds before expiry: enter closing mode
