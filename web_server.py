@@ -43,6 +43,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("web")
 
+import collections
+
+
+class RingBufferLogHandler(logging.Handler):
+    """In-memory ring buffer for recent log entries (used by /api/logs)."""
+
+    def __init__(self, maxlen: int = 500):
+        super().__init__()
+        self.buffer: collections.deque = collections.deque(maxlen=maxlen)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.buffer.append({
+            "ts": record.created,
+            "level": record.levelname,
+            "name": record.name,
+            "msg": self.format(record),
+        })
+
+
+_log_handler = RingBufferLogHandler()
+_log_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_log_handler)
+
 
 # ── Auth ────────────────────────────────────────────────────────
 AUTH_COOKIE = "pm_web_auth"
@@ -548,6 +571,11 @@ class MMRuntime:
                 # Build market info from token IDs
                 market = self._build_market_info_from_tokens(
                     coin, timeframe, up_id, dn_id, condition_id=cond_id)
+                if market is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to determine strike price — cannot trade this window"
+                    )
             else:
                 log.warning("PM tokens not found, using placeholder")
                 market = self._build_placeholder_market(coin, timeframe)
@@ -657,9 +685,18 @@ class MMRuntime:
                             if tokens and tokens[0] and tokens[1]:
                                 up_id, dn_id, _cond_id = tokens
                                 strike, _ws, _we = await asyncio.wait_for(
-                                    asyncio.to_thread(feeds.fetch_pm_strike, self._coin, self._timeframe),
-                                    timeout=15.0,
+                                    asyncio.to_thread(
+                                        feeds.fetch_pm_strike, self._coin, self._timeframe,
+                                        5, 2.0,  # max_retries=5, retry_delay=2s
+                                    ),
+                                    timeout=30.0,
                                 )
+                                if strike <= 0:
+                                    log.warning(
+                                        f"Strike=0 after retries ({elapsed:.0f}s elapsed), "
+                                        f"skipping this window..."
+                                    )
+                                    continue  # keep polling for next window
                                 log.info(
                                     f"New tokens ready after {elapsed:.0f}s: "
                                     f"strike={strike:.2f} UP={up_id[:20]}... DN={dn_id[:20]}..."
@@ -812,22 +849,26 @@ class MMRuntime:
 
     def _build_market_info_from_tokens(self, coin: str, timeframe: str,
                                        up_id: str, dn_id: str,
-                                       condition_id: str = "") -> MarketInfo:
+                                       condition_id: str = "") -> Optional[MarketInfo]:
         """Build MarketInfo from fetched PM token ID tuple.
 
         Fetches the actual strike price from Binance candle open
         and window timing from PM event endDate.
+
+        Returns None if strike cannot be determined (prevents trading with FV=0.5).
         """
         strike, window_start, window_end = feeds.fetch_pm_strike(coin, timeframe)
 
         if strike <= 0 or window_start <= 0:
             # Fallback: use current Binance mid as strike (imperfect but better than 0)
-            log.warning("Could not fetch strike from Binance, using current mid price")
+            log.warning("Could not fetch strike from Binance, trying current mid price")
             now = time.time()
             tf_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "daily": 1440}
             window_duration = tf_minutes.get(timeframe, 60) * 60
-            # Use feed_state.mid if available
             strike = self.feed_state.mid if self.feed_state and self.feed_state.mid else 0.0
+            if strike <= 0:
+                log.error("Strike is 0 and no Binance mid available — cannot trade this window")
+                return None
             window_start = now
             window_end = now + window_duration
 

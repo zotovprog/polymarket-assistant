@@ -152,11 +152,13 @@ class QuoteEngine:
                             inventory: Inventory,
                             volatility: float = 0.0,
                             avg_volatility: float = 0.0,
-                            usdc_budget: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
+                            usdc_budget: float = 0.0,
+                            order_collateral: float = 0.0) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
 
         Args:
             usdc_budget: Session USDC limit (initial_usdc). 0 = no limit.
+            order_collateral: USDC locked in active BUY orders (pending fills).
 
         Returns dict with keys 'up' and 'dn', each containing (bid, ask).
         """
@@ -173,11 +175,22 @@ class QuoteEngine:
         up_bid_size = round(min(up_bid.size, up_room), 2)
         dn_bid_size = round(min(dn_bid.size, dn_room), 2)
 
+        # Hard cutoff: if remaining USDC budget <= 0, skip all BUY generation
+        if usdc_budget > 0:
+            up_locked = inventory.up_shares * inventory.up_cost.avg_entry_price
+            dn_locked = inventory.dn_shares * inventory.dn_cost.avg_entry_price
+            remaining = max(0.0, usdc_budget - up_locked - dn_locked - order_collateral)
+            if remaining <= 0:
+                return {
+                    "up": (None, up_ask),
+                    "dn": (None, dn_ask),
+                }
+
         # Cap BUY size by remaining USDC budget.
         if usdc_budget > 0:
             up_locked = inventory.up_shares * inventory.up_cost.avg_entry_price
             dn_locked = inventory.dn_shares * inventory.dn_cost.avg_entry_price
-            remaining = max(0.0, usdc_budget - up_locked - dn_locked)
+            remaining = max(0.0, usdc_budget - up_locked - dn_locked - order_collateral)
             half_remaining = remaining / 2.0
 
             if up_bid_size > 0 and up_bid.price > 0:

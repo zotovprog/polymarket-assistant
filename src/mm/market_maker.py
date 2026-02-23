@@ -74,6 +74,7 @@ class MarketMaker:
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
         self._one_sided_counter: int = 0
+        self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
 
         # Current quotes (for dashboard)
@@ -92,6 +93,13 @@ class MarketMaker:
         self._on_fill_callbacks: list = []
         self._on_state_change_callbacks: list = []
         self._on_snapshot_callbacks: list = []
+
+    def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
+        """Log a warning at most once per cooldown period."""
+        now = time.time()
+        if now - self._warn_cooldowns.get(key, 0) >= cooldown:
+            self._warn_cooldowns[key] = now
+            log.warning(msg)
 
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
@@ -657,8 +665,15 @@ class MarketMaker:
             if use_taker:
                 # ── Phase 2: Taker ──
                 if not best_bid or best_bid <= 0:
-                    log.warning(f"{label}: No best_bid for taker liquidation")
-                    continue
+                    if time_left < 5:
+                        log.warning(f"{label}: No best_bid, last resort sell at $0.01 ({time_left:.0f}s left)")
+                        best_bid = 0.01
+                    else:
+                        self._throttled_warn(
+                            f"no_bid_{label}",
+                            f"{label}: No best_bid for taker liquidation ({time_left:.0f}s left)",
+                        )
+                        continue
 
                 if best_bid < floor and cfg.liq_abandon_below_floor:
                     if time_left > 5:
@@ -714,7 +729,7 @@ class MarketMaker:
                 size=sell_size,
                 token_id=token_id,
             )
-            order_id = await self.order_mgr.place_order(sell_quote, post_only=post_only)
+            order_id = await self.order_mgr.place_order(sell_quote, post_only=post_only, fallback_taker=True)
             if order_id:
                 self._liquidation_order_ids.add(order_id)
                 placed_any = True
@@ -723,7 +738,10 @@ class MarketMaker:
                     f"({phase}, FV={fv:.2f}, floor={floor:.2f}, "
                     f"best_bid={best_bid or 0:.2f}, {time_left:.0f}s left)")
             else:
-                log.warning(f"Liquidation {label} failed ({real_balance:.1f} shares) — retrying next tick")
+                self._throttled_warn(
+                    f"liq_fail_{label}",
+                    f"Liquidation {label} failed ({real_balance:.1f} shares) — retrying next tick",
+                )
 
         # Advance chunk counter only when we actually placed orders
         if not use_taker and placed_any:

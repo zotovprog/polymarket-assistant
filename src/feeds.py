@@ -269,28 +269,50 @@ def fetch_pm_event_data(coin: str, tf: str) -> dict | None:
 
 
 def fetch_pm_tokens(coin: str, tf: str) -> tuple:
-    """Fetch PM token IDs for up/down markets."""
+    """Fetch PM token IDs and condition ID for up/down markets.
+
+    Returns:
+        (up_token_id, dn_token_id, condition_id) on success,
+        (None, None, None) on failure.
+    """
     event_data = fetch_pm_event_data(coin, tf)
     if event_data is None:
-        return None, None
+        return None, None, None
     try:
-        ids = json.loads(event_data["markets"][0]["clobTokenIds"])
-        return ids[0], ids[1]
+        market = event_data["markets"][0]
+        ids = json.loads(market["clobTokenIds"])
+        condition_id = market.get("conditionId", "")
+        return ids[0], ids[1], condition_id
     except Exception as e:
         print(f"  [PM] token extraction failed: {e}")
-        return None, None
+        return None, None, None
 
 
-def fetch_pm_strike(coin: str, tf: str) -> tuple[float, float, float]:
+def fetch_pm_strike(coin: str, tf: str, max_retries: int = 3,
+                    retry_delay: float = 2.0) -> tuple[float, float, float]:
     """Fetch strike price and window timing from PM event + Binance.
 
     For Up/Down markets, strike = Binance candle open price.
+    Retries up to max_retries times with retry_delay between attempts.
 
     Returns:
         (strike, window_start, window_end) — strike is the Binance open price,
         window_start/end are Unix timestamps.
         Returns (0.0, 0, 0) on failure.
     """
+    for attempt in range(1, max_retries + 1):
+        strike, ws, we = _fetch_pm_strike_once(coin, tf)
+        if strike > 0:
+            return strike, ws, we
+        if attempt < max_retries:
+            print(f"  [PM] strike=0 on attempt {attempt}/{max_retries}, retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+    print(f"  [PM] strike=0 after {max_retries} attempts")
+    return 0.0, 0, 0
+
+
+def _fetch_pm_strike_once(coin: str, tf: str) -> tuple[float, float, float]:
+    """Single attempt to fetch strike price."""
     event_data = fetch_pm_event_data(coin, tf)
     if event_data is None:
         return 0.0, 0, 0

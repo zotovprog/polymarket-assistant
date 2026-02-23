@@ -44,9 +44,20 @@ class OrderManager:
         self._log = log
         self._active_orders: dict[str, Quote] = {}  # order_id -> Quote
         self._filled_order_ids: set[str] = set()
+        self._partial_fill_reported: dict[str, float] = {}  # order_id -> last reported size_matched
         self._pending_cancels: set[str] = set()
         self._mock_token_balances: dict[str, float] = {}
         self._allowance_set: set[str] = set()  # token IDs with allowance already set
+        self._session_budget: float = 0.0  # Hard USDC budget cap (0 = no limit)
+        self._session_spent: float = 0.0   # Total USDC committed to BUY orders this session
+        self._warn_cooldowns: dict[str, float] = {}
+
+    def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
+        """Log a warning at most once per cooldown period."""
+        now = time.time()
+        if now - self._warn_cooldowns.get(key, 0) >= cooldown:
+            self._warn_cooldowns[key] = now
+            self._log.warning(msg)
 
     @property
     def active_order_ids(self) -> list[str]:
@@ -187,7 +198,7 @@ class OrderManager:
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
         return order_id
 
-    async def place_order(self, quote: Quote, *, post_only: bool | None = None) -> Optional[str]:
+    async def place_order(self, quote: Quote, *, post_only: bool | None = None, fallback_taker: bool = False) -> Optional[str]:
         """Place an order with retry on insufficient balance.
 
         Args:
@@ -200,18 +211,52 @@ class OrderManager:
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
 
-        # Log warning if collateral exceeds available USDC
+        # Hard budget cap: reject BUY orders that exceed session budget
         collateral = self.required_collateral(quote)
+        if quote.side == "BUY" and self._session_budget > 0:
+            active_buy_collateral = sum(
+                self.required_collateral(q)
+                for q in self._active_orders.values()
+                if q.side == "BUY"
+            )
+            budget_remaining = self._session_budget - self._session_spent - active_buy_collateral
+            if collateral > budget_remaining + 0.01:
+                # Try to reduce size to fit budget
+                if budget_remaining > 1.0 and quote.price > 0:
+                    max_size = budget_remaining / quote.price
+                    if max_size >= 1.0:
+                        self._throttled_warn(
+                            "budget_cap",
+                            f"Budget cap: {quote.token_id[:8]} {quote.size:.1f}@{quote.price:.2f} "
+                            f"needs ${collateral:.2f} but only ${budget_remaining:.2f} remaining — "
+                            f"reducing to {max_size:.1f}",
+                        )
+                        quote.size = round(max_size, 2)
+                        collateral = self.required_collateral(quote)
+                    else:
+                        self._throttled_warn(
+                            "budget_reject",
+                            f"Budget cap: rejecting {quote.token_id[:8]} BUY "
+                            f"{quote.size:.1f}@{quote.price:.2f} — only ${budget_remaining:.2f} remaining",
+                        )
+                        return None
+                else:
+                    self._throttled_warn(
+                        "budget_exhausted",
+                        f"Budget cap: rejecting {quote.token_id[:8]} BUY "
+                        f"{quote.size:.1f}@{quote.price:.2f} — budget exhausted (${budget_remaining:.2f} remaining)",
+                    )
+                    return None
+
+        # Log warning if collateral exceeds available USDC (mock only)
         if is_mock:
             usdc_avail = float(getattr(self.client, '_usdc_balance', 0.0))
-        else:
-            usdc_avail = 0.0  # Can't check synchronously for live
-        if usdc_avail > 0 and collateral > usdc_avail:
-            log.warning(
-                "Collateral warning: %s %s %.1f@%.2f needs $%.2f but only $%.2f USDC available",
-                quote.side, quote.token_id[:8], quote.size, quote.price,
-                collateral, usdc_avail,
-            )
+            if collateral > usdc_avail:
+                log.warning(
+                    "Collateral warning: %s %s %.1f@%.2f needs $%.2f but only $%.2f USDC available",
+                    quote.side, quote.token_id[:8], quote.size, quote.price,
+                    collateral, usdc_avail,
+                )
 
         # Ensure allowance for SELL orders on conditional tokens
         if quote.side == "SELL" and not is_mock:
@@ -225,9 +270,10 @@ class OrderManager:
             if "not enough balance" in error_msg.lower():
                 reduced = round(quote.size * 0.9, 2)
                 if reduced >= 1.0:
-                    log.warning(
+                    self._throttled_warn(
+                        "insufficient_balance",
                         f"Insufficient balance for {quote.side} "
-                        f"{quote.size:.1f}@{quote.price:.2f} — retrying with {reduced:.1f}"
+                        f"{quote.size:.1f}@{quote.price:.2f} — retrying with {reduced:.1f}",
                     )
                     quote.size = reduced
                     try:
@@ -241,10 +287,24 @@ class OrderManager:
                         f"{quote.size:.1f}@{quote.price:.2f} — too small to retry"
                     )
             elif "crosses book" in error_msg.lower():
-                log.warning(
-                    f"Post-only crossed book: {quote.side} "
-                    f"{quote.size:.1f}@{quote.price:.2f}"
-                )
+                if fallback_taker:
+                    log.info(
+                        "Post-only crossed book, retrying as taker: %s "
+                        "%.1f@%.2f",
+                        quote.side, quote.size, quote.price,
+                    )
+                    try:
+                        return await self._place_order_inner(quote, False)
+                    except Exception as e2:
+                        log.error(f"Taker fallback also failed: {e2}")
+                        return None
+                else:
+                    self._throttled_warn(
+                        "crosses_book",
+                        f"Post-only crossed book: {quote.side} "
+                        f"{quote.size:.1f}@{quote.price:.2f}",
+                        cooldown=10.0,
+                    )
             else:
                 log.error(f"Failed to place order: {e}")
             return None
@@ -454,7 +514,9 @@ class OrderManager:
     async def check_fills(self) -> list[Fill]:
         """Poll for fills on active orders.
 
-        Returns list of new fills detected.
+        Returns list of new fills detected, including partial fills.
+        Tracks previously reported size_matched per order to emit
+        incremental fill events for partial fills.
         """
         fills = []
         to_remove = []
@@ -471,34 +533,41 @@ class OrderManager:
                 status = order.get("status", "")
                 size_matched = float(order.get("size_matched", 0))
 
-                if status in ("MATCHED", "CLOSED") and size_matched > 0:
-                    if order_id in self._filled_order_ids:
-                        to_remove.append(order_id)
-                        continue
+                # Track how much we already reported for this order
+                prev_matched = self._partial_fill_reported.get(order_id, 0.0)
+                new_fill_size = size_matched - prev_matched
 
+                if new_fill_size >= 0.01:
                     fill = Fill(
                         ts=time.time(),
                         side=quote.side,
                         token_id=quote.token_id,
                         price=quote.price,
-                        size=size_matched,
+                        size=round(new_fill_size, 4),
                         fee=0.0,  # Maker fee = 0%
                         order_id=order_id,
                         is_maker=True,
                     )
                     fills.append(fill)
+                    self._partial_fill_reported[order_id] = size_matched
+
+                    # Track session spending for budget cap
+                    if quote.side == "BUY":
+                        self._session_spent += new_fill_size * quote.price
 
                     # Mock balance tracking mirrors fill-side share movements.
                     if hasattr(self.client, "_orders"):
-                        signed_size = size_matched if quote.side == "BUY" else -size_matched
+                        signed_size = new_fill_size if quote.side == "BUY" else -new_fill_size
                         cur = self._mock_token_balances.get(quote.token_id, 0.0)
                         self._mock_token_balances[quote.token_id] = cur + signed_size
 
+                if status in ("MATCHED", "CLOSED"):
                     self._filled_order_ids.add(order_id)
                     to_remove.append(order_id)
-
+                    self._partial_fill_reported.pop(order_id, None)
                 elif status in ("CANCELLED", "EXPIRED"):
                     to_remove.append(order_id)
+                    self._partial_fill_reported.pop(order_id, None)
 
             except Exception as e:
                 log.debug(f"Error checking order {order_id[:12]}...: {e}")
@@ -508,12 +577,44 @@ class OrderManager:
 
         return fills
 
+    async def merge_positions(self, condition_id: str, amount_shares: float,
+                              private_key: str) -> dict:
+        """Merge YES+NO conditional token pairs back into USDC.
+
+        Paper mode: instantly credits USDC balance.
+        Live mode: skipped when using funder/proxy (tokens on Safe, not EOA).
+                   On-chain merge requires tokens on msg.sender's address.
+        """
+        if hasattr(self.client, "_orders"):  # Paper mode
+            self.client._usdc_balance += amount_shares
+            log.info("[MOCK] Merge %.2f pairs -> $%.2f USDC", amount_shares, amount_shares)
+            return {"success": True, "amount_usdc": amount_shares}
+
+        # Live mode: check if using funder/proxy (tokens on Safe, not EOA)
+        funder = getattr(self.client, 'funder', None)
+        signer_addr = None
+        if hasattr(self.client, 'signer'):
+            signer_addr = getattr(self.client.signer, 'address', lambda: None)()
+        if funder and signer_addr and funder.lower() != signer_addr.lower():
+            log.warning(
+                "Merge skipped: tokens on funder (%s), not EOA (%s). "
+                "Using SELL liquidation instead.",
+                funder[:10], signer_addr[:10],
+            )
+            return {"success": False, "error": "funder mode — merge not supported"}
+
+        from .approvals import merge_positions as _merge
+        return await asyncio.to_thread(_merge, private_key, condition_id, amount_shares)
+
     def reset(self) -> None:
         """Clear tracked order state between windows."""
         self._active_orders.clear()
         self._filled_order_ids.clear()
+        self._partial_fill_reported.clear()
         self._mock_token_balances.clear()
         self._allowance_set.clear()
+        self._session_spent = 0.0
+        self._warn_cooldowns = {}
 
     def get_stats(self) -> dict:
         """Get order manager stats."""

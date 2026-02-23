@@ -132,15 +132,38 @@ class MongoLogHandler(logging.Handler):
 
     def __init__(self, mongo_logger: MongoLogger):
         super().__init__()
+        self._dedup: dict[tuple, tuple[float, int]] = {}  # (level, name, msg_prefix) -> (last_ts, suppressed_count)
+        self._dedup_maxsize: int = 500
         self._logger = mongo_logger
 
     def emit(self, record: logging.LogRecord) -> None:
+        now = time.time()
+        # Dedup key: (level, logger name, first 80 chars of message)
+        msg_text = self.format(record)
+        key = (record.levelname, record.name, msg_text[:80])
+
+        if key in self._dedup:
+            last_ts, suppressed = self._dedup[key]
+            if now - last_ts < 5.0:
+                self._dedup[key] = (last_ts, suppressed + 1)
+                return
+            # Cooldown expired — emit with suppression count
+            if suppressed > 0:
+                msg_text = f"{msg_text} (suppressed {suppressed} similar)"
+            self._dedup[key] = (now, 0)
+        else:
+            # Evict oldest if too many keys
+            if len(self._dedup) >= self._dedup_maxsize:
+                oldest_key = min(self._dedup, key=lambda k: self._dedup[k][0])
+                del self._dedup[oldest_key]
+            self._dedup[key] = (now, 0)
+
         doc = {
             "_collection": "logs",
             "ts": record.created,
             "level": record.levelname,
             "name": record.name,
-            "msg": self.format(record),
+            "msg": msg_text,
         }
         try:
             self._logger._queue.put_nowait(doc)
