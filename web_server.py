@@ -1099,13 +1099,19 @@ class MMRuntime:
             pass
 
     async def _send_window_summary(self) -> None:
-        """Send window PnL summary to Telegram based on real balance change."""
+        """Send window PnL summary to Telegram based on real balance change.
+
+        Accounts for unredeemed shares: uses fair value to estimate
+        resolution value of positions still held (winning side ≈ $1,
+        losing side ≈ $0).
+        """
         if not _telegram.enabled or not self.mm:
             return
         try:
             mode = "PAPER" if self._paper_mode else "LIVE"
+            snap = self.mm.snapshot()
 
-            # Fetch current USDC balance (after positions closed)
+            # Fetch current USDC balance
             if self._paper_mode:
                 client = self.mm.order_mgr.client
                 end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
@@ -1113,11 +1119,27 @@ class MMRuntime:
                 try:
                     end_balance = await self.mm.order_mgr.get_usdc_balance()
                 except Exception:
-                    snap = self.mm.snapshot()
                     end_balance = snap.get("usdc_balance_pm") or snap.get("inventory", {}).get("usdc", 0)
 
-            # Real PnL = balance now minus balance at session start
-            session_pnl = end_balance - self._start_balance if self._start_balance else 0.0
+            # Account for unredeemed shares still on the account.
+            # At window close, winning tokens → $1, losing → $0.
+            # Use FV as proxy: FV > 0.5 means likely winning side.
+            inv = snap.get("inventory", {})
+            fv = snap.get("fair_value", {})
+            up_shares = inv.get("up_shares", 0)
+            dn_shares = inv.get("dn_shares", 0)
+            fv_up = fv.get("up", 0.5)
+            fv_dn = fv.get("dn", 0.5)
+
+            # Resolution value: round FV to 0 or 1 for settled markets
+            up_resolution = 1.0 if fv_up >= 0.5 else 0.0
+            dn_resolution = 1.0 if fv_dn >= 0.5 else 0.0
+            unredeemed_value = up_shares * up_resolution + dn_shares * dn_resolution
+
+            effective_balance = end_balance + unredeemed_value
+
+            # Real PnL = (USDC + unredeemed shares value) - start balance
+            session_pnl = effective_balance - self._start_balance if self._start_balance else 0.0
 
             # Record PnL for 1h/24h aggregation
             now = time.time()
@@ -1135,10 +1157,11 @@ class MMRuntime:
                 session_pnl=session_pnl,
                 pnl_1h=pnl_1h,
                 pnl_24h=pnl_24h,
-                usdc_balance=end_balance,
+                usdc_balance=effective_balance,
             )
 
-            # Update start_balance for next window
+            # Update start_balance for next window (use real USDC only —
+            # unredeemed shares will be redeemed before next window starts)
             self._start_balance = end_balance
         except Exception as e:
             log.warning(f"Failed to send window summary to Telegram: {e}")
