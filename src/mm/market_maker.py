@@ -69,6 +69,7 @@ class MarketMaker:
         self._liquidation_attempted = False
         self._liquidation_order_ids: set[str] = set()
         self._cached_usdc_balance: float = 0.0
+        self._starting_usdc_pm: float = 0.0
         self._last_quality: MarketQuality | None = None
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
@@ -127,6 +128,11 @@ class MarketMaker:
             raise ValueError("Market info not set — call set_market() first")
 
         self._running = True
+        # Snapshot starting USDC for real session PnL
+        try:
+            self._starting_usdc_pm = await self.order_mgr.get_usdc_balance()
+        except Exception:
+            self._starting_usdc_pm = 0.0
         self._started_at = time.time()
         self._paused = False
         self._pause_reason = ""
@@ -381,7 +387,10 @@ class MarketMaker:
 
         if is_one_sided:
             self._one_sided_counter += 1
-            if self._one_sided_counter >= self.config.max_one_sided_ticks:
+            # Only trigger one-sided close after bot has been running for a minimum time
+            min_run_time = 120.0  # seconds — give bot time to fill both sides
+            elapsed = time.time() - self._started_at
+            if self._one_sided_counter >= self.config.max_one_sided_ticks and elapsed >= min_run_time:
                 log.warning(
                     f"One-sided exposure for {self._one_sided_counter} ticks: "
                     f"UP={up_sh:.1f} DN={dn_sh:.1f} — early close")
@@ -837,6 +846,14 @@ class MarketMaker:
             for f in reversed(recent)
         ]
 
+        # Real session PnL based on PM balances
+        # = (current_usdc + position_value_at_pm_prices) - starting_usdc
+        _pm_up_price = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
+        _pm_dn_price = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
+        _position_value = (self.inventory.up_shares * _pm_up_price +
+                           self.inventory.dn_shares * _pm_dn_price)
+        _session_pnl = (self._cached_usdc_balance + _position_value) - self._starting_usdc_pm
+
         return {
             # Market info
             "market": {
@@ -887,6 +904,8 @@ class MarketMaker:
             # PnL & Risk
             **risk_stats,
             "avg_spread_bps": round(avg_spread, 1),
+            "session_pnl": round(_session_pnl, 4),
+            "starting_usdc_pm": round(self._starting_usdc_pm, 2),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,

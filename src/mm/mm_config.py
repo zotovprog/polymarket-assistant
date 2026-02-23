@@ -50,7 +50,7 @@ class MMConfig:
     liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
 
     # ── One-Sided Exposure ─────────────────────────────────
-    max_one_sided_ticks: int = 15  # Close if one-sided exposure for this many consecutive ticks
+    max_one_sided_ticks: int = 30  # Close if one-sided exposure for this many consecutive ticks
 
     # ── Window Management ────────────────────────────────────────
     close_window_sec: float = 30.0    # Seconds before expiry: enter closing mode

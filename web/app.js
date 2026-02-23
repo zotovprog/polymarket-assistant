@@ -249,7 +249,7 @@ function updateUI(s) {
     // PnL
     const realized = s.realized_pnl || 0;
     const unrealized = s.unrealized_pnl || 0;
-    const total = s.total_pnl || (realized + unrealized);
+    const total = s.session_pnl != null ? s.session_pnl : (s.total_pnl || (realized + unrealized));
     const stake = s.session_limit || 1;
     const pnlPct = (total / stake * 100).toFixed(1);
     setPnl('pnl-realized', realized);
@@ -556,7 +556,7 @@ function updateCharts(s) {
 
     // PnL chart
     if (pnlSeries) {
-        const total = s.total_pnl || 0;
+        const total = s.session_pnl != null ? s.session_pnl : (s.total_pnl || 0);
         pnlData.push({ time: now, value: total });
         if (pnlData.length > 500) pnlData = pnlData.slice(-300);
         pnlSeries.setData(pnlData);
