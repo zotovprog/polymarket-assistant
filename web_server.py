@@ -1116,7 +1116,7 @@ class MMRuntime:
                 if hasattr(client, "balance"):
                     usdc_balance = float(client.balance)
             else:
-                usdc_balance = snap.get("inventory", {}).get("usdc", 0)
+                usdc_balance = snap.get("usdc_balance_pm") or snap.get("inventory", {}).get("usdc", 0)
 
             _telegram.notify_window_summary(
                 coin=self._coin or "UNKNOWN",
