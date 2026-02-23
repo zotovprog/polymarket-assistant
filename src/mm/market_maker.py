@@ -406,6 +406,20 @@ class MarketMaker:
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
+        # Inventory limit: don't fully pause — suppress BUY on overloaded side
+        _inv_limit_suppress: set[str] = set()  # token keys to suppress BUY
+        if should_pause and "Inventory limit" in reason:
+            max_sh = self.config.max_inventory_shares
+            if self.inventory.up_shares > max_sh:
+                _inv_limit_suppress.add("up")
+            if self.inventory.dn_shares > max_sh:
+                _inv_limit_suppress.add("dn")
+            # Mark as "soft pause" for UI, but keep quoting
+            self._paused = True
+            self._pause_reason = reason + " (selling to reduce)"
+            should_pause = False  # don't block quoting below
+            log.info(f"Inventory limit — suppressing BUY on {_inv_limit_suppress}, continuing to quote")
+
         if should_pause and not self._paused:
             self._paused = True
             self._pause_reason = reason
@@ -417,7 +431,7 @@ class MarketMaker:
             self._pause_reason = ""
             log.info("MM RESUMED")
 
-        if self._paused:
+        if self._paused and not _inv_limit_suppress:
             return
 
         # ── One-sided exposure check ──────────────────────────────
@@ -495,6 +509,14 @@ class MarketMaker:
         )
 
         self._quote_count += 1
+
+        # 6a-pre. Suppress BUY on inventory-overloaded sides
+        if _inv_limit_suppress:
+            for tk in _inv_limit_suppress:
+                bid, ask = all_quotes[tk]
+                if bid is not None:
+                    log.info(f"Suppressing BUY {tk.upper()} due to inventory limit")
+                    all_quotes[tk] = (None, ask)
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
