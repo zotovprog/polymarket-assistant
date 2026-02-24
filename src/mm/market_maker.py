@@ -1118,11 +1118,15 @@ class MarketMaker:
                 "total_chunks": self.config.liq_gradual_chunks,
             },
 
-            # PnL & Risk
+            # PnL & Risk (override fill-based with PM-balance-based)
             **risk_stats,
+            "total_pnl": round(_session_pnl, 4),
+            "unrealized_pnl": round(_position_value, 4),
+            "realized_pnl": round(_session_pnl - _position_value, 4),
             "avg_spread_bps": round(avg_spread, 1),
             "session_pnl": round(_session_pnl, 4),
             "starting_usdc_pm": round(self._starting_usdc_pm, 2),
+            "portfolio_value": round(self._cached_usdc_balance + _position_value, 2),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,

@@ -177,9 +177,9 @@ class MongoLogger:
                     else:
                         net_dn -= size
 
-            net_up = max(0.0, net_up)
-            net_dn = max(0.0, net_dn)
-            unrealized = net_up * fv_up + net_dn * fv_dn
+            # net_up/net_dn can be negative if sells > buys (e.g. from prior inventory)
+            # Only count positive holdings for unrealized value
+            unrealized = max(0.0, net_up) * fv_up + max(0.0, net_dn) * fv_dn
             total = realized + unrealized
 
             return {
@@ -189,8 +189,8 @@ class MongoLogger:
                 "fees": round(fees, 4),
                 "buy_count": buy_count,
                 "sell_count": sell_count,
-                "net_up": round(net_up, 2),
-                "net_dn": round(net_dn, 2),
+                "net_up": round(max(0.0, net_up), 2),
+                "net_dn": round(max(0.0, net_dn), 2),
             }
         except Exception as e:
             log.warning("compute_session_pnl failed: %s", e)

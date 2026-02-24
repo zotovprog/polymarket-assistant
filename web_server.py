@@ -1159,10 +1159,6 @@ class MMRuntime:
             fv_up = fv.get("up", 0.5)
             fv_dn = fv.get("dn", 0.5)
 
-            # Resolution value for unredeemed shares
-            up_resolution = 1.0 if fv_up >= 0.5 else 0.0
-            dn_resolution = 1.0 if fv_dn >= 0.5 else 0.0
-
             session_pnl = 0.0
             effective_balance = 0.0
 
@@ -1174,8 +1170,8 @@ class MMRuntime:
                     timeframe=self._timeframe,
                     window_start=self.mm.market.window_start,
                     window_end=self.mm.market.window_end,
-                    fv_up=up_resolution,
-                    fv_dn=dn_resolution,
+                    fv_up=fv_up,
+                    fv_dn=fv_dn,
                 )
 
             if mongo_pnl and (mongo_pnl["buy_count"] + mongo_pnl["sell_count"]) > 0:
@@ -1208,7 +1204,7 @@ class MMRuntime:
 
                 up_shares = max(0.0, up_shares)
                 dn_shares = max(0.0, dn_shares)
-                unredeemed_value = up_shares * up_resolution + dn_shares * dn_resolution
+                unredeemed_value = up_shares * fv_up + dn_shares * fv_dn
                 effective_balance = end_balance + unredeemed_value
                 session_pnl = effective_balance - self._start_balance if self._start_balance else 0.0
 
@@ -1411,10 +1407,12 @@ async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
         fills = _runtime.mm.risk_mgr.fills
         total = len(fills)
         page = fills[-(offset + limit):-offset or None] if offset else fills[-limit:]
+        up_tid = _runtime.mm.market.up_token_id if _runtime.mm.market else ""
         return {
             "fills": [
                 {
                     "ts": f.ts, "side": f.side,
+                    "token_type": "up" if f.token_id == up_tid else "dn",
                     "token_id": f.token_id[:16] + "...",
                     "price": f.price, "size": f.size,
                     "fee": f.fee, "is_maker": f.is_maker,
