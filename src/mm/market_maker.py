@@ -80,6 +80,7 @@ class MarketMaker:
         self._liq_last_chunk_time: float = 0.0
         self._one_sided_counter: int = 0
         self._merge_failed_this_cycle: bool = False
+        self._closing_start_time_left: float = 0.0
         self._reconcile_prev_pm: tuple[float, float] | None = None
         self._reconcile_stable_count: int = 0
         self._warn_cooldowns: dict[str, float] = {}
@@ -276,6 +277,7 @@ class MarketMaker:
             # Window expired — liquidate and stop
             if not self._is_closing:
                 self._is_closing = True
+                self._closing_start_time_left = max(time_left, 1.0)
                 self._merge_failed_this_cycle = False
                 fv_up, fv_dn = self._compute_fv()
                 self._liq_lock = self.risk_mgr.lock_pnl(
@@ -296,6 +298,7 @@ class MarketMaker:
 
         if time_left <= close_sec and not self._is_closing:
             self._is_closing = True
+            self._closing_start_time_left = time_left
             self._merge_failed_this_cycle = False
             fv_up_close, fv_dn_close = self._compute_fv()
             self._liq_lock = self.risk_mgr.lock_pnl(
@@ -443,6 +446,7 @@ class MarketMaker:
             self._liq_chunk_index = 0
             self._liq_last_chunk_time = 0.0
             self._is_closing = True
+            self._closing_start_time_left = self.market.time_remaining
             self._merge_failed_this_cycle = False
             await self.order_mgr.cancel_all()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
@@ -503,6 +507,7 @@ class MarketMaker:
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
                 self._is_closing = True
+                self._closing_start_time_left = time_left
                 self._merge_failed_this_cycle = False
                 await self.order_mgr.cancel_all()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
@@ -529,6 +534,7 @@ class MarketMaker:
                     self._liq_chunk_index = 0
                     self._liq_last_chunk_time = 0.0
                     self._is_closing = True
+                    self._closing_start_time_left = self.market.time_remaining
                     self._merge_failed_this_cycle = False
                     await self.order_mgr.cancel_all()
                     self._current_quotes = {"up": (None, None), "dn": (None, None)}
@@ -725,6 +731,20 @@ class MarketMaker:
         cfg = self.config
         taker_threshold = cfg.liq_taker_threshold_sec
         use_taker = time_left <= taker_threshold
+        # Emergency drawdown check during liquidation
+        if self._starting_usdc_pm > 0 and self._cached_usdc_balance > 0:
+            _pm_up = self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") else 0.5
+            _pm_dn = self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5
+            _pos_val = self.inventory.up_shares * _pm_up + self.inventory.dn_shares * _pm_dn
+            _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_usdc_pm
+            if _liq_pnl < -2 * self.config.max_drawdown_usd:
+                log.critical("CATASTROPHIC LOSS during liquidation: sPnL=$%.2f, abandoning", _liq_pnl)
+                self._is_closing = False
+                self._running = False
+                return
+            elif _liq_pnl < -self.config.max_drawdown_usd and not use_taker:
+                log.warning("Max drawdown exceeded during liquidation: sPnL=$%.2f, forcing taker mode", _liq_pnl)
+                use_taker = True
 
         # 1. Prune filled/cancelled liquidation orders
         active = set(self.order_mgr.active_order_ids)
@@ -824,9 +844,8 @@ class MarketMaker:
 
             # Adaptive floor decay: floor → 0.01 as time_left → 0
             base_floor = floor
-            window_dur = self.market.window_end - self.market.window_start
-            close_sec = min(cfg.close_window_sec, window_dur * 0.4)
-            decay_ratio = max(0.0, min(1.0, time_left / close_sec)) if close_sec > 0 else 0.0
+            ref = self._closing_start_time_left if self._closing_start_time_left > 0 else 30.0
+            decay_ratio = max(0.0, min(1.0, time_left / ref))
             floor = max(0.01, base_floor * decay_ratio)
             if floor != base_floor:
                 log.info(f"{label}: adaptive floor {base_floor:.2f} → {floor:.2f} "

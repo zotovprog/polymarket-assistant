@@ -805,7 +805,6 @@ class MMRuntime:
     async def stop(self) -> dict:
         """Stop market maker and feeds."""
         snap = self.snapshot()
-        await self._send_window_summary()
 
         if self.mm:
             await self.mm.stop()
@@ -1101,33 +1100,38 @@ class MMRuntime:
     async def _send_window_summary(self) -> None:
         """Send window PnL summary to Telegram based on real balance change.
 
-        Accounts for unredeemed shares: uses fair value to estimate
-        resolution value of positions still held (winning side ≈ $1,
-        losing side ≈ $0).
+        Uses real PM API balances (not internal tracking) to avoid
+        negative-shares bugs corrupting PnL calculation.
         """
         if not _telegram.enabled or not self.mm:
             return
         try:
             mode = "PAPER" if self._paper_mode else "LIVE"
-            snap = self.mm.snapshot()
 
-            # Fetch current USDC balance
+            # Fetch REAL balances from PM API (not internal tracking)
             if self._paper_mode:
                 client = self.mm.order_mgr.client
                 end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
+                up_shares = self.mm.inventory.up_shares
+                dn_shares = self.mm.inventory.dn_shares
             else:
                 try:
                     end_balance = await self.mm.order_mgr.get_usdc_balance()
                 except Exception:
-                    end_balance = snap.get("usdc_balance_pm") or snap.get("inventory", {}).get("usdc", 0)
+                    end_balance = self.mm._cached_usdc_balance or 0
+                try:
+                    up_shares, dn_shares = await self.mm.order_mgr.get_all_token_balances(
+                        self.mm.market.up_token_id, self.mm.market.dn_token_id)
+                except Exception:
+                    up_shares = max(0, self.mm.inventory.up_shares)
+                    dn_shares = max(0, self.mm.inventory.dn_shares)
 
-            # Account for unredeemed shares still on the account.
-            # At window close, winning tokens → $1, losing → $0.
-            # Use FV as proxy: FV > 0.5 means likely winning side.
-            inv = snap.get("inventory", {})
+            # Clamp to 0 (safety net against negative tracking bugs)
+            up_shares = max(0.0, up_shares)
+            dn_shares = max(0.0, dn_shares)
+
+            snap = self.mm.snapshot()
             fv = snap.get("fair_value", {})
-            up_shares = inv.get("up_shares", 0)
-            dn_shares = inv.get("dn_shares", 0)
             fv_up = fv.get("up", 0.5)
             fv_dn = fv.get("dn", 0.5)
 

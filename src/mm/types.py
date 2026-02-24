@@ -101,9 +101,9 @@ class Inventory:
             cost.record_buy(fill.price, fill.size, fill.fee)
         else:  # SELL
             if token_type == "up":
-                self.up_shares -= fill.size
+                self.up_shares = max(0.0, self.up_shares - fill.size)
             else:
-                self.dn_shares -= fill.size
+                self.dn_shares = max(0.0, self.dn_shares - fill.size)
             self.usdc += fill.notional - fill.fee
             cost.record_sell(fill.size)
 

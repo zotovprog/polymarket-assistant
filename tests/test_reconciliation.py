@@ -191,3 +191,85 @@ def test_reconcile_resets_on_window_transition():
     assert mm._reconcile_prev_pm is None
     assert mm._reconcile_stable_count == 0
 
+
+def test_sell_clamps_shares_to_zero():
+    """SELL more than internal inventory -> shares clamped to 0, not negative."""
+    from mm.types import Fill, Inventory
+
+    inv = Inventory(up_shares=5.0, dn_shares=3.0)
+
+    # Sell more DN than we have internally
+    big_sell = Fill(
+        ts=time.time(),
+        side="SELL",
+        token_id="dn_token_456",
+        price=0.50,
+        size=10.0,
+        fee=0.0,
+    )
+    inv.update_from_fill(big_sell, "dn")
+    assert inv.dn_shares == 0.0  # Clamped, not -7.0
+
+    # Same for UP
+    big_sell_up = Fill(
+        ts=time.time(),
+        side="SELL",
+        token_id="up_token_123",
+        price=0.60,
+        size=20.0,
+        fee=0.0,
+    )
+    inv.update_from_fill(big_sell_up, "up")
+    assert inv.up_shares == 0.0  # Clamped, not -15.0
+
+
+def test_floor_decay_from_closing_start():
+    """Floor decay should use closing start time as reference, not close_sec."""
+    mm = _make_mm(live=False)
+    # Simulate entering closing with 400s left in window
+    mm._closing_start_time_left = 400.0
+
+    # At 400s left (just entered closing): decay_ratio should be 1.0
+    ref = mm._closing_start_time_left
+    decay_400 = max(0.0, min(1.0, 400.0 / ref))
+    assert decay_400 == pytest.approx(1.0)
+
+    # At 200s left: decay_ratio should be 0.5
+    decay_200 = max(0.0, min(1.0, 200.0 / ref))
+    assert decay_200 == pytest.approx(0.5)
+
+    # At 0s left: decay_ratio should be 0.0
+    decay_0 = max(0.0, min(1.0, 0.0 / ref))
+    assert decay_0 == pytest.approx(0.0)
+
+    # Verify floor = max(0.01, base_floor * decay_ratio)
+    base_floor = 0.63
+    assert max(0.01, base_floor * decay_200) == pytest.approx(0.315)
+    assert max(0.01, base_floor * decay_0) == pytest.approx(0.01)
+
+
+def test_drawdown_forces_taker_in_liquidation():
+    """Catastrophic loss during liquidation should stop the bot."""
+    mm = _make_mm(live=True)
+    mm._is_closing = True
+    mm._starting_usdc_pm = 50.0  # started with $50
+    mm._cached_usdc_balance = 10.0  # now only $10
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+    mm.feed_state.pm_up = 0.5
+    mm.feed_state.pm_dn = 0.5
+
+    # Session PnL = (10 + 0) - 50 = -$40, max_drawdown_usd default = 100
+    # With max_drawdown=8: -40 < -16 (2*8) -> catastrophic -> abandon
+    mm.config.max_drawdown_usd = 8.0
+
+    # Mock order_mgr methods to prevent real API calls
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_token_balance = AsyncMock(return_value=0.0)
+    mm.order_mgr.get_usdc_balance = AsyncMock(return_value=10.0)
+
+    asyncio.run(mm._liquidate_inventory())
+
+    # Bot should have abandoned liquidation
+    assert mm._is_closing is False
+    assert mm._running is False
