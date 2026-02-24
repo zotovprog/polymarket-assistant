@@ -812,6 +812,7 @@ class MMRuntime:
                             timeframe=self._timeframe,
                             paper_mode=self._paper_mode,
                             initial_usdc=self._initial_usdc,
+                            dev=self._dev_mode,
                         )
                     except Exception as e:
                         log.error(f"Auto-next-window failed: {e}")
