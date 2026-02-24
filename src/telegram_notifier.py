@@ -36,6 +36,15 @@ class TelegramNotifier:
         except RuntimeError:
             pass  # Will be set later via set_loop()
 
+    def switch_credentials(self, token: str, chat_id: str, thread_id: str | int | None = None) -> None:
+        """Switch to different Telegram credentials (e.g. dev channel)."""
+        self.token = token
+        self.chat_id = chat_id
+        self.thread_id = int(thread_id) if thread_id else None
+        self.enabled = bool(self.token and self.chat_id)
+        if self.enabled and not self._client:
+            self._client = httpx.AsyncClient(timeout=10.0)
+
     @property
     def base_url(self) -> str:
         return f"https://api.telegram.org/bot{self.token}"

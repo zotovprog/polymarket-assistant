@@ -133,6 +133,7 @@ class StartRequest(BaseModel):
     timeframe: str = "5m"
     paper_mode: bool = True  # Paper trading by default for safety
     initial_usdc: float = 1000.0
+    dev: bool = False
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -467,6 +468,7 @@ class MMRuntime:
         self._coin: str = ""
         self._timeframe: str = ""
         self._paper_mode: bool = True
+        self._dev_mode: bool = False
         self._initial_usdc: float = 1000.0
         self._next_window_at: float = 0.0  # timestamp when next window starts
         self._mongo = None  # MongoLogger (if MONGO_URI set)
@@ -534,7 +536,7 @@ class MMRuntime:
             raise HTTPException(status_code=400, detail=detail)
 
     async def start(self, coin: str, timeframe: str, paper_mode: bool = True,
-                    initial_usdc: float = 1000.0) -> dict:
+                    initial_usdc: float = 1000.0, dev: bool = False) -> dict:
         """Start feeds and market maker."""
         if self._running:
             raise HTTPException(status_code=400, detail="Already running")
@@ -546,6 +548,19 @@ class MMRuntime:
         self._coin = coin
         self._timeframe = timeframe
         self._paper_mode = paper_mode
+        self._dev_mode = dev
+        if dev:
+            _telegram.switch_credentials(
+                token=os.environ.get("DEV_TELEGRAM_BOT_TOKEN", ""),
+                chat_id=os.environ.get("DEV_TELEGRAM_CHAT_ID", ""),
+            )
+            log.info("Telegram switched to DEV channel")
+        else:
+            _telegram.switch_credentials(
+                token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                thread_id=os.environ.get("TELEGRAM_THREAD_ID", ""),
+            )
         self._initial_usdc = initial_usdc
 
         # Validate credentials before going live
@@ -845,6 +860,7 @@ class MMRuntime:
         result = {
             "is_running": False,
             "paper_mode": self._paper_mode,
+            "dev_mode": self._dev_mode,
             "next_window_in": max(0, self._next_window_at - time.time()) if self._next_window_at else 0,
             "market": {"coin": self._coin, "timeframe": self._timeframe},
             "fair_value": {"up": 0.5, "dn": 0.5, "binance_mid": 0, "volatility": 0},
@@ -1240,6 +1256,7 @@ async def mm_start(req: StartRequest, request: Request):
         req.timeframe,
         req.paper_mode,
         req.initial_usdc,
+        dev=req.dev,
     )
     return {"ok": True, "state": result}
 
