@@ -9,8 +9,6 @@ services:
       - SERVICE_NAME=bot
     ports:
       - 8000:8000
-    volumes:
-      - bot-workspace:/app/workspace
     deploy:
       placement:
         constraints:
@@ -22,6 +20,3 @@ services:
         delay: 10s
         order: start-first
         failure_action: pause
-
-volumes:
-  bot-workspace:
