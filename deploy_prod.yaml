@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   bot:
-    image: ${CI_REGISTRY_IMAGE:-registry.gitlab.com/info_something_tools-group/polymarketbot}:prod
+    image: registry.gitlab.com/info_something_tools-group/polymarketbot:prod
     env_file:
       - .env
     environment:
@@ -12,9 +12,6 @@ services:
     volumes:
       - bot-workspace:/app/workspace
     deploy:
-      placement:
-        constraints:
-          - node.role == worker
       mode: replicated
       replicas: 1
       update_config:

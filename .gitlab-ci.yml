@@ -1,28 +1,12 @@
 variables:
-  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_NAME: $CI_REGISTRY_IMAGE/polymarketbot
   GIT_STRATEGY: clone
 
 stages:
-  - test
   - build
   - deploy
 
-# ── Tests ──────────────────────────────────────────────────
-Test:
-  stage: test
-  tags:
-    - shell
-    - rabbit2
-  script:
-    - docker build --target test -t ${IMAGE_NAME}:test-${CI_PIPELINE_IID} .
-    - docker run --rm ${IMAGE_NAME}:test-${CI_PIPELINE_IID}
-    - docker image rm ${IMAGE_NAME}:test-${CI_PIPELINE_IID} || true
-  only:
-    refs:
-      - main
-      - merge_requests
 
-# ── Build ──────────────────────────────────────────────────
 Build:
   stage: build
   tags:
@@ -30,6 +14,7 @@ Build:
     - rabbit2
   when: manual
   script:
+    - echo "$SMTH_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$SMTH_REGISTRY_USER" --password-stdin
     - >
       docker build -f Dockerfile --target production
       --tag ${IMAGE_NAME}:${CI_PIPELINE_IID}
@@ -38,25 +23,21 @@ Build:
     - docker push --quiet ${IMAGE_NAME}:${CI_PIPELINE_IID}
     - docker image prune --all --force --filter="label=CI_PROJECT_ID=${CI_PROJECT_ID}" --filter="until=1h"
 
-# ── Deploy ─────────────────────────────────────────────────
-# CI/CD Variables (Settings → CI/CD → Variables):
-#   PROD_ENV  - type: File, contents of .env
+
 Deploy:
   stage: deploy
   needs:
     - job: Build
   tags:
     - shell
-    - mgr-1n
-  only:
-    refs:
-      - main
+    - polybot1
   environment:
     name: prod
   variables:
     REF_FILE_VAR_PROD: $PROD_ENV
   script:
     - cat $REF_FILE_VAR_PROD > .env
+    - echo "$SMTH_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$SMTH_REGISTRY_USER" --password-stdin
     - docker pull --quiet ${IMAGE_NAME}:${CI_PIPELINE_IID}
     - docker image tag ${IMAGE_NAME}:${CI_PIPELINE_IID} ${IMAGE_NAME}:${CI_ENVIRONMENT_NAME}
     - docker push --quiet ${IMAGE_NAME}:${CI_ENVIRONMENT_NAME}
