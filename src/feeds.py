@@ -89,7 +89,7 @@ async def ob_poller(symbol: str, state: State):
     binance_rest = _pick_binance_rest()
     rest_url = f"{binance_rest}/depth"
     ws_base = "wss://stream.binance.us:9443" if "binance.us" in binance_rest else "wss://stream.binance.com:9443"
-    ws_url = f"{ws_base}/ws/{symbol.lower()}@depth20@1000ms"
+    ws_url = f"{ws_base}/ws/{symbol.lower()}@depth20@100ms"
     print(f"  [Binance OB] streaming {symbol} via {ws_url}")
 
     async def _apply_depth(bids_raw, asks_raw):

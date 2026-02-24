@@ -7,3 +7,16 @@ src/__pycache__/
 *.pyc
 executions.log.jsonl
 executions.*.jsonl
+.DS_Store
+.pytest_cache/
+
+.env
+.web_access_key
+node_modules/
+data/
+workspace/
+docs/
+tests/
+backtest/report.html
+backtest/report.json
+backtest/sweep_results*.json

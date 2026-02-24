@@ -57,6 +57,7 @@ class OrderManager:
         self._fill_ws_task: asyncio.Task | None = None
         self._fill_ws_running = False
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
+        self._on_fill_callback: Any = None  # Callable or None — called on WS fill
 
     def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
         """Log a warning at most once per cooldown period."""
@@ -541,15 +542,30 @@ class OrderManager:
                               new_quotes: list[Quote]) -> list[str]:
         """Cancel old orders and place new ones.
 
+        Cancels run in parallel. Placements run sequentially to avoid
+        budget accounting races (two BUY orders could both pass the
+        budget check before either is recorded in _active_orders).
+
         Returns list of new order_ids.
         """
-        # Cancel old orders
-        for oid in old_ids:
-            if oid:
-                await self.cancel_order(oid)
+        # Cancel old orders in parallel
+        if old_ids:
+            await asyncio.gather(*(self.cancel_order(oid) for oid in old_ids if oid))
 
-        # Place new orders
-        return await self.place_quotes(*new_quotes)
+        # Place new orders sequentially (budget safety)
+        results = []
+        for q in new_quotes:
+            if q:
+                oid = await self.place_order(q)
+                results.append(oid or "")
+        return results
+
+    def set_fill_callback(self, callback) -> None:
+        """Set a callback to be called when a fill is detected via WS.
+
+        Used by MarketMaker to trigger immediate requote on fill.
+        """
+        self._on_fill_callback = callback
 
     async def start_fill_ws(self, api_key: str = "", api_secret: str = "",
                             api_passphrase: str = "") -> None:
@@ -599,6 +615,11 @@ class OrderManager:
                                     msg.get("size", "?"),
                                     msg.get("price", "?"),
                                 )
+                                if self._on_fill_callback:
+                                    try:
+                                        self._on_fill_callback()
+                                    except Exception:
+                                        pass
                             elif event_type == "order" and msg.get("status") in ("MATCHED", "CLOSED"):
                                 await self._ws_fills_queue.put(msg)
                         except json.JSONDecodeError:

@@ -81,6 +81,7 @@ class MarketMaker:
         self._one_sided_counter: int = 0
         self._merge_failed_this_cycle: bool = False
         self._closing_start_time_left: float = 0.0
+        self._requote_event: asyncio.Event = asyncio.Event()
         self._reconcile_prev_pm: tuple[float, float] | None = None
         self._reconcile_stable_count: int = 0
         self._warn_cooldowns: dict[str, float] = {}
@@ -97,6 +98,13 @@ class MarketMaker:
         self._requote_count: int = 0
         self._tick_count: int = 0
         self._spread_samples: list[float] = []
+
+        # Latency metrics
+        self._last_tick_ms: float = 0.0
+        self._avg_tick_ms: float = 0.0
+        self._tick_ms_samples: list[float] = []
+        self._last_book_ms: float = 0.0
+        self._last_order_ms: float = 0.0
 
         # Callbacks
         self._on_fill_callbacks: list = []
@@ -167,6 +175,9 @@ class MarketMaker:
         self.order_mgr._session_budget = self.inventory.initial_usdc
         self.order_mgr._session_spent = 0.0
 
+        # Wire fill callback → trigger immediate requote
+        self.order_mgr.set_fill_callback(lambda: self._requote_event.set())
+
         # Start heartbeat
         self.heartbeat.start()
 
@@ -231,7 +242,7 @@ class MarketMaker:
         log.info("MarketMaker stopped")
 
     async def _run_loop(self) -> None:
-        """Main quoting loop."""
+        """Main quoting loop — event-driven with timeout fallback."""
         log.info("Quote loop started")
         try:
             while self._running:
@@ -247,7 +258,15 @@ class MarketMaker:
                 except Exception as e:
                     log.error(f"Tick error: {e}", exc_info=True)
 
-                await asyncio.sleep(self.config.requote_interval_sec)
+                # Wait for event OR timeout (whichever comes first)
+                try:
+                    await asyncio.wait_for(
+                        self._requote_event.wait(),
+                        timeout=self.config.requote_interval_sec,
+                    )
+                    self._requote_event.clear()
+                except asyncio.TimeoutError:
+                    pass  # Normal tick on timeout
         except asyncio.CancelledError:
             pass
         log.info("Quote loop ended")
@@ -257,6 +276,7 @@ class MarketMaker:
         if not self.market:
             return
         self._tick_count += 1
+        _t0 = time.perf_counter()
 
         # ── Periodic snapshot (every 10 ticks ≈ 20s) ────────────
         if self._on_snapshot_callbacks and self._tick_count % 10 == 0:
@@ -324,6 +344,7 @@ class MarketMaker:
                     cb(fill, token_type)
                 except Exception:
                     pass
+        _t_fills = time.perf_counter()
 
         # Live mode: periodically reconcile internal shares with PM balances.
         # Skip during closing to save HTTP calls (liquidation does its own balance checks).
@@ -372,6 +393,8 @@ class MarketMaker:
                 self._reconcile_stable_count = 0
                 self._reconcile_prev_pm = None
 
+        _t_reconcile = time.perf_counter()
+
         if self._is_closing:
             # Continuously try to sell remaining inventory each tick
             await self._liquidate_inventory()
@@ -399,6 +422,8 @@ class MarketMaker:
             asks=asks,
             trades=trades,
         )
+
+        _t_fv = time.perf_counter()
 
         # 3b. Sync FV to mock client for realistic paper trading
         if hasattr(self.order_mgr.client, 'set_fair_values'):
@@ -580,11 +605,21 @@ class MarketMaker:
                 all_quotes["dn"] = (None, all_quotes["dn"][1])
 
         # 6b. Fetch Polymarket book and clamp quotes to avoid crossing.
+        # Use cached WS prices when both sides are fresh (0ms), fallback to HTTP.
+        ws_fresh = (
+            getattr(st, "pm_connected", False)
+            and (time.time() - getattr(st, "pm_last_update_ts", 0)) < 10
+        )
         for token_key, token_id in [
             ("up", self.market.up_token_id),
             ("dn", self.market.dn_token_id),
         ]:
-            book = await self.order_mgr.get_book_summary(token_id)
+            ws_bid = st.pm_up_bid if token_key == "up" else st.pm_dn_bid
+            ws_ask = st.pm_up if token_key == "up" else st.pm_dn
+            if ws_fresh and ws_bid is not None and ws_ask is not None:
+                book = {"best_bid": ws_bid, "best_ask": ws_ask}
+            else:
+                book = await self.order_mgr.get_book_summary(token_id)
             bid, ask = all_quotes[token_key]
             bid, ask = self.quote_engine.clamp_to_book(
                 bid, ask, book["best_bid"], book["best_ask"],
@@ -597,6 +632,7 @@ class MarketMaker:
             if ask is not None and ask.size > max_sh:
                 ask.size = round(max_sh, 2)
             all_quotes[token_key] = (bid, ask)
+        _t_quotes = time.perf_counter()
 
         # 7. Place or update orders
         # On Polymarket: SELL requires token inventory. Use BUY-only strategy:
@@ -655,6 +691,8 @@ class MarketMaker:
                 updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                 self._current_quotes[token_key] = (updated_bid, updated_ask)
 
+        _t_orders = time.perf_counter()
+
         # 8. Track spread for stats
         up_bid, up_ask = self._current_quotes.get("up", (None, None))
         if up_bid and up_ask and up_ask.price > 0:
@@ -662,6 +700,28 @@ class MarketMaker:
             self._spread_samples.append(spread_bps)
             if len(self._spread_samples) > 1000:
                 self._spread_samples = self._spread_samples[-500:]
+
+        # 9. Latency metrics
+        total_ms = (_t_orders - _t0) * 1000
+        self._last_tick_ms = total_ms
+        self._last_book_ms = (_t_quotes - _t_reconcile) * 1000  # fv + risk + quotes + book clamp
+        self._last_order_ms = (_t_orders - _t_quotes) * 1000
+        self._tick_ms_samples.append(total_ms)
+        if len(self._tick_ms_samples) > 100:
+            self._tick_ms_samples = self._tick_ms_samples[-50:]
+        self._avg_tick_ms = sum(self._tick_ms_samples) / len(self._tick_ms_samples)
+
+        if self._tick_count % 10 == 0:
+            log.info(
+                "TICK latency: fills=%.0fms reconcile=%.0fms fv=%.0fms "
+                "quotes+book=%.0fms orders=%.0fms total=%.0fms",
+                (_t_fills - _t0) * 1000,
+                (_t_reconcile - _t_fills) * 1000,
+                (_t_fv - _t_reconcile) * 1000,
+                (_t_quotes - _t_fv) * 1000,
+                (_t_orders - _t_quotes) * 1000,
+                total_ms,
+            )
 
     def _compute_fv(self) -> tuple[float, float]:
         """Compute current fair values from feed state. Returns (fv_up, fv_dn)."""
@@ -1138,6 +1198,14 @@ class MarketMaker:
 
             # Fills
             "recent_fills": fills_data,
+
+            # Latency
+            "latency": {
+                "last_tick_ms": round(self._last_tick_ms, 1),
+                "avg_tick_ms": round(self._avg_tick_ms, 1),
+                "fv_quotes_book_ms": round(self._last_book_ms, 1),
+                "order_place_ms": round(self._last_order_ms, 1),
+            },
 
             # Session
             "quote_count": self._quote_count,

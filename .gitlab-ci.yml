@@ -1,0 +1,112 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  DOCKER_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  DOCKER_IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+
+# ── Tests ──────────────────────────────────────────────────
+test:
+  stage: test
+  image: python:3.11-slim
+  before_script:
+    - pip install --no-cache-dir -r requirements.txt
+    - pip install pytest
+  script:
+    - python -m pytest tests/ -v --tb=short
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ── Build Docker image → GitLab Container Registry ────────
+build:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -t $DOCKER_IMAGE -t $DOCKER_IMAGE_LATEST .
+    - docker push $DOCKER_IMAGE
+    - docker push $DOCKER_IMAGE_LATEST
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# ── Deploy to server via SSH ──────────────────────────────
+# Required CI/CD variables (Settings → CI/CD → Variables):
+#   SSH_PRIVATE_KEY  - private key for server access (type: File)
+#   SERVER_HOST      - server IP or hostname
+#   SERVER_USER      - SSH username (default: root)
+#   SERVER_PORT      - SSH port (default: 22)
+#   APP_DIR          - deployment directory on server (default: /opt/polymarketbot)
+#
+# Environment variables (add as CI/CD variables):
+#   PM_WEB_ACCESS_KEY, PM_PRIVATE_KEY, PM_FUNDER,
+#   PM_API_KEY, PM_API_SECRET, PM_API_PASSPHRASE,
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_THREAD_ID,
+#   TELEGRAM_BOT_USERNAME, MONGO_URI, MONGO_DB
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client docker-cli
+    - eval $(ssh-agent -s)
+    - chmod 600 "$SSH_PRIVATE_KEY"
+    - ssh-add "$SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - ssh-keyscan -p ${SERVER_PORT:-22} $SERVER_HOST >> ~/.ssh/known_hosts 2>/dev/null
+  script:
+    - |
+      SSH_CMD="ssh -p ${SERVER_PORT:-22} ${SERVER_USER:-root}@${SERVER_HOST}"
+      APP=${APP_DIR:-/opt/polymarketbot}
+
+      # Login to GitLab Container Registry on server
+      $SSH_CMD "docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY"
+
+      # Pull latest image
+      $SSH_CMD "docker pull $DOCKER_IMAGE_LATEST"
+
+      # Ensure app directory exists
+      $SSH_CMD "mkdir -p $APP"
+
+      # Generate .env on server from CI/CD variables
+      $SSH_CMD "cat > $APP/.env << 'ENVEOF'
+      PM_WEB_ACCESS_KEY=${PM_WEB_ACCESS_KEY:-}
+      PM_PRIVATE_KEY=${PM_PRIVATE_KEY:-}
+      PM_FUNDER=${PM_FUNDER:-}
+      PM_API_KEY=${PM_API_KEY:-}
+      PM_API_SECRET=${PM_API_SECRET:-}
+      PM_API_PASSPHRASE=${PM_API_PASSPHRASE:-}
+      TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_THREAD_ID=${TELEGRAM_THREAD_ID:-}
+      TELEGRAM_BOT_USERNAME=${TELEGRAM_BOT_USERNAME:-}
+      MONGO_URI=${MONGO_URI:-}
+      MONGO_DB=${MONGO_DB:-pm_bot}
+      ENVEOF"
+
+      # Stop old container, start new one
+      $SSH_CMD "docker stop polymarketbot 2>/dev/null || true"
+      $SSH_CMD "docker rm polymarketbot 2>/dev/null || true"
+      $SSH_CMD "docker run -d \
+        --name polymarketbot \
+        --restart unless-stopped \
+        --env-file $APP/.env \
+        -p 8000:8000 \
+        -v $APP/workspace:/app/workspace \
+        $DOCKER_IMAGE_LATEST"
+
+      # Health check
+      $SSH_CMD "sleep 5 && docker ps --filter name=polymarketbot --format '{{.Status}}'"
+  environment:
+    name: production
+    url: http://$SERVER_HOST:8000
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  allow_failure: false

@@ -24,7 +24,7 @@ class MMConfig:
 
     # ── Requoting ────────────────────────────────────────────────
     requote_interval_sec: float = 1.0    # seconds between requote checks (was 2.0)
-    requote_threshold_bps: float = 5.0   # min price move to requote
+    requote_threshold_bps: float = 10.0   # min price move to requote (raised for 1s tick interval)
 
     # ── Order Types ──────────────────────────────────────────────
     gtd_duration_sec: int = 300          # GTD order lifetime (5 min)
