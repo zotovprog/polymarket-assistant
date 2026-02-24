@@ -968,7 +968,45 @@ class MMRuntime:
         if self.mm:
             self.mm.config = self.mm_config
             self.mm.quote_engine.config = self.mm_config
+        # Persist to MongoDB (fire-and-forget)
+        asyncio.ensure_future(self._save_config())
         return self.mm_config.to_dict()
+
+    async def _save_config(self) -> None:
+        """Save current config to MongoDB for persistence across deploys."""
+        if not config.MONGO_URI:
+            return
+        try:
+            import motor.motor_asyncio
+            client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGO_URI)
+            db = client[config.MONGO_DB]
+            await db.config.replace_one(
+                {"_id": "mm_config"},
+                {"_id": "mm_config", **self.mm_config.to_dict()},
+                upsert=True,
+            )
+            client.close()
+            log.info("Config saved to MongoDB")
+        except Exception as e:
+            log.warning("Failed to save config to MongoDB: %s", e)
+
+    async def load_config(self) -> None:
+        """Load saved config from MongoDB (called at startup)."""
+        if not config.MONGO_URI:
+            return
+        try:
+            import motor.motor_asyncio
+            client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGO_URI)
+            db = client[config.MONGO_DB]
+            doc = await db.config.find_one({"_id": "mm_config"})
+            client.close()
+            if doc:
+                doc.pop("_id", None)
+                self.mm_config.update(**doc)
+                log.info("Config loaded from MongoDB: spread=%s, skew=%s",
+                         self.mm_config.half_spread_bps, self.mm_config.skew_bps_per_unit)
+        except Exception as e:
+            log.warning("Failed to load config from MongoDB: %s", e)
 
     def _build_market_info(self, coin: str, timeframe: str,
                            tokens: dict) -> MarketInfo:
@@ -1422,6 +1460,7 @@ async def markets():
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
+    await _runtime.load_config()
     if _telegram.enabled:
         await _tg_bot.start()
         log.info("Telegram bot polling started")
