@@ -659,12 +659,18 @@ class MMRuntime:
         if not paper_mode and PM_PRIVATE_KEY:
             self.mm._private_key = PM_PRIVATE_KEY
 
-        # Telegram fill notifications disabled — only window summary is sent
-        # if _telegram.enabled:
-        #     self.mm.on_fill(self._on_fill_telegram)
-
         await self.mm.start()
         self._running = True
+
+        # Notify Telegram about MM start
+        mode_str = "PAPER" if paper_mode else "LIVE"
+        _telegram.notify_mm_start(
+            coin=coin,
+            timeframe=timeframe,
+            mode=mode_str,
+            half_spread_bps=self.mm_config.half_spread_bps,
+            order_size_usd=self.mm_config.order_size_usd,
+        )
 
         # Snapshot starting balance for real PnL calc in Telegram summary
         try:
@@ -1100,21 +1106,6 @@ class MMRuntime:
             window_start=now,
             window_end=now + 3600,
         )
-
-    def _on_fill_telegram(self, fill, token_type: str) -> None:
-        """Send fill notification via Telegram."""
-        try:
-            _telegram.notify_fill(
-                coin=self._coin or "UNKNOWN",
-                timeframe=self._timeframe or "UNKNOWN",
-                side=fill.side,
-                price=fill.price,
-                size=fill.size,
-                fee=fill.fee,
-                is_maker=fill.is_maker,
-            )
-        except Exception:
-            pass
 
     async def _send_window_summary(self) -> None:
         """Send window PnL summary to Telegram.
