@@ -16,7 +16,6 @@ node_modules/
 data/
 workspace/
 docs/
-tests/
 backtest/report.html
 backtest/report.json
 backtest/sweep_results*.json
