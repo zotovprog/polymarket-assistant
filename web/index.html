@@ -35,6 +35,7 @@
                 <span id="status-text">Offline</span>
                 <span id="uptime" class="stat-small"></span>
                 <span class="feed-dots" id="header-feeds"></span>
+                <span class="ws-status" id="ws-status"><span class="ws-dot" id="ws-dot"></span><span id="ws-label">WS</span></span>
             </div>
             <div class="header-actions">
                 <button id="btn-emergency" class="btn btn-destructive" onclick="emergency()" aria-label="Emergency stop">
@@ -317,6 +318,46 @@
         <!-- Feed Status -->
         <div class="feed-status-bar" id="feed-status">
             <span style="color:var(--text-muted)">No feed data</span>
+        </div>
+
+        <!-- Latency -->
+        <div class="collapsible-section">
+            <div class="collapsible-header" onclick="toggleSection(this)">
+                <span><i class="fas fa-tachometer-alt"></i> Latency</span>
+                <span class="collapsible-right">
+                    <span id="latency-header-value" class="value-accent">-- ms</span>
+                    <span class="chevron">&#x25be;</span>
+                </span>
+            </div>
+            <div class="collapsible-content">
+                <div class="latency-big-numbers">
+                    <div class="latency-big-num">
+                        <div class="lat-label">Last Tick</div>
+                        <div id="lat-last-tick" class="lat-value">--</div>
+                    </div>
+                    <div class="latency-big-num">
+                        <div class="lat-label">Average</div>
+                        <div id="lat-avg-tick" class="lat-value">--</div>
+                    </div>
+                </div>
+                <div class="latency-stacked-bar-container">
+                    <div class="latency-stacked-bar" id="latency-bar">
+                        <div class="latency-segment lat-seg-fills" id="lat-bar-fills" style="width:20%"></div>
+                        <div class="latency-segment lat-seg-reconcile" id="lat-bar-reconcile" style="width:20%"></div>
+                        <div class="latency-segment lat-seg-fv" id="lat-bar-fv" style="width:20%"></div>
+                        <div class="latency-segment lat-seg-quotes" id="lat-bar-quotes" style="width:20%"></div>
+                        <div class="latency-segment lat-seg-orders" id="lat-bar-orders" style="width:20%"></div>
+                    </div>
+                </div>
+                <div class="latency-legend">
+                    <span class="latency-legend-item"><span class="latency-legend-dot" style="background:#3b82f6"></span> Fills <strong id="lat-leg-fills">--</strong></span>
+                    <span class="latency-legend-item"><span class="latency-legend-dot" style="background:#8b5cf6"></span> Reconcile <strong id="lat-leg-reconcile">--</strong></span>
+                    <span class="latency-legend-item"><span class="latency-legend-dot" style="background:#06b6d4"></span> FV <strong id="lat-leg-fv">--</strong></span>
+                    <span class="latency-legend-item"><span class="latency-legend-dot" style="background:#f59e0b"></span> Quotes <strong id="lat-leg-quotes">--</strong></span>
+                    <span class="latency-legend-item"><span class="latency-legend-dot" style="background:#10b981"></span> Orders <strong id="lat-leg-orders">--</strong></span>
+                </div>
+                <div class="latency-chart-container" id="latency-chart"></div>
+            </div>
         </div>
 
         <!-- Session Stats (includes old PnL details) -->
