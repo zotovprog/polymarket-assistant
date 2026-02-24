@@ -1224,6 +1224,10 @@ class MMRuntime:
             if effective_balance <= 0:
                 effective_balance = self._start_balance + session_pnl
 
+            log.info(
+                "Sending window summary: pnl=$%.2f, balance=$%.2f, enabled=%s",
+                session_pnl, effective_balance, _telegram.enabled,
+            )
             _telegram.notify_window_summary(
                 coin=self._coin or "UNKNOWN",
                 timeframe=self._timeframe or "UNKNOWN",

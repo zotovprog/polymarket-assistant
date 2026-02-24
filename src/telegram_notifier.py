@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import html
+import logging
 import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+
+log = logging.getLogger("tg.notify")
 
 
 class TelegramNotifier:
@@ -68,21 +71,21 @@ class TelegramNotifier:
                 payload["message_thread_id"] = self.thread_id
             resp = await self._client.post(self.api_url, json=payload)
             if not resp.is_success:
-                print(f"  [TELEGRAM] send http {resp.status_code}: {resp.text[:300]}")
+                log.warning("send http %s: %s", resp.status_code, resp.text[:300])
                 return
             try:
                 data = resp.json()
                 if not data.get("ok", False):
-                    print(f"  [TELEGRAM] send api error: {data}")
+                    log.warning("send api error: %s", data)
             except Exception:
                 pass
         except Exception as e:
-            print(f"  [TELEGRAM] send error: {e}")
+            log.warning("send error: %s", e)
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Capture the main event loop for cross-thread notification dispatch."""
         self._main_loop = loop
-        print(f"  [TELEGRAM] main loop captured (id={id(loop)})")
+        log.info("main loop captured (id=%s)", id(loop))
 
     def _fire(self, html: str) -> None:
         """Schedule _send as a background task with cleanup callback.
@@ -101,10 +104,10 @@ class TelegramNotifier:
             # Use the captured main event loop.
             main = self._main_loop
             if main is not None and main.is_running():
-                print(f"  [TELEGRAM] _fire: scheduling from worker thread (loop={id(self._main_loop)})")
+                log.info("_fire: scheduling from worker thread")
                 main.call_soon_threadsafe(self._schedule_from_thread, main, html)
             else:
-                print("  [TELEGRAM] _fire: no main loop available, message dropped")
+                log.warning("_fire: no main loop available, message dropped")
 
     def _schedule_from_thread(self, loop: asyncio.AbstractEventLoop, html: str) -> None:
         """Create an async task from the main event loop thread."""
@@ -118,7 +121,7 @@ class TelegramNotifier:
             return
         exc = task.exception()
         if exc:
-            print(f"  [TELEGRAM] background task error: {exc}")
+            log.warning("background task error: %s", exc)
 
     def _ts(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -183,6 +186,8 @@ class TelegramNotifier:
             f"  24h: <code>${pnl_24h:+.2f}</code>\n\n"
             f"\U0001f4b0 <b>Balance:</b> <code>${usdc_balance:.2f}</code> USDC"
         )
+        log.info("notify_window_summary: firing message (enabled=%s, chat=%s)",
+                 self.enabled, self.chat_id)
         self._fire(html)
 
     # ---- Direct async API (for interactive bot) ----
@@ -212,7 +217,7 @@ class TelegramNotifier:
             data = resp.json()
             return data.get("result")
         except Exception as e:
-            print(f"  [TELEGRAM] send_with_keyboard error: {e}")
+            log.warning("send_with_keyboard error: %s", e)
             return None
 
     async def answer_callback_query(
@@ -229,7 +234,7 @@ class TelegramNotifier:
                 payload["show_alert"] = True
             await self._client.post(f"{self.base_url}/answerCallbackQuery", json=payload)
         except Exception as e:
-            print(f"  [TELEGRAM] answer_callback_query error: {e}")
+            log.warning("answer_callback_query error: %s", e)
 
     async def edit_message_text(
         self,
@@ -252,7 +257,7 @@ class TelegramNotifier:
                 payload["reply_markup"] = {"inline_keyboard": keyboard}
             await self._client.post(f"{self.base_url}/editMessageText", json=payload)
         except Exception as e:
-            print(f"  [TELEGRAM] edit_message_text error: {e}")
+            log.warning("edit_message_text error: %s", e)
 
     async def delete_message(self, message_id: int) -> None:
         """Delete a message."""
@@ -264,7 +269,7 @@ class TelegramNotifier:
                 json={"chat_id": self.chat_id, "message_id": message_id},
             )
         except Exception as e:
-            print(f"  [TELEGRAM] delete_message error: {e}")
+            log.warning("delete_message error: %s", e)
 
     async def get_me(self) -> dict | None:
         """Call getMe to retrieve bot info."""
@@ -275,7 +280,7 @@ class TelegramNotifier:
             data = resp.json()
             return data.get("result")
         except Exception as e:
-            print(f"  [TELEGRAM] get_me error: {e}")
+            log.warning("get_me error: %s", e)
             return None
 
     async def get_updates(
@@ -299,7 +304,7 @@ class TelegramNotifier:
             data = resp.json()
             return data.get("result", [])
         except Exception as e:
-            print(f"  [TELEGRAM] get_updates error: {e}")
+            log.warning("get_updates error: %s", e)
             return []
 
     async def close(self) -> None:
