@@ -848,6 +848,7 @@ class MMRuntime:
         if self.mm:
             snap = self.mm.snapshot()
             snap["paper_mode"] = self._paper_mode
+            snap["dev_mode"] = self._dev_mode
             snap["session_limit"] = self._initial_usdc
             snap["next_window_in"] = max(0, self._next_window_at - time.time()) if self._next_window_at else 0
             if self._paper_mode:
