@@ -14,7 +14,7 @@ RUN mkdir -p /app/workspace
 
 # ── Test target (used by CI) ──────────────────────────────
 FROM base AS test
-RUN pip install --no-cache-dir pytest
+RUN pip install --no-cache-dir pytest pytest-asyncio
 CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
 
 # ── Production target ─────────────────────────────────────
