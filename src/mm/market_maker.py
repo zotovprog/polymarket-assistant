@@ -80,6 +80,8 @@ class MarketMaker:
         self._liq_last_chunk_time: float = 0.0
         self._one_sided_counter: int = 0
         self._merge_failed_this_cycle: bool = False
+        self._reconcile_prev_pm: tuple[float, float] | None = None
+        self._reconcile_stable_count: int = 0
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
 
@@ -321,6 +323,8 @@ class MarketMaker:
 
         # Live mode: periodically reconcile internal shares with PM balances.
         # Skip during closing to save HTTP calls (liquidation does its own balance checks).
+        # Uses debounce: only reconcile if PM values are stable for 3+ consecutive checks
+        # to avoid oscillation from PM balance API lagging behind fill detection.
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live and self._tick_count % 5 == 0 and not self._is_closing:
             real_up, real_dn = await self.order_mgr.get_all_token_balances(
@@ -331,14 +335,38 @@ class MarketMaker:
             up_diff = abs(real_up - self.inventory.up_shares)
             dn_diff = abs(real_dn - self.inventory.dn_shares)
             if up_diff > 1.0 or dn_diff > 1.0:
-                log.warning(
-                    "Inventory reconcile: internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
-                    self.inventory.up_shares,
-                    self.inventory.dn_shares,
-                    real_up,
-                    real_dn,
-                )
-                self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                prev = self._reconcile_prev_pm
+                pm_stable = (prev is not None
+                             and abs(real_up - prev[0]) < 0.5
+                             and abs(real_dn - prev[1]) < 0.5)
+                self._reconcile_prev_pm = (real_up, real_dn)
+
+                if pm_stable:
+                    self._reconcile_stable_count += 1
+                else:
+                    self._reconcile_stable_count = 1
+
+                if self._reconcile_stable_count >= 3:
+                    log.warning(
+                        "Inventory reconcile (confirmed %d checks): "
+                        "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
+                        self._reconcile_stable_count,
+                        self.inventory.up_shares, self.inventory.dn_shares,
+                        real_up, real_dn,
+                    )
+                    self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                    self._reconcile_stable_count = 0
+                    self._reconcile_prev_pm = None
+                else:
+                    log.info(
+                        "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                        self._reconcile_stable_count,
+                        self.inventory.up_shares, self.inventory.dn_shares,
+                        real_up, real_dn,
+                    )
+            else:
+                self._reconcile_stable_count = 0
+                self._reconcile_prev_pm = None
 
         if self._is_closing:
             # Continuously try to sell remaining inventory each tick
@@ -386,8 +414,14 @@ class MarketMaker:
         self.risk_mgr.record_vol(vol)
 
         # 5. Check risk limits
+        # Compute session PnL from real PM balance for risk checks (immune to reconciliation oscillation)
+        _pm_up = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
+        _pm_dn = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
+        _pos_value = self.inventory.up_shares * _pm_up + self.inventory.dn_shares * _pm_dn
+        _session_pnl = (self._cached_usdc_balance + _pos_value) - self._starting_usdc_pm if self._starting_usdc_pm > 0 else None
+
         should_pause, reason = self.risk_mgr.should_pause(
-            self.inventory, vol, fv_up, fv_dn)
+            self.inventory, vol, fv_up, fv_dn, session_pnl=_session_pnl)
 
         # Exit triggers (TP, trailing stop, drawdown) ALWAYS take priority — even if already paused
         if should_pause and ("Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason):
@@ -943,6 +977,8 @@ class MarketMaker:
         self._liq_last_chunk_time = 0.0
         self._is_closing = False
         self._merge_failed_this_cycle = False
+        self._reconcile_prev_pm = None
+        self._reconcile_stable_count = 0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
 

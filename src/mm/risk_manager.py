@@ -88,33 +88,40 @@ class RiskManager:
     def should_pause(self, inventory: Inventory,
                      current_vol: float = 0.0,
                      fv_up: float = 0.5,
-                     fv_dn: float = 0.5) -> tuple[bool, str]:
+                     fv_dn: float = 0.5,
+                     session_pnl: float | None = None) -> tuple[bool, str]:
         """Check if MM should pause quoting.
+
+        Args:
+            session_pnl: PM-balance-based session PnL (more reliable than internal).
+                         If provided, used for drawdown/TP/trailing stop checks.
 
         Returns (should_pause, reason).
         """
         # Check PnL-based exits FIRST (take profit, drawdown, trailing stop)
         # These must run before inventory limit — inventory pause must not block profit-taking
         pnl = self.compute_pnl(inventory, fv_up, fv_dn)
+        # Prefer session_pnl (PM-balance-based) — immune to reconciliation oscillation
+        check_pnl = session_pnl if session_pnl is not None else pnl["total_pnl"]
 
         # Check take-profit
-        if self.config.take_profit_usd > 0 and pnl["total_pnl"] >= self.config.take_profit_usd:
-            return True, f"Take profit hit: PnL=${pnl['total_pnl']:.2f} >= ${self.config.take_profit_usd:.2f}"
+        if self.config.take_profit_usd > 0 and check_pnl >= self.config.take_profit_usd:
+            return True, f"Take profit hit: PnL=${check_pnl:.2f} >= ${self.config.take_profit_usd:.2f}"
 
         # Check drawdown
-        if pnl["total_pnl"] < -self.config.max_drawdown_usd:
-            return True, f"Max drawdown exceeded: PnL=${pnl['total_pnl']:.2f}"
+        if check_pnl < -self.config.max_drawdown_usd:
+            return True, f"Max drawdown exceeded: PnL=${check_pnl:.2f}"
 
         # Trailing stop — only activates after peak PnL reaches a meaningful level
-        if pnl["total_pnl"] > self._peak_pnl:
-            self._peak_pnl = pnl["total_pnl"]
+        if check_pnl > self._peak_pnl:
+            self._peak_pnl = check_pnl
         if self.config.trailing_stop_pct > 0 and self._peak_pnl > 0:
             # Min peak: 25% of take_profit or $2, whichever is larger
             min_peak = max(2.0, self.config.take_profit_usd * 0.25) if self.config.take_profit_usd > 0 else 2.0
             if self._peak_pnl >= min_peak:
                 trail_threshold = self._peak_pnl * (1 - self.config.trailing_stop_pct)
-                if pnl["total_pnl"] < trail_threshold:
-                    return True, f"Trailing stop: PnL=${pnl['total_pnl']:.2f} dropped from peak ${self._peak_pnl:.2f}"
+                if check_pnl < trail_threshold:
+                    return True, f"Trailing stop: PnL=${check_pnl:.2f} dropped from peak ${self._peak_pnl:.2f}"
 
         # Check inventory limit (after PnL exits)
         if not self.check_inventory_limit(inventory):
