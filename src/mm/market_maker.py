@@ -160,6 +160,7 @@ class MarketMaker:
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
         self._one_sided_counter = 0
+        self.risk_mgr.reset()
 
         # Set budget cap on order manager (enforced at placement time)
         self.order_mgr._session_budget = self.inventory.initial_usdc
@@ -969,9 +970,10 @@ class MarketMaker:
         await self.order_mgr.cancel_all()
         self._current_quotes = {"up": (None, None), "dn": (None, None)}
 
-        # Reset cost basis and liquidation state for new window
+        # Reset cost basis, risk state, and liquidation state for new window
         self.inventory.up_cost.reset()
         self.inventory.dn_cost.reset()
+        self.risk_mgr.reset()
         self._liq_lock = None
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
