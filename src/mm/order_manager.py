@@ -270,6 +270,37 @@ class OrderManager:
             if not await self.ensure_sell_allowance(quote.token_id):
                 log.warning(f"Cannot place SELL — allowance setup failed for {quote.token_id[:12]}...")
                 return None
+
+            # SELL balance pre-check: SELL requires size*(1-price) USDC collateral
+            sell_collateral = quote.size * (1.0 - quote.price)
+            if sell_collateral > 0.01:
+                usdc_bal = await self.get_usdc_balance()
+                if usdc_bal < sell_collateral:
+                    if usdc_bal > 0.01 and quote.price < 1.0:
+                        max_affordable = usdc_bal / (1.0 - quote.price)
+                        pm_min = 5.0
+                        if max_affordable >= pm_min:
+                            self._throttled_warn(
+                                "sell_balance_cap",
+                                f"SELL balance cap: need ${sell_collateral:.2f} but only "
+                                f"${usdc_bal:.2f} USDC — reducing {quote.size:.1f} → {max_affordable:.1f}",
+                            )
+                            quote.size = round(max_affordable, 2)
+                        else:
+                            self._throttled_warn(
+                                "sell_balance_skip",
+                                f"SELL skipped: need ${sell_collateral:.2f} USDC but only "
+                                f"${usdc_bal:.2f} (max_affordable={max_affordable:.1f} < min {pm_min})",
+                            )
+                            return None
+                    else:
+                        self._throttled_warn(
+                            "sell_no_usdc",
+                            f"SELL skipped: no USDC for collateral "
+                            f"(need ${sell_collateral:.2f}, have ${usdc_bal:.2f})",
+                        )
+                        return None
+
         try:
             return await self._place_order_inner(quote, use_post_only)
         except Exception as e:

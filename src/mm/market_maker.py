@@ -79,6 +79,7 @@ class MarketMaker:
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
         self._one_sided_counter: int = 0
+        self._merge_failed_this_cycle: bool = False
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
 
@@ -232,9 +233,11 @@ class MarketMaker:
             while self._running:
                 try:
                     try:
-                        await asyncio.wait_for(self._tick(), timeout=5.0)
+                        tick_timeout = 15.0 if self._is_closing else 10.0
+                        await asyncio.wait_for(self._tick(), timeout=tick_timeout)
                     except asyncio.TimeoutError:
-                        self._log.warning("_tick() timed out after 5s, skipping iteration")
+                        self._log.warning("_tick() timed out after %.0fs, skipping iteration",
+                                          15.0 if self._is_closing else 10.0)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -270,6 +273,7 @@ class MarketMaker:
             # Window expired — liquidate and stop
             if not self._is_closing:
                 self._is_closing = True
+                self._merge_failed_this_cycle = False
                 fv_up, fv_dn = self._compute_fv()
                 self._liq_lock = self.risk_mgr.lock_pnl(
                     self.inventory, fv_up, fv_dn,
@@ -289,6 +293,7 @@ class MarketMaker:
 
         if time_left <= close_sec and not self._is_closing:
             self._is_closing = True
+            self._merge_failed_this_cycle = False
             fv_up_close, fv_dn_close = self._compute_fv()
             self._liq_lock = self.risk_mgr.lock_pnl(
                 self.inventory, fv_up_close, fv_dn_close,
@@ -315,8 +320,9 @@ class MarketMaker:
                     pass
 
         # Live mode: periodically reconcile internal shares with PM balances.
+        # Skip during closing to save HTTP calls (liquidation does its own balance checks).
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live and self._tick_count % 5 == 0:
+        if is_live and self._tick_count % 5 == 0 and not self._is_closing:
             real_up, real_dn = await self.order_mgr.get_all_token_balances(
                 self.market.up_token_id,
                 self.market.dn_token_id,
@@ -402,6 +408,7 @@ class MarketMaker:
             self._liq_chunk_index = 0
             self._liq_last_chunk_time = 0.0
             self._is_closing = True
+            self._merge_failed_this_cycle = False
             await self.order_mgr.cancel_all()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
@@ -461,6 +468,7 @@ class MarketMaker:
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
                 self._is_closing = True
+                self._merge_failed_this_cycle = False
                 await self.order_mgr.cancel_all()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 return
@@ -486,6 +494,7 @@ class MarketMaker:
                     self._liq_chunk_index = 0
                     self._liq_last_chunk_time = 0.0
                     self._is_closing = True
+                    self._merge_failed_this_cycle = False
                     await self.order_mgr.cancel_all()
                     self._current_quotes = {"up": (None, None), "dn": (None, None)}
                     return
@@ -650,7 +659,7 @@ class MarketMaker:
         dn_bal = await self.order_mgr.get_token_balance(self.market.dn_token_id)
         merge_amount = min(up_bal, dn_bal)
 
-        if merge_amount >= 1.0 and self.market.condition_id:
+        if merge_amount >= 1.0 and self.market.condition_id and not self._merge_failed_this_cycle:
             try:
                 result = await self.order_mgr.merge_positions(
                     self.market.condition_id, merge_amount, self._private_key)
@@ -673,7 +682,9 @@ class MarketMaker:
                         cur = self.order_mgr._mock_token_balances.get(tid, 0.0)
                         self.order_mgr._mock_token_balances[tid] = max(0.0, cur - merge_amount)
             else:
-                log.warning("Merge failed: %s", result.get("error", "unknown"))
+                self._merge_failed_this_cycle = True
+                log.warning("Merge failed (will not retry this cycle): %s",
+                            result.get("error", "unknown"))
 
         time_left = self.market.time_remaining
         cfg = self.config
@@ -715,6 +726,39 @@ class MarketMaker:
 
         # 6. Compute fair values for pricing
         fv_up, fv_dn = self._compute_fv()
+
+        # ── Pre-flight dust check: if both sides < PM min, try merge dust then skip ──
+        pm_min_pf = self.market.min_order_size if self.market else 5.0
+        if up_bal < pm_min_pf and dn_bal < pm_min_pf and (up_bal > 0.1 or dn_bal > 0.1):
+            # Try merging dust pairs first (if both > 0)
+            dust_merge = min(up_bal, dn_bal)
+            if dust_merge >= 0.5 and self.market.condition_id and not self._merge_failed_this_cycle:
+                try:
+                    r = await self.order_mgr.merge_positions(
+                        self.market.condition_id, dust_merge, self._private_key)
+                    if r.get("success"):
+                        log.info("Dust merge: %.2f pairs → $%.2f USDC", dust_merge, dust_merge)
+                        self.inventory.up_shares = max(0.0, self.inventory.up_shares - dust_merge)
+                        self.inventory.dn_shares = max(0.0, self.inventory.dn_shares - dust_merge)
+                        self.inventory.usdc += dust_merge
+                    else:
+                        self._merge_failed_this_cycle = True
+                except Exception:
+                    self._merge_failed_this_cycle = True
+
+            # Re-check after potential merge
+            up_rem_pf = await self.order_mgr.get_token_balance(self.market.up_token_id)
+            dn_rem_pf = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+            if up_rem_pf < pm_min_pf and dn_rem_pf < pm_min_pf:
+                fv_up_pf, fv_dn_pf = self._compute_fv()
+                dust_val = up_rem_pf * fv_up_pf + dn_rem_pf * fv_dn_pf
+                self._throttled_warn(
+                    "liq_dust_preflight",
+                    f"Liquidation dust: UP={up_rem_pf:.2f} DN={dn_rem_pf:.2f} "
+                    f"(all < PM min {pm_min_pf}). ~${dust_val:.2f} locked. Awaiting expiry.",
+                    cooldown=120.0,
+                )
+                return
 
         has_real_balance = False
         placed_any = False
@@ -806,7 +850,11 @@ class MarketMaker:
 
                 # Chunk sizing: split remaining balance
                 remaining_chunks = max(1, cfg.liq_gradual_chunks - self._liq_chunk_index)
-                chunk_size = round(max(0, real_balance - 0.5) / remaining_chunks, 2)
+                is_last_chunk = (self._liq_chunk_index >= cfg.liq_gradual_chunks - 1)
+                if is_last_chunk:
+                    chunk_size = round(real_balance, 2)
+                else:
+                    chunk_size = round(real_balance / remaining_chunks, 2)
                 # PM minimum order size = 5 shares; if chunk < min, sell all at once
                 pm_min_size = self.market.min_order_size if self.market else 5.0
                 if chunk_size < pm_min_size and real_balance >= pm_min_size:
@@ -874,7 +922,7 @@ class MarketMaker:
                     f"Liquidation dust: UP={up_rem:.2f} DN={dn_rem:.2f} "
                     f"(all < PM min {pm_min}). ~${dust_value:.2f} locked. "
                     f"Waiting for expiry.",
-                    cooldown=30.0,
+                    cooldown=120.0,
                 )
                 # Stay in _is_closing=True so bot doesn't resume quoting,
                 # but stop spamming sell attempts — just wait for window end
@@ -894,6 +942,7 @@ class MarketMaker:
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
         self._is_closing = False
+        self._merge_failed_this_cycle = False
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
 

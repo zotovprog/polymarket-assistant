@@ -57,7 +57,15 @@ class HeartbeatManager:
             "heartbeat_count": self._heartbeat_count,
             "error_count": self._error_count,
             "interval_sec": self.interval,
+            "heartbeat_id": self._heartbeat_id[:8] + "...",
         }
+
+    def regenerate_id(self) -> str:
+        """Force-regenerate heartbeat ID (e.g. after reconnect)."""
+        self._heartbeat_id = str(uuid.uuid4())
+        self._consecutive_failures = 0
+        log.info("Heartbeat ID force-regenerated: %s…", self._heartbeat_id[:8])
+        return self._heartbeat_id
 
     async def _send_heartbeat(self) -> bool:
         """Send a single heartbeat.
@@ -80,6 +88,15 @@ class HeartbeatManager:
         except Exception as e:
             self._error_count += 1
             self._consecutive_failures += 1
+            err_lower = str(e).lower()
+            # PM invalidated our heartbeat ID — regenerate a fresh one
+            if "invalid" in err_lower or "not found" in err_lower:
+                old_id = self._heartbeat_id[:8]
+                self._heartbeat_id = str(uuid.uuid4())
+                log.info("Heartbeat ID regenerated: %s… → %s… (was: %s)",
+                         old_id, self._heartbeat_id[:8], e)
+                self._consecutive_failures = 0
+                return True
             log.warning(f"Heartbeat failed: {e}")
             if self._consecutive_failures >= 3:
                 log.critical(
