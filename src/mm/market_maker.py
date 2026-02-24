@@ -556,6 +556,7 @@ class MarketMaker:
             usdc_budget=self.inventory.initial_usdc,
             order_collateral=order_collateral,
             tick_size=self.market.tick_size if self.market else 0.01,
+            time_remaining=time_left,
         )
 
         self._quote_count += 1

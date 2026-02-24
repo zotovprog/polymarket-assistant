@@ -1063,7 +1063,11 @@ class MMRuntime:
             window_start = now
             window_end = now + window_duration
 
-        log.info(f"Market info: strike={strike:.2f} window=[{window_start:.0f}, {window_end:.0f}]")
+        # Buffer: treat window as ending 10s before PM endDate
+        # so timer shows 0 before PM resolves, and bot enters closing mode earlier
+        window_end = window_end - 10.0
+
+        log.info(f"Market info: strike={strike:.2f} window=[{window_start:.0f}, {window_end:.0f}] (10s buffer applied)")
 
         return MarketInfo(
             coin=coin,
@@ -1159,54 +1163,23 @@ class MMRuntime:
             fv_up = fv.get("up", 0.5)
             fv_dn = fv.get("dn", 0.5)
 
-            session_pnl = 0.0
-            effective_balance = 0.0
+            # Use PM-balance-based PnL from snapshot (same as dashboard)
+            session_pnl = snap.get("session_pnl", 0.0)
+            portfolio_value = snap.get("portfolio_value", 0.0)
+            effective_balance = portfolio_value if portfolio_value > 0 else (self._start_balance + session_pnl)
 
-            # ── Priority 1: MongoDB fills (exact transaction history) ──
-            mongo_pnl = None
+            # Log MongoDB fills for comparison (debug only)
             if self._mongo and self.mm.market:
                 mongo_pnl = await self._mongo.compute_session_pnl(
-                    coin=self._coin,
-                    timeframe=self._timeframe,
+                    coin=self._coin, timeframe=self._timeframe,
                     window_start=self.mm.market.window_start,
                     window_end=self.mm.market.window_end,
-                    fv_up=fv_up,
-                    fv_dn=fv_dn,
+                    fv_up=fv_up, fv_dn=fv_dn,
                 )
-
-            if mongo_pnl and (mongo_pnl["buy_count"] + mongo_pnl["sell_count"]) > 0:
-                session_pnl = mongo_pnl["total_pnl"]
-                # Balance = start + pnl
-                effective_balance = self._start_balance + session_pnl
-                log.info(
-                    "Window PnL (MongoDB): $%.2f (buys=%d, sells=%d, fees=$%.4f)",
-                    session_pnl, mongo_pnl["buy_count"],
-                    mongo_pnl["sell_count"], mongo_pnl["fees"],
-                )
-            else:
-                # ── Priority 2: PM balance diff (fallback) ──
-                if self._paper_mode:
-                    client = self.mm.order_mgr.client
-                    end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
-                    up_shares = self.mm.inventory.up_shares
-                    dn_shares = self.mm.inventory.dn_shares
-                else:
-                    try:
-                        end_balance = await self.mm.order_mgr.get_usdc_balance()
-                    except Exception:
-                        end_balance = self.mm._cached_usdc_balance or 0
-                    try:
-                        up_shares, dn_shares = await self.mm.order_mgr.get_all_token_balances(
-                            self.mm.market.up_token_id, self.mm.market.dn_token_id)
-                    except Exception:
-                        up_shares = max(0, self.mm.inventory.up_shares)
-                        dn_shares = max(0, self.mm.inventory.dn_shares)
-
-                up_shares = max(0.0, up_shares)
-                dn_shares = max(0.0, dn_shares)
-                unredeemed_value = up_shares * fv_up + dn_shares * fv_dn
-                effective_balance = end_balance + unredeemed_value
-                session_pnl = effective_balance - self._start_balance if self._start_balance else 0.0
+                if mongo_pnl:
+                    log.info("MongoDB fills PnL: $%.4f (buys=%d, sells=%d) vs dashboard: $%.4f",
+                             mongo_pnl["total_pnl"], mongo_pnl["buy_count"],
+                             mongo_pnl["sell_count"], session_pnl)
 
             # Record PnL for 1h/24h aggregation
             now = time.time()

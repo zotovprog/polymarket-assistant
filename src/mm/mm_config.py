@@ -8,9 +8,9 @@ class MMConfig:
     """All MM parameters — can be updated at runtime via API."""
 
     # ── Spread ───────────────────────────────────────────────────
-    half_spread_bps: float = 150.0       # 1.5% half-spread default
+    half_spread_bps: float = 300.0       # 3% half-spread default (safe for 15m binaries)
     min_spread_bps: float = 50.0         # Absolute minimum half-spread
-    max_spread_bps: float = 500.0        # Absolute maximum half-spread
+    max_spread_bps: float = 1000.0       # Absolute maximum half-spread (raised for gamma widening)
     vol_spread_mult: float = 1.5         # Widen spread by this factor in high-vol
 
     # ── Sizing ───────────────────────────────────────────────────
@@ -23,7 +23,7 @@ class MMConfig:
     skew_bps_per_unit: float = 15.0      # skew per share of net delta
 
     # ── Requoting ────────────────────────────────────────────────
-    requote_interval_sec: float = 2.0    # seconds between requote checks
+    requote_interval_sec: float = 1.0    # seconds between requote checks (was 2.0)
     requote_threshold_bps: float = 5.0   # min price move to requote
 
     # ── Order Types ──────────────────────────────────────────────
@@ -50,7 +50,7 @@ class MMConfig:
     liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
 
     # ── One-Sided Exposure ─────────────────────────────────
-    max_one_sided_ticks: int = 90  # Close if one-sided exposure for this many consecutive ticks (~3min at 2s ticks)
+    max_one_sided_ticks: int = 180  # Close if one-sided exposure for this many consecutive ticks (~3min at 1s ticks)
     min_fv_to_quote: float = 0.15  # Don't quote a side if its FV < this (market already decided)
 
     # ── Window Management ────────────────────────────────────────

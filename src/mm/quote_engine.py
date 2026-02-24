@@ -4,13 +4,14 @@ Core logic:
   bid = fair_value - half_spread - inventory_skew
   ask = fair_value + half_spread - inventory_skew
 
-Spread is widened during high volatility.
-Inventory skew pushes quotes to reduce net delta.
+For DN tokens, skew is inverted (shifts mid UP when long UP)
+so that the bot buys DN aggressively to hedge.
+
+Spread is widened during high volatility and near expiry (gamma-aware).
 Prices are rounded to PM's configured tick increment.
 """
 from __future__ import annotations
 import logging
-import math
 from .types import Quote, Inventory
 from .mm_config import MMConfig
 
@@ -35,8 +36,9 @@ class QuoteEngine:
         self.config = config
 
     def _effective_half_spread(self, volatility: float,
-                                avg_vol: float) -> float:
-        """Compute half-spread, widening in high-vol regime."""
+                                avg_vol: float,
+                                time_remaining: float = -1.0) -> float:
+        """Compute half-spread, widening in high-vol regime and near expiry."""
         base = self.config.half_spread_bps
 
         if avg_vol > 0 and volatility > avg_vol:
@@ -48,14 +50,20 @@ class QuoteEngine:
             mult = 1.0 + (vol_ratio - 1.0) * (self.config.vol_spread_mult - 1.0)
             base *= mult
 
+        # Gamma-aware widening: binary option gamma explodes as T→0
+        # Linearly widen up to 3x in last 2 minutes
+        if time_remaining >= 0 and time_remaining < 120:
+            time_mult = 1.0 + (120.0 - time_remaining) / 120.0 * 2.0
+            base *= time_mult
+
         return max(self.config.min_spread_bps,
                    min(self.config.max_spread_bps, base))
 
     def _inventory_skew(self, inventory: Inventory) -> float:
         """Compute price skew based on net delta.
 
-        Positive delta (long UP) → skew negative → lower bid/ask
-        to encourage selling UP / buying DN.
+        Positive delta (long UP) → skew positive → shifts mid down for UP token,
+        shifts mid up for DN token (with invert_skew=True).
         Returns skew in price units.
         """
         delta = inventory.net_delta
@@ -67,7 +75,9 @@ class QuoteEngine:
                         inventory: Inventory,
                         volatility: float = 0.0,
                         avg_volatility: float = 0.0,
-                        tick_size: float = 0.01) -> tuple[Quote, Quote]:
+                        tick_size: float = 0.01,
+                        invert_skew: bool = False,
+                        time_remaining: float = -1.0) -> tuple[Quote, Quote]:
         """Generate a bid and ask quote for a single token.
 
         Args:
@@ -80,9 +90,11 @@ class QuoteEngine:
         Returns:
             (bid_quote, ask_quote)
         """
-        half_spread_bps = self._effective_half_spread(volatility, avg_volatility)
+        half_spread_bps = self._effective_half_spread(volatility, avg_volatility, time_remaining)
         half_spread = _bps_to_price(half_spread_bps)
         skew = self._inventory_skew(inventory)
+        if invert_skew:
+            skew = -skew
 
         bid_price = _round_price(fair_value - half_spread - skew, tick_size)
         ask_price = _round_price(fair_value + half_spread - skew, tick_size)
@@ -157,7 +169,8 @@ class QuoteEngine:
                             avg_volatility: float = 0.0,
                             usdc_budget: float = 0.0,
                             order_collateral: float = 0.0,
-                            tick_size: float = 0.01) -> dict[str, tuple[Quote | None, Quote]]:
+                            tick_size: float = 0.01,
+                            time_remaining: float = -1.0) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
 
         Args:
@@ -167,9 +180,11 @@ class QuoteEngine:
         Returns dict with keys 'up' and 'dn', each containing (bid, ask).
         """
         up_bid, up_ask = self.generate_quotes(
-            fv_up, up_token_id, inventory, volatility, avg_volatility, tick_size=tick_size)
+            fv_up, up_token_id, inventory, volatility, avg_volatility,
+            tick_size=tick_size, time_remaining=time_remaining)
         dn_bid, dn_ask = self.generate_quotes(
-            fv_dn, dn_token_id, inventory, volatility, avg_volatility, tick_size=tick_size)
+            fv_dn, dn_token_id, inventory, volatility, avg_volatility,
+            tick_size=tick_size, invert_skew=True, time_remaining=time_remaining)
 
         # Cap BUY size by remaining inventory room per token.
         max_shares = self.config.max_inventory_shares
