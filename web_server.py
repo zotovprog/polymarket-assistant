@@ -34,6 +34,7 @@ from mm.types import MarketInfo, Inventory
 from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
 from telegram_notifier import TelegramNotifier
+from telegram_bot import TelegramBotManager
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
@@ -1116,52 +1117,71 @@ class MMRuntime:
             pass
 
     async def _send_window_summary(self) -> None:
-        """Send window PnL summary to Telegram based on real balance change.
+        """Send window PnL summary to Telegram.
 
-        Uses real PM API balances (not internal tracking) to avoid
-        negative-shares bugs corrupting PnL calculation.
+        Priority: MongoDB fills (exact) -> PM balance diff (fallback).
         """
         if not _telegram.enabled or not self.mm:
             return
         try:
             mode = "PAPER" if self._paper_mode else "LIVE"
-
-            # Fetch REAL balances from PM API (not internal tracking)
-            if self._paper_mode:
-                client = self.mm.order_mgr.client
-                end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
-                up_shares = self.mm.inventory.up_shares
-                dn_shares = self.mm.inventory.dn_shares
-            else:
-                try:
-                    end_balance = await self.mm.order_mgr.get_usdc_balance()
-                except Exception:
-                    end_balance = self.mm._cached_usdc_balance or 0
-                try:
-                    up_shares, dn_shares = await self.mm.order_mgr.get_all_token_balances(
-                        self.mm.market.up_token_id, self.mm.market.dn_token_id)
-                except Exception:
-                    up_shares = max(0, self.mm.inventory.up_shares)
-                    dn_shares = max(0, self.mm.inventory.dn_shares)
-
-            # Clamp to 0 (safety net against negative tracking bugs)
-            up_shares = max(0.0, up_shares)
-            dn_shares = max(0.0, dn_shares)
-
             snap = self.mm.snapshot()
             fv = snap.get("fair_value", {})
             fv_up = fv.get("up", 0.5)
             fv_dn = fv.get("dn", 0.5)
 
-            # Resolution value: round FV to 0 or 1 for settled markets
+            # Resolution value for unredeemed shares
             up_resolution = 1.0 if fv_up >= 0.5 else 0.0
             dn_resolution = 1.0 if fv_dn >= 0.5 else 0.0
-            unredeemed_value = up_shares * up_resolution + dn_shares * dn_resolution
 
-            effective_balance = end_balance + unredeemed_value
+            session_pnl = 0.0
+            effective_balance = 0.0
 
-            # Real PnL = (USDC + unredeemed shares value) - start balance
-            session_pnl = effective_balance - self._start_balance if self._start_balance else 0.0
+            # ── Priority 1: MongoDB fills (exact transaction history) ──
+            mongo_pnl = None
+            if self._mongo and self.mm.market:
+                mongo_pnl = await self._mongo.compute_session_pnl(
+                    coin=self._coin,
+                    timeframe=self._timeframe,
+                    window_start=self.mm.market.window_start,
+                    window_end=self.mm.market.window_end,
+                    fv_up=up_resolution,
+                    fv_dn=dn_resolution,
+                )
+
+            if mongo_pnl and (mongo_pnl["buy_count"] + mongo_pnl["sell_count"]) > 0:
+                session_pnl = mongo_pnl["total_pnl"]
+                # Balance = start + pnl
+                effective_balance = self._start_balance + session_pnl
+                log.info(
+                    "Window PnL (MongoDB): $%.2f (buys=%d, sells=%d, fees=$%.4f)",
+                    session_pnl, mongo_pnl["buy_count"],
+                    mongo_pnl["sell_count"], mongo_pnl["fees"],
+                )
+            else:
+                # ── Priority 2: PM balance diff (fallback) ──
+                if self._paper_mode:
+                    client = self.mm.order_mgr.client
+                    end_balance = float(client.balance) if hasattr(client, "balance") else self._initial_usdc
+                    up_shares = self.mm.inventory.up_shares
+                    dn_shares = self.mm.inventory.dn_shares
+                else:
+                    try:
+                        end_balance = await self.mm.order_mgr.get_usdc_balance()
+                    except Exception:
+                        end_balance = self.mm._cached_usdc_balance or 0
+                    try:
+                        up_shares, dn_shares = await self.mm.order_mgr.get_all_token_balances(
+                            self.mm.market.up_token_id, self.mm.market.dn_token_id)
+                    except Exception:
+                        up_shares = max(0, self.mm.inventory.up_shares)
+                        dn_shares = max(0, self.mm.inventory.dn_shares)
+
+                up_shares = max(0.0, up_shares)
+                dn_shares = max(0.0, dn_shares)
+                unredeemed_value = up_shares * up_resolution + dn_shares * dn_resolution
+                effective_balance = end_balance + unredeemed_value
+                session_pnl = effective_balance - self._start_balance if self._start_balance else 0.0
 
             # Record PnL for 1h/24h aggregation
             now = time.time()
@@ -1171,6 +1191,9 @@ class MMRuntime:
 
             pnl_1h = sum(p for t, p in self._pnl_history if t >= now - 3600)
             pnl_24h = sum(p for t, p in self._pnl_history)
+
+            if effective_balance <= 0:
+                effective_balance = self._start_balance + session_pnl
 
             _telegram.notify_window_summary(
                 coin=self._coin or "UNKNOWN",
@@ -1182,9 +1205,9 @@ class MMRuntime:
                 usdc_balance=effective_balance,
             )
 
-            # Update start_balance for next window (use real USDC only —
-            # unredeemed shares will be redeemed before next window starts)
-            self._start_balance = end_balance
+            # Update start_balance for next window
+            if effective_balance > 0:
+                self._start_balance = effective_balance
         except Exception as e:
             log.warning(f"Failed to send window summary to Telegram: {e}")
 
@@ -1209,6 +1232,13 @@ class MMRuntime:
 
 # ── Singleton runtime ───────────────────────────────────────────
 _runtime = MMRuntime()
+
+# ── Telegram Bot (interactive management) ──────────────────────
+_tg_bot = TelegramBotManager(
+    notifier=_telegram,
+    get_runtime=lambda: _runtime,
+    access_key=ACCESS_KEY,
+)
 
 
 # ── Routes ──────────────────────────────────────────────────────
@@ -1397,9 +1427,18 @@ async def markets():
     }
 
 
-# ── Shutdown ────────────────────────────────────────────────────
+# ── Startup / Shutdown ─────────────────────────────────────────
+@app.on_event("startup")
+async def _startup():
+    _telegram.set_loop(asyncio.get_running_loop())
+    if _telegram.enabled:
+        await _tg_bot.start()
+        log.info("Telegram bot polling started")
+
+
 @app.on_event("shutdown")
 async def _shutdown():
+    await _tg_bot.stop()
     if _runtime.is_running:
         try:
             await asyncio.wait_for(_runtime.stop(), timeout=15.0)

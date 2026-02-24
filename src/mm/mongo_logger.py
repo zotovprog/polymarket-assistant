@@ -114,6 +114,128 @@ class MongoLogger:
         except asyncio.QueueFull:
             pass
 
+    async def compute_session_pnl(
+        self,
+        coin: str,
+        timeframe: str,
+        window_start: float,
+        window_end: float,
+        fv_up: float = 0.5,
+        fv_dn: float = 0.5,
+    ) -> dict | None:
+        """Compute real PnL from MongoDB fills for a specific window.
+
+        Returns dict with realized_pnl, unrealized_pnl, total_pnl,
+        fees, buy_count, sell_count, net_up, net_dn, or None on error.
+        """
+        if not self._db:
+            return None
+        try:
+            query = {
+                "ts": {"$gte": window_start, "$lte": window_end + 60},
+                "market.coin": coin,
+                "market.timeframe": timeframe,
+            }
+            cursor = self._db.fills.find(query).sort("ts", 1)
+            fills = await cursor.to_list(length=10_000)
+
+            if not fills:
+                return {"realized_pnl": 0, "unrealized_pnl": 0,
+                        "total_pnl": 0, "fees": 0,
+                        "buy_count": 0, "sell_count": 0,
+                        "net_up": 0, "net_dn": 0}
+
+            realized = 0.0
+            fees = 0.0
+            net_up = 0.0
+            net_dn = 0.0
+            buy_count = 0
+            sell_count = 0
+
+            for f in fills:
+                side = f.get("side", "")
+                price = float(f.get("price", 0))
+                size = float(f.get("size", 0))
+                fee = float(f.get("fee", 0))
+                token_type = f.get("token_type", "")
+
+                fees += fee
+                notional = price * size
+
+                if side == "BUY":
+                    realized -= notional + fee
+                    buy_count += 1
+                    if token_type == "up":
+                        net_up += size
+                    else:
+                        net_dn += size
+                elif side == "SELL":
+                    realized += notional - fee
+                    sell_count += 1
+                    if token_type == "up":
+                        net_up -= size
+                    else:
+                        net_dn -= size
+
+            net_up = max(0.0, net_up)
+            net_dn = max(0.0, net_dn)
+            unrealized = net_up * fv_up + net_dn * fv_dn
+            total = realized + unrealized
+
+            return {
+                "realized_pnl": round(realized, 4),
+                "unrealized_pnl": round(unrealized, 4),
+                "total_pnl": round(total, 4),
+                "fees": round(fees, 4),
+                "buy_count": buy_count,
+                "sell_count": sell_count,
+                "net_up": round(net_up, 2),
+                "net_dn": round(net_dn, 2),
+            }
+        except Exception as e:
+            log.warning("compute_session_pnl failed: %s", e)
+            return None
+
+    async def compute_total_pnl(self, coin: str, timeframe: str) -> dict | None:
+        """Compute cumulative PnL from ALL fills for a coin/timeframe.
+
+        Returns dict with total_pnl, fees, fill_count, or None on error.
+        """
+        if not self._db:
+            return None
+        try:
+            pipeline = [
+                {"$match": {"market.coin": coin, "market.timeframe": timeframe}},
+                {"$group": {
+                    "_id": None,
+                    "buy_cost": {"$sum": {"$cond": [
+                        {"$eq": ["$side", "BUY"]},
+                        {"$add": [{"$multiply": ["$price", "$size"]}, "$fee"]},
+                        0,
+                    ]}},
+                    "sell_rev": {"$sum": {"$cond": [
+                        {"$eq": ["$side", "SELL"]},
+                        {"$subtract": [{"$multiply": ["$price", "$size"]}, "$fee"]},
+                        0,
+                    ]}},
+                    "total_fees": {"$sum": "$fee"},
+                    "count": {"$sum": 1},
+                }},
+            ]
+            results = await self._db.fills.aggregate(pipeline).to_list(1)
+            if not results:
+                return {"total_pnl": 0, "fees": 0, "fill_count": 0}
+            r = results[0]
+            realized = r["sell_rev"] - r["buy_cost"]
+            return {
+                "total_pnl": round(realized, 4),
+                "fees": round(r["total_fees"], 4),
+                "fill_count": r["count"],
+            }
+        except Exception as e:
+            log.warning("compute_total_pnl failed: %s", e)
+            return None
+
     def log_snapshot(self, state: dict) -> None:
         """Enqueue a periodic bot-state snapshot."""
         doc = {
