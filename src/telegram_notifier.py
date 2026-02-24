@@ -289,23 +289,23 @@ class TelegramNotifier:
         """Long-poll getUpdates."""
         if not self.enabled or not self._client:
             return []
-        try:
-            params: dict[str, Any] = {
-                "timeout": timeout,
-                "allowed_updates": ["message", "callback_query"],
-            }
-            if offset is not None:
-                params["offset"] = offset
-            resp = await self._client.post(
-                f"{self.base_url}/getUpdates",
-                json=params,
-                timeout=timeout + 10,
+        params: dict[str, Any] = {
+            "timeout": timeout,
+            "allowed_updates": ["message", "callback_query"],
+        }
+        if offset is not None:
+            params["offset"] = offset
+        resp = await self._client.post(
+            f"{self.base_url}/getUpdates",
+            json=params,
+            timeout=timeout + 10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            raise RuntimeError(
+                f"Telegram getUpdates failed: {data.get('error_code')} {data.get('description', '')}"
             )
-            data = resp.json()
-            return data.get("result", [])
-        except Exception as e:
-            log.warning("get_updates error: %s", e)
-            return []
+        return data.get("result", [])
 
     async def close(self) -> None:
         """Graceful shutdown: wait for pending messages, close HTTP client."""

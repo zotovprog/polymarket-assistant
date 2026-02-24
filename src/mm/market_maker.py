@@ -105,6 +105,11 @@ class MarketMaker:
         self._tick_ms_samples: list[float] = []
         self._last_book_ms: float = 0.0
         self._last_order_ms: float = 0.0
+        self._last_fills_ms: float = 0.0
+        self._last_reconcile_ms: float = 0.0
+        self._last_fv_ms: float = 0.0
+        self._last_quotes_ms: float = 0.0
+        self._last_orders_ms: float = 0.0
 
         # Callbacks
         self._on_fill_callbacks: list = []
@@ -285,10 +290,10 @@ class MarketMaker:
                 for cb in self._on_snapshot_callbacks:
                     try:
                         cb(snap)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    except Exception as e:
+                        log.warning("Snapshot callback error: %s", e)
+            except Exception as e:
+                log.warning("Snapshot build error: %s", e)
 
         # ── End-of-window management ─────────────────────────────
         time_left = self.market.time_remaining
@@ -342,8 +347,8 @@ class MarketMaker:
             for cb in self._on_fill_callbacks:
                 try:
                     cb(fill, token_type)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("Fill callback error: %s", e)
         _t_fills = time.perf_counter()
 
         # Live mode: periodically reconcile internal shares with PM balances.
@@ -706,6 +711,11 @@ class MarketMaker:
         self._last_tick_ms = total_ms
         self._last_book_ms = (_t_quotes - _t_reconcile) * 1000  # fv + risk + quotes + book clamp
         self._last_order_ms = (_t_orders - _t_quotes) * 1000
+        self._last_fills_ms = (_t_fills - _t0) * 1000
+        self._last_reconcile_ms = (_t_reconcile - _t_fills) * 1000
+        self._last_fv_ms = (_t_fv - _t_reconcile) * 1000
+        self._last_quotes_ms = (_t_quotes - _t_fv) * 1000
+        self._last_orders_ms = (_t_orders - _t_quotes) * 1000
         self._tick_ms_samples.append(total_ms)
         if len(self._tick_ms_samples) > 100:
             self._tick_ms_samples = self._tick_ms_samples[-50:]
@@ -1203,8 +1213,11 @@ class MarketMaker:
             "latency": {
                 "last_tick_ms": round(self._last_tick_ms, 1),
                 "avg_tick_ms": round(self._avg_tick_ms, 1),
-                "fv_quotes_book_ms": round(self._last_book_ms, 1),
-                "order_place_ms": round(self._last_order_ms, 1),
+                "fills_ms": round(self._last_fills_ms, 1),
+                "reconcile_ms": round(self._last_reconcile_ms, 1),
+                "fv_ms": round(self._last_fv_ms, 1),
+                "quotes_ms": round(self._last_quotes_ms, 1),
+                "orders_ms": round(self._last_orders_ms, 1),
             },
 
             # Session

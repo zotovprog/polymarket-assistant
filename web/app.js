@@ -1,4 +1,4 @@
-/* Polymarket MM Dashboard — Frontend App v2 */
+/* Polymarket MM Dashboard — Frontend App v3 (WebSocket + Animations + Latency) */
 
 const API_BASE = '';
 let isRunning = false;
@@ -15,12 +15,25 @@ let spreadChart = null;
 let spreadSeries = null;
 let pnlChart = null;
 let pnlSeries = null;
+let latencyChart = null;
+let latencySeries = null;
 let pnlData = [];
 let spreadData = [];
+let latencyData = [];
 let lastStartedAt = 0;
 
 // Last known state for order distance calc
 let lastState = {};
+
+// Animation: previous values cache
+const _prevValues = {};
+
+// WebSocket state
+let _ws = null;
+let _wsConnected = false;
+let _wsReconnectDelay = 1000;
+let _wsReconnectTimer = null;
+let _wsAuthKey = '';  // saved from login for WS auth
 
 // ── Collapsible Sections ─────────────────────────────
 function toggleSection(el) {
@@ -52,6 +65,7 @@ async function doLogin() {
             body: JSON.stringify({key}),
         });
         if (r.ok) {
+            _wsAuthKey = key;
             showDashboard();
         } else {
             document.getElementById('auth-error').textContent = 'Invalid key';
@@ -67,7 +81,7 @@ function showDashboard() {
     document.getElementById('auth-screen').classList.add('hidden');
     document.getElementById('dashboard').classList.remove('hidden');
     initCharts();
-    startPolling();
+    connectWebSocket();
     // Auto-start watch mode for live feed data when no session is running
     autoWatch();
 }
@@ -88,6 +102,89 @@ async function autoWatch() {
         });
     } catch(e) {
         // Silent fail — watch is optional
+    }
+}
+
+// ── WebSocket Client ─────────────────────────────────
+function connectWebSocket() {
+    if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) {
+        return;
+    }
+
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // Auth: try saved key from login, fallback to cookie (cookie auth handled server-side)
+    const tokenParam = _wsAuthKey ? `?token=${encodeURIComponent(_wsAuthKey)}` : '';
+    const url = `${proto}//${location.host}/ws${tokenParam}`;
+
+    try {
+        _ws = new WebSocket(url);
+    } catch (e) {
+        _startFallbackPolling();
+        return;
+    }
+
+    _ws.onopen = () => {
+        _wsConnected = true;
+        _wsReconnectDelay = 1000; // Reset backoff
+        _updateWsStatus(true);
+        _stopFallbackPolling();
+    };
+
+    _ws.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'pong' || data.type === 'ping') return;
+            lastState = data;
+            updateUI(data);
+        } catch (e) {
+            // Ignore parse errors
+        }
+    };
+
+    _ws.onclose = () => {
+        _wsConnected = false;
+        _updateWsStatus(false);
+        _scheduleReconnect();
+    };
+
+    _ws.onerror = () => {
+        _wsConnected = false;
+        _updateWsStatus(false);
+    };
+}
+
+function _scheduleReconnect() {
+    if (_wsReconnectTimer) return;
+    _startFallbackPolling();
+    _wsReconnectTimer = setTimeout(() => {
+        _wsReconnectTimer = null;
+        connectWebSocket();
+    }, _wsReconnectDelay);
+    // Exponential backoff: 1s → 2s → 4s → ... → 30s max
+    _wsReconnectDelay = Math.min(30000, _wsReconnectDelay * 2);
+}
+
+function _startFallbackPolling() {
+    if (pollTimer) return;
+    pollState();
+    pollTimer = setInterval(pollState, 2000);
+}
+
+function _stopFallbackPolling() {
+    if (pollTimer) {
+        clearInterval(pollTimer);
+        pollTimer = null;
+    }
+}
+
+function _updateWsStatus(connected) {
+    const dot = document.getElementById('ws-dot');
+    const label = document.getElementById('ws-label');
+    if (dot) {
+        dot.className = 'ws-dot' + (connected ? ' ws-connected' : (_wsReconnectTimer ? ' ws-reconnecting' : ''));
+    }
+    if (label) {
+        label.textContent = connected ? 'WS' : 'WS...';
     }
 }
 
@@ -136,30 +233,40 @@ function initCharts() {
         });
     }
 
+    // Latency chart
+    const latEl = document.getElementById('latency-chart');
+    if (latEl && typeof LightweightCharts !== 'undefined') {
+        latencyChart = LightweightCharts.createChart(latEl, {
+            ...chartOpts, width: latEl.clientWidth, height: 134,
+        });
+        latencySeries = latencyChart.addAreaSeries({
+            topColor: 'rgba(168, 85, 247, 0.3)', bottomColor: 'rgba(168, 85, 247, 0.0)',
+            lineColor: '#a855f7', lineWidth: 2,
+            priceFormat: { type: 'custom', formatter: v => v.toFixed(0) + ' ms' },
+        });
+    }
+
     // Resize observer
     const ro = new ResizeObserver(() => {
         if (priceChart && priceEl) priceChart.applyOptions({ width: priceEl.clientWidth });
         if (spreadChart && spreadEl) spreadChart.applyOptions({ width: spreadEl.clientWidth });
         if (pnlChart && pnlEl) pnlChart.applyOptions({ width: pnlEl.clientWidth });
+        if (latencyChart && latEl) latencyChart.applyOptions({ width: latEl.clientWidth });
     });
     if (priceEl) ro.observe(priceEl);
     if (spreadEl) ro.observe(spreadEl);
     if (pnlEl) ro.observe(pnlEl);
+    if (latEl) ro.observe(latEl);
 }
 
-// ── Polling ──────────────────────────────────────────
-function startPolling() {
-    pollState();
-    pollTimer = setInterval(pollState, 1500);
-}
-
+// ── Polling (fallback only) ──────────────────────────
 async function pollState() {
     try {
         const r = await fetch(`${API_BASE}/api/mm/state`);
         if (r.status === 401) {
             document.getElementById('dashboard').classList.add('hidden');
             document.getElementById('auth-screen').classList.remove('hidden');
-            clearInterval(pollTimer);
+            _stopFallbackPolling();
             return;
         }
         const s = await r.json();
@@ -168,6 +275,48 @@ async function pollState() {
     } catch(e) {
         document.getElementById('status-text').textContent = 'Connection error';
         document.getElementById('status-indicator').className = 'status-dot offline';
+    }
+}
+
+// ── Animated Value Updates ───────────────────────────
+function setNumberAnimated(id, val, prefix, decimals) {
+    const el = document.getElementById(id);
+    if (!el) return;
+
+    const numVal = typeof val === 'number' ? val : parseFloat(val);
+    const displayText = (prefix || '') + (isNaN(numVal) ? val : numVal.toFixed(decimals || 2));
+
+    const prevKey = id;
+    const prev = _prevValues[prevKey];
+    _prevValues[prevKey] = numVal;
+
+    el.textContent = displayText;
+
+    if (prev !== undefined && !isNaN(numVal) && !isNaN(prev) && numVal !== prev) {
+        const cls = numVal > prev ? 'flash-up' : 'flash-down';
+        el.classList.remove('flash-up', 'flash-down', 'flash-change');
+        // Force reflow to restart animation
+        void el.offsetWidth;
+        el.classList.add(cls);
+        el.addEventListener('animationend', () => {
+            el.classList.remove('flash-up', 'flash-down', 'flash-change');
+        }, { once: true });
+    }
+}
+
+function setTextAnimated(id, val) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const prev = _prevValues[id];
+    _prevValues[id] = val;
+    el.textContent = val;
+    if (prev !== undefined && prev !== val) {
+        el.classList.remove('flash-up', 'flash-down', 'flash-change');
+        void el.offsetWidth;
+        el.classList.add('flash-change');
+        el.addEventListener('animationend', () => {
+            el.classList.remove('flash-change');
+        }, { once: true });
     }
 }
 
@@ -195,13 +344,13 @@ function updateUI(s) {
 
     // PM balance & session limit (settings row 2)
     const pmBal = s.usdc_balance_pm;
-    setText('pm-balance', pmBal != null ? '$' + pmBal.toFixed(2) : '—');
+    setText('pm-balance', pmBal != null ? '$' + pmBal.toFixed(2) : '\u2014');
     const stakeInput = document.getElementById('stake-usdc');
     if (s.session_limit) {
         setText('session-limit', '$' + s.session_limit.toFixed(0));
         if (isRunning && stakeInput) stakeInput.value = s.session_limit;
     } else {
-        setText('session-limit', stakeInput ? '$' + stakeInput.value : '—');
+        setText('session-limit', stakeInput ? '$' + stakeInput.value : '\u2014');
     }
 
     // Status
@@ -240,38 +389,38 @@ function updateUI(s) {
 
     // Binance price
     if (s.fair_value) {
-        document.getElementById('binance-price').textContent =
-            s.fair_value.binance_mid ? '$' + s.fair_value.binance_mid.toLocaleString() : '—';
+        setNumberAnimated('binance-price',
+            s.fair_value.binance_mid || 0, '$', 2);
 
-        // Fair values
-        setText('fv-up', s.fair_value.up ? s.fair_value.up.toFixed(4) : '—');
-        setText('fv-dn', s.fair_value.dn ? s.fair_value.dn.toFixed(4) : '—');
+        // Fair values (animated)
+        setNumberAnimated('fv-up', s.fair_value.up || 0, '', 4);
+        setNumberAnimated('fv-dn', s.fair_value.dn || 0, '', 4);
     }
 
-    // Quotes
+    // Quotes (animated)
     if (s.quotes) {
-        setQuote('up-bid', s.quotes.up_bid);
-        setQuote('up-ask', s.quotes.up_ask);
-        setQuote('dn-bid', s.quotes.dn_bid);
-        setQuote('dn-ask', s.quotes.dn_ask);
+        setQuoteAnimated('up-bid', s.quotes.up_bid);
+        setQuoteAnimated('up-ask', s.quotes.up_ask);
+        setQuoteAnimated('dn-bid', s.quotes.dn_bid);
+        setQuoteAnimated('dn-ask', s.quotes.dn_ask);
     }
 
-    // PM prices
+    // PM prices (animated)
     if (s.pm_prices) {
-        setText('pm-up', s.pm_prices.up ? s.pm_prices.up.toFixed(4) : '—');
-        setText('pm-dn', s.pm_prices.dn ? s.pm_prices.dn.toFixed(4) : '—');
+        setNumberAnimated('pm-up', s.pm_prices.up || 0, '', 4);
+        setNumberAnimated('pm-dn', s.pm_prices.dn || 0, '', 4);
     }
 
-    // Inventory
+    // Inventory (animated)
     if (s.inventory) {
-        setText('inv-up', s.inventory.up_shares);
-        setText('inv-dn', s.inventory.dn_shares);
-        setText('inv-delta', s.inventory.net_delta);
-        setText('inv-usdc', '$' + (s.inventory.usdc || 0).toFixed(2));
+        setNumberAnimated('inv-up', s.inventory.up_shares || 0, '', 1);
+        setNumberAnimated('inv-dn', s.inventory.dn_shares || 0, '', 1);
+        setNumberAnimated('inv-delta', s.inventory.net_delta || 0, '', 1);
+        setNumberAnimated('inv-usdc', s.inventory.usdc || 0, '$', 2);
         updateInventoryBar(s.inventory);
         // Avg entry prices
-        setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '—');
-        setText('inv-dn-avg', s.inventory.dn_avg_entry != null ? s.inventory.dn_avg_entry.toFixed(4) : '—');
+        setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '\u2014');
+        setText('inv-dn-avg', s.inventory.dn_avg_entry != null ? s.inventory.dn_avg_entry.toFixed(4) : '\u2014');
     }
 
     // Liquidation lock
@@ -287,7 +436,7 @@ function updateUI(s) {
         }
     }
 
-    // ── PnL (simplified: 3 big numbers) ──────────────
+    // ── PnL (simplified: 3 big numbers, animated) ────
     const sessionPnl = s.session_pnl != null ? s.session_pnl : (s.total_pnl || 0);
     const positionsWorth = (s.inventory?.up_shares || 0) * (s.pm_prices?.up || 0)
                          + (s.inventory?.dn_shares || 0) * (s.pm_prices?.dn || 0);
@@ -295,10 +444,10 @@ function updateUI(s) {
     const stake = s.session_limit || 1;
     const pnlPct = (sessionPnl / stake * 100).toFixed(1);
 
-    // Session PnL (big)
+    // Session PnL (big, animated)
     const pnlSessionEl = document.getElementById('pnl-session');
     if (pnlSessionEl) {
-        pnlSessionEl.textContent = '$' + sessionPnl.toFixed(4);
+        setNumberAnimated('pnl-session', sessionPnl, '$', 4);
         pnlSessionEl.classList.remove('pnl-positive', 'pnl-negative');
         pnlSessionEl.classList.add(sessionPnl >= 0 ? 'pnl-positive' : 'pnl-negative');
     }
@@ -309,16 +458,10 @@ function updateUI(s) {
     }
 
     // Positions worth
-    const posEl = document.getElementById('pnl-positions-worth');
-    if (posEl) {
-        posEl.textContent = '$' + positionsWorth.toFixed(2);
-    }
+    setNumberAnimated('pnl-positions-worth', positionsWorth, '$', 2);
 
     // Free USDC
-    const freeEl = document.getElementById('pnl-free-usdc');
-    if (freeEl) {
-        freeEl.textContent = '$' + freeUsdc.toFixed(2);
-    }
+    setNumberAnimated('pnl-free-usdc', freeUsdc, '$', 2);
 
     // Session Stats (collapsed section) — detailed PnL + stats
     const realized = s.realized_pnl || 0;
@@ -334,7 +477,7 @@ function updateUI(s) {
     setText('stat-quotes', s.quote_count || 0);
     setText('stat-requotes', s.requote_count || 0);
     setText('stat-spread', (s.avg_spread_bps || 0).toFixed(0) + ' bps');
-    setText('stat-vol', s.fair_value ? (s.fair_value.volatility * 100).toFixed(3) + '%' : '—');
+    setText('stat-vol', s.fair_value ? (s.fair_value.volatility * 100).toFixed(3) + '%' : '\u2014');
     // Current spread in collapsible header
     setText('current-spread', (s.avg_spread_bps || 0).toFixed(0) + ' bps');
 
@@ -347,7 +490,7 @@ function updateUI(s) {
 
     // Fills
     if (s.recent_fills) {
-        updateFills(s.recent_fills);
+        updateFillsAnimated(s.recent_fills);
         setText('fill-count', s.fill_count || s.recent_fills.length);
     }
 
@@ -357,10 +500,15 @@ function updateUI(s) {
     // Market Quality
     updateMarketQuality(s.market_quality);
 
+    // Latency panel
+    if (s.latency) {
+        updateLatency(s.latency);
+    }
+
     // Market info + window progress
     if (s.market) {
         setText('market-info', `${s.market.coin || ''} ${s.market.timeframe || ''}`);
-        setText('market-strike', 'Strike: ' + (s.market.strike ? '$' + s.market.strike.toLocaleString() : '—'));
+        setText('market-strike', 'Strike: ' + (s.market.strike ? '$' + s.market.strike.toLocaleString() : '\u2014'));
         const tr = s.market.time_remaining || 0;
         const mins = Math.floor(tr / 60), secs = Math.floor(tr % 60);
         setText('market-time', tr > 0 ? `${mins}m ${secs}s` : 'Expired');
@@ -472,8 +620,18 @@ function setQuote(prefix, data) {
         setText(prefix + '-price', data.price.toFixed(2));
         setText(prefix + '-size', data.size.toFixed(1));
     } else {
-        setText(prefix + '-price', '—');
-        setText(prefix + '-size', '—');
+        setText(prefix + '-price', '\u2014');
+        setText(prefix + '-size', '\u2014');
+    }
+}
+
+function setQuoteAnimated(prefix, data) {
+    if (data) {
+        setNumberAnimated(prefix + '-price', data.price, '', 2);
+        setNumberAnimated(prefix + '-size', data.size, '', 1);
+    } else {
+        setText(prefix + '-price', '\u2014');
+        setText(prefix + '-size', '\u2014');
     }
 }
 
@@ -502,13 +660,22 @@ function updateInventoryBar(inv) {
     bar.style.background = pct > 55 ? 'var(--success)' : pct < 45 ? 'var(--destructive)' : 'var(--accent)';
 }
 
-function updateFills(fills) {
+// ── Fills (with animation for new rows) ──────────────
+let _lastFillCount = 0;
+
+function updateFillsAnimated(fills) {
     const body = document.getElementById('fills-body');
     if (!body) return;
-    body.innerHTML = fills.slice(0, 20).map(f => {
+
+    const newCount = fills.length;
+    const hasNewFills = newCount > _lastFillCount && _lastFillCount > 0;
+    _lastFillCount = newCount;
+
+    body.innerHTML = fills.slice(0, 20).map((f, i) => {
         const time = new Date(f.ts * 1000).toLocaleTimeString();
         const cls = f.side === 'BUY' ? 'fill-buy' : 'fill-sell';
-        return `<tr>
+        const newCls = (hasNewFills && i === 0) ? ' fill-new' : '';
+        return `<tr class="${newCls}">
             <td>${time}</td>
             <td class="${cls}">${f.side}</td>
             <td>${f.price.toFixed(2)}</td>
@@ -564,13 +731,13 @@ function updateMarketQuality(mq) {
     const scoreVal = document.getElementById('quality-score-value');
 
     if (!mq || mq.overall_score == null) {
-        if (badge) badge.textContent = '—';
+        if (badge) badge.textContent = '\u2014';
         if (barFill) barFill.style.width = '0%';
-        if (scoreVal) scoreVal.textContent = '—';
-        setText('quality-liquidity', '—');
-        setText('quality-spread-bps', '— bps');
-        setText('quality-bid-depth', '$—');
-        setText('quality-ask-depth', '$—');
+        if (scoreVal) scoreVal.textContent = '\u2014';
+        setText('quality-liquidity', '\u2014');
+        setText('quality-spread-bps', '\u2014 bps');
+        setText('quality-bid-depth', '$\u2014');
+        setText('quality-ask-depth', '$\u2014');
         return;
     }
 
@@ -599,6 +766,64 @@ function updateMarketQuality(mq) {
     setText('quality-ask-depth', '$' + (mq.ask_depth_usd || 0).toFixed(0));
 }
 
+// ── Latency Panel ────────────────────────────────────
+function updateLatency(lat) {
+    const lastTick = lat.last_tick_ms || 0;
+    const avgTick = lat.avg_tick_ms || 0;
+
+    // Header value
+    setText('latency-header-value', lastTick.toFixed(0) + ' ms');
+
+    // Big numbers with color
+    const lastEl = document.getElementById('lat-last-tick');
+    if (lastEl) {
+        lastEl.textContent = lastTick.toFixed(0) + ' ms';
+        lastEl.className = 'lat-value ' + (lastTick < 50 ? 'lat-green' : lastTick < 200 ? 'lat-yellow' : 'lat-red');
+    }
+    const avgEl = document.getElementById('lat-avg-tick');
+    if (avgEl) {
+        avgEl.textContent = avgTick.toFixed(0) + ' ms';
+        avgEl.className = 'lat-value ' + (avgTick < 50 ? 'lat-green' : avgTick < 200 ? 'lat-yellow' : 'lat-red');
+    }
+
+    // Stacked bar
+    const fills = lat.fills_ms || 0;
+    const reconcile = lat.reconcile_ms || 0;
+    const fv = lat.fv_ms || 0;
+    const quotes = lat.quotes_ms || 0;
+    const orders = lat.orders_ms || 0;
+    const total = fills + reconcile + fv + quotes + orders;
+
+    if (total > 0) {
+        const pct = (v) => (v / total * 100).toFixed(1) + '%';
+        const barFills = document.getElementById('lat-bar-fills');
+        const barReconcile = document.getElementById('lat-bar-reconcile');
+        const barFv = document.getElementById('lat-bar-fv');
+        const barQuotes = document.getElementById('lat-bar-quotes');
+        const barOrders = document.getElementById('lat-bar-orders');
+        if (barFills) barFills.style.width = pct(fills);
+        if (barReconcile) barReconcile.style.width = pct(reconcile);
+        if (barFv) barFv.style.width = pct(fv);
+        if (barQuotes) barQuotes.style.width = pct(quotes);
+        if (barOrders) barOrders.style.width = pct(orders);
+    }
+
+    // Legend values
+    setText('lat-leg-fills', fills.toFixed(0) + 'ms');
+    setText('lat-leg-reconcile', reconcile.toFixed(0) + 'ms');
+    setText('lat-leg-fv', fv.toFixed(0) + 'ms');
+    setText('lat-leg-quotes', quotes.toFixed(0) + 'ms');
+    setText('lat-leg-orders', orders.toFixed(0) + 'ms');
+
+    // Chart point
+    if (latencySeries && lastTick > 0) {
+        const now = Math.floor(Date.now() / 1000);
+        latencyData.push({ time: now, value: lastTick });
+        if (latencyData.length > 500) latencyData = latencyData.slice(-300);
+        latencySeries.setData(latencyData);
+    }
+}
+
 function updateFeedStatus(feeds) {
     const container = document.getElementById('feed-status');
     if (!container) return;
@@ -606,8 +831,6 @@ function updateFeedStatus(feeds) {
         container.innerHTML = '<span style="color:var(--text-muted)">No feed data</span>';
         return;
     }
-
-    const now = Date.now();
 
     function indicator(label, connected, msgCount, errCount, latencyMs) {
         let color = '#ef4444'; // red
@@ -619,7 +842,7 @@ function updateFeedStatus(feeds) {
                 color = '#22c55e'; // green
             }
         }
-        const latStr = latencyMs != null ? latencyMs + 'ms' : '—';
+        const latStr = latencyMs != null ? latencyMs + 'ms' : '\u2014';
         return `<span class="feed-ind" style="margin-right:16px">` +
             `<span style="color:${color};font-size:12px">${icon}</span> ` +
             `<b>${label}</b> ${msgCount} msgs | ${errCount} err | ${latStr}` +
@@ -673,6 +896,7 @@ function updateCharts(s) {
         lastStartedAt = s.started_at;
         pnlData = [];
         spreadData = [];
+        latencyData = [];
     }
 
     const now = Math.floor(Date.now() / 1000);
@@ -900,7 +1124,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const badge = document.getElementById('cred-status');
                 const text = document.getElementById('cred-status-text');
                 if (badge) badge.className = 'cred-badge';
-                if (text) text.textContent = '—';
+                if (text) text.textContent = '\u2014';
             }
         });
     }

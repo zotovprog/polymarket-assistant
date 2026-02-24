@@ -11,13 +11,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 import time
 import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -99,7 +100,7 @@ PM_API_PASSPHRASE = os.environ.get("PM_API_PASSPHRASE", "").strip()
 
 log.info(f"PM_PRIVATE_KEY={'set' if PM_PRIVATE_KEY else 'MISSING'} (len={len(PM_PRIVATE_KEY)})")
 log.info(f"PM_FUNDER={'set' if PM_FUNDER else 'MISSING'} (len={len(PM_FUNDER)})")
-log.info(f"PM_API_KEY={'set' if PM_API_KEY else 'MISSING'} (len={len(PM_API_KEY)}, prefix={PM_API_KEY[:8]}...)" if PM_API_KEY else "PM_API_KEY=MISSING")
+log.info(f"PM_API_KEY={'set' if PM_API_KEY else 'MISSING'} (len={len(PM_API_KEY)})" if PM_API_KEY else "PM_API_KEY=MISSING")
 log.info(f"PM_API_SECRET={'set' if PM_API_SECRET else 'MISSING'} (len={len(PM_API_SECRET)})")
 log.info(f"PM_API_PASSPHRASE={'set' if PM_API_PASSPHRASE else 'MISSING'} (len={len(PM_API_PASSPHRASE)})")
 
@@ -1235,6 +1236,63 @@ class MMRuntime:
 # ── Singleton runtime ───────────────────────────────────────────
 _runtime = MMRuntime()
 
+
+# ── WebSocket Connection Manager ───────────────────────────────
+class ConnectionManager:
+    """Manages active WebSocket connections with thread-safe broadcast."""
+
+    def __init__(self):
+        self._connections: list[WebSocket] = []
+        self._lock = asyncio.Lock()
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self._connections.append(websocket)
+        log.info("WS client connected (%d total)", len(self._connections))
+
+    async def disconnect(self, websocket: WebSocket):
+        async with self._lock:
+            if websocket in self._connections:
+                self._connections.remove(websocket)
+        log.info("WS client disconnected (%d remaining)", len(self._connections))
+
+    async def broadcast(self, data: dict):
+        """Send JSON to all connected clients, removing dead connections."""
+        message = json.dumps(data)
+        dead: list[WebSocket] = []
+        async with self._lock:
+            clients = list(self._connections)
+        for ws in clients:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    if ws in self._connections:
+                        self._connections.remove(ws)
+
+    @property
+    def client_count(self) -> int:
+        return len(self._connections)
+
+
+_ws_manager = ConnectionManager()
+
+
+async def _ws_broadcast_loop():
+    """Broadcast state snapshots to all WS clients every ~1s."""
+    while True:
+        try:
+            if _ws_manager.client_count > 0:
+                snap = _runtime.snapshot()
+                await _ws_manager.broadcast(snap)
+        except Exception as e:
+            log.warning("WS broadcast error: %s", e)
+        await asyncio.sleep(1.0)
+
 # ── Telegram Bot (interactive management) ──────────────────────
 _tg_bot = TelegramBotManager(
     notifier=_telegram,
@@ -1422,6 +1480,42 @@ async def health():
     }
 
 
+# ── WebSocket endpoint ─────────────────────────────────────────
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    """WebSocket for real-time dashboard updates.
+
+    Auth via query param ?token= OR cookie pm_web_auth.
+    Client can send "ping" → server replies {"type":"pong"}.
+    """
+    # Auth check
+    token = websocket.query_params.get("token", "")
+    cookie = websocket.cookies.get(AUTH_COOKIE, "")
+    if token != ACCESS_KEY and cookie != ACCESS_KEY:
+        await websocket.close(code=1008, reason="unauthorized")
+        return
+
+    await _ws_manager.connect(websocket)
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                if data.strip() == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except asyncio.TimeoutError:
+                # No message in 30s — send ping to keep alive
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await _ws_manager.disconnect(websocket)
+
+
 # ── Available markets ──────────────────────────────────────────
 @app.get("/api/markets")
 async def markets():
@@ -1432,6 +1526,15 @@ async def markets():
 
 
 # ── Startup / Shutdown ─────────────────────────────────────────
+def _sigterm_handler(signum, frame):
+    """Handle SIGTERM for graceful shutdown in Docker."""
+    log.info("Received SIGTERM — initiating graceful shutdown")
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
@@ -1439,6 +1542,8 @@ async def _startup():
     if _telegram.enabled:
         await _tg_bot.start()
         log.info("Telegram bot polling started")
+    # Start WebSocket broadcast loop
+    asyncio.create_task(_ws_broadcast_loop())
 
 
 @app.on_event("shutdown")
