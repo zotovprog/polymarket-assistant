@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  bot:
+    image: ${CI_REGISTRY_IMAGE:-registry.gitlab.com/info_something_tools-group/polymarketbot}:prod
+    env_file:
+      - .env
+    environment:
+      - SERVICE_NAME=bot
+    ports:
+      - 8000:8000
+    volumes:
+      - bot-workspace:/app/workspace
+    deploy:
+      placement:
+        constraints:
+          - node.role == worker
+      mode: replicated
+      replicas: 1
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: pause
+
+volumes:
+  bot-workspace:
