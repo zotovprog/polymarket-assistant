@@ -282,7 +282,10 @@ class TelegramBotManager:
             ],
             # Dev toggle
             [
-                {"text": f"Dev: {'ON \u2705' if s['dev'] else 'OFF'}", "callback_data": f"set_dev:{'0' if s['dev'] else '1'}"},
+                {
+                    "text": "Dev: ON \u2705" if s["dev"] else "Dev: OFF",
+                    "callback_data": "set_dev:0" if s["dev"] else "set_dev:1",
+                },
             ],
             # Action row
             [
