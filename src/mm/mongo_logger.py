@@ -128,7 +128,7 @@ class MongoLogger:
         Returns dict with realized_pnl, unrealized_pnl, total_pnl,
         fees, buy_count, sell_count, net_up, net_dn, or None on error.
         """
-        if not self._db:
+        if self._db is None:
             return None
         try:
             query = {
@@ -201,7 +201,7 @@ class MongoLogger:
 
         Returns dict with total_pnl, fees, fill_count, or None on error.
         """
-        if not self._db:
+        if self._db is None:
             return None
         try:
             pipeline = [
