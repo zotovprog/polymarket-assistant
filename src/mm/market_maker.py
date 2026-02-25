@@ -219,6 +219,17 @@ class MarketMaker:
         self._running = True
         self._emergency_flag = False
         self._emergency_stopped = False
+
+        # Cancel ALL existing orders first — prevents stale orders from previous
+        # crashed sessions (GTD orders can survive up to 5 minutes after crash)
+        try:
+            cancelled = await self.order_mgr.cancel_all(force_exchange=True)
+            if cancelled:
+                log.info("Startup: cancelled %d stale orders from previous session", cancelled)
+                await asyncio.sleep(1.0)  # Wait for PM to settle after cancels
+        except Exception as e:
+            log.warning("Startup: cancel_all failed: %s", e)
+
         # Snapshot starting portfolio (USDC + token values) for real session PnL
         try:
             (real_up, real_dn), starting_usdc = await asyncio.gather(
@@ -253,6 +264,23 @@ class MarketMaker:
                 _fv_dn = _fv_dn if _fv_dn > 0 else 0.5
             _token_value = self._cached_pm_up_shares * _fv_up + self._cached_pm_dn_shares * _fv_dn
             self._starting_portfolio_pm = starting_usdc + _token_value
+            # Initialize internal inventory from PM balances (pre-existing tokens
+            # from previous sessions must be tracked to avoid phantom PnL)
+            if self._cached_pm_up_shares > 0 or self._cached_pm_dn_shares > 0:
+                self.inventory.up_shares = self._cached_pm_up_shares
+                self.inventory.dn_shares = self._cached_pm_dn_shares
+                self.inventory.usdc = starting_usdc
+                # Set cost basis from current prices (best guess for pre-existing)
+                if self._cached_pm_up_shares > 0:
+                    self.inventory.up_cost.total_shares = self._cached_pm_up_shares
+                    self.inventory.up_cost.total_cost = self._cached_pm_up_shares * _fv_up
+                if self._cached_pm_dn_shares > 0:
+                    self.inventory.dn_cost.total_shares = self._cached_pm_dn_shares
+                    self.inventory.dn_cost.total_cost = self._cached_pm_dn_shares * _fv_dn
+                log.warning(
+                    "Pre-existing tokens found: UP=%.2f DN=%.2f — initialized inventory from PM",
+                    self._cached_pm_up_shares, self._cached_pm_dn_shares,
+                )
             log.info(
                 "Starting portfolio: USDC=$%.2f + tokens=$%.2f (UP=%.2f@%.3f DN=%.2f@%.3f) = $%.2f",
                 starting_usdc, _token_value,
@@ -744,8 +772,13 @@ class MarketMaker:
         if self._paused and not _inv_limit_suppress and not self._quality_pause_active:
             return
 
-        # Reset catastrophic counter when PnL is healthy
-        if not should_pause or "drawdown" not in reason.lower():
+        # Reset catastrophic counter when PnL is healthy.
+        # Only reset if we're NOT in the middle of a drawdown confirmation cycle.
+        # The exit trigger block sets should_pause=False while waiting for confirmation,
+        # so we check _session_pnl directly instead of relying on should_pause.
+        if _session_pnl is not None and _session_pnl > -self.config.max_drawdown_usd:
+            if self._catastrophic_count > 0:
+                log.info("PnL recovered ($%.2f), resetting catastrophic counter", _session_pnl)
             self._catastrophic_count = 0
 
         # ── One-sided exposure check ──────────────────────────────
