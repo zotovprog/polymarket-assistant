@@ -426,11 +426,13 @@ class MarketMaker:
         is_live = not hasattr(self.order_mgr.client, "_orders")
         reconcile_requested = self.order_mgr.reconcile_requested
         if is_live and not self._is_closing and (self._tick_count % 5 == 0 or reconcile_requested):
-            real_up, real_dn = await self.order_mgr.get_all_token_balances(
-                self.market.up_token_id,
-                self.market.dn_token_id,
+            (real_up, real_dn), usdc_bal = await asyncio.gather(
+                self.order_mgr.get_all_token_balances(
+                    self.market.up_token_id,
+                    self.market.dn_token_id,
+                ),
+                self.order_mgr.get_usdc_balance(),
             )
-            usdc_bal = await self.order_mgr.get_usdc_balance()
             if usdc_bal is not None:
                 self._cached_usdc_balance = usdc_bal
             else:
@@ -668,8 +670,10 @@ class MarketMaker:
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live and self._tick_count % self.config.quality_check_interval == 0:
             try:
-                up_book = await self.order_mgr.get_full_book(self.market.up_token_id)
-                dn_book = await self.order_mgr.get_full_book(self.market.dn_token_id)
+                up_book, dn_book = await asyncio.gather(
+                    self.order_mgr.get_full_book(self.market.up_token_id),
+                    self.order_mgr.get_full_book(self.market.dn_token_id),
+                )
                 self._last_quality = self.quality_analyzer.analyze(
                     up_book, dn_book, fv_up, fv_dn)
                 self._quality_error_count = 0
@@ -767,6 +771,15 @@ class MarketMaker:
             getattr(st, "pm_connected", False)
             and (time.time() - getattr(st, "pm_last_update_ts", 0)) < 10
         )
+        # Pre-fetch book summaries in parallel if WS data is stale.
+        books_cache = {}
+        if not ws_fresh:
+            up_summary, dn_summary = await asyncio.gather(
+                self.order_mgr.get_book_summary(self.market.up_token_id),
+                self.order_mgr.get_book_summary(self.market.dn_token_id),
+            )
+            books_cache["up"] = up_summary
+            books_cache["dn"] = dn_summary
         for token_key, token_id in [
             ("up", self.market.up_token_id),
             ("dn", self.market.dn_token_id),
@@ -776,7 +789,11 @@ class MarketMaker:
             if ws_fresh and ws_bid is not None and ws_ask is not None:
                 book = {"best_bid": ws_bid, "best_ask": ws_ask}
             else:
-                book = await self.order_mgr.get_book_summary(token_id)
+                book = (
+                    books_cache[token_key]
+                    if token_key in books_cache
+                    else await self.order_mgr.get_book_summary(token_id)
+                )
             bid, ask = all_quotes[token_key]
             bid, ask = self.quote_engine.clamp_to_book(
                 bid, ask, book["best_bid"], book["best_ask"],

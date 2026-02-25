@@ -22,12 +22,19 @@ class MMConfig:
     # Safety bounds for critical runtime-adjustable parameters.
     VALIDATION_BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
         "half_spread_bps": (5.0, 5000.0),
+        "min_spread_bps": (1.0, 2000.0),
+        "max_spread_bps": (10.0, 10000.0),
+        "vol_spread_mult": (1.0, 10.0),
         "order_size_usd": (1.0, 500.0),
+        "min_order_size_usd": (0.5, 200.0),
+        "max_order_size_usd": (1.0, 1000.0),
         "max_position_usd": (5.0, 5000.0),
+        "max_inventory_shares": (1.0, 500.0),
         "layers": (1.0, 10.0),
         "layer_spacing_bps": (1.0, 1000.0),
         "skew_bps_per_unit": (0.0, 500.0),
         "refresh_interval_s": (0.5, 60.0),
+        "requote_threshold_bps": (1.0, 500.0),
         "heartbeat_interval_sec": (1.0, 30.0),
         "session_limit": (0.0, 100000.0),
         "max_drawdown_usd": (1.0, 1000.0),
@@ -41,6 +48,9 @@ class MMConfig:
         "liq_chunk_interval_s": (1.0, 300.0),
         "liq_gradual_chunks": (1.0, 50.0),
         "liq_max_discount_from_fv": (0.0, 0.5),
+        "gtd_duration_sec": (30.0, 3600.0),
+        "close_window_sec": (5.0, 300.0),
+        "resolution_wait_sec": (10.0, 600.0),
     }
 
     # ── Spread ───────────────────────────────────────────────────

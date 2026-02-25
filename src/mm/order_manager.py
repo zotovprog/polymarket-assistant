@@ -812,98 +812,121 @@ class OrderManager:
         check_order = list(ws_priority_ids)
         check_order.extend(oid for oid in self._active_orders if oid not in ws_priority_ids)
 
+        order_data = []
         for order_id in check_order:
             quote = self._active_orders.get(order_id)
-            if not quote:
-                continue
-            try:
-                order = await self._retry(
-                    asyncio.to_thread,
-                    self.client.get_order,
-                    order_id,
-                )
-                if order is None:
-                    continue
-                status = order.get("status", "")
-                size_matched_raw = order.get("size_matched", 0)
-                size_matched = self._safe_float(size_matched_raw)
-                if size_matched is None:
-                    self._reconcile_requested = True
-                    log.error(
-                        "Anomalous fill: invalid size_matched (%s) for order %s",
-                        size_matched_raw,
-                        order_id[:12],
-                    )
-                    continue
+            if quote:
+                order_data.append((order_id, quote))
 
-                # Track how much we already reported for this order
-                prev_matched = self._partial_fill_reported.get(order_id, 0.0)
-                remaining_size = max(0.0, quote.size - prev_matched)
-                new_fill_size = size_matched - prev_matched
+        if order_data:
+            fetch_results = await asyncio.gather(
+                *(
+                    self._retry(
+                        asyncio.to_thread,
+                        self.client.get_order,
+                        order_id,
+                    )
+                    for order_id, _ in order_data
+                ),
+                return_exceptions=True,
+            )
 
-                if new_fill_size > remaining_size + 0.1:
-                    self._reconcile_requested = True
-                    log.error(
-                        "Anomalous fill: size_matched exceeds order remainder "
-                        "(order=%s size_matched=%.4f already_filled=%.4f remaining=%.4f original=%.4f)",
-                        order_id[:12],
-                        size_matched,
-                        prev_matched,
-                        remaining_size,
-                        quote.size,
-                    )
-                    continue
-                if new_fill_size < -0.1:
-                    self._reconcile_requested = True
-                    log.error(
-                        "Anomalous fill: size_matched regressed "
-                        "(order=%s size_matched=%.4f already_filled=%.4f)",
-                        order_id[:12],
-                        size_matched,
-                        prev_matched,
-                    )
+            for (order_id, quote), order_result in zip(order_data, fetch_results):
+                if isinstance(order_result, Exception):
+                    log.debug(f"Error checking order {order_id[:12]}...: {order_result}")
                     continue
 
-                if new_fill_size >= 0.01:
-                    fill_price = self._extract_fill_price(order, quote.price)
-                    is_maker = self._order_post_only.get(order_id, True)
-                    notional = fill_price * new_fill_size
-                    fee = 0.0 if is_maker else notional * self.config.taker_fee_rate
-                    fill = Fill(
-                        ts=time.time(),
-                        side=quote.side,
-                        token_id=quote.token_id,
-                        price=fill_price,
-                        size=round(new_fill_size, 4),
-                        fee=fee,
-                        order_id=order_id,
-                        is_maker=is_maker,
-                    )
-                    fills.append(fill)
-                    self._partial_fill_reported[order_id] = size_matched
+                try:
+                    order = order_result
+                    if order is None:
+                        continue
+                    status = order.get("status", "")
+                    size_matched_raw = order.get("size_matched", 0)
+                    size_matched = self._safe_float(size_matched_raw)
+                    if size_matched is None:
+                        self._reconcile_requested = True
+                        log.error(
+                            "Anomalous fill: invalid size_matched (%s) for order %s",
+                            size_matched_raw,
+                            order_id[:12],
+                        )
+                        continue
 
-                    # Track session spending for budget cap
-                    if quote.side == "BUY":
-                        self._session_spent += new_fill_size * fill_price
-                    elif quote.side == "SELL":
-                        self._session_spent = max(0.0, self._session_spent - new_fill_size * fill_price)
+                    # Track how much we already reported for this order
+                    prev_matched = self._partial_fill_reported.get(order_id, 0.0)
+                    remaining_size = max(0.0, quote.size - prev_matched)
+                    new_fill_size = size_matched - prev_matched
 
-                    # Mock balance tracking mirrors fill-side share movements.
-                    if hasattr(self.client, "_orders"):
-                        signed_size = new_fill_size if quote.side == "BUY" else -new_fill_size
-                        cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                        self._mock_token_balances[quote.token_id] = cur + signed_size
+                    if new_fill_size > remaining_size + 0.1:
+                        self._reconcile_requested = True
+                        log.error(
+                            "Anomalous fill: size_matched exceeds order remainder "
+                            "(order=%s size_matched=%.4f already_filled=%.4f remaining=%.4f original=%.4f)",
+                            order_id[:12],
+                            size_matched,
+                            prev_matched,
+                            remaining_size,
+                            quote.size,
+                        )
+                        # Still clean up completed/cancelled orders to prevent drift
+                        if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
+                            to_remove.append(order_id)
+                            self._partial_fill_reported.pop(order_id, None)
+                        continue
+                    if new_fill_size < -0.1:
+                        self._reconcile_requested = True
+                        log.error(
+                            "Anomalous fill: size_matched regressed "
+                            "(order=%s size_matched=%.4f already_filled=%.4f)",
+                            order_id[:12],
+                            size_matched,
+                            prev_matched,
+                        )
+                        if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
+                            to_remove.append(order_id)
+                            self._partial_fill_reported.pop(order_id, None)
+                        continue
 
-                if status in ("MATCHED", "CLOSED"):
-                    self._filled_order_ids.add(order_id)
-                    to_remove.append(order_id)
-                    self._partial_fill_reported.pop(order_id, None)
-                elif status in ("CANCELLED", "EXPIRED"):
-                    to_remove.append(order_id)
-                    self._partial_fill_reported.pop(order_id, None)
+                    if new_fill_size >= 0.01:
+                        fill_price = self._extract_fill_price(order, quote.price)
+                        is_maker = self._order_post_only.get(order_id, True)
+                        notional = fill_price * new_fill_size
+                        fee = 0.0 if is_maker else notional * self.config.taker_fee_rate
+                        fill = Fill(
+                            ts=time.time(),
+                            side=quote.side,
+                            token_id=quote.token_id,
+                            price=fill_price,
+                            size=round(new_fill_size, 4),
+                            fee=fee,
+                            order_id=order_id,
+                            is_maker=is_maker,
+                        )
+                        fills.append(fill)
+                        self._partial_fill_reported[order_id] = size_matched
 
-            except Exception as e:
-                log.debug(f"Error checking order {order_id[:12]}...: {e}")
+                        # Track session spending for budget cap
+                        if quote.side == "BUY":
+                            self._session_spent += new_fill_size * fill_price
+                        elif quote.side == "SELL":
+                            self._session_spent = max(0.0, self._session_spent - new_fill_size * fill_price)
+
+                        # Mock balance tracking mirrors fill-side share movements.
+                        if hasattr(self.client, "_orders"):
+                            signed_size = new_fill_size if quote.side == "BUY" else -new_fill_size
+                            cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                            self._mock_token_balances[quote.token_id] = cur + signed_size
+
+                    if status in ("MATCHED", "CLOSED"):
+                        self._filled_order_ids.add(order_id)
+                        to_remove.append(order_id)
+                        self._partial_fill_reported.pop(order_id, None)
+                    elif status in ("CANCELLED", "EXPIRED"):
+                        to_remove.append(order_id)
+                        self._partial_fill_reported.pop(order_id, None)
+
+                except Exception as e:
+                    log.debug(f"Error checking order {order_id[:12]}...: {e}")
 
         for oid in to_remove:
             self._active_orders.pop(oid, None)
