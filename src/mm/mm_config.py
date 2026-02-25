@@ -30,6 +30,7 @@ class MMConfig:
         "max_order_size_usd": (1.0, 1000.0),
         "max_position_usd": (5.0, 5000.0),
         "max_inventory_shares": (1.0, 500.0),
+        "max_net_delta_shares": (1.0, 200.0),
         "layers": (1.0, 10.0),
         "layer_spacing_bps": (1.0, 1000.0),
         "skew_bps_per_unit": (0.0, 500.0),
@@ -65,7 +66,8 @@ class MMConfig:
     max_order_size_usd: float = 100.0
 
     # ── Inventory ────────────────────────────────────────────────
-    max_inventory_shares: float = 25.0   # max shares one-sided
+    max_inventory_shares: float = 15.0   # max shares one-sided
+    max_net_delta_shares: float = 10.0   # Max abs(up_shares - dn_shares) - directional exposure cap
     skew_bps_per_unit: float = 15.0      # skew per share of net delta
 
     # ── Requoting ────────────────────────────────────────────────
@@ -79,7 +81,7 @@ class MMConfig:
     use_gtd: bool = True                 # use GTD order type
 
     # ── Risk ─────────────────────────────────────────────────────
-    max_drawdown_usd: float = 15.0       # max session drawdown (conservative default)
+    max_drawdown_usd: float = 8.0        # max session drawdown (conservative default)
     volatility_pause_mult: float = 3.0   # pause if vol > N × avg
     max_loss_per_fill_usd: float = 5.0   # Max acceptable loss on single fill
     take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)

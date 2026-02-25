@@ -47,8 +47,13 @@ class RiskManager:
 
     def check_inventory_limit(self, inventory: Inventory) -> bool:
         """Return True if inventory is within limits."""
-        return (abs(inventory.up_shares) <= self.config.max_inventory_shares and
-                abs(inventory.dn_shares) <= self.config.max_inventory_shares)
+        if abs(inventory.up_shares) > self.config.max_inventory_shares:
+            return False
+        if abs(inventory.dn_shares) > self.config.max_inventory_shares:
+            return False
+        if abs(inventory.net_delta) > self.config.max_net_delta_shares:
+            return False
+        return True
 
     def compute_pnl(self, inventory: Inventory,
                     fv_up: float = 0.5, fv_dn: float = 0.5) -> dict:
@@ -125,6 +130,12 @@ class RiskManager:
 
         # Check inventory limit (after PnL exits)
         if not self.check_inventory_limit(inventory):
+            if abs(inventory.net_delta) > self.config.max_net_delta_shares:
+                return True, (
+                    f"Inventory limit (net delta): |{inventory.net_delta:.1f}| > "
+                    f"{self.config.max_net_delta_shares:.0f} "
+                    f"(UP={inventory.up_shares:.1f}, DN={inventory.dn_shares:.1f})"
+                )
             return True, f"Inventory limit exceeded: UP={inventory.up_shares:.1f}, DN={inventory.dn_shares:.1f}"
 
         # Check volatility spike
@@ -152,6 +163,7 @@ class RiskManager:
             "inventory_up": round(inventory.up_shares, 2),
             "inventory_dn": round(inventory.dn_shares, 2),
             "net_delta": round(inventory.net_delta, 2),
+            "max_net_delta_shares": self.config.max_net_delta_shares,
             "usdc_balance": round(inventory.usdc, 2),
         }
 

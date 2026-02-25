@@ -88,6 +88,16 @@ class MarketMaker:
         self._merge_failed_this_cycle: bool = False
         self._closing_start_time_left: float = 0.0
         self._requote_event: asyncio.Event = asyncio.Event()
+        self._imbalance_start_ts: float = 0.0
+        self._imbalance_adjustments: dict = {
+            "leading_spread_mult": 1.0,
+            "lagging_spread_mult": 1.0,
+            "skew_mult": 1.0,
+            "tier": 0,
+            "suppress_leading_buy": False,
+            "force_taker_lagging": False,
+        }
+        self._taker_quotes: list[Quote] = []
         self._reconcile_prev_pm: tuple[float, float] | None = None
         self._reconcile_stable_count: int = 0
         self._warn_cooldowns: dict[str, float] = {}
@@ -229,6 +239,16 @@ class MarketMaker:
         self._quality_error_count = 0
         self._quality_success_count = 0
         self._quality_pause_active = False
+        self._imbalance_start_ts = 0.0
+        self._imbalance_adjustments = {
+            "leading_spread_mult": 1.0,
+            "lagging_spread_mult": 1.0,
+            "skew_mult": 1.0,
+            "tier": 0,
+            "suppress_leading_buy": False,
+            "force_taker_lagging": False,
+        }
+        self._taker_quotes = []
         self.risk_mgr.reset()
 
         # Set budget cap on order manager (enforced at placement time)
@@ -497,6 +517,16 @@ class MarketMaker:
         _t_reconcile = time.perf_counter()
 
         if self._is_closing:
+            self._imbalance_start_ts = 0.0
+            self._imbalance_adjustments = {
+                "leading_spread_mult": 1.0,
+                "lagging_spread_mult": 1.0,
+                "skew_mult": 1.0,
+                "tier": 0,
+                "suppress_leading_buy": False,
+                "force_taker_lagging": False,
+            }
+            self._taker_quotes = []
             # Continuously try to sell remaining inventory each tick
             await self._liquidate_inventory()
             return
@@ -614,6 +644,12 @@ class MarketMaker:
                 _inv_limit_suppress.add("up")
             if self.inventory.dn_shares > max_sh:
                 _inv_limit_suppress.add("dn")
+            # Net delta breach: suppress BUY on the leading (higher shares) side
+            if "net delta" in reason:
+                if self.inventory.up_shares >= self.inventory.dn_shares:
+                    _inv_limit_suppress.add("up")
+                else:
+                    _inv_limit_suppress.add("dn")
             # Mark as "soft pause" for UI, but keep quoting
             self._paused = True
             self._pause_reason = reason + " (selling to reduce)"
@@ -731,6 +767,48 @@ class MarketMaker:
         if self._quality_pause_active:
             return
 
+        # 5b. Paired filling imbalance escalation (skip during closing mode).
+        imbalance = abs(self.inventory.up_shares - self.inventory.dn_shares)
+        now_ts = time.time()
+        if imbalance > 2.0:
+            if self._imbalance_start_ts <= 0:
+                self._imbalance_start_ts = now_ts
+            imbalance_duration = max(0.0, now_ts - self._imbalance_start_ts)
+        else:
+            self._imbalance_start_ts = 0.0
+            imbalance_duration = 0.0
+
+        prev_tier = int(self._imbalance_adjustments.get("tier", 0))
+        self._imbalance_adjustments = self.quote_engine.compute_imbalance_adjustments(
+            self.inventory,
+            imbalance,
+            imbalance_duration,
+        )
+        tier = int(self._imbalance_adjustments.get("tier", 0))
+        if tier != prev_tier:
+            leading_key = "up" if self.inventory.up_shares > self.inventory.dn_shares else (
+                "dn" if self.inventory.dn_shares > self.inventory.up_shares else "none"
+            )
+            lagging_key = "dn" if leading_key == "up" else ("up" if leading_key == "dn" else "none")
+            log.info(
+                "Paired filling tier %d: imbalance=%.2f duration=%.1fs leading=%s lagging=%s",
+                tier,
+                imbalance,
+                imbalance_duration,
+                leading_key.upper(),
+                lagging_key.upper(),
+            )
+
+        if fills and imbalance > 2.0:
+            self._requote_event.set()
+
+        leading_token: str | None = None
+        lagging_token: str | None = None
+        if self.inventory.up_shares > self.inventory.dn_shares:
+            leading_token, lagging_token = "up", "dn"
+        elif self.inventory.dn_shares > self.inventory.up_shares:
+            leading_token, lagging_token = "dn", "up"
+
         # 6. Generate quotes (with USDC budget cap)
         order_collateral = sum(
             self.order_mgr.required_collateral(q)
@@ -745,10 +823,52 @@ class MarketMaker:
             usdc_budget=self.inventory.initial_usdc,
             order_collateral=order_collateral,
             tick_size=self.market.tick_size if self.market else 0.01,
+            imbalance_adjustments=self._imbalance_adjustments,
             time_remaining=time_left,
         )
 
         self._quote_count += 1
+
+        tick_size = self.market.tick_size if self.market else 0.01
+
+        def _round_to_tick(price: float) -> float:
+            rounded = round(round(price / tick_size) * tick_size, 10)
+            return max(tick_size, min(1.0 - tick_size, rounded))
+
+        def _apply_spread_multiplier(token_key: str, spread_mult: float) -> None:
+            if spread_mult <= 0:
+                return
+            bid, ask = all_quotes[token_key]
+            if bid is None or ask is None:
+                return
+
+            mid_px = (bid.price + ask.price) / 2.0
+            half = max(tick_size * 0.5, ((ask.price - bid.price) / 2.0) * spread_mult)
+            bid.price = _round_to_tick(mid_px - half)
+            ask.price = _round_to_tick(mid_px + half)
+
+            # Maintain at least one tick spread after rounding.
+            if bid.price >= ask.price:
+                bid.price = _round_to_tick(ask.price - tick_size)
+                if bid.price >= ask.price:
+                    ask.price = _round_to_tick(bid.price + tick_size)
+
+            all_quotes[token_key] = (bid, ask)
+
+        # 6a-pre. Paired filling spread asymmetry and hard side suppression.
+        if leading_token:
+            _apply_spread_multiplier(
+                leading_token,
+                float(self._imbalance_adjustments.get("leading_spread_mult", 1.0)),
+            )
+        if lagging_token:
+            _apply_spread_multiplier(
+                lagging_token,
+                float(self._imbalance_adjustments.get("lagging_spread_mult", 1.0)),
+            )
+        if leading_token and self._imbalance_adjustments.get("suppress_leading_buy", False):
+            lead_bid, lead_ask = all_quotes[leading_token]
+            all_quotes[leading_token] = (None, lead_ask)
 
         # 6a-pre. Suppress BUY on inventory-overloaded sides
         if _inv_limit_suppress:
@@ -767,6 +887,14 @@ class MarketMaker:
             if fv_dn < min_fv and all_quotes["dn"][0] is not None:
                 log.info(f"Skipping DN bid: FV={fv_dn:.3f} < min_fv={min_fv}")
                 all_quotes["dn"] = (None, all_quotes["dn"][1])
+
+        self._taker_quotes = []
+        taker_lagging_key: str | None = None
+        if lagging_token and self._imbalance_adjustments.get("force_taker_lagging", False):
+            lag_bid, _ = all_quotes[lagging_token]
+            if lag_bid is not None:
+                self._taker_quotes.append(lag_bid)
+                taker_lagging_key = lagging_token
 
         # 6b. Fetch Polymarket book and clamp quotes to avoid crossing.
         # Use cached WS prices when both sides are fresh (0ms), fallback to HTTP.
@@ -802,6 +930,9 @@ class MarketMaker:
                 bid, ask, book["best_bid"], book["best_ask"],
                 tick_size=self.market.tick_size,
             )
+            if taker_lagging_key == token_key and bid is not None and book["best_ask"] is not None:
+                # Force taker cross on lagging side to accelerate balancing fills.
+                bid.price = _round_to_tick(float(book["best_ask"]))
             # Re-apply max inventory cap after clamping (safety net)
             max_sh = self.config.max_inventory_shares
             if bid is not None and bid.size > max_sh:
@@ -823,8 +954,12 @@ class MarketMaker:
         for token_key in ("up", "dn"):
             new_bid, new_ask = all_quotes[token_key]
             cur_bid, cur_ask = self._current_quotes.get(token_key, (None, None))
+            use_taker_bid = bool(new_bid is not None and any(q is new_bid for q in self._taker_quotes))
 
             need_bid = self.quote_engine.should_requote(cur_bid, new_bid)
+            if use_taker_bid and new_bid is not None:
+                # Force refresh while in taker mode so lagging-side BUY keeps crossing.
+                need_bid = True
             bid_notional = (new_bid.size * new_bid.price) if new_bid else 0.0
             if need_bid and bid_notional < self.config.min_order_size_usd:
                 need_bid = False
@@ -887,15 +1022,41 @@ class MarketMaker:
                 if need_ask:
                     new_quotes.append(new_ask)
 
-                new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
-
-                # Only update tracking when cancel_replace actually placed orders
-                if new_ids is not None:
+                if use_taker_bid and need_bid:
+                    # cancel_replace cannot set per-order post_only, so handle taker bid manually.
+                    if old_ids:
+                        cancel_results = await asyncio.gather(
+                            *(self.order_mgr.cancel_order(oid) for oid in old_ids if oid)
+                        )
+                        if not all(cancel_results):
+                            failed = sum(1 for r in cancel_results if not r)
+                            log.warning(
+                                "taker cancel/replace: %d/%d cancels failed, skipping new placements",
+                                failed,
+                                len(cancel_results),
+                            )
+                            continue
+                    if need_bid and new_bid is not None:
+                        await self.order_mgr.place_order(
+                            new_bid,
+                            post_only=False,
+                            fallback_taker=True,
+                        )
+                    if need_ask and new_ask is not None:
+                        await self.order_mgr.place_order(new_ask)
                     updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
                     updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                     self._current_quotes[token_key] = (updated_bid, updated_ask)
-                # If cancel_replace failed (returned []), leave _current_quotes unchanged
-                # so next tick retries the cancel+replace
+                else:
+                    new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
+
+                    # Only update tracking when cancel_replace actually placed orders
+                    if new_ids is not None:
+                        updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
+                        updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
+                        self._current_quotes[token_key] = (updated_bid, updated_ask)
+                    # If cancel_replace failed (returned []), leave _current_quotes unchanged
+                    # so next tick retries the cancel+replace
 
         _t_orders = time.perf_counter()
 
@@ -1339,6 +1500,16 @@ class MarketMaker:
         self._reconcile_stable_count = 0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
+        self._imbalance_start_ts = 0.0
+        self._imbalance_adjustments = {
+            "leading_spread_mult": 1.0,
+            "lagging_spread_mult": 1.0,
+            "skew_mult": 1.0,
+            "tier": 0,
+            "suppress_leading_buy": False,
+            "force_taker_lagging": False,
+        }
+        self._taker_quotes = []
 
         # Update market info
         self.market = new_market
@@ -1443,6 +1614,15 @@ class MarketMaker:
                 "usdc": round(self.inventory.usdc, 2),
                 "up_avg_entry": round(self.inventory.up_cost.avg_entry_price, 4),
                 "dn_avg_entry": round(self.inventory.dn_cost.avg_entry_price, 4),
+            },
+
+            # Paired filling state
+            "paired_filling": {
+                "imbalance_shares": round(abs(self.inventory.up_shares - self.inventory.dn_shares), 2),
+                "imbalance_duration_sec": round(
+                    max(0.0, time.time() - self._imbalance_start_ts), 2
+                ) if self._imbalance_start_ts > 0 else 0.0,
+                **self._imbalance_adjustments,
             },
 
             # Liquidation lock

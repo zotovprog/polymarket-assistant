@@ -59,7 +59,13 @@ class QuoteEngine:
         return max(self.config.min_spread_bps,
                    min(self.config.max_spread_bps, base))
 
-    def _inventory_skew(self, inventory: Inventory) -> float:
+    def _inventory_skew(
+        self,
+        inventory: Inventory,
+        *,
+        tier: int = 0,
+        skew_mult: float = 1.0,
+    ) -> float:
         """Compute price skew based on net delta.
 
         Positive delta (long UP) → skew positive → shifts mid down for UP token,
@@ -67,8 +73,82 @@ class QuoteEngine:
         Returns skew in price units.
         """
         delta = inventory.net_delta
-        skew_bps = delta * self.config.skew_bps_per_unit
+        if delta == 0:
+            return 0.0
+
+        safe_tier = max(0, min(3, int(tier)))
+        exponent = 1.0 + 0.5 * (safe_tier / 3.0)
+        sign = 1.0 if delta > 0 else -1.0
+        skew_bps = sign * self.config.skew_bps_per_unit * (abs(delta) ** exponent) * max(1.0, skew_mult)
         return _bps_to_price(skew_bps)
+
+    def compute_imbalance_adjustments(
+        self,
+        inventory: Inventory,
+        fill_imbalance_shares: float,
+        imbalance_duration_sec: float,
+    ) -> dict:
+        """Compute asymmetric spread/skew adjustments based on fill imbalance."""
+        imbalance = max(0.0, float(fill_imbalance_shares))
+        duration = max(0.0, float(imbalance_duration_sec))
+
+        # Tier 0 hard gate: very small imbalance gets no adjustments regardless of duration.
+        if imbalance < 3.0:
+            return {
+                "leading_spread_mult": 1.0,
+                "lagging_spread_mult": 1.0,
+                "skew_mult": 1.0,
+                "tier": 0,
+                "suppress_leading_buy": False,
+                "force_taker_lagging": False,
+            }
+
+        # Size-based tier escalation.
+        if imbalance >= 15.0:
+            size_tier = 3
+        elif imbalance >= 8.0:
+            size_tier = 2
+        else:
+            size_tier = 1
+
+        # Time-based tier escalation.
+        if duration > 20.0:
+            time_tier = 3
+        elif duration >= 10.0:
+            time_tier = 2
+        else:
+            time_tier = 1
+
+        tier = max(size_tier, time_tier)
+
+        if tier == 1:
+            return {
+                "leading_spread_mult": 1.3,
+                "lagging_spread_mult": 0.5,
+                "skew_mult": 1.5,
+                "tier": 1,
+                "suppress_leading_buy": False,
+                "force_taker_lagging": False,
+            }
+        if tier == 2:
+            return {
+                "leading_spread_mult": 2.0,
+                "lagging_spread_mult": 0.3,
+                "skew_mult": 2.5,
+                "tier": 2,
+                "suppress_leading_buy": False,
+                "force_taker_lagging": False,
+            }
+
+        # Tier 3 keeps aggressive spread profile and enables hard balancing actions.
+        return {
+            "leading_spread_mult": 2.0,
+            "lagging_spread_mult": 0.3,
+            "skew_mult": 3.0,
+            "tier": 3,
+            "suppress_leading_buy": True,
+            "force_taker_lagging": True,
+        }
 
     def generate_quotes(self, fair_value: float,
                         token_id: str,
@@ -77,6 +157,7 @@ class QuoteEngine:
                         avg_volatility: float = 0.0,
                         tick_size: float = 0.01,
                         invert_skew: bool = False,
+                        imbalance_adjustments: dict | None = None,
                         time_remaining: float = -1.0) -> tuple[Quote, Quote]:
         """Generate a bid and ask quote for a single token.
 
@@ -92,7 +173,12 @@ class QuoteEngine:
         """
         half_spread_bps = self._effective_half_spread(volatility, avg_volatility, time_remaining)
         half_spread = _bps_to_price(half_spread_bps)
-        skew = self._inventory_skew(inventory)
+        imbalance_adjustments = imbalance_adjustments or {}
+        skew = self._inventory_skew(
+            inventory,
+            tier=int(imbalance_adjustments.get("tier", 0)),
+            skew_mult=float(imbalance_adjustments.get("skew_mult", 1.0)),
+        )
         if invert_skew:
             skew = -skew
 
@@ -170,6 +256,7 @@ class QuoteEngine:
                             usdc_budget: float = 0.0,
                             order_collateral: float = 0.0,
                             tick_size: float = 0.01,
+                            imbalance_adjustments: dict | None = None,
                             time_remaining: float = -1.0) -> dict[str, tuple[Quote | None, Quote]]:
         """Generate quotes for both UP and DN tokens.
 
@@ -181,10 +268,13 @@ class QuoteEngine:
         """
         up_bid, up_ask = self.generate_quotes(
             fv_up, up_token_id, inventory, volatility, avg_volatility,
-            tick_size=tick_size, time_remaining=time_remaining)
+            tick_size=tick_size, imbalance_adjustments=imbalance_adjustments,
+            time_remaining=time_remaining)
         dn_bid, dn_ask = self.generate_quotes(
             fv_dn, dn_token_id, inventory, volatility, avg_volatility,
-            tick_size=tick_size, invert_skew=True, time_remaining=time_remaining)
+            tick_size=tick_size, invert_skew=True,
+            imbalance_adjustments=imbalance_adjustments,
+            time_remaining=time_remaining)
 
         # Cap BUY size by remaining inventory room per token.
         max_shares = self.config.max_inventory_shares
