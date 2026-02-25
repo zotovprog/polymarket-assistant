@@ -80,6 +80,9 @@ class MarketMaker:
         self._cached_pm_dn_shares: float = 0.0
         self._starting_usdc_pm: float = 0.0
         self._starting_portfolio_pm: float = 0.0  # USDC + token values at start
+        self._pnl_grace_until: float = 0.0  # Skip PnL risk checks until this timestamp
+        self._catastrophic_count: int = 0  # Consecutive CATASTROPHIC readings
+        self._catastrophic_threshold: int = 3  # Readings required before shutdown
         self._last_quality: MarketQuality | None = None
         self._quality_error_count: int = 0
         self._quality_success_count: int = 0
@@ -232,9 +235,22 @@ class MarketMaker:
             self._cached_pm_up_shares = real_up if real_up is not None else 0.0
             self._cached_pm_dn_shares = real_dn if real_dn is not None else 0.0
             # Include pre-existing tokens in starting portfolio
-            # Use current PM prices or FV as valuation
-            _fv_up = self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") and self.feed_state.pm_up else 0.5
-            _fv_dn = self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") and self.feed_state.pm_dn else 0.5
+            # Wait for valid PM prices (WS feed) before computing starting portfolio
+            _fv_up, _fv_dn = 0.0, 0.0
+            for _price_attempt in range(10):
+                _fv_up = getattr(self.feed_state, "pm_up", 0.0) or 0.0
+                _fv_dn = getattr(self.feed_state, "pm_dn", 0.0) or 0.0
+                if _fv_up > 0 and _fv_dn > 0:
+                    break
+                log.info("Waiting for PM prices before starting (attempt %d/10)...", _price_attempt + 1)
+                await asyncio.sleep(1.0)
+            if _fv_up <= 0 or _fv_dn <= 0:
+                log.critical(
+                    "PM prices not available after 10s! Using 0.5 fallback. "
+                    "Starting PnL will be UNRELIABLE until prices arrive."
+                )
+                _fv_up = _fv_up if _fv_up > 0 else 0.5
+                _fv_dn = _fv_dn if _fv_dn > 0 else 0.5
             _token_value = self._cached_pm_up_shares * _fv_up + self._cached_pm_dn_shares * _fv_dn
             self._starting_portfolio_pm = starting_usdc + _token_value
             log.info(
@@ -251,6 +267,8 @@ class MarketMaker:
             self._cached_pm_up_shares = 0.0
             self._cached_pm_dn_shares = 0.0
         self._started_at = time.time()
+        self._pnl_grace_until = self._started_at + 30.0  # 30s grace period for PnL checks
+        self._catastrophic_count = 0
         self._paused = False
         self._pause_reason = ""
         self._heartbeat_failure_task = None
@@ -639,33 +657,58 @@ class MarketMaker:
         _current_portfolio = self._cached_usdc_balance + _pos_value
         _session_pnl = (_current_portfolio - self._starting_portfolio_pm) if self._starting_portfolio_pm > 0 else None
 
+        # Grace period: skip PnL-based risk checks for first 30s while balances settle
+        _in_grace = time.time() < self._pnl_grace_until
+        _risk_pnl = None if _in_grace else _session_pnl
+        if _in_grace and self._tick_count % 10 == 0:
+            log.info("PnL grace period active (%.0fs left), risk checks use fill-based PnL",
+                     self._pnl_grace_until - time.time())
+
         should_pause, reason = self.risk_mgr.should_pause(
-            self.inventory, vol, fv_up, fv_dn, session_pnl=_session_pnl)
+            self.inventory, vol, fv_up, fv_dn, session_pnl=_risk_pnl)
 
         # Exit triggers (TP, trailing stop, drawdown) ALWAYS take priority — even if already paused
         if should_pause and ("Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason):
-            log.warning(f"Exit trigger: {reason}")
-            self._paused = False
-            self._pause_reason = ""
-            # Lock prices at trigger time
-            self._liq_lock = self.risk_mgr.lock_pnl(
-                self.inventory, fv_up, fv_dn,
-                self.config.liq_price_floor_margin)
-            log.info(
-                "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
-                "UP_floor=%.2f DN_floor=%.2f",
-                self._liq_lock.trigger_pnl,
-                self._liq_lock.up_avg_entry, self._liq_lock.dn_avg_entry,
-                self._liq_lock.min_sell_price_up, self._liq_lock.min_sell_price_dn,
-            )
-            self._liq_chunk_index = 0
-            self._liq_last_chunk_time = 0.0
-            self._is_closing = True
-            self._closing_start_time_left = self.market.time_remaining
-            self._merge_failed_this_cycle = False
-            await self.order_mgr.cancel_all()
-            self._current_quotes = {"up": (None, None), "dn": (None, None)}
-            return
+            # For Max drawdown: require confirmation (grace period + consecutive readings)
+            if "Max drawdown" in reason:
+                if _in_grace:
+                    log.info("Max drawdown trigger skipped (grace period): %s", reason)
+                    should_pause = False
+                else:
+                    self._catastrophic_count += 1
+                    if self._catastrophic_count < self._catastrophic_threshold:
+                        log.warning(
+                            "Max drawdown reading %d/%d: %s",
+                            self._catastrophic_count, self._catastrophic_threshold, reason,
+                        )
+                        should_pause = False  # Don't act yet, wait for confirmation
+                    else:
+                        log.warning("Max drawdown CONFIRMED (%d readings): %s",
+                                    self._catastrophic_count, reason)
+                        self._catastrophic_count = 0
+            if should_pause:
+                log.warning(f"Exit trigger: {reason}")
+                self._paused = False
+                self._pause_reason = ""
+                # Lock prices at trigger time
+                self._liq_lock = self.risk_mgr.lock_pnl(
+                    self.inventory, fv_up, fv_dn,
+                    self.config.liq_price_floor_margin)
+                log.info(
+                    "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
+                    "UP_floor=%.2f DN_floor=%.2f",
+                    self._liq_lock.trigger_pnl,
+                    self._liq_lock.up_avg_entry, self._liq_lock.dn_avg_entry,
+                    self._liq_lock.min_sell_price_up, self._liq_lock.min_sell_price_dn,
+                )
+                self._liq_chunk_index = 0
+                self._liq_last_chunk_time = 0.0
+                self._is_closing = True
+                self._closing_start_time_left = self.market.time_remaining
+                self._merge_failed_this_cycle = False
+                await self.order_mgr.cancel_all()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
 
         # Inventory limit: don't fully pause — suppress BUY on overloaded side
         _inv_limit_suppress: set[str] = set()  # token keys to suppress BUY
@@ -700,6 +743,10 @@ class MarketMaker:
 
         if self._paused and not _inv_limit_suppress and not self._quality_pause_active:
             return
+
+        # Reset catastrophic counter when PnL is healthy
+        if not should_pause or "drawdown" not in reason.lower():
+            self._catastrophic_count = 0
 
         # ── One-sided exposure check ──────────────────────────────
         up_sh = self.inventory.up_shares
@@ -1102,7 +1149,7 @@ class MarketMaker:
         # 8b. Refresh PM balances AFTER order placement for accurate PnL.
         # USDC changes when orders are placed/filled; token balances change on fills.
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live and not self._is_closing:
+        if is_live:
             try:
                 (real_up, real_dn), usdc_bal = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(
@@ -1230,11 +1277,49 @@ class MarketMaker:
             _pos_val = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
             _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_portfolio_pm
             if _liq_pnl < -2 * self.config.max_drawdown_usd:
-                await self._emergency_shutdown(
-                    f"CATASTROPHIC LOSS during liquidation: sPnL=${_liq_pnl:.2f}"
+                self._catastrophic_count += 1
+                log.warning(
+                    "CATASTROPHIC reading %d/%d: sPnL=$%.2f (USDC=$%.2f, pos=$%.2f, start=$%.2f)",
+                    self._catastrophic_count, self._catastrophic_threshold,
+                    _liq_pnl, self._cached_usdc_balance, _pos_val,
+                    self._starting_portfolio_pm,
                 )
-                return
-            elif _liq_pnl < -self.config.max_drawdown_usd and not use_taker:
+                if self._catastrophic_count >= self._catastrophic_threshold:
+                    # Fresh recheck: re-fetch balances before final decision
+                    try:
+                        fresh_usdc = await self.order_mgr.get_usdc_balance()
+                        (fresh_up, fresh_dn) = await self.order_mgr.get_all_token_balances(
+                            self.market.up_token_id, self.market.dn_token_id)
+                        if fresh_usdc is not None:
+                            self._cached_usdc_balance = fresh_usdc
+                        if fresh_up is not None:
+                            self._cached_pm_up_shares = fresh_up
+                        if fresh_dn is not None:
+                            self._cached_pm_dn_shares = fresh_dn
+                        _fresh_pos = (self._cached_pm_up_shares * _pm_up +
+                                      self._cached_pm_dn_shares * _pm_dn)
+                        _fresh_pnl = (self._cached_usdc_balance + _fresh_pos) - self._starting_portfolio_pm
+                        log.warning("CATASTROPHIC fresh recheck: sPnL=$%.2f (was $%.2f)", _fresh_pnl, _liq_pnl)
+                        if _fresh_pnl < -2 * self.config.max_drawdown_usd:
+                            await self._emergency_shutdown(
+                                f"CATASTROPHIC LOSS confirmed ({self._catastrophic_threshold} readings + fresh recheck): "
+                                f"sPnL=${_fresh_pnl:.2f}"
+                            )
+                            return
+                        else:
+                            log.warning("CATASTROPHIC averted after fresh recheck: sPnL=$%.2f", _fresh_pnl)
+                            self._catastrophic_count = 0
+                    except Exception as e:
+                        log.error("CATASTROPHIC recheck failed: %s — shutting down as precaution", e)
+                        await self._emergency_shutdown(
+                            f"CATASTROPHIC LOSS (recheck failed): sPnL=${_liq_pnl:.2f}"
+                        )
+                        return
+                else:
+                    return  # Wait for more readings before deciding
+            else:
+                self._catastrophic_count = 0  # Reset counter on non-catastrophic reading
+            if _liq_pnl < -self.config.max_drawdown_usd and not use_taker:
                 log.warning("Max drawdown exceeded during liquidation: sPnL=$%.2f, forcing taker mode", _liq_pnl)
                 use_taker = True
 
