@@ -1402,6 +1402,7 @@ body {
     color: var(--text-muted);
     position: sticky;
     bottom: 0;
+    z-index: 100;
 }
 
 .risk-ok      { color: var(--success); }
