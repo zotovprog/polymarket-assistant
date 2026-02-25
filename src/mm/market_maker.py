@@ -429,7 +429,8 @@ class MarketMaker:
         require_scoring = bool(getattr(self.config, "rebate_require_scoring", False))
         non_scoring_mult = float(getattr(self.config, "rebate_non_scoring_size_mult", 0.7))
         non_scoring_mult = max(0.1, min(1.0, non_scoring_mult))
-        min_size = float(getattr(self.config, "min_quote_size_shares", 1.0))
+        pm_min_size = float(self.market.min_order_size) if self.market else 5.0
+        min_size = max(float(getattr(self.config, "min_quote_size_shares", 1.0)), pm_min_size)
         dropped = 0
         resized = 0
         eligible = 0
@@ -1599,24 +1600,33 @@ class MarketMaker:
             cur_bid, cur_ask = self._current_quotes.get(token_key, (None, None))
             use_taker_bid = bool(new_bid is not None and any(q is new_bid for q in self._taker_quotes))
             use_ioc_like_bid = bool(use_taker_bid and getattr(self.config, "paired_fill_ioc_enabled", False))
+            pm_min_size = float(self.market.min_order_size) if self.market else 5.0
+
+            if new_bid is not None and 0 < new_bid.size < pm_min_size:
+                new_bid.size = round(pm_min_size, 2)
 
             need_bid = self.quote_engine.should_requote(cur_bid, new_bid)
             if use_taker_bid and new_bid is not None:
                 need_bid = True
+            bid_size = new_bid.size if new_bid else 0.0
             bid_notional = (new_bid.size * new_bid.price) if new_bid else 0.0
-            if need_bid and bid_notional < self.config.min_order_size_usd:
+            if need_bid and (bid_notional < self.config.min_order_size_usd or bid_size < pm_min_size):
                 need_bid = False
 
             stale_bid = (not need_bid and cur_bid and cur_bid.order_id
                          and (new_bid is None
-                              or bid_notional < self.config.min_order_size_usd))
+                              or bid_notional < self.config.min_order_size_usd
+                              or bid_size < pm_min_size))
 
             token_bal = (self.inventory.up_shares if token_key == "up"
                          else self.inventory.dn_shares)
             if new_ask and token_bal > 0:
                 new_ask.size = round(min(new_ask.size, token_bal), 2)
+            if new_ask and 0 < new_ask.size < pm_min_size and token_bal >= pm_min_size:
+                new_ask.size = round(pm_min_size, 2)
             ask_size = new_ask.size if new_ask else 0.0
             ask_price = new_ask.price if new_ask else 0.0
+            ask_notional = ask_size * ask_price
             current_ask_size = cur_ask.size if (cur_ask and cur_ask.order_id) else 0.0
             material_ask_size_change = (
                 new_ask is not None
@@ -1641,10 +1651,13 @@ class MarketMaker:
                 if token_bal > 0 and new_ask is not None:
                     need_ask = True
 
-            if need_ask and (ask_size * ask_price) < self.config.min_order_size_usd:
+            if need_ask and (ask_notional < self.config.min_order_size_usd or ask_size < pm_min_size):
                 need_ask = False
             stale_ask = (cur_ask and cur_ask.order_id
-                         and (token_bal <= 0 or oversized_live_ask)
+                         and (token_bal <= 0 or oversized_live_ask
+                              or new_ask is None
+                              or ask_size < pm_min_size
+                              or ask_notional < self.config.min_order_size_usd)
                          and not need_ask)
 
             if need_bid or need_ask or stale_bid or stale_ask:

@@ -8,6 +8,7 @@ Uses py_clob_client for:
 """
 from __future__ import annotations
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -113,6 +114,7 @@ class OrderManager:
         self._reconcile_requested: bool = False
         self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
         self._on_ws_reconnect: Any = None  # Callable() — notify WS reconnect event
+        self._post_orders_mode: str | None = None  # runtime-resolved py-clob-client signature mode
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
@@ -147,6 +149,101 @@ class OrderManager:
         if now - self._warn_cooldowns.get(key, 0) >= cooldown:
             self._warn_cooldowns[key] = now
             self._log.warning(msg)
+
+    @staticmethod
+    def _is_signature_type_error(exc: TypeError) -> bool:
+        """Heuristic: distinguish call-signature TypeError from runtime TypeError."""
+        msg = str(exc).lower()
+        markers = (
+            "positional argument",
+            "keyword argument",
+            "required positional argument",
+            "unexpected keyword",
+        )
+        return any(m in msg for m in markers)
+
+    def _post_orders_mode_candidates(self) -> list[str]:
+        """Return compatible post_orders invocation modes, most likely first."""
+        if self._post_orders_mode:
+            return [self._post_orders_mode]
+
+        modes: list[str] = []
+        try:
+            sig = inspect.signature(self.client.post_orders)
+            params = list(sig.parameters.values())
+            names = {p.name for p in params}
+            positional = [
+                p for p in params
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            ]
+            if positional:
+                modes.append("batch_only")
+            if "orders" in names:
+                modes.append("orders_kw")
+            if "signed_orders" in names:
+                modes.append("signed_orders_kw")
+            if "order_type" in names or "post_only" in names:
+                modes.append("legacy_keywords")
+            if len(positional) >= 3:
+                modes.append("legacy_positional")
+        except Exception:
+            pass
+
+        # Safety fallbacks for unknown versions.
+        for mode in (
+            "batch_only",
+            "orders_kw",
+            "signed_orders_kw",
+            "legacy_keywords",
+            "legacy_positional",
+        ):
+            if mode not in modes:
+                modes.append(mode)
+        return modes
+
+    async def _post_orders_compat(self, batch: list[Any], order_type: Any, post_only: bool) -> Any:
+        """Call client.post_orders across py-clob-client API variants."""
+        modes = self._post_orders_mode_candidates()
+        last_type_error: TypeError | None = None
+
+        for mode in modes:
+            try:
+                if mode == "batch_only":
+                    resp = await asyncio.to_thread(self.client.post_orders, batch)
+                elif mode == "orders_kw":
+                    resp = await asyncio.to_thread(self.client.post_orders, orders=batch)
+                elif mode == "signed_orders_kw":
+                    resp = await asyncio.to_thread(self.client.post_orders, signed_orders=batch)
+                elif mode == "legacy_keywords":
+                    resp = await asyncio.to_thread(
+                        self.client.post_orders,
+                        batch,
+                        order_type=order_type,
+                        post_only=post_only,
+                    )
+                elif mode == "legacy_positional":
+                    resp = await asyncio.to_thread(
+                        self.client.post_orders,
+                        batch,
+                        order_type,
+                        post_only,
+                    )
+                else:
+                    continue
+
+                if self._post_orders_mode != mode:
+                    log.info("Resolved post_orders mode: %s", mode)
+                self._post_orders_mode = mode
+                return resp
+            except TypeError as exc:
+                if not self._is_signature_type_error(exc):
+                    raise
+                last_type_error = exc
+                continue
+
+        if last_type_error is not None:
+            raise last_type_error
+        raise RuntimeError("Failed to resolve compatible post_orders signature")
 
     @property
     def active_order_ids(self) -> list[str]:
@@ -707,12 +804,7 @@ class OrderManager:
 
             try:
                 resp = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.client.post_orders,
-                        batch,
-                        order_type,
-                        use_post_only,
-                    ),
+                    self._post_orders_compat(batch, order_type, use_post_only),
                     timeout=15.0,
                 )
                 self._notify_heartbeat_id(resp)
