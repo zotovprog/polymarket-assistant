@@ -33,6 +33,52 @@ except ImportError:
     _HAS_CLOB_TYPES = False
 
 
+class TradeLedger:
+    """Persistent trade history with backfill from API."""
+
+    def __init__(self, max_entries: int = 1000):
+        self._trades: list[dict] = []  # All recorded trades
+        self._trade_ids: set[str] = set()  # Dedup by trade_id
+        self._max_entries = max_entries
+
+    def record(self, trade: dict) -> bool:
+        """Record a trade. Returns True if new, False if duplicate."""
+        trade_id = trade.get("id") or trade.get("trade_id") or ""
+        if trade_id and trade_id in self._trade_ids:
+            return False
+        if trade_id:
+            self._trade_ids.add(trade_id)
+        self._trades.append(trade)
+        if len(self._trades) > self._max_entries:
+            # Remove oldest, update trade_ids set
+            removed = self._trades[:len(self._trades) - self._max_entries]
+            self._trades = self._trades[-self._max_entries:]
+            for r in removed:
+                rid = r.get("id") or r.get("trade_id") or ""
+                if rid:
+                    self._trade_ids.discard(rid)
+        return True
+
+    @property
+    def trades(self) -> list[dict]:
+        return list(self._trades)
+
+    @property
+    def count(self) -> int:
+        return len(self._trades)
+
+    def summary(self) -> dict:
+        """Return summary stats."""
+        buys = [t for t in self._trades if t.get("side") == "BUY"]
+        sells = [t for t in self._trades if t.get("side") == "SELL"]
+        return {
+            "total_trades": len(self._trades),
+            "buys": len(buys),
+            "sells": len(sells),
+            "unique_trade_ids": len(self._trade_ids),
+        }
+
+
 class OrderManager:
     """Manage orders on Polymarket CLOB."""
 
@@ -58,6 +104,7 @@ class OrderManager:
         self._fill_ws_task: asyncio.Task | None = None
         self._fill_ws_running = False
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
+        self.trade_ledger = TradeLedger()
         self._last_fill_check_ts: float = 0.0
         self._usdc_balance_cache: float | None = None
         self._usdc_balance_cache_ts: float = 0.0
@@ -65,10 +112,15 @@ class OrderManager:
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
         self._reconcile_requested: bool = False
         self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
+        self._on_ws_reconnect: Any = None  # Callable() — notify WS reconnect event
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
         self._on_heartbeat_id = callback
+
+    def set_ws_reconnect_callback(self, callback) -> None:
+        """Set callback invoked when fill WS disconnects/reconnect loop kicks in."""
+        self._on_ws_reconnect = callback
 
     @staticmethod
     def _extract_heartbeat_id(resp: Any) -> str | None:
@@ -105,6 +157,10 @@ class OrderManager:
         return dict(self._active_orders)
 
     @property
+    def trade_stats(self) -> dict:
+        return self.trade_ledger.summary()
+
+    @property
     def reconcile_requested(self) -> bool:
         """Whether an external inventory reconcile should be forced soon."""
         return self._reconcile_requested
@@ -119,6 +175,14 @@ class OrderManager:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _safe_str(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        return str(value).strip()
 
     @classmethod
     def _extract_fill_price(cls, order: dict[str, Any], fallback: float) -> float:
@@ -135,6 +199,71 @@ class OrderManager:
             if px is not None and px > 0:
                 return px
         return fallback
+
+    @classmethod
+    def _extract_trade_id(cls, payload: dict[str, Any], order_id: str = "") -> str:
+        """Extract trade-level identifier from PM payload (not order_id)."""
+        if not isinstance(payload, dict):
+            return ""
+        order_ref = cls._safe_str(order_id)
+        for key in (
+            "trade_id",
+            "tradeID",
+            "id",
+            "match_id",
+            "matchId",
+            "fill_id",
+            "fillId",
+            "transaction_hash",
+            "transactionHash",
+            "tx_hash",
+            "txHash",
+            "hash",
+        ):
+            candidate = cls._safe_str(payload.get(key))
+            if candidate and candidate != order_ref:
+                return candidate
+        return ""
+
+    @classmethod
+    def _build_ledger_trade_id(
+        cls,
+        source: str,
+        payload: dict[str, Any],
+        order_id: str,
+        fill_size: float,
+        fill_price: float,
+        prev_matched: float = 0.0,
+    ) -> str:
+        """Return a stable dedup key for ledger records."""
+        trade_id = cls._extract_trade_id(payload, order_id=order_id)
+        if trade_id:
+            return trade_id
+
+        data = payload if isinstance(payload, dict) else {}
+        ts = cls._safe_str(
+            data.get("timestamp")
+            or data.get("time")
+            or data.get("created_at")
+            or data.get("updated_at")
+            or data.get("transacted_at")
+        )
+        seq = cls._safe_str(
+            data.get("sequence")
+            or data.get("seq")
+            or data.get("offset")
+            or data.get("nonce")
+        )
+        status = cls._safe_str(data.get("status"))
+        matched = cls._safe_str(
+            data.get("size_matched")
+            or data.get("matched_size")
+            or data.get("filled_size")
+        )
+        return (
+            f"{source}:{cls._safe_str(order_id)}:{ts}:{seq}:{status}:{matched}:"
+            f"{prev_matched:.4f}:{fill_size:.4f}:{fill_price:.6f}"
+        )
 
     async def _retry(self, coro_func, *args, max_retries: int = 3,
                      base_delay: float = 0.5, **kwargs):
@@ -480,6 +609,205 @@ class OrderManager:
             else:
                 log.error(f"Failed to place order: {e}")
             return None
+
+    async def place_orders_batch(self, quotes: list[Quote], *, post_only: bool | None = None) -> list[str | None]:
+        """Place multiple orders in a single API call using post_orders.
+
+        Polymarket supports up to 15 orders per batch.
+
+        Args:
+            quotes: List of Quote objects to place.
+            post_only: Override post-only flag. None = use config default.
+
+        Returns:
+            List of order_ids (None for failed orders).
+        """
+        if not quotes:
+            return []
+
+        use_post_only = self.config.use_post_only if post_only is None else post_only
+        is_mock = hasattr(self.client, "_orders")
+
+        # Mock/paper client does not expose batch API; place individually.
+        if is_mock:
+            results: list[str | None] = []
+            for q in quotes:
+                oid = await self.place_order(q, post_only=use_post_only)
+                results.append(oid)
+            return results
+
+        if not _HAS_CLOB_TYPES:
+            raise ImportError("py_clob_client not installed for live trading")
+
+        signed_orders: list[Any | None] = []
+        order_type = OrderType.GTD if self.config.use_gtd else OrderType.GTC
+        planned_buy_collateral = 0.0
+
+        for quote in quotes:
+            # Hard budget cap for BUY orders.
+            collateral = self.required_collateral(quote)
+            if quote.side == "BUY" and self._session_budget > 0:
+                active_buy_collateral = sum(
+                    self.required_collateral(q)
+                    for q in self._active_orders.values()
+                    if q.side == "BUY"
+                )
+                budget_remaining = (
+                    self._session_budget
+                    - self._session_spent
+                    - active_buy_collateral
+                    - planned_buy_collateral
+                )
+                if collateral > budget_remaining + 0.01:
+                    self._throttled_warn(
+                        "batch_budget_reject",
+                        f"Batch BUY rejected: {quote.size:.1f}@{quote.price:.2f} needs "
+                        f"${collateral:.2f}, remaining ${budget_remaining:.2f}",
+                    )
+                    signed_orders.append(None)
+                    continue
+                planned_buy_collateral += collateral
+
+            # Ensure allowance for SELL orders.
+            if quote.side == "SELL":
+                if not await self.ensure_sell_allowance(quote.token_id):
+                    self._throttled_warn(
+                        "batch_sell_allowance",
+                        f"Batch SELL skipped — allowance setup failed for {quote.token_id[:12]}...",
+                    )
+                    signed_orders.append(None)
+                    continue
+
+            oa = OrderArgs(
+                token_id=quote.token_id,
+                price=quote.price,
+                size=quote.size,
+                side=quote.side,
+            )
+            if self.config.use_gtd:
+                oa.expiration = int(time.time()) + self.config.gtd_duration_sec
+
+            try:
+                signed = await asyncio.to_thread(self.client.create_order, oa)
+                signed_orders.append(signed)
+            except Exception as e:
+                log.warning("Failed to sign order %s: %s", quote.side, e)
+                signed_orders.append(None)
+
+        valid_indices = [i for i, s in enumerate(signed_orders) if s is not None]
+        valid_signed = [signed_orders[i] for i in valid_indices]
+
+        if not valid_signed:
+            return [None] * len(quotes)
+
+        results: list[str | None] = [None] * len(quotes)
+        for batch_start in range(0, len(valid_signed), 15):
+            batch = valid_signed[batch_start:batch_start + 15]
+            batch_indices = valid_indices[batch_start:batch_start + 15]
+
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.client.post_orders,
+                        batch,
+                        order_type,
+                        use_post_only,
+                    ),
+                    timeout=15.0,
+                )
+                self._notify_heartbeat_id(resp)
+
+                # post_orders may return list directly or wrapped payload.
+                if isinstance(resp, list):
+                    order_results = resp
+                elif isinstance(resp, dict):
+                    order_results = resp.get("orders", [resp])
+                else:
+                    order_results = [resp]
+
+                for idx, order_resp in zip(batch_indices, order_results):
+                    if not isinstance(order_resp, dict):
+                        continue
+                    order_id = (
+                        order_resp.get("orderID")
+                        or order_resp.get("order_id")
+                        or order_resp.get("id")
+                    )
+                    if order_id:
+                        quote = quotes[idx]
+                        quote.order_id = order_id
+                        quote.placed_at = time.time()
+                        self._active_orders[order_id] = quote
+                        self._order_post_only[order_id] = use_post_only
+                        results[idx] = order_id
+                        log.info(
+                            "Batch placed %s %s %.1f@%.2f id=%s...",
+                            quote.side, quote.token_id[:8], quote.size, quote.price, order_id[:12],
+                        )
+            except Exception as e:
+                log.error("Batch post_orders failed: %s", e)
+                # Fallback to individual placement for failed batch.
+                for idx in batch_indices:
+                    try:
+                        oid = await self.place_order(quotes[idx], post_only=use_post_only)
+                        results[idx] = oid
+                    except Exception:
+                        pass
+
+        return results
+
+    async def cancel_orders_batch(self, order_ids: list[str]) -> int:
+        """Cancel multiple orders in a single API call.
+
+        Polymarket supports up to 3000 cancels per batch.
+
+        Returns number of successfully cancelled orders.
+        """
+        if not order_ids:
+            return 0
+
+        is_mock = hasattr(self.client, "_orders")
+        cancelled_ids: set[str] = set()
+
+        if is_mock:
+            for oid in order_ids:
+                try:
+                    self.client.cancel(oid)
+                    cancelled_ids.add(oid)
+                except Exception:
+                    pass
+            for oid in cancelled_ids:
+                self._active_orders.pop(oid, None)
+                self._order_post_only.pop(oid, None)
+            return len(cancelled_ids)
+
+        for batch_start in range(0, len(order_ids), 3000):
+            batch = order_ids[batch_start:batch_start + 3000]
+            try:
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(self.client.cancel_orders, batch),
+                    timeout=10.0,
+                )
+                self._notify_heartbeat_id(resp)
+                # Assume full batch success if API didn't raise.
+                cancelled_ids.update(batch)
+            except Exception as e:
+                log.warning("Batch cancel failed: %s, falling back to individual", e)
+                for oid in batch:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(self.client.cancel, oid),
+                            timeout=5.0,
+                        )
+                        cancelled_ids.add(oid)
+                    except Exception:
+                        pass
+
+        for oid in cancelled_ids:
+            self._active_orders.pop(oid, None)
+            self._order_post_only.pop(oid, None)
+
+        return len(cancelled_ids)
 
     async def get_book_summary(self, token_id: str) -> dict[str, float | None]:
         """Fetch best bid/ask from Polymarket CLOB for a token.
@@ -835,6 +1163,11 @@ class OrderManager:
             except Exception as e:
                 if self._fill_ws_running:
                     log.warning("Fill WS disconnected: %s — reconnecting in 5s", e)
+                    if self._on_ws_reconnect:
+                        try:
+                            self._on_ws_reconnect()
+                        except Exception:
+                            pass
                     await asyncio.sleep(5)
         log.info("Fill WS: stopped")
 
@@ -887,13 +1220,32 @@ class OrderManager:
                 self._partial_fill_reported[oid] = prev_matched + fill_size
 
                 is_maker = self._order_post_only.get(oid, True)
-                fee = 0.0 if is_maker else taker_fee_usd(fill_price, fill_size, quote.side)
+                fee = (
+                    0.0
+                    if is_maker
+                    else taker_fee_usd(fill_price, fill_size, quote.side, token_id=quote.token_id)
+                )
                 fill = Fill(
                     ts=now, side=quote.side, token_id=quote.token_id,
                     price=fill_price, size=round(fill_size, 4),
                     fee=fee, order_id=oid, is_maker=is_maker,
                 )
                 fills.append(fill)
+                trade_id = self._build_ledger_trade_id(
+                    "ws_trade", ws_msg, oid, fill_size, fill_price, prev_matched
+                )
+                self.trade_ledger.record({
+                    "id": trade_id,
+                    "order_id": fill.order_id,
+                    "ts": fill.ts,
+                    "side": fill.side,
+                    "token_id": fill.token_id,
+                    "price": fill.price,
+                    "size": fill.size,
+                    "fee": fill.fee,
+                    "is_maker": fill.is_maker,
+                    "source": "ws",
+                })
 
                 if quote.side == "BUY":
                     self._session_spent += fill_size * fill_price
@@ -902,7 +1254,11 @@ class OrderManager:
 
                 if hasattr(self.client, "_orders"):
                     if quote.side == "BUY":
-                        actual_size = net_shares_after_buy_fee(fill_size) if not is_maker else fill_size
+                        actual_size = (
+                            net_shares_after_buy_fee(fill_size, fill_price, token_id=quote.token_id)
+                            if not is_maker
+                            else fill_size
+                        )
                         cur = self._mock_token_balances.get(quote.token_id, 0.0)
                         self._mock_token_balances[quote.token_id] = cur + actual_size
                     else:
@@ -931,12 +1287,32 @@ class OrderManager:
                         if missed >= 0.01:
                             fill_price = self._extract_fill_price(ws_msg, quote.price)
                             is_maker = self._order_post_only.get(oid, True)
-                            fee = 0.0 if is_maker else taker_fee_usd(fill_price, missed, quote.side)
-                            fills.append(Fill(
+                            fee = (
+                                0.0
+                                if is_maker
+                                else taker_fee_usd(fill_price, missed, quote.side, token_id=quote.token_id)
+                            )
+                            fill = Fill(
                                 ts=now, side=quote.side, token_id=quote.token_id,
                                 price=fill_price, size=round(missed, 4),
                                 fee=fee, order_id=oid, is_maker=is_maker,
-                            ))
+                            )
+                            fills.append(fill)
+                            trade_id = self._build_ledger_trade_id(
+                                "ws_order", ws_msg, oid, missed, fill_price, prev
+                            )
+                            self.trade_ledger.record({
+                                "id": trade_id,
+                                "order_id": fill.order_id,
+                                "ts": fill.ts,
+                                "side": fill.side,
+                                "token_id": fill.token_id,
+                                "price": fill.price,
+                                "size": fill.size,
+                                "fee": fill.fee,
+                                "is_maker": fill.is_maker,
+                                "source": "ws",
+                            })
                             if quote.side == "BUY":
                                 self._session_spent += missed * fill_price
                             elif quote.side == "SELL":
@@ -984,12 +1360,32 @@ class OrderManager:
                     if new_fill >= 0.01:
                         fill_price = self._extract_fill_price(result, quote.price)
                         is_maker = self._order_post_only.get(oid, True)
-                        fee = 0.0 if is_maker else taker_fee_usd(fill_price, new_fill, quote.side)
-                        fills.append(Fill(
+                        fee = (
+                            0.0
+                            if is_maker
+                            else taker_fee_usd(fill_price, new_fill, quote.side, token_id=quote.token_id)
+                        )
+                        fill = Fill(
                             ts=now, side=quote.side, token_id=quote.token_id,
                             price=fill_price, size=round(new_fill, 4),
                             fee=fee, order_id=oid, is_maker=is_maker,
-                        ))
+                        )
+                        fills.append(fill)
+                        trade_id = self._build_ledger_trade_id(
+                            "http_poll", result, oid, new_fill, fill_price, prev
+                        )
+                        self.trade_ledger.record({
+                            "id": trade_id,
+                            "order_id": fill.order_id,
+                            "ts": fill.ts,
+                            "side": fill.side,
+                            "token_id": fill.token_id,
+                            "price": fill.price,
+                            "size": fill.size,
+                            "fee": fill.fee,
+                            "is_maker": fill.is_maker,
+                            "source": "http",
+                        })
                         self._partial_fill_reported[oid] = size_matched
                         if quote.side == "BUY":
                             self._session_spent += new_fill * fill_price
@@ -997,7 +1393,11 @@ class OrderManager:
                             self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
                         if hasattr(self.client, "_orders"):
                             if quote.side == "BUY":
-                                actual = net_shares_after_buy_fee(new_fill) if not is_maker else new_fill
+                                actual = (
+                                    net_shares_after_buy_fee(new_fill, fill_price, token_id=quote.token_id)
+                                    if not is_maker
+                                    else new_fill
+                                )
                                 cur = self._mock_token_balances.get(quote.token_id, 0.0)
                                 self._mock_token_balances[quote.token_id] = cur + actual
                             else:
@@ -1019,6 +1419,84 @@ class OrderManager:
             self._order_post_only.pop(oid, None)
 
         return fills
+
+    async def backfill_trades(self, market_id: str = "", token_id: str = "") -> int:
+        """Backfill trade history from getTrades API.
+
+        Uses getTradesPaginated if available, falls back to getTrades.
+        Returns number of new trades added.
+        """
+        if hasattr(self.client, "_orders"):  # Mock/paper mode
+            return 0
+
+        new_count = 0
+        try:
+            # Try paginated endpoint first
+            cursor = ""
+            for page in range(10):  # Max 10 pages
+                params = {}
+                if market_id:
+                    params["market"] = market_id
+                if cursor:
+                    params["cursor"] = cursor
+
+                paginated_getter = (
+                    getattr(self.client, "get_trades_paginated", None)
+                    or getattr(self.client, "getTradesPaginated", None)
+                )
+                trades_getter = (
+                    getattr(self.client, "get_trades", None)
+                    or getattr(self.client, "getTrades", None)
+                )
+                getter = paginated_getter or trades_getter
+                if not getter:
+                    break
+
+                result = await asyncio.to_thread(
+                    getter,
+                    **params
+                )
+
+                trades = result if isinstance(result, list) else result.get("data", [])
+                next_cursor = result.get("next_cursor", "") if isinstance(result, dict) else ""
+
+                for trade in trades:
+                    trade_doc = trade if isinstance(trade, dict) else {"raw": trade}
+                    if isinstance(trade_doc, dict):
+                        order_id = self._safe_str(
+                            trade_doc.get("order_id")
+                            or trade_doc.get("maker_order_id")
+                            or trade_doc.get("taker_order_id")
+                        )
+                        has_trade_id = bool(self._extract_trade_id(trade_doc, order_id))
+                        if not has_trade_id:
+                            price = self._safe_float(trade_doc.get("price")) or 0.0
+                            size = self._safe_float(
+                                trade_doc.get("size")
+                                or trade_doc.get("amount")
+                                or trade_doc.get("matched_size")
+                            ) or 0.0
+                            synthetic = self._build_ledger_trade_id(
+                                "api_backfill",
+                                trade_doc,
+                                order_id,
+                                size,
+                                price,
+                            )
+                            trade_doc = dict(trade_doc)
+                            trade_doc["id"] = synthetic
+                    if self.trade_ledger.record(trade_doc):
+                        new_count += 1
+
+                if not next_cursor or not trades or not paginated_getter:
+                    break
+                cursor = next_cursor
+        except Exception as e:
+            log.warning("Trade backfill failed: %s", e)
+
+        if new_count > 0:
+            log.info("Backfilled %d trades from API", new_count)
+        return new_count
 
     async def merge_positions(self, condition_id: str, amount_shares: float,
                               private_key: str) -> dict:
@@ -1048,6 +1526,29 @@ class OrderManager:
 
         from .approvals import merge_positions as _merge
         return await asyncio.to_thread(_merge, private_key, condition_id, amount_shares)
+
+    async def redeem_positions(self, condition_id: str, private_key: str) -> dict:
+        """Redeem resolved winning tokens back to USDC."""
+        if hasattr(self.client, "_orders"):  # Paper mode
+            return {"success": False, "error": "paper mode"}
+        if not condition_id:
+            return {"success": False, "error": "missing condition_id"}
+        if not private_key:
+            return {"success": False, "error": "missing private key"}
+
+        funder = getattr(self.client, 'funder', None)
+        signer_addr = None
+        if hasattr(self.client, 'signer'):
+            signer_addr = getattr(self.client.signer, 'address', lambda: None)()
+        if funder and signer_addr and funder.lower() != signer_addr.lower():
+            log.warning(
+                "Redeem skipped: tokens on funder (%s), not EOA (%s)",
+                funder[:10], signer_addr[:10],
+            )
+            return {"success": False, "error": "funder mode — redeem not supported"}
+
+        from .approvals import redeem_positions as _redeem
+        return await asyncio.to_thread(_redeem, private_key, condition_id)
 
     def reset(self) -> None:
         """Clear tracked order state between windows."""

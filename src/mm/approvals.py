@@ -224,6 +224,20 @@ CTF_MERGE_ABI = [
     },
 ]
 
+CTF_REDEEM_ABI = [
+    {
+        "name": "redeemPositions",
+        "type": "function",
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSets", "type": "uint256[]"},
+        ],
+        "outputs": [],
+    },
+]
+
 
 def merge_positions(
     private_key: str,
@@ -325,4 +339,75 @@ def merge_positions(
 
     except Exception as e:
         log.error("Merge error: %s", e)
+        return {"success": False, "error": str(e)}
+
+
+def redeem_positions(
+    private_key: str,
+    condition_id: str,
+    rpc_url: str = POLYGON_RPC,
+) -> dict:
+    """Redeem winning resolved conditional tokens back into USDC."""
+    try:
+        from web3 import Web3
+        from web3.middleware import ExtraDataToPOAMiddleware
+    except ImportError:
+        log.error("web3 not installed — cannot redeem positions")
+        return {"success": False, "error": "web3 not installed"}
+
+    key = private_key.strip()
+    if not key:
+        return {"success": False, "error": "missing private key"}
+    if not key.startswith("0x"):
+        key = f"0x{key}"
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    try:
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+    except Exception:
+        pass
+    if not w3.is_connected():
+        return {"success": False, "error": "RPC connection failed"}
+
+    account = w3.eth.account.from_key(key)
+    pub_key = account.address
+    ctf = w3.eth.contract(
+        address=w3.to_checksum_address(CTF_CONTRACT),
+        abi=CTF_REDEEM_ABI,
+    )
+
+    try:
+        cond_hex = condition_id.replace("0x", "").strip()
+        if len(cond_hex) != 64:
+            return {"success": False, "error": f"condition_id must be 32 bytes, got {len(cond_hex)//2}"}
+        cond_bytes = bytes.fromhex(cond_hex)
+    except (TypeError, ValueError, AttributeError) as e:
+        return {"success": False, "error": f"invalid condition_id hex: {e}"}
+
+    parent_collection = b"\x00" * 32
+    try:
+        gas_params = _get_gas_params(w3)
+        nonce = w3.eth.get_transaction_count(pub_key)
+        tx = ctf.functions.redeemPositions(
+            w3.to_checksum_address(USDC_E),
+            parent_collection,
+            cond_bytes,
+            [1, 2],  # YES and NO partitions
+        ).build_transaction({
+            "chainId": 137,
+            "from": pub_key,
+            "nonce": nonce,
+            "gas": 220_000,
+            **gas_params,
+        })
+        signed = w3.eth.account.sign_transaction(tx, private_key=key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+        if receipt["status"] == 1:
+            log.info("Redeem OK: condition=%s tx=%s...", cond_hex[:12], tx_hash.hex()[:16])
+            return {"success": True, "tx_hash": tx_hash.hex()}
+        log.error("Redeem tx failed (status=0): %s", tx_hash.hex())
+        return {"success": False, "tx_hash": tx_hash.hex(), "error": "tx reverted"}
+    except Exception as e:
+        log.error("Redeem error: %s", e)
         return {"success": False, "error": str(e)}

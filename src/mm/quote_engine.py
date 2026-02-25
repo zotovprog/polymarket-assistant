@@ -12,8 +12,10 @@ Prices are rounded to PM's configured tick increment.
 """
 from __future__ import annotations
 import logging
+import random
 from .types import Quote, Inventory
 from .mm_config import MMConfig
+from .dynamic_spread import DynamicSpread
 
 log = logging.getLogger("mm.quotes")
 
@@ -34,6 +36,69 @@ class QuoteEngine:
 
     def __init__(self, config: MMConfig):
         self.config = config
+        self._quote_price_jitter_ticks: int | None = None
+        self._quote_size_jitter_mult: float | None = None
+        self._dynamic_spread: DynamicSpread | None = None
+        self._dynamic_spread_sig: tuple[float, float, float, float] | None = None
+
+    def _ensure_dynamic_spread(self) -> DynamicSpread:
+        """Create/update dynamic spread model when runtime config changes."""
+        sig = (
+            float(getattr(self.config, "dynamic_spread_gamma", 0.10)),
+            float(getattr(self.config, "dynamic_spread_k", 1.5)),
+            float(getattr(self.config, "dynamic_spread_min_bps", self.config.min_spread_bps)),
+            float(getattr(self.config, "dynamic_spread_max_bps", self.config.max_spread_bps)),
+        )
+        if self._dynamic_spread is None or self._dynamic_spread_sig != sig:
+            self._dynamic_spread = DynamicSpread(
+                gamma=sig[0],
+                k=sig[1],
+                min_spread_bps=sig[2],
+                max_spread_bps=sig[3],
+            )
+            self._dynamic_spread_sig = sig
+        return self._dynamic_spread
+
+    def _apply_price_jitter(self, price: float, tick_size: float) -> float:
+        """Apply anti-detection price jitter to a single quote level."""
+        if not bool(getattr(self.config, "price_jitter_enabled", True)):
+            return _round_price(price, tick_size)
+
+        jitter_ticks = self._quote_price_jitter_ticks
+        if jitter_ticks is None:
+            max_ticks = max(0, int(getattr(self.config, "price_jitter_ticks", 1)))
+            if max_ticks == 0:
+                jitter_ticks = 0
+            else:
+                jitter_ticks = random.choice([-max_ticks, 0, 0, max_ticks])
+
+        return _round_price(price + jitter_ticks * tick_size, tick_size)
+
+    def _apply_size_jitter(self, size: float) -> float:
+        """Apply anti-detection size jitter and enforce minimum order size."""
+        size_val = max(0.0, float(size))
+        if bool(getattr(self.config, "size_jitter_enabled", True)):
+            size_mult = self._quote_size_jitter_mult
+            if size_mult is None:
+                jitter_pct = max(0.0, float(getattr(self.config, "size_jitter_pct", 0.20)))
+                size_mult = 1.0 + random.uniform(-jitter_pct, jitter_pct)
+            size_val *= size_mult
+
+        size_val = max(float(getattr(self.config, "min_quote_size_shares", 1.0)), size_val)
+        size_val = min(size_val, float(self.config.max_inventory_shares))
+        return round(size_val, 2)
+
+    def jitter_requote_interval(self, base_interval: float) -> float:
+        """Apply anti-detection jitter to requote loop sleep interval."""
+        interval = float(base_interval)
+        if not bool(getattr(self.config, "requote_interval_jitter_enabled", True)):
+            return max(1.0, interval)
+
+        max_jitter = max(0.0, float(getattr(self.config, "requote_interval_jitter_sec", 1.5)))
+        if max_jitter == 0.0:
+            return max(1.0, interval)
+
+        return max(1.0, interval + random.uniform(-max_jitter, max_jitter))
 
     def _effective_half_spread(self, volatility: float,
                                 avg_vol: float,
@@ -147,7 +212,7 @@ class QuoteEngine:
             "skew_mult": 3.0,
             "tier": 3,
             "suppress_leading_buy": True,
-            "force_taker_lagging": False,
+            "force_taker_lagging": bool(getattr(self.config, "paired_fill_ioc_enabled", False)),
         }
 
     def generate_quotes(self, fair_value: float,
@@ -171,9 +236,36 @@ class QuoteEngine:
         Returns:
             (bid_quote, ask_quote)
         """
-        half_spread_bps = self._effective_half_spread(volatility, avg_volatility, time_remaining)
-        half_spread = _bps_to_price(half_spread_bps)
+        base_half_spread_bps = self._effective_half_spread(volatility, avg_volatility, time_remaining)
+        base_half_spread = _bps_to_price(base_half_spread_bps)
+        bid_half_spread = base_half_spread
+        ask_half_spread = base_half_spread
         imbalance_adjustments = imbalance_adjustments or {}
+
+        if bool(getattr(self.config, "dynamic_spread_enabled", True)):
+            try:
+                dyn = self._ensure_dynamic_spread()
+                inv_delta = inventory.net_delta
+                if invert_skew:
+                    inv_delta = -inv_delta
+                inv_delta *= max(1.0, float(imbalance_adjustments.get("skew_mult", 1.0)))
+                effective_t = (
+                    time_remaining
+                    if time_remaining is not None and time_remaining >= 0
+                    else max(30.0, float(self.config.requote_interval_sec) * 5.0)
+                )
+                dyn_bid_half, dyn_ask_half = dyn.compute_asymmetric_spread(
+                    sigma=max(0.0, float(volatility)),
+                    T_seconds=effective_t,
+                    inventory_delta=inv_delta,
+                    fair_value=fair_value,
+                )
+                hard_cap = _bps_to_price(self.config.max_spread_bps)
+                bid_half_spread = min(hard_cap, max(base_half_spread, dyn_bid_half))
+                ask_half_spread = min(hard_cap, max(base_half_spread, dyn_ask_half))
+            except Exception as e:
+                log.debug("Dynamic spread fallback to static: %s", e)
+
         skew = self._inventory_skew(
             inventory,
             tier=int(imbalance_adjustments.get("tier", 0)),
@@ -182,8 +274,8 @@ class QuoteEngine:
         if invert_skew:
             skew = -skew
 
-        bid_price = _round_price(fair_value - half_spread - skew, tick_size)
-        ask_price = _round_price(fair_value + half_spread - skew, tick_size)
+        bid_price = _round_price(fair_value - bid_half_spread - skew, tick_size)
+        ask_price = _round_price(fair_value + ask_half_spread - skew, tick_size)
 
         # Ensure bid < ask (at least 1 tick apart)
         if bid_price >= ask_price:
@@ -200,10 +292,38 @@ class QuoteEngine:
         if ask_size > max_shares:
             ask_size = max_shares
 
+        # Anti-detection: apply jitter as the final transform before Quote objects.
+        if bool(getattr(self.config, "price_jitter_enabled", True)):
+            max_ticks = max(0, int(getattr(self.config, "price_jitter_ticks", 1)))
+            if max_ticks == 0:
+                self._quote_price_jitter_ticks = 0
+            else:
+                self._quote_price_jitter_ticks = random.choice([-max_ticks, 0, 0, max_ticks])
+        else:
+            self._quote_price_jitter_ticks = None
+        bid_price = self._apply_price_jitter(bid_price, tick_size)
+        ask_price = self._apply_price_jitter(ask_price, tick_size)
+        self._quote_price_jitter_ticks = None
+
+        # Ensure bid < ask after jitter (at least 1 tick apart).
+        if bid_price >= ask_price:
+            mid = (bid_price + ask_price) / 2.0
+            bid_price = _round_price(mid - tick_size, tick_size)
+            ask_price = _round_price(mid + tick_size, tick_size)
+
+        if bool(getattr(self.config, "size_jitter_enabled", True)):
+            jitter_pct = max(0.0, float(getattr(self.config, "size_jitter_pct", 0.20)))
+            self._quote_size_jitter_mult = 1.0 + random.uniform(-jitter_pct, jitter_pct)
+        else:
+            self._quote_size_jitter_mult = None
+        bid_size = self._apply_size_jitter(bid_size)
+        ask_size = self._apply_size_jitter(ask_size)
+        self._quote_size_jitter_mult = None
+
         bid = Quote(side="BUY", token_id=token_id,
-                    price=bid_price, size=round(bid_size, 2))
+                    price=bid_price, size=bid_size)
         ask = Quote(side="SELL", token_id=token_id,
-                    price=ask_price, size=round(ask_size, 2))
+                    price=ask_price, size=ask_size)
 
         return bid, ask
 

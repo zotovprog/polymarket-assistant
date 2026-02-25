@@ -55,6 +55,12 @@ class FairValueEngine:
         self.vol_cap = vol_cap
         self.signal_weight = signal_weight
         self._last_vol: float = 0.0005  # fallback vol (typical BTC per-minute)
+        self._last_source: str = "model"  # "model" or "pm_anchor" or "blended"
+
+    @property
+    def last_source(self) -> str:
+        """Which FV source was used in the last computation."""
+        return self._last_source
 
     def realized_vol(self, klines: list[dict]) -> float:
         """Compute realized volatility from kline closes.
@@ -191,3 +197,104 @@ class FairValueEngine:
 
         fv_dn = max(0.01, min(0.99, 1.0 - fv_up))
         return fv_up, fv_dn
+
+    def compute_with_pm_anchor(
+        self,
+        mid: float,
+        strike: float,
+        time_remaining_sec: float,
+        klines: list[dict],
+        pm_up: float = 0.0,
+        pm_dn: float = 0.0,
+        pm_age_sec: float = 999.0,
+        bids: list = None,
+        asks: list = None,
+        trades: list = None,
+        pm_freshness_threshold: float = 15.0,
+        model_weight_when_stale: float = 1.0,
+        model_weight_when_fresh: float = 0.3,
+        divergence_override_pct: float = 0.05,
+    ) -> tuple[float, float]:
+        """Compute fair value using PM mid as primary anchor, model as overlay.
+
+        Strategy:
+        - If PM data is fresh (<15s): use PM mid-price as base, model as adjustment
+        - If PM data is stale (>15s): use model as primary
+        - If model and PM diverge > 5%: trust model (Binance data is faster)
+
+        Returns (fair_value_up, fair_value_dn).
+        """
+        # Step 1: Compute model FV
+        model_fv_up, model_fv_dn = self.compute(
+            mid, strike, time_remaining_sec, klines, bids, asks, trades
+        )
+        self._last_source = "model"
+
+        # Step 2: Determine PM-based FV
+        pm_available = (pm_up > 0.01 and pm_dn > 0.01)
+        pm_fresh = pm_available and pm_age_sec < pm_freshness_threshold
+
+        if not pm_available:
+            # No PM data — use model only
+            return model_fv_up, model_fv_dn
+
+        # PM mid as anchor
+        pm_mid_up = pm_up
+        pm_mid_dn = pm_dn
+
+        # Normalize PM prices (ensure they sum close to 1)
+        pm_sum = pm_up + pm_dn
+        if abs(pm_sum - 1.0) > 0.05:
+            # PM prices don't sum to 1 — likely stale or wrong, use model
+            log.warning(
+                "PM prices don't sum to 1.0: up=%.3f dn=%.3f sum=%.3f",
+                pm_up,
+                pm_dn,
+                pm_sum,
+            )
+            return model_fv_up, model_fv_dn
+
+        # Step 3: Check divergence
+        divergence = abs(model_fv_up - pm_mid_up)
+        if divergence > divergence_override_pct:
+            # Model and PM diverge significantly — trust model (Binance is faster)
+            log.info(
+                "FV divergence %.1f%% > %.1f%% — using model (%.3f) over PM (%.3f)",
+                divergence * 100,
+                divergence_override_pct * 100,
+                model_fv_up,
+                pm_mid_up,
+            )
+            return model_fv_up, model_fv_dn
+
+        # Step 4: Blend based on freshness
+        if pm_fresh:
+            w_model = model_weight_when_fresh
+        else:
+            w_model = model_weight_when_stale
+        w_model = max(0.0, min(1.0, w_model))
+
+        if w_model >= 1.0:
+            self._last_source = "model"
+            return model_fv_up, model_fv_dn
+
+        w_pm = 1.0 - w_model
+
+        blended_up = w_pm * pm_mid_up + w_model * model_fv_up
+        blended_dn = w_pm * pm_mid_dn + w_model * model_fv_dn
+
+        # Normalize to sum to 1
+        total = blended_up + blended_dn
+        if total > 0:
+            blended_up = blended_up / total
+            blended_dn = blended_dn / total
+
+        blended_up = max(0.01, min(0.99, blended_up))
+        blended_dn = max(0.01, min(0.99, blended_dn))
+
+        if w_pm > 0.7:
+            self._last_source = "pm_anchor"
+        else:
+            self._last_source = "blended"
+
+        return blended_up, blended_dn

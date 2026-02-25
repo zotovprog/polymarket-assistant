@@ -76,6 +76,7 @@ class Inventory:
     initial_usdc: float = 0.0  # Starting balance for PnL calc
     up_cost: CostBasis = field(default_factory=CostBasis)
     dn_cost: CostBasis = field(default_factory=CostBasis)
+    paired: PairedInventory = field(default_factory=lambda: PairedInventory())
 
     @property
     def net_delta(self) -> float:
@@ -108,7 +109,11 @@ class Inventory:
             else:
                 # Taker: fee is in shares; fill.fee is the USD-equivalent
                 from .pm_fees import net_shares_after_buy_fee
-                received_shares = net_shares_after_buy_fee(fill.size)
+                received_shares = net_shares_after_buy_fee(
+                    fill.size,
+                    fill.price,
+                    token_id=fill.token_id,
+                )
                 usdc_cost = fill.notional  # USDC cost = size * price, no extra fee
             if token_type == "up":
                 self.up_shares += received_shares
@@ -151,6 +156,67 @@ class Inventory:
             elif real_dn < self.dn_cost.total_shares:
                 # Shares decreased externally — reduce cost proportionally
                 self.dn_cost.record_sell(self.dn_cost.total_shares - real_dn)
+
+
+@dataclass
+class PairedInventory:
+    """Track paired UP+DN positions for merge-first strategy.
+
+    q_pair = min(up_shares, dn_shares) — guaranteed mergeable
+    q_excess_up = up_shares - q_pair — directional risk
+    q_excess_dn = dn_shares - q_pair — directional risk
+
+    Merge is free ($0 fee) and returns $1.00 per pair.
+    Profit = $1.00 - avg_cost_up_in_pair - avg_cost_dn_in_pair
+    """
+    q_pair: float = 0.0
+    q_excess_up: float = 0.0
+    q_excess_dn: float = 0.0
+    total_pair_cost: float = 0.0  # Total USDC spent on paired shares
+    merged_count: float = 0.0     # Total pairs merged this session
+    merged_profit: float = 0.0    # Total profit from merges
+
+    def update(self, up_shares: float, dn_shares: float,
+               up_avg_price: float, dn_avg_price: float) -> None:
+        """Recalculate paired/excess from current inventory."""
+        self.q_pair = min(up_shares, dn_shares)
+        self.q_excess_up = max(0.0, up_shares - self.q_pair)
+        self.q_excess_dn = max(0.0, dn_shares - self.q_pair)
+        if self.q_pair > 0:
+            self.total_pair_cost = self.q_pair * (up_avg_price + dn_avg_price)
+        else:
+            self.total_pair_cost = 0.0
+
+    @property
+    def pair_profit_per_unit(self) -> float:
+        """Expected profit per merged pair."""
+        if self.q_pair <= 0 or self.total_pair_cost <= 0:
+            return 0.0
+        avg_cost = self.total_pair_cost / self.q_pair
+        return 1.0 - avg_cost  # Merge returns $1, cost is avg_cost
+
+    @property
+    def expected_merge_profit(self) -> float:
+        """Total expected profit from merging all current pairs."""
+        return self.q_pair * self.pair_profit_per_unit
+
+    def record_merge(self, amount: float, profit: float) -> None:
+        """Record a completed merge."""
+        self.merged_count += amount
+        self.merged_profit += profit
+        self.q_pair = max(0.0, self.q_pair - amount)
+
+    def to_dict(self) -> dict:
+        return {
+            "q_pair": round(self.q_pair, 4),
+            "q_excess_up": round(self.q_excess_up, 4),
+            "q_excess_dn": round(self.q_excess_dn, 4),
+            "total_pair_cost": round(self.total_pair_cost, 4),
+            "pair_profit_per_unit": round(self.pair_profit_per_unit, 6),
+            "expected_merge_profit": round(self.expected_merge_profit, 4),
+            "merged_count": round(self.merged_count, 4),
+            "merged_profit": round(self.merged_profit, 4),
+        }
 
 
 @dataclass

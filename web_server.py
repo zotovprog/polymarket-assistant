@@ -35,6 +35,7 @@ import feeds
 from mm.types import MarketInfo, Inventory
 from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
+from mm.market_selector import MarketSelector
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
 from version import __version__ as APP_VERSION, git_hash as _git_hash_fn
@@ -147,18 +148,36 @@ class ConfigUpdateRequest(BaseModel):
     min_spread_bps: Optional[float] = None
     max_spread_bps: Optional[float] = None
     vol_spread_mult: Optional[float] = None
+    dynamic_spread_enabled: Optional[bool] = None
+    dynamic_spread_gamma: Optional[float] = None
+    dynamic_spread_k: Optional[float] = None
+    dynamic_spread_min_bps: Optional[float] = None
+    dynamic_spread_max_bps: Optional[float] = None
     order_size_usd: Optional[float] = Field(default=None)
     min_order_size_usd: Optional[float] = None
     max_order_size_usd: Optional[float] = None
     max_inventory_shares: Optional[float] = None
+    max_net_delta_shares: Optional[float] = None
     skew_bps_per_unit: Optional[float] = Field(default=None)
+    min_quote_size_shares: Optional[float] = None
     requote_interval_sec: Optional[float] = Field(default=None)
     refresh_interval_s: Optional[float] = Field(default=None)
     requote_threshold_bps: Optional[float] = None
+    requote_interval_jitter_enabled: Optional[bool] = None
+    requote_interval_jitter_sec: Optional[float] = None
+    event_requote_enabled: Optional[bool] = None
+    event_pm_mid_threshold_bps: Optional[float] = None
+    event_binance_threshold_bps: Optional[float] = None
+    event_poll_interval_sec: Optional[float] = None
+    event_fallback_interval_sec: Optional[float] = None
     gtd_duration_sec: Optional[int] = None
     heartbeat_interval_sec: Optional[int] = None
     use_post_only: Optional[bool] = None
     use_gtd: Optional[bool] = None
+    price_jitter_enabled: Optional[bool] = None
+    price_jitter_ticks: Optional[int] = None
+    size_jitter_enabled: Optional[bool] = None
+    size_jitter_pct: Optional[float] = None
     max_drawdown_usd: Optional[float] = Field(default=None)
     volatility_pause_mult: Optional[float] = Field(default=None)
     max_loss_per_fill_usd: Optional[float] = Field(default=None)
@@ -175,7 +194,19 @@ class ConfigUpdateRequest(BaseModel):
     liq_taker_threshold_sec: Optional[float] = None
     liq_max_discount_from_fv: Optional[float] = Field(default=None)
     liq_abandon_below_floor: Optional[bool] = None
+    merge_sell_epsilon: Optional[float] = None
+    merge_sell_min_depth_pairs: Optional[float] = None
+    entry_settle_sec: Optional[float] = None
     enabled: Optional[bool] = None
+    rebate_scoring_enabled: Optional[bool] = None
+    rebate_check_interval_ticks: Optional[int] = None
+    rebate_require_scoring: Optional[bool] = None
+    rebate_non_scoring_size_mult: Optional[float] = None
+    rebate_score_timeout_sec: Optional[float] = None
+    market_selector_min_score: Optional[float] = None
+    paired_fill_ioc_enabled: Optional[bool] = None
+    redeem_after_resolution_enabled: Optional[bool] = None
+    redeem_retry_interval_sec: Optional[float] = None
     session_limit: Optional[float] = None  # Max USDC budget for session
 
     @field_validator(
@@ -183,14 +214,26 @@ class ConfigUpdateRequest(BaseModel):
         "min_spread_bps",
         "max_spread_bps",
         "vol_spread_mult",
+        "dynamic_spread_gamma",
+        "dynamic_spread_k",
+        "dynamic_spread_min_bps",
+        "dynamic_spread_max_bps",
         "order_size_usd",
         "min_order_size_usd",
         "max_order_size_usd",
         "max_inventory_shares",
+        "max_net_delta_shares",
         "skew_bps_per_unit",
+        "min_quote_size_shares",
         "requote_interval_sec",
         "refresh_interval_s",
         "requote_threshold_bps",
+        "requote_interval_jitter_sec",
+        "event_pm_mid_threshold_bps",
+        "event_binance_threshold_bps",
+        "event_poll_interval_sec",
+        "event_fallback_interval_sec",
+        "size_jitter_pct",
         "max_drawdown_usd",
         "volatility_pause_mult",
         "max_loss_per_fill_usd",
@@ -202,6 +245,13 @@ class ConfigUpdateRequest(BaseModel):
         "liq_chunk_interval_s",
         "liq_taker_threshold_sec",
         "liq_max_discount_from_fv",
+        "merge_sell_epsilon",
+        "merge_sell_min_depth_pairs",
+        "entry_settle_sec",
+        "rebate_non_scoring_size_mult",
+        "rebate_score_timeout_sec",
+        "market_selector_min_score",
+        "redeem_retry_interval_sec",
         "session_limit",
         mode="before",
     )
@@ -224,6 +274,8 @@ class ConfigUpdateRequest(BaseModel):
         "heartbeat_interval_sec",
         "max_one_sided_ticks",
         "liq_gradual_chunks",
+        "price_jitter_ticks",
+        "rebate_check_interval_ticks",
         mode="before",
     )
     @classmethod
@@ -569,6 +621,8 @@ class MMRuntime:
         self._running = False
         self._coin: str = ""
         self._timeframe: str = ""
+        self._requested_coin: str = ""
+        self._requested_timeframe: str = ""
         self._paper_mode: bool = True
         self._dev_mode: bool = False
         self._initial_usdc: float = 1000.0
@@ -582,6 +636,7 @@ class MMRuntime:
         self._strike_retry_task: asyncio.Task | None = None
         self._last_good_tick_size: float = 0.01
         self._last_good_min_order_size: float = 5.0
+        self._last_market_selection: dict[str, Any] | None = None
 
     @property
     def is_running(self) -> bool:
@@ -601,6 +656,183 @@ class MMRuntime:
     def _is_valid_min_order_size(min_order_size: float) -> bool:
         """Sanity bounds for PM min_order_size to avoid pathological API values."""
         return 0.0 < float(min_order_size) <= 100.0
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    async def _fetch_public_book_metrics(self, token_id: str) -> dict[str, float]:
+        """Fetch best bid/ask and coarse depth from public PM orderbook."""
+        import requests as _req
+
+        empty = {"best_bid": 0.0, "best_ask": 0.0, "bid_depth_usd": 0.0, "ask_depth_usd": 0.0}
+        if not token_id:
+            return empty
+        try:
+            resp = await asyncio.to_thread(
+                lambda: _req.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": token_id},
+                    timeout=8,
+                )
+            )
+            if not resp.ok:
+                return empty
+            data = resp.json() or {}
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            bid_levels = [level for level in bids if isinstance(level, dict)]
+            ask_levels = [level for level in asks if isinstance(level, dict)]
+            bid_prices = [self._safe_float(level.get("price"), 0.0) for level in bid_levels]
+            ask_prices = [self._safe_float(level.get("price"), 0.0) for level in ask_levels]
+            best_bid = max([p for p in bid_prices if p > 0], default=0.0)
+            best_ask = min([p for p in ask_prices if p > 0], default=0.0)
+            bid_depth = sum(
+                self._safe_float(level.get("price"), 0.0) * self._safe_float(level.get("size"), 0.0)
+                for level in bid_levels[:30]
+            )
+            ask_depth = sum(
+                self._safe_float(level.get("price"), 0.0) * self._safe_float(level.get("size"), 0.0)
+                for level in ask_levels[:30]
+            )
+            return {
+                "best_bid": max(0.0, best_bid),
+                "best_ask": max(0.0, best_ask),
+                "bid_depth_usd": max(0.0, bid_depth),
+                "ask_depth_usd": max(0.0, ask_depth),
+            }
+        except Exception:
+            return empty
+
+    async def _build_selector_candidate(self, coin: str, timeframe: str) -> dict[str, Any] | None:
+        """Build market selector metrics for a single coin/timeframe pair."""
+        try:
+            tokens = await asyncio.wait_for(
+                asyncio.to_thread(feeds.fetch_pm_tokens, coin, timeframe),
+                timeout=15.0,
+            )
+        except Exception:
+            return None
+        if not tokens or not tokens[0] or not tokens[1]:
+            return None
+        up_id, dn_id, _ = tokens
+        up_book, dn_book = await asyncio.gather(
+            self._fetch_public_book_metrics(up_id),
+            self._fetch_public_book_metrics(dn_id),
+        )
+        up_bid = up_book["best_bid"]
+        up_ask = up_book["best_ask"]
+        dn_bid = dn_book["best_bid"]
+        dn_ask = dn_book["best_ask"]
+        if up_bid <= 0 or up_ask <= 0 or dn_bid <= 0 or dn_ask <= 0:
+            return None
+
+        spread_up = ((up_ask - up_bid) / max(up_ask, 1e-9)) * 10000.0
+        spread_dn = ((dn_ask - dn_bid) / max(dn_ask, 1e-9)) * 10000.0
+        spread_bps = max(0.0, (spread_up + spread_dn) / 2.0)
+        depth_usd = min(
+            up_book["bid_depth_usd"] + up_book["ask_depth_usd"],
+            dn_book["bid_depth_usd"] + dn_book["ask_depth_usd"],
+        )
+        mid_up = (up_bid + up_ask) / 2.0
+        mid_dn = (dn_bid + dn_ask) / 2.0
+        avg_price = max(0.01, min(0.99, (mid_up + mid_dn) / 2.0))
+
+        volume_24h = 0.0
+        try:
+            event_data = await asyncio.wait_for(
+                asyncio.to_thread(feeds.fetch_pm_event_data, coin, timeframe),
+                timeout=12.0,
+            )
+            if event_data:
+                market0 = ((event_data.get("markets") or [{}])[0]) if isinstance(event_data, dict) else {}
+                volume_24h = max(
+                    self._safe_float(event_data.get("volume24hr"), 0.0),
+                    self._safe_float(event_data.get("volume24h"), 0.0),
+                    self._safe_float(event_data.get("volume"), 0.0),
+                    self._safe_float(market0.get("volume24hr"), 0.0),
+                    self._safe_float(market0.get("volume24h"), 0.0),
+                    self._safe_float(market0.get("volume"), 0.0),
+                )
+        except Exception:
+            volume_24h = 0.0
+
+        volatility = 1.0
+        if self.feed_state and self._coin == coin and self.feed_state.klines:
+            try:
+                closes = [float(k[4]) for k in self.feed_state.klines[-40:] if len(k) >= 5]
+                if len(closes) >= 2:
+                    abs_rets = [abs(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes))]
+                    volatility = max(0.0, min(5.0, sum(abs_rets) / len(abs_rets)))
+            except Exception:
+                volatility = 1.0
+
+        return {
+            "coin": coin,
+            "timeframe": timeframe,
+            "spread_bps": spread_bps,
+            "depth_usd": depth_usd,
+            "volume_24h": volume_24h,
+            "avg_price": avg_price,
+            "volatility": volatility,
+        }
+
+    async def _auto_select_market(self, coin: str, timeframe: str) -> tuple[str, str]:
+        """Resolve AUTO coin/timeframe using MarketSelector ranking."""
+        coin_auto = coin.strip().lower() == "auto"
+        tf_auto = timeframe.strip().lower() == "auto"
+        if not coin_auto and not tf_auto:
+            return coin, timeframe
+
+        candidate_pairs: list[tuple[str, str]] = []
+        coins = config.COINS if coin_auto else [coin]
+        for c in coins:
+            timeframes = config.COIN_TIMEFRAMES.get(c, [])
+            if tf_auto:
+                candidate_pairs.extend((c, tf) for tf in timeframes)
+            elif timeframe in timeframes:
+                candidate_pairs.append((c, timeframe))
+
+        if not candidate_pairs:
+            fallback_coin = config.COINS[0] if coin_auto and config.COINS else coin
+            fallback_timeframes = config.COIN_TIMEFRAMES.get(fallback_coin, [])
+            fallback_tf = (
+                fallback_timeframes[0]
+                if tf_auto and fallback_timeframes
+                else timeframe
+            )
+            return fallback_coin, fallback_tf
+
+        selector = MarketSelector()
+        selector.MIN_RECOMMEND_SCORE = float(
+            getattr(self.mm_config, "market_selector_min_score", selector.MIN_RECOMMEND_SCORE)
+        )
+
+        results = await asyncio.gather(
+            *(self._build_selector_candidate(c, tf) for c, tf in candidate_pairs),
+            return_exceptions=True,
+        )
+        candidates = [r for r in results if isinstance(r, dict)]
+        if not candidates:
+            fallback_coin, fallback_tf = candidate_pairs[0]
+            return fallback_coin, fallback_tf
+
+        ranked = selector.rank_markets(candidates)
+        best = selector.recommend(candidates) or ranked[0]
+        self._last_market_selection = {
+            "requested_coin": coin,
+            "requested_timeframe": timeframe,
+            "selected_coin": best.get("coin", coin),
+            "selected_timeframe": best.get("timeframe", timeframe),
+            "selected_score": best.get("score", 0.0),
+            "selected_recommendation": best.get("recommendation", "skip"),
+            "top": ranked[:5],
+            "ts": time.time(),
+        }
+        return str(best.get("coin", coin)), str(best.get("timeframe", timeframe))
 
     async def _cancel_strike_retry_task(self) -> None:
         """Stop background strike recovery loop if active."""
@@ -741,6 +973,22 @@ class MMRuntime:
             await self.stop_watch()
 
         initial_usdc = float(initial_usdc)
+        req_coin = str(coin)
+        req_tf = str(timeframe)
+        self._requested_coin = req_coin
+        self._requested_timeframe = req_tf
+
+        selected_coin, selected_tf = await self._auto_select_market(req_coin, req_tf)
+        if selected_coin != coin or selected_tf != timeframe:
+            log.info(
+                "Market selector: %s/%s -> %s/%s",
+                req_coin,
+                req_tf,
+                selected_coin,
+                selected_tf,
+            )
+        coin = selected_coin
+        timeframe = selected_tf
         self._coin = coin
         self._timeframe = timeframe
         self._paper_mode = paper_mode
@@ -935,6 +1183,25 @@ class MMRuntime:
                     self._feed_tasks.clear()
                     break
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
+                redeem_elapsed = 0.0
+                if (
+                    (not self._paper_mode)
+                    and bool(getattr(self.mm_config, "redeem_after_resolution_enabled", True))
+                    and mm.market
+                    and mm.market.condition_id
+                ):
+                    redeem_started = time.time()
+                    redeem_timeout = min(
+                        float(getattr(self.mm_config, "resolution_wait_sec", 90.0)),
+                        180.0,
+                    )
+                    try:
+                        redeem_result = await mm.redeem_after_resolution(max_wait_sec=redeem_timeout)
+                        log.info("Redeem result: %s", redeem_result)
+                    except Exception as e:
+                        log.warning("Redeem attempt failed: %s", e)
+                    redeem_elapsed = max(0.0, time.time() - redeem_started)
+
                 await self._send_window_summary()
                 self._running = False
                 await self._cancel_strike_retry_task()
@@ -952,8 +1219,8 @@ class MMRuntime:
 
                 if self.mm_config.auto_next_window:
                     # Poll for new window tokens instead of fixed wait
-                    min_wait = 15.0  # minimum cooldown after expiry
-                    max_wait = self.mm_config.resolution_wait_sec
+                    max_wait = max(10.0, float(self.mm_config.resolution_wait_sec) - redeem_elapsed)
+                    min_wait = min(15.0, max(2.0, max_wait * 0.25))
                     poll_interval = 10.0
                     self._next_window_at = time.time() + max_wait
                     log.info(f"Auto-next-window: polling for new tokens (max {max_wait:.0f}s)...")
@@ -1035,8 +1302,8 @@ class MMRuntime:
                     try:
                         log.info("Auto-starting next window...")
                         await self.start(
-                            coin=self._coin,
-                            timeframe=self._timeframe,
+                            coin=self._requested_coin or self._coin,
+                            timeframe=self._requested_timeframe or self._timeframe,
                             paper_mode=self._paper_mode,
                             initial_usdc=self._initial_usdc,
                             dev=self._dev_mode,
@@ -1088,6 +1355,8 @@ class MMRuntime:
             snap["feeds"] = self._build_feeds_dict()
             snap["app_version"] = APP_VERSION
             snap["app_git_hash"] = APP_GIT_HASH
+            if self._last_market_selection:
+                snap["market_selector"] = self._last_market_selection
             return snap
 
         result = {
@@ -1105,6 +1374,8 @@ class MMRuntime:
         result["feeds"] = self._build_feeds_dict()
         result["app_version"] = APP_VERSION
         result["app_git_hash"] = APP_GIT_HASH
+        if self._last_market_selection:
+            result["market_selector"] = self._last_market_selection
         if self._watching and self.feed_state:
             st = self.feed_state
             result["fair_value"]["binance_mid"] = st.mid

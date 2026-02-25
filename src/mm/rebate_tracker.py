@@ -27,6 +27,21 @@ class RebateTracker:
         self._total_checked: int = 0
         self._estimated_daily_rebate: float = 0.0
         self._last_check: float = 0.0
+        self._fee_weights: list[tuple[float, float, str]] = []
+        self._zone_eligibility: dict[str, dict[str, int]] = {
+            "extreme": {"eligible": 0, "ineligible": 0},
+            "moderate": {"eligible": 0, "ineligible": 0},
+            "balanced": {"eligible": 0, "ineligible": 0},
+        }
+
+    @staticmethod
+    def _price_zone(price: float) -> str:
+        """Classify price into rebate scoring zones."""
+        if price < 0.15 or price > 0.85:
+            return "extreme"
+        if (0.15 <= price < 0.35) or (0.65 < price <= 0.85):
+            return "moderate"
+        return "balanced"
 
     async def check_order_scoring(self, token_id: str, price: float,
                                    size: float, side: str) -> Optional[dict]:
@@ -42,6 +57,8 @@ class RebateTracker:
             Scoring result dict or None on error.
         """
         try:
+            zone = self._price_zone(price)
+            weight = (price * (1.0 - price)) ** 2
             params = {
                 "token_id": token_id,
                 "price": price,
@@ -51,9 +68,15 @@ class RebateTracker:
             result = await asyncio.to_thread(
                 self.client.is_order_scoring, params
             )
+            self._fee_weights.append((time.time(), weight, token_id))
+            if len(self._fee_weights) > 500:
+                self._fee_weights = self._fee_weights[-500:]
+
             self._total_checked += 1
-            if result and result.get("scoring", False):
+            is_eligible = bool(result and result.get("scoring", False))
+            if is_eligible:
                 self._eligible_count += 1
+            self._zone_eligibility[zone]["eligible" if is_eligible else "ineligible"] += 1
             self._last_check = time.time()
             return result
         except Exception as e:
@@ -79,7 +102,9 @@ class RebateTracker:
 
     def estimate_daily_rebate(self, daily_volume_usd: float,
                               avg_time_in_book_sec: float,
-                              eligible_ratio: float = None) -> float:
+                              eligible_ratio: Optional[float] = None,
+                              pool_size_usd: float = 5000.0,
+                              our_market_share: float = 0.01) -> float:
         """Rough estimate of daily rebate based on activity.
 
         This is a simplified estimate — actual rebates depend on
@@ -89,6 +114,8 @@ class RebateTracker:
             daily_volume_usd: Our expected daily maker volume
             avg_time_in_book_sec: Average time orders stay in book
             eligible_ratio: Fraction of orders that score (auto from history if None)
+            pool_size_usd: Estimated daily maker rebate pool in USD
+            our_market_share: Our expected share of total maker volume
 
         Returns:
             Estimated daily rebate in USD.
@@ -97,17 +124,69 @@ class RebateTracker:
             eligible_ratio = (self._eligible_count / self._total_checked
                               if self._total_checked > 0 else 0.5)
 
-        # Simplified model: rebate proportional to volume × time × eligibility
-        # Actual formula depends on pool size and competition
-        # Conservative estimate: ~0.1-0.5% of eligible volume
-        base_rate = 0.002  # 0.2% of volume as rebate (conservative)
-        estimate = daily_volume_usd * base_rate * eligible_ratio
+        # Keep daily_volume_usd and avg_time_in_book_sec in the signature for
+        # backward compatibility, but estimate from pool, share, and eligibility.
+        estimate = pool_size_usd * our_market_share * eligible_ratio
 
         self._estimated_daily_rebate = round(estimate, 4)
+        log.info(
+            "Estimated daily rebate=%.4f (pool_size_usd=%.2f, market_share=%.4f, "
+            "eligible_ratio=%.4f, daily_volume_usd=%.2f, avg_time_in_book_sec=%.1f)",
+            self._estimated_daily_rebate,
+            pool_size_usd,
+            our_market_share,
+            eligible_ratio,
+            daily_volume_usd,
+            avg_time_in_book_sec,
+        )
         return self._estimated_daily_rebate
+
+    def scoring_eligibility_summary(self) -> dict:
+        """Return eligible vs ineligible scoring counts by price zone."""
+        summary: dict[str, dict[str, float | int]] = {}
+        for zone, counts in self._zone_eligibility.items():
+            eligible = counts["eligible"]
+            ineligible = counts["ineligible"]
+            total = eligible + ineligible
+            summary[zone] = {
+                "eligible": eligible,
+                "ineligible": ineligible,
+                "total": total,
+                "eligible_ratio": (eligible / total if total > 0 else 0.0),
+            }
+        return summary
+
+    def recommend_quote_zone(self) -> str:
+        """Recommend a quoting focus zone from scoring history."""
+        if self._total_checked < 10:
+            return "insufficient_data"
+
+        summary = self.scoring_eligibility_summary()
+        zone_order = ("extreme", "moderate", "balanced")
+        best_zone = "insufficient_data"
+        best_ratio = -1.0
+        best_total = -1
+
+        for zone in zone_order:
+            ratio = float(summary[zone]["eligible_ratio"])
+            total = int(summary[zone]["total"])
+            if ratio > best_ratio or (ratio == best_ratio and total > best_total):
+                best_zone = zone
+                best_ratio = ratio
+                best_total = total
+
+        return best_zone
+
+    @property
+    def fee_curve_weight_log(self) -> list[tuple[float, float, str]]:
+        """Recent fee curve weights as (timestamp, weight, token_id)."""
+        return list(self._fee_weights)
 
     @property
     def stats(self) -> dict:
+        summary = self.scoring_eligibility_summary()
+        avg_fee_weight = (sum(w for _, w, _ in self._fee_weights) / len(self._fee_weights)
+                          if self._fee_weights else 0.0)
         return {
             "eligible_count": self._eligible_count,
             "total_checked": self._total_checked,
@@ -115,6 +194,11 @@ class RebateTracker:
                                if self._total_checked > 0 else 0.0),
             "estimated_daily_rebate": self._estimated_daily_rebate,
             "last_check": self._last_check,
+            "avg_fee_weight": avg_fee_weight,
+            "price_zone_breakdown": {
+                zone: int(data["total"]) for zone, data in summary.items()
+            },
+            "recommendation": self.recommend_quote_zone(),
         }
 
     def reset(self) -> None:
@@ -124,3 +208,9 @@ class RebateTracker:
         self._total_checked = 0
         self._estimated_daily_rebate = 0.0
         self._last_check = 0.0
+        self._fee_weights.clear()
+        self._zone_eligibility = {
+            "extreme": {"eligible": 0, "ineligible": 0},
+            "moderate": {"eligible": 0, "ineligible": 0},
+            "balanced": {"eligible": 0, "ineligible": 0},
+        }

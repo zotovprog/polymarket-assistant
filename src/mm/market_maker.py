@@ -30,8 +30,96 @@ from .risk_manager import RiskManager, LiquidationLock
 from .heartbeat import HeartbeatManager
 from .rebate_tracker import RebateTracker
 from .market_quality import MarketQualityAnalyzer, MarketQuality
+from .markout_tca import MarkoutTracker
+from .pnl_decomposition import PnLDecomposition
+from .event_requote import EventRequoter
 
 log = logging.getLogger("mm.engine")
+
+
+class SREMetrics:
+    """Track operational health metrics for the MM bot."""
+
+    def __init__(self, max_samples: int = 500):
+        self._max = max_samples
+        self._tick_durations_ms: list[float] = []
+        self._order_rtts_ms: list[float] = []
+        self._fill_check_ms: list[float] = []
+        self._api_success: int = 0
+        self._api_failure: int = 0
+        self._tick_timeouts: int = 0
+        self._ws_reconnects: int = 0
+        self._heartbeat_errors: int = 0
+        self._last_reset: float = 0.0
+
+    def record_tick(self, duration_ms: float) -> None:
+        self._tick_durations_ms.append(duration_ms)
+        if len(self._tick_durations_ms) > self._max:
+            self._tick_durations_ms = self._tick_durations_ms[-self._max:]
+
+    def record_order_rtt(self, rtt_ms: float) -> None:
+        self._order_rtts_ms.append(rtt_ms)
+        if len(self._order_rtts_ms) > self._max:
+            self._order_rtts_ms = self._order_rtts_ms[-self._max:]
+
+    def record_fill_check(self, duration_ms: float) -> None:
+        self._fill_check_ms.append(duration_ms)
+        if len(self._fill_check_ms) > self._max:
+            self._fill_check_ms = self._fill_check_ms[-self._max:]
+
+    def record_api_call(self, success: bool) -> None:
+        if success:
+            self._api_success += 1
+        else:
+            self._api_failure += 1
+
+    def record_tick_timeout(self) -> None:
+        self._tick_timeouts += 1
+
+    def record_ws_reconnect(self) -> None:
+        self._ws_reconnects += 1
+
+    def record_heartbeat_error(self) -> None:
+        self._heartbeat_errors += 1
+
+    @staticmethod
+    def _percentile(data: list[float], pct: float) -> float:
+        if not data:
+            return 0.0
+        sorted_data = sorted(data)
+        idx = int(len(sorted_data) * pct / 100.0)
+        idx = min(idx, len(sorted_data) - 1)
+        return sorted_data[idx]
+
+    @property
+    def stats(self) -> dict:
+        total_api = self._api_success + self._api_failure
+        return {
+            "tick_p50_ms": round(self._percentile(self._tick_durations_ms, 50), 1),
+            "tick_p95_ms": round(self._percentile(self._tick_durations_ms, 95), 1),
+            "tick_p99_ms": round(self._percentile(self._tick_durations_ms, 99), 1),
+            "order_rtt_p50_ms": round(self._percentile(self._order_rtts_ms, 50), 1),
+            "order_rtt_p95_ms": round(self._percentile(self._order_rtts_ms, 95), 1),
+            "fill_check_p50_ms": round(self._percentile(self._fill_check_ms, 50), 1),
+            "fill_check_p95_ms": round(self._percentile(self._fill_check_ms, 95), 1),
+            "api_success_rate": round(self._api_success / max(total_api, 1) * 100, 1),
+            "api_total_calls": total_api,
+            "tick_timeouts_total": self._tick_timeouts,
+            "ws_reconnects": self._ws_reconnects,
+            "heartbeat_errors": self._heartbeat_errors,
+            "tick_samples": len(self._tick_durations_ms),
+        }
+
+    def reset(self) -> None:
+        self._tick_durations_ms.clear()
+        self._order_rtts_ms.clear()
+        self._fill_check_ms.clear()
+        self._api_success = 0
+        self._api_failure = 0
+        self._tick_timeouts = 0
+        self._ws_reconnects = 0
+        self._heartbeat_errors = 0
+        self._last_reset = time.time()
 
 
 class MarketMaker:
@@ -63,9 +151,19 @@ class MarketMaker:
         )
         self.rebate = RebateTracker(clob_client)
         self.quality_analyzer = MarketQualityAnalyzer(config)
+        self.markout_tracker = MarkoutTracker(self._get_token_mid)
+        self.pnl_decomp = PnLDecomposition()
+        self.event_requoter = EventRequoter(
+            pm_mid_threshold_bps=self.config.event_pm_mid_threshold_bps,
+            binance_threshold_bps=self.config.event_binance_threshold_bps,
+            fallback_interval_sec=self.config.event_fallback_interval_sec,
+        )
 
         # State
         self.inventory = Inventory()
+        # Merge-first tracking
+        self._merge_check_interval: int = 10  # Check for merge opportunity every N ticks
+        self._merge_check_counter: int = 0
         self.market: Optional[MarketInfo] = None
         self._running = False
         self._emergency_flag = False
@@ -111,6 +209,12 @@ class MarketMaker:
         self._reconcile_stable_count: int = 0
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
+        self.sre_metrics = SREMetrics()
+        self._last_trade_backfill_ts: float = 0.0
+        self._trade_backfill_interval_sec: float = 60.0
+        self._toxicity_spread_mult: float = 1.0
+        self._toxicity_mode: str = "normal"
+        self._last_requote_events: list[dict[str, Any]] = []
 
         # Current quotes (for dashboard)
         self._current_quotes: dict[str, tuple[Optional[Quote], Optional[Quote]]] = {
@@ -148,8 +252,220 @@ class MarketMaker:
             self._warn_cooldowns[key] = now
             log.warning(msg)
 
+    async def _refresh_fee_rate_cache(self) -> None:
+        """Best-effort refresh of dynamic fee params for current market tokens."""
+        if not self.market or hasattr(self.order_mgr.client, "_orders"):
+            return
+        try:
+            from .pm_fees import fetch_fee_rate
+        except Exception:
+            return
+
+        token_ids = [tid for tid in (self.market.up_token_id, self.market.dn_token_id) if tid]
+        if not token_ids:
+            return
+
+        results = await asyncio.gather(
+            *(fetch_fee_rate(token_id) for token_id in token_ids),
+            return_exceptions=True,
+        )
+        for token_id, result in zip(token_ids, results):
+            if isinstance(result, Exception):
+                log.warning("Fee-rate refresh failed for %s...: %s", token_id[:12], result)
+
+    def _get_token_mid(self, token_id: str) -> float | None:
+        """Best-effort current PM mid for a specific token."""
+        if not self.market:
+            return None
+        st = self.feed_state
+        if token_id == self.market.up_token_id:
+            bid = float(getattr(st, "pm_up_bid", 0.0) or 0.0)
+            ask = float(getattr(st, "pm_up", 0.0) or 0.0)
+        elif token_id == self.market.dn_token_id:
+            bid = float(getattr(st, "pm_dn_bid", 0.0) or 0.0)
+            ask = float(getattr(st, "pm_dn", 0.0) or 0.0)
+        else:
+            return None
+        if bid > 0 and ask > 0:
+            return (bid + ask) / 2.0
+        return ask if ask > 0 else None
+
+    async def _maybe_backfill_trades(self, *, triggered_by_fills: bool = False) -> None:
+        """Run periodic trade-ledger backfill in live mode."""
+        if hasattr(self.order_mgr.client, "_orders"):
+            return
+        now = time.time()
+        due = triggered_by_fills or ((now - self._last_trade_backfill_ts) >= self._trade_backfill_interval_sec)
+        if not due:
+            return
+        try:
+            added = await asyncio.wait_for(self.order_mgr.backfill_trades(), timeout=8.0)
+            self._last_trade_backfill_ts = now
+            self.sre_metrics.record_api_call(True)
+            if added > 0:
+                log.info("Trade backfill: +%d ledger entries", added)
+        except Exception as e:
+            self._last_trade_backfill_ts = now
+            self.sre_metrics.record_api_call(False)
+            self._throttled_warn(
+                "trade_backfill_failed",
+                f"Trade backfill failed: {e}",
+                cooldown=30.0,
+            )
+
+    def _update_toxicity_mode(self) -> None:
+        """Set spread multiplier based on markout toxicity metrics."""
+        stats = self.markout_tracker.stats
+        total = int(stats.get("total_fills", 0) or 0)
+        avg_5s = float(stats.get("avg_markout_5s", 0.0) or 0.0)
+        adverse_5s = float(stats.get("adverse_pct_5s", 0.0) or 0.0)
+
+        prev_mode = self._toxicity_mode
+        if total < 8:
+            self._toxicity_mode = "normal"
+            self._toxicity_spread_mult = 1.0
+        elif avg_5s <= -0.0030 or adverse_5s >= 70.0:
+            self._toxicity_mode = "high"
+            self._toxicity_spread_mult = 1.50
+        elif avg_5s <= -0.0015 or adverse_5s >= 55.0:
+            self._toxicity_mode = "elevated"
+            self._toxicity_spread_mult = 1.25
+        else:
+            self._toxicity_mode = "normal"
+            self._toxicity_spread_mult = 1.0
+
+        if self._toxicity_mode != prev_mode:
+            log.info(
+                "Toxicity mode %s → %s (fills=%d avg5s=%.5f adverse5s=%.1f%% spread_x=%.2f)",
+                prev_mode,
+                self._toxicity_mode,
+                total,
+                avg_5s,
+                adverse_5s,
+                self._toxicity_spread_mult,
+            )
+
+    @staticmethod
+    def _best_bid_price_size(book: dict[str, Any] | None) -> tuple[float | None, float]:
+        """Extract top bid price/size from get_full_book payload."""
+        if not isinstance(book, dict):
+            return None, 0.0
+        bids = book.get("bids") or []
+        if not bids:
+            return None, 0.0
+        top = bids[0] if isinstance(bids[0], dict) else {}
+        try:
+            return float(top.get("price", 0.0)), float(top.get("size", 0.0))
+        except Exception:
+            return None, 0.0
+
+    async def _should_prefer_pair_sell_over_merge(self, merge_pairs: float) -> bool:
+        """Use live top-book premium/depth to decide sell-over-merge."""
+        if not self.market or merge_pairs <= 0:
+            return False
+        try:
+            up_book, dn_book = await asyncio.gather(
+                self.order_mgr.get_full_book(self.market.up_token_id),
+                self.order_mgr.get_full_book(self.market.dn_token_id),
+            )
+            up_bid_px, up_bid_sz = self._best_bid_price_size(up_book)
+            dn_bid_px, dn_bid_sz = self._best_bid_price_size(dn_book)
+            if not up_bid_px or not dn_bid_px:
+                return False
+
+            bid_sum = up_bid_px + dn_bid_px
+            premium = bid_sum - 1.0
+            depth_pairs = min(max(0.0, up_bid_sz), max(0.0, dn_bid_sz))
+            min_depth = min(float(self.config.merge_sell_min_depth_pairs), float(merge_pairs))
+            epsilon = float(self.config.merge_sell_epsilon)
+            prefer_sell = premium >= epsilon and depth_pairs >= min_depth
+            if prefer_sell:
+                log.info(
+                    "Merge skipped: sell-over-merge premium=%.4f (bid_sum=%.4f) depth_pairs=%.2f >= %.2f",
+                    premium,
+                    bid_sum,
+                    depth_pairs,
+                    min_depth,
+                )
+            return prefer_sell
+        except Exception as e:
+            log.debug("Merge break-even check failed: %s", e)
+            return False
+
+    async def _apply_rebate_scoring_filters(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+        *,
+        is_live: bool,
+    ) -> None:
+        """Use PM order scoring to adjust quote selection/sizing."""
+        if not is_live or not bool(getattr(self.config, "rebate_scoring_enabled", True)):
+            return
+        interval = max(1, int(getattr(self.config, "rebate_check_interval_ticks", 20)))
+        if self._tick_count % interval != 0:
+            return
+
+        quote_refs: list[tuple[str, str, Quote]] = []
+        for token_key in ("up", "dn"):
+            bid, ask = all_quotes[token_key]
+            if bid is not None and not any(q is bid for q in self._taker_quotes):
+                quote_refs.append((token_key, "BUY", bid))
+            if ask is not None:
+                quote_refs.append((token_key, "SELL", ask))
+        if not quote_refs:
+            return
+
+        payload = [
+            {"token_id": q.token_id, "price": q.price, "size": q.size, "side": side}
+            for _, side, q in quote_refs
+        ]
+        timeout = max(0.5, float(getattr(self.config, "rebate_score_timeout_sec", 3.0)))
+        try:
+            results = await asyncio.wait_for(self.rebate.check_batch(payload), timeout=timeout)
+        except Exception as e:
+            self._throttled_warn("rebate_scoring", f"Rebate scoring check failed: {e}", cooldown=30.0)
+            return
+
+        require_scoring = bool(getattr(self.config, "rebate_require_scoring", False))
+        non_scoring_mult = float(getattr(self.config, "rebate_non_scoring_size_mult", 0.7))
+        non_scoring_mult = max(0.1, min(1.0, non_scoring_mult))
+        min_size = float(getattr(self.config, "min_quote_size_shares", 1.0))
+        dropped = 0
+        resized = 0
+        eligible = 0
+
+        for (token_key, side, quote), result in zip(quote_refs, results):
+            scoring_ok = bool(result and result.get("scoring", False))
+            if scoring_ok:
+                eligible += 1
+                continue
+
+            if require_scoring:
+                cur_bid, cur_ask = all_quotes[token_key]
+                if side == "BUY":
+                    all_quotes[token_key] = (None, cur_ask)
+                else:
+                    all_quotes[token_key] = (cur_bid, None)
+                dropped += 1
+                continue
+
+            old_size = quote.size
+            quote.size = round(max(min_size, quote.size * non_scoring_mult), 2)
+            if quote.size < old_size:
+                resized += 1
+
+        log.info(
+            "Rebate scoring: eligible=%d/%d dropped=%d resized=%d require_scoring=%s",
+            eligible,
+            len(quote_refs),
+            dropped,
+            resized,
+            require_scoring,
+        )
+
     def _schedule_heartbeat_failure(self) -> None:
         """Schedule async heartbeat failure handler from sync callback context."""
+        self.sre_metrics.record_heartbeat_error()
         if self._heartbeat_failure_task and not self._heartbeat_failure_task.done():
             return
         try:
@@ -188,11 +504,57 @@ class MarketMaker:
             await self.heartbeat.stop()
         except Exception as e:
             log.error("Emergency heartbeat stop failed: %s", e, exc_info=True)
+        self.markout_tracker.stop()
 
         self._running = False
         self._paused = True
         self._pause_reason = reason
         self._is_closing = True
+
+    def _event_requote_snapshot(self, had_fill: bool = False) -> list[Any]:
+        """Evaluate event-driven requote conditions from current feed state."""
+        if not bool(getattr(self.config, "event_requote_enabled", True)):
+            return []
+        st = self.feed_state
+
+        # Keep thresholds hot-reloaded from runtime config updates.
+        self.event_requoter.pm_mid_threshold_bps = float(
+            getattr(self.config, "event_pm_mid_threshold_bps", self.event_requoter.pm_mid_threshold_bps)
+        )
+        self.event_requoter.binance_threshold_bps = float(
+            getattr(self.config, "event_binance_threshold_bps", self.event_requoter.binance_threshold_bps)
+        )
+        self.event_requoter.fallback_interval_sec = float(
+            getattr(self.config, "event_fallback_interval_sec", self.event_requoter.fallback_interval_sec)
+        )
+
+        pm_bid = float(getattr(st, "pm_up_bid", 0.0) or 0.0)
+        pm_ask = float(getattr(st, "pm_up", 0.0) or 0.0)
+        pm_mid = ((pm_bid + pm_ask) / 2.0) if (pm_bid > 0 and pm_ask > 0) else None
+        if pm_mid is None and pm_ask > 0:
+            pm_mid = pm_ask
+
+        best_bid = pm_bid if pm_bid > 0 else None
+        best_ask = pm_ask if pm_ask > 0 else None
+        binance_mid = float(getattr(st, "mid", 0.0) or 0.0)
+        if binance_mid <= 0:
+            binance_mid = None
+
+        tier = int(self._imbalance_adjustments.get("tier", 0))
+        events = self.event_requoter.check_events(
+            current_pm_mid=pm_mid,
+            current_binance_price=binance_mid,
+            current_best_bid=best_bid,
+            current_best_ask=best_ask,
+            had_fill=had_fill,
+            inventory_imbalance_tier=tier,
+        )
+        if events:
+            self._last_requote_events = [
+                {"event_type": e.event_type, "timestamp": e.timestamp, "detail": e.detail}
+                for e in events[-10:]
+            ]
+        return events
 
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
@@ -248,6 +610,13 @@ class MarketMaker:
             self._cached_usdc_balance = starting_usdc
             self._cached_pm_up_shares = real_up if real_up is not None else 0.0
             self._cached_pm_dn_shares = real_dn if real_dn is not None else 0.0
+            # Always initialize internal inventory from real PM balances to avoid stale state.
+            self.inventory.up_shares = self._cached_pm_up_shares
+            self.inventory.dn_shares = self._cached_pm_dn_shares
+            self.inventory.usdc = starting_usdc
+            self.inventory.initial_usdc = starting_usdc
+            self.inventory.up_cost.reset()
+            self.inventory.dn_cost.reset()
             # Include pre-existing tokens in starting portfolio
             # Wait for valid PM prices (WS feed) before computing starting portfolio
             _fv_up, _fv_dn = 0.0, 0.0
@@ -270,9 +639,6 @@ class MarketMaker:
             # Initialize internal inventory from PM balances (pre-existing tokens
             # from previous sessions must be tracked to avoid phantom PnL)
             if self._cached_pm_up_shares > 0 or self._cached_pm_dn_shares > 0:
-                self.inventory.up_shares = self._cached_pm_up_shares
-                self.inventory.dn_shares = self._cached_pm_dn_shares
-                self.inventory.usdc = starting_usdc
                 # Set cost basis from current prices (best guess for pre-existing)
                 if self._cached_pm_up_shares > 0:
                     self.inventory.up_cost.total_shares = self._cached_pm_up_shares
@@ -297,6 +663,12 @@ class MarketMaker:
             self._cached_usdc_balance = 0.0
             self._cached_pm_up_shares = 0.0
             self._cached_pm_dn_shares = 0.0
+            self.inventory.up_shares = 0.0
+            self.inventory.dn_shares = 0.0
+            self.inventory.usdc = 0.0
+            self.inventory.initial_usdc = 0.0
+            self.inventory.up_cost.reset()
+            self.inventory.dn_cost.reset()
         self._started_at = time.time()
         self._pnl_grace_until = self._started_at + 30.0  # 30s grace period for PnL checks
         self._catastrophic_count = 0
@@ -304,6 +676,10 @@ class MarketMaker:
         self._pause_reason = ""
         self._heartbeat_failure_task = None
         self._tick_count = 0
+        self._merge_check_counter = 0
+        self._last_trade_backfill_ts = 0.0
+        self._toxicity_spread_mult = 1.0
+        self._toxicity_mode = "normal"
         self._is_closing = False
         self._liquidation_attempted = False
         self._liquidation_order_ids = set()
@@ -329,9 +705,23 @@ class MarketMaker:
         # Set budget cap on order manager (enforced at placement time)
         self.order_mgr._session_budget = self.inventory.initial_usdc
         self.order_mgr._session_spent = 0.0
+        self.pnl_decomp.reset()
+        self.rebate.reset()
+        self.markout_tracker.stop()
+        self.markout_tracker = MarkoutTracker(self._get_token_mid)
+        self.event_requoter = EventRequoter(
+            pm_mid_threshold_bps=self.config.event_pm_mid_threshold_bps,
+            binance_threshold_bps=self.config.event_binance_threshold_bps,
+            fallback_interval_sec=self.config.event_fallback_interval_sec,
+        )
+        self._last_requote_events = []
+
+        # Warm fee-rate cache for both tokens (best-effort, non-fatal).
+        await self._refresh_fee_rate_cache()
 
         # Wire fill callback → trigger immediate requote
         self.order_mgr.set_fill_callback(lambda: self._requote_event.set())
+        self.order_mgr.set_ws_reconnect_callback(self.sre_metrics.record_ws_reconnect)
 
         # Wire heartbeat ID sync: order/cancel responses may contain new ID
         self.order_mgr.set_heartbeat_id_callback(self.heartbeat.update_id)
@@ -393,6 +783,7 @@ class MarketMaker:
 
         # Stop fill WebSocket
         await self.order_mgr.stop_fill_ws()
+        self.markout_tracker.stop()
 
         # Stop heartbeat
         await self.heartbeat.stop()
@@ -409,6 +800,7 @@ class MarketMaker:
                         tick_timeout = 15.0 if self._is_closing else 10.0
                         await asyncio.wait_for(self._tick(), timeout=tick_timeout)
                     except asyncio.TimeoutError:
+                        self.sre_metrics.record_tick_timeout()
                         self._log.warning("_tick() timed out after %.0fs, skipping iteration",
                                           15.0 if self._is_closing else 10.0)
                 except asyncio.CancelledError:
@@ -416,15 +808,29 @@ class MarketMaker:
                 except Exception as e:
                     log.error(f"Tick error: {e}", exc_info=True)
 
-                # Wait for event OR timeout (whichever comes first)
-                try:
-                    await asyncio.wait_for(
-                        self._requote_event.wait(),
-                        timeout=self.config.requote_interval_sec,
-                    )
-                    self._requote_event.clear()
-                except asyncio.TimeoutError:
-                    pass  # Normal tick on timeout
+                # Wait until explicit trigger, event-driven market movement, or timeout.
+                sleep_budget = self.quote_engine.jitter_requote_interval(
+                    self.config.requote_interval_sec
+                )
+                poll_interval = max(0.05, float(getattr(self.config, "event_poll_interval_sec", 0.25)))
+                deadline = time.monotonic() + max(0.1, float(sleep_budget))
+                while self._running:
+                    if self._requote_event.is_set():
+                        self._requote_event.clear()
+                        break
+
+                    events = self._event_requote_snapshot(had_fill=False)
+                    if events:
+                        non_timer = [e for e in events if e.event_type != "timer_fallback"]
+                        if non_timer:
+                            event_names = ",".join(sorted({e.event_type for e in non_timer}))
+                            log.debug("Event-driven requote trigger: %s", event_names)
+                        break
+
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(min(poll_interval, remaining))
         except asyncio.CancelledError:
             pass
         log.info("Quote loop ended")
@@ -519,6 +925,12 @@ class MarketMaker:
             token_type = "up" if fill.token_id == self.market.up_token_id else "dn"
             self.inventory.update_from_fill(fill, token_type)
             self.risk_mgr.record_fill(fill)
+            self.pnl_decomp.record_fill(
+                fill.side, fill.token_id, fill.price, fill.size, fill.fee, fill.is_maker
+            )
+            self.markout_tracker.record_fill(
+                fill.side, fill.token_id, fill.price, fill.size, fill.is_maker
+            )
             log.info(f"FILL: {fill.side} {fill.size:.1f}@{fill.price:.2f} "
                      f"({token_type.upper()}) fee={fill.fee:.4f}")
             for cb in self._on_fill_callbacks:
@@ -526,14 +938,29 @@ class MarketMaker:
                     cb(fill, token_type)
                 except Exception as e:
                     log.warning("Fill callback error: %s", e)
+        await self._maybe_backfill_trades(triggered_by_fills=bool(fills))
+        await self.markout_tracker.check_markouts()
+        self._update_toxicity_mode()
         _t_fills = time.perf_counter()
+
+        merge_reconcile_requested = False
+        # Merge-first: check for merge opportunity periodically (skip during closing).
+        if not self._is_closing:
+            self._merge_check_counter += 1
+            if self._merge_check_counter >= self._merge_check_interval:
+                self._merge_check_counter = 0
+                if not self._merge_failed_this_cycle:
+                    merge_profit = await self._try_merge_pairs()
+                    if merge_profit > 0:
+                        merge_reconcile_requested = True
+                        self.order_mgr.invalidate_usdc_cache()
 
         # Live mode: periodically reconcile internal shares with PM balances.
         # Skip during closing to save HTTP calls (liquidation does its own balance checks).
         # Uses debounce: only reconcile if PM values are stable for 3+ consecutive checks
         # to avoid oscillation from PM balance API lagging behind fill detection.
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        reconcile_requested = self.order_mgr.reconcile_requested
+        reconcile_requested = self.order_mgr.reconcile_requested or merge_reconcile_requested
         if is_live and not self._is_closing and (self._tick_count % 15 == 0 or reconcile_requested):
             (real_up, real_dn), usdc_bal = await asyncio.gather(
                 self.order_mgr.get_all_token_balances(
@@ -581,7 +1008,7 @@ class MarketMaker:
                         else:
                             self._reconcile_stable_count = 1
 
-                        if self._reconcile_stable_count >= 1:
+                        if self._reconcile_stable_count >= 3:
                             log.warning(
                                 "Inventory reconcile (confirmed %d checks): "
                                 "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
@@ -594,7 +1021,7 @@ class MarketMaker:
                             self._reconcile_prev_pm = None
                         else:
                             log.info(
-                                "Inventory drift (%d/1): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                                "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
                                 self._reconcile_stable_count,
                                 self.inventory.up_shares, self.inventory.dn_shares,
                                 real_up, real_dn,
@@ -675,16 +1102,9 @@ class MarketMaker:
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
-        # 3. Compute fair value
-        fv_up, fv_dn = self.fair_value.compute(
-            mid=mid,
-            strike=strike,
-            time_remaining_sec=self.market.time_remaining,
-            klines=klines,
-            bids=bids,
-            asks=asks,
-            trades=trades,
-        )
+        # 3. Compute fair value (PM-anchored when PM data is fresh).
+        _t_fv_start = time.perf_counter()
+        fv_up, fv_dn = self._compute_fv()
 
         _t_fv = time.perf_counter()
 
@@ -970,8 +1390,9 @@ class MarketMaker:
             imbalance,
             imbalance_duration,
         )
-        # Imbalance handling must remain passive (spread/skew only), never taker-forced.
-        self._imbalance_adjustments["force_taker_lagging"] = False
+        if not bool(getattr(self.config, "paired_fill_ioc_enabled", False)):
+            # Default: passive-only paired-filling management.
+            self._imbalance_adjustments["force_taker_lagging"] = False
         tier = int(self._imbalance_adjustments.get("tier", 0))
         if tier != prev_tier:
             leading_key = "up" if self.inventory.up_shares > self.inventory.dn_shares else (
@@ -987,6 +1408,9 @@ class MarketMaker:
                 lagging_key.upper(),
             )
 
+        # Update event-requote tracker with latest state, including fill triggers.
+        self._event_requote_snapshot(had_fill=bool(fills))
+
         if fills and imbalance > 2.0:
             self._requote_event.set()
 
@@ -996,6 +1420,19 @@ class MarketMaker:
             leading_token, lagging_token = "up", "dn"
         elif self.inventory.dn_shares > self.inventory.up_shares:
             leading_token, lagging_token = "dn", "up"
+
+        # Entry settle window: skip initial quoting right after a new window opens.
+        entry_settle_sec = max(0.0, float(getattr(self.config, "entry_settle_sec", 0.0)))
+        if entry_settle_sec > 0 and time.time() < (self.market.window_start + entry_settle_sec):
+            remaining = (self.market.window_start + entry_settle_sec) - time.time()
+            if self._tick_count % 5 == 0:
+                log.info(
+                    "Entry settle active: waiting %.1fs before quoting this window",
+                    max(0.0, remaining),
+                )
+            await self.order_mgr.cancel_all()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
 
         # 6. Generate quotes (with USDC budget cap)
         order_collateral = sum(
@@ -1054,6 +1491,9 @@ class MarketMaker:
                 lagging_token,
                 float(self._imbalance_adjustments.get("lagging_spread_mult", 1.0)),
             )
+        if self._toxicity_spread_mult > 1.0:
+            _apply_spread_multiplier("up", self._toxicity_spread_mult)
+            _apply_spread_multiplier("dn", self._toxicity_spread_mult)
         if widen_spread_tick:
             _apply_spread_multiplier("up", 2.0)
             _apply_spread_multiplier("dn", 2.0)
@@ -1124,6 +1564,14 @@ class MarketMaker:
             if taker_lagging_key == token_key and bid is not None and book["best_ask"] is not None:
                 # Force taker cross on lagging side to accelerate balancing fills.
                 bid.price = _round_to_tick(float(book["best_ask"]))
+            elif self._toxicity_mode == "high":
+                # Toxic flow defense: stand one tick off BBO instead of queue-front.
+                if bid is not None and book["best_bid"] is not None:
+                    safer_bid = _round_to_tick(float(book["best_bid"]) - tick_size)
+                    bid.price = min(bid.price, safer_bid)
+                if ask is not None and book["best_ask"] is not None:
+                    safer_ask = _round_to_tick(float(book["best_ask"]) + tick_size)
+                    ask.price = max(ask.price, safer_ask)
             # Re-apply max inventory cap after clamping (safety net)
             max_sh = self.config.max_inventory_shares
             if bid is not None and bid.size > max_sh:
@@ -1131,6 +1579,8 @@ class MarketMaker:
             if ask is not None and ask.size > max_sh:
                 ask.size = round(max_sh, 2)
             all_quotes[token_key] = (bid, ask)
+
+        await self._apply_rebate_scoring_filters(all_quotes, is_live=is_live)
         _t_quotes = time.perf_counter()
 
         # Abort if emergency shutdown was triggered during this tick
@@ -1141,13 +1591,14 @@ class MarketMaker:
         # Collect all operations first, then execute cancels→places in parallel
         # to cut tick latency in half (was sequential UP then DN).
         pending_cancels: list[str] = []
-        pending_places: list[tuple[Quote, bool | None, bool]] = []  # (quote, post_only, fallback_taker)
+        pending_places: list[tuple[Quote, bool | None, bool, bool]] = []  # (quote, post_only, fallback_taker, ioc_like)
         pending_updates: dict[str, tuple] = {}  # token_key -> (bid, ask)
 
         for token_key in ("up", "dn"):
             new_bid, new_ask = all_quotes[token_key]
             cur_bid, cur_ask = self._current_quotes.get(token_key, (None, None))
             use_taker_bid = bool(new_bid is not None and any(q is new_bid for q in self._taker_quotes))
+            use_ioc_like_bid = bool(use_taker_bid and getattr(self.config, "paired_fill_ioc_enabled", False))
 
             need_bid = self.quote_engine.should_requote(cur_bid, new_bid)
             if use_taker_bid and new_bid is not None:
@@ -1206,38 +1657,73 @@ class MarketMaker:
                 if need_bid and new_bid is not None:
                     po = False if use_taker_bid else None
                     ft = True if use_taker_bid else False
-                    pending_places.append((new_bid, po, ft))
+                    pending_places.append((new_bid, po, ft, use_ioc_like_bid))
                 if need_ask and new_ask is not None:
-                    pending_places.append((new_ask, None, False))
+                    pending_places.append((new_ask, None, False, False))
 
-                updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
+                updated_bid = (
+                    None
+                    if (need_bid and use_ioc_like_bid)
+                    else (new_bid if need_bid else (None if stale_bid else cur_bid))
+                )
                 updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                 pending_updates[token_key] = (updated_bid, updated_ask)
 
-        # Cancel all old orders in parallel (UP + DN at once)
+        # Cancel old orders via batch API.
         if pending_cancels:
-            cancel_results = await asyncio.gather(
-                *(self.order_mgr.cancel_order(oid) for oid in pending_cancels if oid),
-                return_exceptions=True,
-            )
-            cancel_ok = all(not isinstance(r, Exception) and r for r in cancel_results)
-            if not cancel_ok:
-                failed = sum(1 for r in cancel_results if isinstance(r, Exception) or not r)
-                log.warning("Parallel cancel: %d/%d failed, skipping placements",
-                            failed, len(cancel_results))
+            pending_cancels = list(dict.fromkeys(oid for oid in pending_cancels if oid))
+            cancelled = await self.order_mgr.cancel_orders_batch(pending_cancels)
+            self.sre_metrics.record_api_call(cancelled == len(pending_cancels))
+            if cancelled < len(pending_cancels):
+                failed = len(pending_cancels) - cancelled
+                log.warning(
+                    "Batch cancel: %d/%d failed, skipping placements",
+                    failed, len(pending_cancels),
+                )
                 pending_places.clear()
                 pending_updates.clear()
 
-        # Place all new orders in parallel (UP + DN at once)
+        # Place new orders safely:
+        # - maker orders via batch API (fewer HTTP calls),
+        # - taker/special orders sequentially (avoid budget races).
         if pending_places:
-            place_results = await asyncio.gather(
-                *(self.order_mgr.place_order(q, post_only=po, fallback_taker=ft)
-                  for q, po, ft in pending_places),
-                return_exceptions=True,
-            )
-            place_failed = sum(1 for r in place_results if isinstance(r, Exception) or r is None)
+            maker_batch_quotes: list[Quote] = []
+            sequential_places: list[tuple[Quote, bool | None, bool, bool]] = []
+            for q, po, ft, ioc_like in pending_places:
+                if (po is None or po is True) and not ft and not ioc_like:
+                    maker_batch_quotes.append(q)
+                else:
+                    sequential_places.append((q, po, ft, ioc_like))
+
+            place_failed = 0
+            place_total = 0
+
+            if maker_batch_quotes:
+                batch_ids = await self.order_mgr.place_orders_batch(
+                    maker_batch_quotes,
+                    post_only=self.config.use_post_only,
+                )
+                place_total += len(batch_ids)
+                place_failed += sum(1 for oid in batch_ids if not oid)
+
+            for q, po, ft, ioc_like in sequential_places:
+                oid = await self.order_mgr.place_order(q, post_only=po, fallback_taker=ft)
+                place_total += 1
+                if not oid:
+                    place_failed += 1
+                    continue
+                if ioc_like:
+                    # IOC-like behavior: taker-second-leg should not rest in book.
+                    try:
+                        await self.order_mgr.cancel_order(oid)
+                    except Exception:
+                        pass
+
+            if place_total > 0:
+                self.sre_metrics.record_api_call(place_failed == 0)
+
             if place_failed:
-                log.warning("Parallel place: %d/%d orders failed", place_failed, len(place_results))
+                log.warning("Order placement: %d/%d orders failed", place_failed, place_total)
 
         # Update quote tracking
         for tk, (bid, ask) in pending_updates.items():
@@ -1285,13 +1771,16 @@ class MarketMaker:
         self._last_order_ms = (_t_orders - _t_quotes) * 1000
         self._last_fills_ms = (_t_fills - _t0) * 1000
         self._last_reconcile_ms = (_t_reconcile - _t_fills) * 1000
-        self._last_fv_ms = (_t_fv - _t_reconcile) * 1000
+        self._last_fv_ms = (_t_fv - _t_fv_start) * 1000
         self._last_quotes_ms = (_t_quotes - _t_fv) * 1000
         self._last_orders_ms = (_t_orders - _t_quotes) * 1000
+        self.sre_metrics.record_fill_check(self._last_fills_ms)
+        self.sre_metrics.record_order_rtt(self._last_orders_ms)
         self._tick_ms_samples.append(total_ms)
         if len(self._tick_ms_samples) > 100:
             self._tick_ms_samples = self._tick_ms_samples[-50:]
         self._avg_tick_ms = sum(self._tick_ms_samples) / len(self._tick_ms_samples)
+        self.sre_metrics.record_tick(self._last_tick_ms)
 
         if self._tick_count % 10 == 0:
             log.info(
@@ -1299,7 +1788,7 @@ class MarketMaker:
                 "quotes+book=%.0fms orders=%.0fms total=%.0fms",
                 (_t_fills - _t0) * 1000,
                 (_t_reconcile - _t_fills) * 1000,
-                (_t_fv - _t_reconcile) * 1000,
+                self._last_fv_ms,
                 (_t_quotes - _t_fv) * 1000,
                 (_t_orders - _t_quotes) * 1000,
                 total_ms,
@@ -1319,10 +1808,23 @@ class MarketMaker:
         bids = list(st.bids) if st.bids else []
         asks = list(st.asks) if st.asks else []
         trades = list(st.trades) if st.trades else []
-        return self.fair_value.compute(
+
+        pm_up_bid = float(getattr(st, "pm_up_bid", 0.0) or 0.0)
+        pm_up_ask = float(getattr(st, "pm_up", 0.0) or 0.0)
+        pm_dn_bid = float(getattr(st, "pm_dn_bid", 0.0) or 0.0)
+        pm_dn_ask = float(getattr(st, "pm_dn", 0.0) or 0.0)
+        pm_up = ((pm_up_bid + pm_up_ask) / 2.0) if (pm_up_bid > 0 and pm_up_ask > 0) else pm_up_ask
+        pm_dn = ((pm_dn_bid + pm_dn_ask) / 2.0) if (pm_dn_bid > 0 and pm_dn_ask > 0) else pm_dn_ask
+        pm_last_update = float(getattr(st, "pm_last_update_ts", 0.0) or 0.0)
+        pm_age_sec = (time.time() - pm_last_update) if pm_last_update > 0 else 999.0
+
+        return self.fair_value.compute_with_pm_anchor(
             mid, self.market.strike,
             self.market.time_remaining, klines,
-            bids, asks, trades,
+            pm_up=pm_up,
+            pm_dn=pm_dn,
+            pm_age_sec=pm_age_sec,
+            bids=bids, asks=asks, trades=trades,
         )
 
     async def _get_liq_lock_best_bids(self) -> tuple[float | None, float | None]:
@@ -1338,6 +1840,82 @@ class MarketMaker:
         except Exception as e:
             log.warning("Failed to fetch best bids for liquidation lock: %s", e)
             return None, None
+
+    async def _try_merge_pairs(self) -> float:
+        """Attempt to merge paired UP+DN inventory.
+
+        Returns profit from merge (0.0 if no merge done).
+        """
+        if not self.market or self._is_closing:
+            return 0.0
+
+        # Update paired inventory tracking
+        self.inventory.paired.update(
+            self.inventory.up_shares,
+            self.inventory.dn_shares,
+            self.inventory.up_cost.avg_entry_price,
+            self.inventory.dn_cost.avg_entry_price,
+        )
+
+        q_pair = self.inventory.paired.q_pair
+        if q_pair < 1.0:  # Need at least 1 pair
+            return 0.0
+
+        merge_amount = int(q_pair)  # Merge whole units only
+        if merge_amount < 1:
+            return 0.0
+
+        if await self._should_prefer_pair_sell_over_merge(merge_amount):
+            self._requote_event.set()
+            return 0.0
+
+        # Only merge if profitable (cost < $1.00 per pair)
+        if self.inventory.paired.pair_profit_per_unit <= 0:
+            log.info(
+                "Merge skip: pair cost %.4f >= $1.00",
+                self.inventory.paired.total_pair_cost / max(q_pair, 0.01),
+            )
+            return 0.0
+
+        expected_profit = merge_amount * self.inventory.paired.pair_profit_per_unit
+        log.info("Merge attempt: %d pairs, expected profit $%.4f", merge_amount, expected_profit)
+
+        try:
+            # Use the existing merge_positions method in order_manager
+            result = await self.order_mgr.merge_positions(
+                condition_id=self.market.condition_id,
+                amount_shares=merge_amount,
+                private_key="",  # OrderManager handles key internally
+            )
+            if result.get("success"):
+                self.inventory.paired.record_merge(merge_amount, expected_profit)
+                merge_total_cost = max(0.0, merge_amount - expected_profit)
+                self.pnl_decomp.record_merge(merge_amount, merge_total_cost)
+                # Update inventory — merge removes both UP and DN shares, adds USDC.
+                self.inventory.up_shares = max(0.0, self.inventory.up_shares - merge_amount)
+                self.inventory.dn_shares = max(0.0, self.inventory.dn_shares - merge_amount)
+                self.inventory.usdc += merge_amount  # $1 per pair
+                self.inventory.up_cost.record_sell(merge_amount)
+                self.inventory.dn_cost.record_sell(merge_amount)
+                # Keep paper-mode balances in sync with merged inventory.
+                if hasattr(self.order_mgr.client, "_orders"):
+                    for tid in [self.market.up_token_id, self.market.dn_token_id]:
+                        cur = self.order_mgr._mock_token_balances.get(tid, 0.0)
+                        self.order_mgr._mock_token_balances[tid] = max(0.0, cur - merge_amount)
+                log.info(
+                    "Merge SUCCESS: %d pairs -> $%d USDC, profit $%.4f",
+                    merge_amount,
+                    merge_amount,
+                    expected_profit,
+                )
+                return expected_profit
+            log.warning("Merge failed: %s", result.get("error", "unknown"))
+            self._merge_failed_this_cycle = True
+            return 0.0
+        except Exception as e:
+            log.error("Merge exception: %s", e)
+            self._merge_failed_this_cycle = True
+            return 0.0
 
     async def _liquidate_inventory(self) -> None:
         """Smart liquidation with merge + 3-phase SELL exit.
@@ -1373,6 +1951,10 @@ class MarketMaker:
                 log.warning("Merge exception: %s", e)
                 result = {"success": False, "error": str(e)}
             if result.get("success"):
+                pre_up_avg = self.inventory.up_cost.avg_entry_price
+                pre_dn_avg = self.inventory.dn_cost.avg_entry_price
+                merge_total_cost = merge_amount * max(0.0, pre_up_avg + pre_dn_avg)
+                self.pnl_decomp.record_merge(merge_amount, merge_total_cost)
                 log.info(
                     "MERGE: %.2f pairs → $%.2f USDC",
                     merge_amount, merge_amount,
@@ -1500,6 +2082,10 @@ class MarketMaker:
                         self.inventory.up_shares = max(0.0, self.inventory.up_shares - dust_merge)
                         self.inventory.dn_shares = max(0.0, self.inventory.dn_shares - dust_merge)
                         self.inventory.usdc += dust_merge
+                        pre_up_avg = self.inventory.up_cost.avg_entry_price
+                        pre_dn_avg = self.inventory.dn_cost.avg_entry_price
+                        merge_total_cost = dust_merge * max(0.0, pre_up_avg + pre_dn_avg)
+                        self.pnl_decomp.record_merge(dust_merge, merge_total_cost)
                     else:
                         self._merge_failed_this_cycle = True
                 except Exception:
@@ -1578,8 +2164,10 @@ class MarketMaker:
 
             # Adjust floor for taker fee when in taker mode
             if use_taker:
-                from .pm_fees import TAKER_FEE_PCT
-                floor = floor * (1.0 + TAKER_FEE_PCT / 100.0)
+                from .pm_fees import taker_fee_usd
+                taker_fee = taker_fee_usd(floor, 1.0, "SELL", token_id=token_id)
+                taker_fee_ratio = taker_fee / max(floor, 1e-9)
+                floor = floor * (1.0 + taker_fee_ratio)
 
             if use_taker:
                 # ── Phase 2: Taker ──
@@ -1734,6 +2322,63 @@ class MarketMaker:
                 # Stay in _is_closing=True so bot doesn't resume quoting,
                 # but stop spamming sell attempts — just wait for window end
 
+    async def redeem_after_resolution(self, max_wait_sec: float | None = None) -> dict:
+        """Best-effort winner token redemption after market resolution."""
+        if hasattr(self.order_mgr.client, "_orders"):
+            return {"success": False, "error": "paper mode"}
+        if not self.market or not self.market.condition_id:
+            return {"success": False, "error": "missing condition_id"}
+        if not self._private_key:
+            return {"success": False, "error": "missing private key"}
+
+        timeout_sec = (
+            float(max_wait_sec)
+            if max_wait_sec is not None
+            else float(getattr(self.config, "resolution_wait_sec", 90.0))
+        )
+        retry_interval = max(2.0, float(getattr(self.config, "redeem_retry_interval_sec", 15.0)))
+        deadline = time.time() + max(0.0, timeout_sec)
+        attempts = 0
+        last_result: dict[str, Any] = {"success": False, "error": "not_attempted"}
+
+        while True:
+            attempts += 1
+            try:
+                last_result = await self.order_mgr.redeem_positions(
+                    condition_id=self.market.condition_id,
+                    private_key=self._private_key,
+                )
+            except Exception as e:
+                last_result = {"success": False, "error": str(e)}
+
+            if last_result.get("success"):
+                self.order_mgr.invalidate_usdc_cache()
+                log.info(
+                    "Redeem success for condition %s... (attempt %d)",
+                    self.market.condition_id[:12],
+                    attempts,
+                )
+                return {**last_result, "attempts": attempts}
+
+            err = str(last_result.get("error", "")).lower()
+            terminal = (
+                "funder mode" in err
+                or "missing private key" in err
+                or "missing condition_id" in err
+                or "not supported" in err
+            )
+            if terminal or time.time() >= deadline:
+                break
+            await asyncio.sleep(retry_interval)
+
+        log.warning(
+            "Redeem not completed for condition %s... after %d attempt(s): %s",
+            self.market.condition_id[:12],
+            attempts,
+            last_result.get("error", "unknown"),
+        )
+        return {**last_result, "attempts": attempts}
+
     async def on_window_transition(self, new_market: MarketInfo) -> None:
         """Handle window transition — cancel all, switch tokens, resume."""
         log.info(f"Window transition: {new_market.coin} {new_market.timeframe}")
@@ -1751,10 +2396,19 @@ class MarketMaker:
         self._liq_last_chunk_time = 0.0
         self._is_closing = False
         self._merge_failed_this_cycle = False
+        self._merge_check_counter = 0
         self._reconcile_prev_pm = None
         self._reconcile_stable_count = 0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
+        self._toxicity_spread_mult = 1.0
+        self._toxicity_mode = "normal"
+        self.event_requoter = EventRequoter(
+            pm_mid_threshold_bps=self.config.event_pm_mid_threshold_bps,
+            binance_threshold_bps=self.config.event_binance_threshold_bps,
+            fallback_interval_sec=self.config.event_fallback_interval_sec,
+        )
+        self._last_requote_events = []
         self._imbalance_start_ts = 0.0
         self._imbalance_adjustments = {
             "leading_spread_mult": 1.0,
@@ -1771,6 +2425,7 @@ class MarketMaker:
         log.info(f"New window: strike={new_market.strike:.2f} "
                  f"UP={new_market.up_token_id[:12]}... "
                  f"DN={new_market.dn_token_id[:12]}...")
+        await self._refresh_fee_rate_cache()
 
     def snapshot(self) -> dict:
         """Get current state for dashboard API."""
@@ -1781,14 +2436,8 @@ class MarketMaker:
         vol = 0.0
         if self.market and st.mid and st.mid > 0:
             klines = list(st.klines) if st.klines else []
-            bids = list(st.bids) if st.bids else []
-            asks = list(st.asks) if st.asks else []
-            trades = list(st.trades) if st.trades else []
             try:
-                fv_up, fv_dn = self.fair_value.compute(
-                    st.mid, self.market.strike,
-                    self.market.time_remaining, klines,
-                    bids, asks, trades)
+                fv_up, fv_dn = self._compute_fv()
                 vol = self.fair_value.realized_vol(klines)
             except Exception:
                 pass
@@ -1846,6 +2495,14 @@ class MarketMaker:
                            self._cached_pm_dn_shares * _pm_dn_price)
         _current_portfolio = self._cached_usdc_balance + _position_value
         _session_pnl = _current_portfolio - self._starting_portfolio_pm if self._starting_portfolio_pm > 0 else 0.0
+        inventory_unrealized = self.pnl_decomp.update_inventory_cost(
+            self.inventory.up_shares,
+            self.inventory.up_cost.avg_entry_price,
+            _pm_up_price,
+            self.inventory.dn_shares,
+            self.inventory.dn_cost.avg_entry_price,
+            _pm_dn_price,
+        )
 
         return {
             # Market info
@@ -1952,8 +2609,34 @@ class MarketMaker:
             # Heartbeat
             "heartbeat": self.heartbeat.stats,
 
+            # Merge-first paired inventory
+            "paired_inventory": self.inventory.paired.to_dict(),
+
             # Rebate
             "rebate": self.rebate.stats,
+
+            # Execution quality / toxicity
+            "markout_tca": {
+                **self.markout_tracker.stats,
+                "toxicity_mode": self._toxicity_mode,
+                "toxicity_spread_mult": round(self._toxicity_spread_mult, 2),
+                "recent": self.markout_tracker.recent_records,
+            },
+
+            # Event-driven requote telemetry
+            "event_requote": {
+                **self.event_requoter.stats,
+                "recent": self._last_requote_events[-10:],
+            },
+
+            # PnL decomposition
+            "pnl_decomposition": {
+                **self.pnl_decomp.stats,
+                "inventory_unrealized_usd": round(inventory_unrealized, 4),
+            },
+
+            # SRE metrics
+            "sre_metrics": self.sre_metrics.stats,
 
             # Config (current)
             "config": self.config.to_dict(),
