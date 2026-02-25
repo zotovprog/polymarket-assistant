@@ -1182,10 +1182,24 @@ class MMRuntime:
             await asyncio.sleep(2.0)
             mm = self.mm
             if not mm:
+                self._running = False
                 break
             # MM stopped itself (window expiry or other reason)
             if not mm._running:
                 log.info(f"Monitor: mm._running=False, _is_closing={mm._is_closing}")
+            if not mm._running and not (mm._is_closing or (mm.market and mm.market.time_remaining <= 0)):
+                log.error(
+                    "Monitor: MM stopped unexpectedly mid-window; syncing runtime state and stopping feeds"
+                )
+                self._running = False
+                await self._cancel_strike_retry_task()
+                await self._stop_feed_tasks()
+                try:
+                    if mm.heartbeat.is_running:
+                        await mm.heartbeat.stop()
+                except Exception as e:
+                    log.warning("Failed to stop heartbeat after unexpected MM stop: %s", e)
+                break
             if not mm._running and (mm._is_closing or (mm.market and mm.market.time_remaining <= 0)):
                 # Don't auto-restart after emergency shutdown
                 if mm._emergency_stopped:

@@ -151,6 +151,38 @@ def test_debounce_prevents_oscillation():
     assert mm.inventory.dn_shares == pytest.approx(18.0)
 
 
+def test_forced_reconcile_arms_guard():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0  # stop after reconcile path
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+    mm.order_mgr._reconcile_requested = True
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(15.0, 18.0))
+    mm.order_mgr.get_usdc_balance = AsyncMock(return_value=100.0)
+
+    before = time.time()
+    _run_tick_with_reconcile_gate(mm)
+
+    assert mm._reconcile_guard_until > before
+    assert mm.order_mgr.reconcile_requested is False
+
+
+def test_reconcile_guard_pauses_liquidation_tick():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm._reconcile_guard_until = time.time() + 8.0
+    mm.market.window_end = time.time() + 120.0
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm._liquidate_inventory = AsyncMock()
+
+    asyncio.run(mm._tick())
+
+    mm._liquidate_inventory.assert_not_awaited()
+
+
 def test_session_pnl_prevents_false_drawdown():
     risk_mgr, inventory = _make_risk_setup()
 

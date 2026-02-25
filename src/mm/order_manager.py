@@ -334,6 +334,52 @@ class OrderManager:
             return value.strip()
         return str(value).strip()
 
+    @staticmethod
+    def _compact_raw(payload: Any, max_len: int = 1200) -> str:
+        """Compact payload for logs without blowing up line length."""
+        try:
+            raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
+        except Exception:
+            raw = repr(payload)
+        if len(raw) > max_len:
+            return f"{raw[:max_len]}...<truncated>"
+        return raw
+
+    @classmethod
+    def _extract_batch_reject_reason(cls, payload: Any) -> str:
+        """Best-effort reject reason extraction from post_orders item payload."""
+        if isinstance(payload, str):
+            return payload.strip() or "empty response"
+        if not isinstance(payload, dict):
+            return f"unexpected payload type: {type(payload).__name__}"
+
+        error = payload.get("error")
+        if isinstance(error, dict):
+            for key in ("message", "error", "reason", "code"):
+                msg = cls._safe_str(error.get(key))
+                if msg:
+                    return msg
+        elif error is not None:
+            msg = cls._safe_str(error)
+            if msg:
+                return msg
+
+        for key in (
+            "errorMsg",
+            "error_msg",
+            "error_message",
+            "message",
+            "reason",
+            "status",
+            "failureReason",
+            "rejectReason",
+        ):
+            msg = cls._safe_str(payload.get(key))
+            if msg:
+                return msg
+
+        return "missing order id / unknown reject reason"
+
     @classmethod
     def _extract_fill_price(cls, order: dict[str, Any], fallback: float) -> float:
         """Best-effort fill price from exchange payload, with quote fallback."""
@@ -870,8 +916,20 @@ class OrderManager:
                 else:
                     order_results = [resp]
 
-                for idx, order_resp in zip(batch_indices, order_results):
+                for pos, idx in enumerate(batch_indices):
+                    quote = quotes[idx]
+                    order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
+                        reason = self._extract_batch_reject_reason(order_resp)
+                        log.error(
+                            "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
+                            quote.side,
+                            quote.token_id[:8],
+                            quote.size,
+                            quote.price,
+                            reason,
+                            self._compact_raw(order_resp),
+                        )
                         continue
                     order_id = (
                         order_resp.get("orderID")
@@ -879,7 +937,6 @@ class OrderManager:
                         or order_resp.get("id")
                     )
                     if order_id:
-                        quote = quotes[idx]
                         quote.order_id = order_id
                         quote.placed_at = time.time()
                         self._active_orders[order_id] = quote
@@ -889,12 +946,32 @@ class OrderManager:
                             "Batch placed %s %s %.1f@%.2f id=%s...",
                             quote.side, quote.token_id[:8], quote.size, quote.price, order_id[:12],
                         )
+                    else:
+                        reason = self._extract_batch_reject_reason(order_resp)
+                        log.error(
+                            "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
+                            quote.side,
+                            quote.token_id[:8],
+                            quote.size,
+                            quote.price,
+                            reason,
+                            self._compact_raw(order_resp),
+                        )
             except Exception as e:
                 log.error("Batch post_orders failed: %s", e)
                 # Fallback to individual placement for failed batch.
                 for idx in batch_indices:
+                    quote = quotes[idx]
+                    log.warning(
+                        "Batch fallback to single order for %s %s %.1f@%.2f (cause=%s)",
+                        quote.side,
+                        quote.token_id[:8],
+                        quote.size,
+                        quote.price,
+                        str(e),
+                    )
                     try:
-                        oid = await self.place_order(quotes[idx], post_only=use_post_only)
+                        oid = await self.place_order(quote, post_only=use_post_only)
                         results[idx] = oid
                     except Exception:
                         pass

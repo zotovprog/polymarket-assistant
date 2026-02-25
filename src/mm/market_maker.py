@@ -209,6 +209,7 @@ class MarketMaker:
         self._taker_quotes: list[Quote] = []
         self._reconcile_prev_pm: tuple[float, float] | None = None
         self._reconcile_stable_count: int = 0
+        self._reconcile_guard_until: float = 0.0
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
         self.sre_metrics = SREMetrics()
@@ -253,6 +254,47 @@ class MarketMaker:
         if now - self._warn_cooldowns.get(key, 0) >= cooldown:
             self._warn_cooldowns[key] = now
             log.warning(msg)
+
+    def _arm_reconcile_guard(self, up_diff: float, dn_diff: float, source: str) -> None:
+        """Briefly pause merge/liquidation after large inventory reconcile jumps."""
+        max_diff = max(float(up_diff), float(dn_diff))
+        total_diff = float(up_diff) + float(dn_diff)
+        if max_diff < 3.0 and total_diff < 6.0:
+            return
+
+        # Short cooldown to let PM balances converge before acting on reconciled inventory.
+        guard_sec = min(20.0, max(4.0, 0.25 * total_diff))
+        until = time.time() + guard_sec
+        if until > self._reconcile_guard_until:
+            self._reconcile_guard_until = until
+        log.warning(
+            "Reconcile drift guard armed for %.1fs (%s): up_diff=%.2f dn_diff=%.2f",
+            guard_sec,
+            source,
+            up_diff,
+            dn_diff,
+        )
+
+    def _reconcile_guard_active(self) -> bool:
+        """Whether temporary reconcile cooldown is active for merge/liquidation."""
+        if self._reconcile_guard_until <= 0:
+            return False
+        if not self._running:
+            return False
+        if not self.market:
+            return False
+
+        now = time.time()
+        if now >= self._reconcile_guard_until:
+            self._reconcile_guard_until = 0.0
+            return False
+
+        # Never block close-out very close to expiry.
+        time_left = self.market.time_remaining
+        if time_left <= max(5.0, float(self.config.liq_taker_threshold_sec)):
+            self._reconcile_guard_until = 0.0
+            return False
+        return True
 
     async def _refresh_fee_rate_cache(self) -> None:
         """Best-effort refresh of dynamic fee params for current market tokens."""
@@ -680,6 +722,7 @@ class MarketMaker:
         self._heartbeat_failure_task = None
         self._tick_count = 0
         self._merge_check_counter = 0
+        self._reconcile_guard_until = 0.0
         self._last_trade_backfill_ts = 0.0
         self._toxicity_spread_mult = 1.0
         self._toxicity_mode = "normal"
@@ -949,14 +992,22 @@ class MarketMaker:
         merge_reconcile_requested = False
         # Merge-first: check for merge opportunity periodically (skip during closing).
         if not self._is_closing:
-            self._merge_check_counter += 1
-            if self._merge_check_counter >= self._merge_check_interval:
-                self._merge_check_counter = 0
-                if not self._merge_failed_this_cycle:
-                    merge_profit = await self._try_merge_pairs()
-                    if merge_profit > 0:
-                        merge_reconcile_requested = True
-                        self.order_mgr.invalidate_usdc_cache()
+            if self._reconcile_guard_active():
+                guard_left = max(0.0, self._reconcile_guard_until - time.time())
+                self._throttled_warn(
+                    "merge_reconcile_guard",
+                    f"Merge check paused for {guard_left:.1f}s after reconcile drift",
+                    cooldown=3.0,
+                )
+            else:
+                self._merge_check_counter += 1
+                if self._merge_check_counter >= self._merge_check_interval:
+                    self._merge_check_counter = 0
+                    if not self._merge_failed_this_cycle:
+                        merge_profit = await self._try_merge_pairs()
+                        if merge_profit > 0:
+                            merge_reconcile_requested = True
+                            self.order_mgr.invalidate_usdc_cache()
 
         # Live mode: periodically reconcile internal shares with PM balances.
         # Skip during closing to save HTTP calls (liquidation does its own balance checks).
@@ -986,6 +1037,8 @@ class MarketMaker:
                 self._cached_pm_up_shares = real_up
                 self._cached_pm_dn_shares = real_dn
                 if reconcile_requested:
+                    forced_up_diff = abs(real_up - self.inventory.up_shares)
+                    forced_dn_diff = abs(real_dn - self.inventory.dn_shares)
                     log.warning(
                         "Forced reconcile after anomalous fill: internal UP=%.2f DN=%.2f "
                         "→ PM UP=%.2f DN=%.2f",
@@ -993,6 +1046,7 @@ class MarketMaker:
                         real_up, real_dn,
                     )
                     self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                    self._arm_reconcile_guard(forced_up_diff, forced_dn_diff, "forced")
                     self._reconcile_stable_count = 0
                     self._reconcile_prev_pm = None
                     self.order_mgr.clear_reconcile_request()
@@ -1020,6 +1074,7 @@ class MarketMaker:
                                 real_up, real_dn,
                             )
                             self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                            self._arm_reconcile_guard(up_diff, dn_diff, "debounced")
                             self._reconcile_stable_count = 0
                             self._reconcile_prev_pm = None
                         else:
@@ -1051,6 +1106,14 @@ class MarketMaker:
                 "force_taker_lagging": False,
             }
             self._taker_quotes = []
+            if self._reconcile_guard_active():
+                guard_left = max(0.0, self._reconcile_guard_until - time.time())
+                self._throttled_warn(
+                    "liquidation_reconcile_guard",
+                    f"Liquidation paused for {guard_left:.1f}s after reconcile drift",
+                    cooldown=2.0,
+                )
+                return
             # Continuously try to sell remaining inventory each tick
             await self._liquidate_inventory()
             return
@@ -2416,6 +2479,7 @@ class MarketMaker:
         self._merge_check_counter = 0
         self._reconcile_prev_pm = None
         self._reconcile_stable_count = 0
+        self._reconcile_guard_until = 0.0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0
@@ -2599,6 +2663,7 @@ class MarketMaker:
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,
             "is_running": self._running,
+            "reconcile_guard_sec": round(max(0.0, self._reconcile_guard_until - time.time()), 1),
 
             # Orders
             **order_stats,
