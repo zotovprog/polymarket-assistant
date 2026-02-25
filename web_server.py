@@ -15,13 +15,14 @@ import signal
 import sys
 import time
 import logging
+import math
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 # ── Path setup ──────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -139,37 +140,123 @@ class StartRequest(BaseModel):
 
 
 class ConfigUpdateRequest(BaseModel):
-    half_spread_bps: Optional[float] = None
+    half_spread_bps: Optional[float] = Field(default=None)
     min_spread_bps: Optional[float] = None
     max_spread_bps: Optional[float] = None
     vol_spread_mult: Optional[float] = None
-    order_size_usd: Optional[float] = None
+    order_size_usd: Optional[float] = Field(default=None)
     min_order_size_usd: Optional[float] = None
     max_order_size_usd: Optional[float] = None
     max_inventory_shares: Optional[float] = None
-    skew_bps_per_unit: Optional[float] = None
-    requote_interval_sec: Optional[float] = None
+    skew_bps_per_unit: Optional[float] = Field(default=None)
+    requote_interval_sec: Optional[float] = Field(default=None)
+    refresh_interval_s: Optional[float] = Field(default=None)
     requote_threshold_bps: Optional[float] = None
     gtd_duration_sec: Optional[int] = None
     heartbeat_interval_sec: Optional[int] = None
     use_post_only: Optional[bool] = None
     use_gtd: Optional[bool] = None
-    max_drawdown_usd: Optional[float] = None
-    volatility_pause_mult: Optional[float] = None
-    max_loss_per_fill_usd: Optional[float] = None
-    take_profit_usd: Optional[float] = None
-    trailing_stop_pct: Optional[float] = None
+    max_drawdown_usd: Optional[float] = Field(default=None)
+    volatility_pause_mult: Optional[float] = Field(default=None)
+    max_loss_per_fill_usd: Optional[float] = Field(default=None)
+    take_profit_usd: Optional[float] = Field(default=None)
+    trailing_stop_pct: Optional[float] = Field(default=None)
     max_one_sided_ticks: Optional[int] = None
     close_window_sec: Optional[float] = None
     auto_next_window: Optional[bool] = None
     resolution_wait_sec: Optional[float] = None
     liq_price_floor_enabled: Optional[bool] = None
-    liq_gradual_chunks: Optional[int] = None
-    liq_chunk_interval_sec: Optional[float] = None
+    liq_gradual_chunks: Optional[int] = Field(default=None)
+    liq_chunk_interval_sec: Optional[float] = Field(default=None)
+    liq_chunk_interval_s: Optional[float] = Field(default=None)
     liq_taker_threshold_sec: Optional[float] = None
-    liq_max_discount_from_fv: Optional[float] = None
+    liq_max_discount_from_fv: Optional[float] = Field(default=None)
     liq_abandon_below_floor: Optional[bool] = None
     enabled: Optional[bool] = None
+    session_limit: Optional[float] = None  # Max USDC budget for session
+
+    @field_validator(
+        "half_spread_bps",
+        "min_spread_bps",
+        "max_spread_bps",
+        "vol_spread_mult",
+        "order_size_usd",
+        "min_order_size_usd",
+        "max_order_size_usd",
+        "max_inventory_shares",
+        "skew_bps_per_unit",
+        "requote_interval_sec",
+        "refresh_interval_s",
+        "requote_threshold_bps",
+        "max_drawdown_usd",
+        "volatility_pause_mult",
+        "max_loss_per_fill_usd",
+        "take_profit_usd",
+        "trailing_stop_pct",
+        "close_window_sec",
+        "resolution_wait_sec",
+        "liq_chunk_interval_sec",
+        "liq_chunk_interval_s",
+        "liq_taker_threshold_sec",
+        "liq_max_discount_from_fv",
+        "session_limit",
+        mode="before",
+    )
+    @classmethod
+    def _validate_finite_numbers(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("must be a number")
+        try:
+            n = float(v)
+        except (TypeError, ValueError) as e:
+            raise ValueError("must be a valid number") from e
+        if not math.isfinite(n):
+            raise ValueError("must be finite")
+        return v
+
+    @field_validator(
+        "gtd_duration_sec",
+        "heartbeat_interval_sec",
+        "max_one_sided_ticks",
+        "liq_gradual_chunks",
+        mode="before",
+    )
+    @classmethod
+    def _validate_int_numbers(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            raise ValueError("must be an integer")
+        try:
+            n = float(v)
+        except (TypeError, ValueError) as e:
+            raise ValueError("must be a valid integer") from e
+        if not math.isfinite(n) or not n.is_integer():
+            raise ValueError("must be a valid integer")
+        return int(n)
+
+
+def _validate_config_updates_before_apply(updates: dict[str, Any]) -> dict[str, Any]:
+    """Clamp incoming config updates against MMConfig bounds before runtime apply."""
+    if not updates:
+        return updates
+
+    staged = MMConfig.from_dict(_runtime.mm_config.to_dict())
+    staged.update(**updates)
+
+    normalized: dict[str, Any] = {}
+    for key, value in updates.items():
+        if key == "session_limit":
+            normalized[key] = value
+            continue
+        target_key = MMConfig.UPDATE_ALIASES.get(key, key)
+        if key in MMConfig.UPDATE_ALIASES and target_key in normalized:
+            continue
+        if hasattr(staged, target_key):
+            normalized[target_key] = getattr(staged, target_key)
+    return normalized
 
 
 # ── Mock CLOB Client (for paper trading) ────────────────────────
@@ -478,10 +565,89 @@ class MMRuntime:
         self._pnl_history: list[tuple[float, float]] = []  # [(timestamp, session_pnl), ...]
         self._watching = False
         self._start_balance: float = 0.0  # PM USDC balance at session start
+        self._strike_invalid: bool = False
+        self._strike_retry_task: asyncio.Task | None = None
 
     @property
     def is_running(self) -> bool:
         return self._running and self.mm is not None
+
+    @staticmethod
+    def _is_valid_strike(strike: float) -> bool:
+        """Strike sanity bounds for tradable windows."""
+        return 0.0 < float(strike) <= 200000.0
+
+    async def _cancel_strike_retry_task(self) -> None:
+        """Stop background strike recovery loop if active."""
+        task = self._strike_retry_task
+        if not task:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("Strike retry task cleanup failed: %s", e)
+        finally:
+            self._strike_retry_task = None
+
+    def _ensure_strike_retry_task(self) -> None:
+        """Launch strike recovery loop when window is in watch mode."""
+        if self._strike_retry_task and not self._strike_retry_task.done():
+            return
+        self._strike_retry_task = asyncio.create_task(self._retry_strike_loop())
+
+    async def _retry_strike_loop(self) -> None:
+        """Retry strike fetch every 30s until strike becomes valid."""
+        try:
+            while self._running and self._strike_invalid:
+                await asyncio.sleep(30.0)
+                if not self._running or not self._strike_invalid:
+                    break
+                mm = self.mm
+                if not mm or not mm.market:
+                    break
+
+                try:
+                    strike, window_start, window_end = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            feeds.fetch_pm_strike,
+                            self._coin,
+                            self._timeframe,
+                            5,
+                            2.0,
+                        ),
+                        timeout=30.0,
+                    )
+                except Exception as e:
+                    log.warning("Strike retry failed, staying in watch mode: %s", e)
+                    continue
+
+                if (not self._is_valid_strike(strike)
+                        or window_start <= 0
+                        or window_end <= window_start):
+                    log.warning(
+                        "Strike retry invalid (strike=%.6f ws=%.0f we=%.0f), staying in watch mode",
+                        float(strike), float(window_start), float(window_end),
+                    )
+                    continue
+
+                buffered_window_end = max(window_start + 1.0, window_end - 10.0)
+                mm.market.strike = float(strike)
+                mm.market.window_start = float(window_start)
+                mm.market.window_end = float(buffered_window_end)
+                self._strike_invalid = False
+                mm._requote_event.set()
+                log.info(
+                    "Strike recovered: strike=%.2f window=[%.0f, %.0f] — resuming normal trading",
+                    mm.market.strike, mm.market.window_start, mm.market.window_end,
+                )
+                break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._strike_retry_task = None
 
     async def validate_live_credentials(self) -> dict:
         """Validate Polymarket API credentials via get_api_keys() (read-only)."""
@@ -542,6 +708,9 @@ class MMRuntime:
         """Start feeds and market maker."""
         if self._running:
             raise HTTPException(status_code=400, detail="Already running")
+
+        await self._cancel_strike_retry_task()
+        self._strike_invalid = False
 
         if self._watching:
             await self.stop_watch()
@@ -619,16 +788,13 @@ class MMRuntime:
                 # Build market info from token IDs
                 market = self._build_market_info_from_tokens(
                     coin, timeframe, up_id, dn_id, condition_id=cond_id)
-                if market is None:
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Failed to determine strike price — cannot trade this window"
-                    )
             else:
                 log.warning("PM tokens not found, using placeholder")
+                self._strike_invalid = False
                 market = self._build_placeholder_market(coin, timeframe)
         except Exception as e:
             log.warning(f"PM token fetch failed: {e}")
+            self._strike_invalid = False
             market = self._build_placeholder_market(coin, timeframe)
 
         # Wait for initial data (max 10s)
@@ -662,6 +828,8 @@ class MMRuntime:
 
         await self.mm.start()
         self._running = True
+        if self._strike_invalid:
+            self._ensure_strike_retry_task()
 
         # Notify Telegram about MM start
         mode_str = "PAPER" if paper_mode else "LIVE"
@@ -719,6 +887,7 @@ class MMRuntime:
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
                 await self._send_window_summary()
                 self._running = False
+                await self._cancel_strike_retry_task()
                 for t in self._feed_tasks:
                     t.cancel()
                 self._feed_tasks.clear()
@@ -758,9 +927,9 @@ class MMRuntime:
                                     ),
                                     timeout=30.0,
                                 )
-                                if strike <= 0:
+                                if not self._is_valid_strike(strike):
                                     log.warning(
-                                        f"Strike=0 after retries ({elapsed:.0f}s elapsed), "
+                                        f"Invalid strike {strike:.6f} after retries ({elapsed:.0f}s elapsed), "
                                         f"skipping this window..."
                                     )
                                     continue  # keep polling for next window
@@ -829,6 +998,8 @@ class MMRuntime:
     async def stop(self) -> dict:
         """Stop market maker and feeds."""
         snap = self.snapshot()
+        await self._cancel_strike_retry_task()
+        self._strike_invalid = False
 
         if self.mm:
             await self.mm.stop()
@@ -956,6 +1127,8 @@ class MMRuntime:
 
     async def stop_watch(self):
         """Stop watch mode feeds."""
+        await self._cancel_strike_retry_task()
+        self._strike_invalid = False
         for t in self._feed_tasks:
             t.cancel()
         self._feed_tasks.clear()
@@ -965,6 +1138,21 @@ class MMRuntime:
 
     def update_config(self, **kwargs) -> dict:
         """Update MM config at runtime."""
+        # Handle session_limit separately (not part of MMConfig)
+        session_limit = kwargs.pop("session_limit", None)
+        if session_limit is not None:
+            self._initial_usdc = float(session_limit)
+            if self.mm:
+                self.mm.inventory.initial_usdc = self._initial_usdc
+                self.mm.order_mgr._session_budget = self._initial_usdc
+                spent = self.mm.order_mgr._session_spent
+                if self._initial_usdc < spent:
+                    log.warning(
+                        "New session limit $%.2f is below already-spent $%.2f — "
+                        "BUY orders will be blocked until inventory frees up",
+                        self._initial_usdc, spent,
+                    )
+            log.info("Session limit updated to $%.2f", self._initial_usdc)
         self.mm_config.update(**kwargs)
         if self.mm:
             self.mm.config = self.mm_config
@@ -981,10 +1169,10 @@ class MMRuntime:
             import motor.motor_asyncio
             client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGO_URI)
             db = client[config.MONGO_DB]
+            doc = {"_id": "mm_config", **self.mm_config.to_dict(),
+                   "session_limit": self._initial_usdc}
             await db.config.replace_one(
-                {"_id": "mm_config"},
-                {"_id": "mm_config", **self.mm_config.to_dict()},
-                upsert=True,
+                {"_id": "mm_config"}, doc, upsert=True,
             )
             client.close()
             log.info("Config saved to MongoDB")
@@ -1003,9 +1191,14 @@ class MMRuntime:
             client.close()
             if doc:
                 doc.pop("_id", None)
+                saved_limit = doc.pop("session_limit", None)
+                if saved_limit is not None:
+                    self._initial_usdc = float(saved_limit)
                 self.mm_config.update(**doc)
-                log.info("Config loaded from MongoDB: spread=%s, skew=%s",
-                         self.mm_config.half_spread_bps, self.mm_config.skew_bps_per_unit)
+                self.mm_config.validate()
+                log.info("Config loaded from MongoDB: spread=%s, skew=%s, session_limit=$%.2f",
+                         self.mm_config.half_spread_bps, self.mm_config.skew_bps_per_unit,
+                         self._initial_usdc)
         except Exception as e:
             log.warning("Failed to load config from MongoDB: %s", e)
 
@@ -1046,27 +1239,28 @@ class MMRuntime:
 
         Fetches the actual strike price from Binance candle open
         and window timing from PM event endDate.
-
-        Returns None if strike cannot be determined (prevents trading with FV=0.5).
         """
         strike, window_start, window_end = feeds.fetch_pm_strike(coin, timeframe)
 
-        if strike <= 0 or window_start <= 0:
-            # Fallback: use current Binance mid as strike (imperfect but better than 0)
-            log.warning("Could not fetch strike from Binance, trying current mid price")
-            now = time.time()
-            tf_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "daily": 1440}
-            window_duration = tf_minutes.get(timeframe, 60) * 60
-            strike = self.feed_state.mid if self.feed_state and self.feed_state.mid else 0.0
-            if strike <= 0:
-                log.error("Strike is 0 and no Binance mid available — cannot trade this window")
-                return None
+        now = time.time()
+        tf_minutes = {"5m": 5, "15m": 15, "1h": 60, "4h": 240, "daily": 1440}
+        window_duration = tf_minutes.get(timeframe, 60) * 60
+
+        if window_start <= 0:
             window_start = now
-            window_end = now + window_duration
+        if window_end <= window_start:
+            window_end = window_start + window_duration
+
+        if not self._is_valid_strike(strike):
+            self._strike_invalid = True
+            strike = 0.0
+            log.error("Strike fetch failed, cannot start window — entering watch mode")
+        else:
+            self._strike_invalid = False
 
         # Buffer: treat window as ending 10s before PM endDate
         # so timer shows 0 before PM resolves, and bot enters closing mode earlier
-        window_end = window_end - 10.0
+        window_end = max(window_start + 1.0, window_end - 10.0)
 
         log.info(f"Market info: strike={strike:.2f} window=[{window_start:.0f}, {window_end:.0f}] (10s buffer applied)")
 
@@ -1369,7 +1563,11 @@ async def mm_state(request: Request):
 @app.post("/api/mm/config")
 async def mm_config_update(req: ConfigUpdateRequest, request: Request):
     _require_auth(request)
+    if req.session_limit is not None:
+        if req.session_limit < 5:
+            return JSONResponse({"error": "session_limit must be >= 5"}, status_code=400)
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    updates = _validate_config_updates_before_apply(updates)
     new_config = _runtime.update_config(**updates)
     return {"ok": True, "config": new_config}
 
@@ -1377,7 +1575,9 @@ async def mm_config_update(req: ConfigUpdateRequest, request: Request):
 @app.get("/api/mm/config")
 async def mm_config_get(request: Request):
     _require_auth(request)
-    return {"config": _runtime.mm_config.to_dict()}
+    cfg = _runtime.mm_config.to_dict()
+    cfg["session_limit"] = _runtime._initial_usdc
+    return {"config": cfg}
 
 
 @app.post("/api/mm/emergency")
@@ -1389,6 +1589,7 @@ async def mm_emergency(request: Request):
         await _runtime.mm.heartbeat.stop()
         _runtime.mm._paused = True
         _runtime.mm._pause_reason = "Emergency stop"
+        _runtime.mm._running = False  # Actually stop the tick loop
         return {"ok": True, "cancelled": cancelled}
     return {"ok": True, "cancelled": 0}
 

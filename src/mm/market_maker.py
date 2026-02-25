@@ -124,11 +124,17 @@ class MarketMaker:
             log.warning(msg)
 
     def _on_heartbeat_failure(self) -> None:
-        log.warning("Heartbeat lost — orders likely cancelled by PM")
+        log.warning("Heartbeat lost — orders likely cancelled by PM, pausing bot")
         self._current_quotes = {
             "up": (None, None),
             "dn": (None, None),
         }
+        # PM auto-cancels all orders on heartbeat failure — clear our tracking
+        self.order_mgr._active_orders.clear()
+        self.order_mgr._order_post_only.clear()
+        # Pause the bot until heartbeat recovers
+        self._paused = True
+        self._pause_reason = "Heartbeat failure — orders auto-cancelled by PM"
 
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
@@ -158,8 +164,12 @@ class MarketMaker:
         self._running = True
         # Snapshot starting USDC for real session PnL
         try:
-            self._starting_usdc_pm = await self.order_mgr.get_usdc_balance()
-            self._cached_usdc_balance = self._starting_usdc_pm
+            starting_usdc = await self.order_mgr.get_usdc_balance()
+            if starting_usdc is None:
+                log.warning("Failed to fetch starting USDC balance, defaulting to 0.0")
+                starting_usdc = 0.0
+            self._starting_usdc_pm = starting_usdc
+            self._cached_usdc_balance = starting_usdc
         except Exception:
             self._starting_usdc_pm = 0.0
             self._cached_usdc_balance = 0.0
@@ -312,8 +322,21 @@ class MarketMaker:
                 self._liq_last_chunk_time = 0.0
                 await self.order_mgr.cancel_all()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
-                log.info("Window expired — cancelled all orders, liquidating inventory")
+                log.warning("Window expired — entering closing mode")
+
+            # Retry liquidation up to 3 times with 3s gaps.
+            for attempt in range(3):
                 await self._liquidate_inventory()
+                await asyncio.sleep(3.0)
+                has_up = self.inventory.up_shares > 0.5
+                has_dn = self.inventory.dn_shares > 0.5
+                if not has_up and not has_dn:
+                    log.info("Liquidation complete after %d attempts", attempt + 1)
+                    break
+                log.warning(
+                    "Liquidation attempt %d: still holding UP=%.1f DN=%.1f",
+                    attempt + 1, self.inventory.up_shares, self.inventory.dn_shares
+                )
             self._running = False
             return
 
@@ -361,42 +384,52 @@ class MarketMaker:
                 self.market.up_token_id,
                 self.market.dn_token_id,
             )
-            self._cached_usdc_balance = await self.order_mgr.get_usdc_balance()
-            up_diff = abs(real_up - self.inventory.up_shares)
-            dn_diff = abs(real_dn - self.inventory.dn_shares)
-            if up_diff > 1.0 or dn_diff > 1.0:
-                prev = self._reconcile_prev_pm
-                pm_stable = (prev is not None
-                             and abs(real_up - prev[0]) < 0.5
-                             and abs(real_dn - prev[1]) < 0.5)
-                self._reconcile_prev_pm = (real_up, real_dn)
-
-                if pm_stable:
-                    self._reconcile_stable_count += 1
-                else:
-                    self._reconcile_stable_count = 1
-
-                if self._reconcile_stable_count >= 3:
-                    log.warning(
-                        "Inventory reconcile (confirmed %d checks): "
-                        "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
-                        self._reconcile_stable_count,
-                        self.inventory.up_shares, self.inventory.dn_shares,
-                        real_up, real_dn,
-                    )
-                    self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
-                    self._reconcile_stable_count = 0
-                    self._reconcile_prev_pm = None
-                else:
-                    log.info(
-                        "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
-                        self._reconcile_stable_count,
-                        self.inventory.up_shares, self.inventory.dn_shares,
-                        real_up, real_dn,
-                    )
+            usdc_bal = await self.order_mgr.get_usdc_balance()
+            if usdc_bal is not None:
+                self._cached_usdc_balance = usdc_bal
             else:
+                log.warning("Failed to refresh USDC balance, keeping previous cached value")
+
+            if real_up is None or real_dn is None:
+                log.error("Skipping inventory reconcile: failed to fetch PM token balances")
                 self._reconcile_stable_count = 0
                 self._reconcile_prev_pm = None
+            else:
+                up_diff = abs(real_up - self.inventory.up_shares)
+                dn_diff = abs(real_dn - self.inventory.dn_shares)
+                if up_diff > 1.0 or dn_diff > 1.0:
+                    prev = self._reconcile_prev_pm
+                    pm_stable = (prev is not None
+                                 and abs(real_up - prev[0]) < 0.5
+                                 and abs(real_dn - prev[1]) < 0.5)
+                    self._reconcile_prev_pm = (real_up, real_dn)
+
+                    if pm_stable:
+                        self._reconcile_stable_count += 1
+                    else:
+                        self._reconcile_stable_count = 1
+
+                    if self._reconcile_stable_count >= 3:
+                        log.warning(
+                            "Inventory reconcile (confirmed %d checks): "
+                            "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
+                            self._reconcile_stable_count,
+                            self.inventory.up_shares, self.inventory.dn_shares,
+                            real_up, real_dn,
+                        )
+                        self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                        self._reconcile_stable_count = 0
+                        self._reconcile_prev_pm = None
+                    else:
+                        log.info(
+                            "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                            self._reconcile_stable_count,
+                            self.inventory.up_shares, self.inventory.dn_shares,
+                            real_up, real_dn,
+                        )
+                else:
+                    self._reconcile_stable_count = 0
+                    self._reconcile_prev_pm = None
 
         _t_reconcile = time.perf_counter()
 
@@ -409,6 +442,21 @@ class MarketMaker:
 
         # 1. Defensive copies of feed data
         mid = st.mid
+        now = time.time()
+        last_ok_ts = getattr(st, "binance_ob_last_ok_ts", 0.0) or 0.0
+        if last_ok_ts > 0:
+            staleness = now - last_ok_ts
+            is_stale = staleness > 5.0
+        else:
+            staleness = now - self._started_at if self._started_at > 0 else 0.0
+            is_stale = staleness > 10.0
+
+        if is_stale:
+            log.warning("Binance feed stale (%.1fs), cancelling orders and skipping tick", staleness)
+            await self.order_mgr.cancel_all()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
+
         bids = list(st.bids) if st.bids else []
         asks = list(st.asks) if st.asks else []
         trades = list(st.trades) if st.trades else []
@@ -417,10 +465,23 @@ class MarketMaker:
         if not mid or mid <= 0:
             return
 
+        try:
+            strike = float(self.market.strike)
+        except (TypeError, ValueError):
+            strike = 0.0
+        if strike <= 0 or strike > 200000:
+            self._throttled_warn(
+                "invalid_strike",
+                "Strike invalid/unavailable — cancelling all orders and staying in watch mode",
+            )
+            await self.order_mgr.cancel_all()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
+
         # 3. Compute fair value
         fv_up, fv_dn = self.fair_value.compute(
             mid=mid,
-            strike=self.market.strike,
+            strike=strike,
             time_remaining_sec=self.market.time_remaining,
             klines=klines,
             bids=bids,
@@ -738,6 +799,10 @@ class MarketMaker:
         st = self.feed_state
         mid = st.mid if st.mid and st.mid > 0 else 0
         if mid <= 0 or not self.market:
+            log.warning(
+                "_compute_fv fallback: mid=%s, market=%s — returning 0.5/0.5",
+                mid, bool(self.market)
+            )
             return 0.5, 0.5
         klines = list(st.klines) if st.klines else []
         bids = list(st.bids) if st.bids else []
@@ -769,6 +834,9 @@ class MarketMaker:
         # ── Phase 0: Merge YES+NO pairs → USDC ──────────────────
         up_bal = await self.order_mgr.get_token_balance(self.market.up_token_id)
         dn_bal = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+        if up_bal is None or dn_bal is None:
+            log.error("Liquidation: failed to fetch token balances; retrying next chunk")
+            return
         merge_amount = min(up_bal, dn_bal)
 
         if merge_amount >= 1.0 and self.market.condition_id and not self._merge_failed_this_cycle:
@@ -875,6 +943,9 @@ class MarketMaker:
             # Re-check after potential merge
             up_rem_pf = await self.order_mgr.get_token_balance(self.market.up_token_id)
             dn_rem_pf = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+            if up_rem_pf is None or dn_rem_pf is None:
+                log.error("Liquidation: failed to refresh token balances after merge; retrying next chunk")
+                return
             if up_rem_pf < pm_min_pf and dn_rem_pf < pm_min_pf:
                 fv_up_pf, fv_dn_pf = self._compute_fv()
                 dust_val = up_rem_pf * fv_up_pf + dn_rem_pf * fv_dn_pf
@@ -888,12 +959,17 @@ class MarketMaker:
 
         has_real_balance = False
         placed_any = False
+        balance_fetch_failed = False
 
         for label, token_id in [
             ("UP", self.market.up_token_id),
             ("DN", self.market.dn_token_id),
         ]:
             real_balance = await self.order_mgr.get_token_balance(token_id)
+            if real_balance is None:
+                log.error("%s balance fetch failed during liquidation; retrying next chunk", label)
+                balance_fetch_failed = True
+                continue
             if real_balance <= 0.1:
                 log.info(f"No real balance for {label}")
                 continue
@@ -906,21 +982,30 @@ class MarketMaker:
 
             # Determine price floor from lock or cost basis
             floor = 0.01
+            cost = self.inventory.up_cost if is_up else self.inventory.dn_cost
+            cost_basis = cost.avg_entry_price if cost else 0.0
+            hard_min_floor = max(0.05, cost_basis * 0.5) if cost_basis > 0 else 0.05
             if cfg.liq_price_floor_enabled and self._liq_lock:
                 floor = (self._liq_lock.min_sell_price_up if is_up
                          else self._liq_lock.min_sell_price_dn)
             elif cfg.liq_price_floor_enabled:
-                cost = self.inventory.up_cost if is_up else self.inventory.dn_cost
                 floor = max(0.01, cost.avg_entry_price + cfg.liq_price_floor_margin)
 
-            # Adaptive floor decay: floor → 0.01 as time_left → 0
+            # Adaptive floor decay with hard floor guardrail
             base_floor = floor
             ref = self._closing_start_time_left if self._closing_start_time_left > 0 else 30.0
             decay_ratio = max(0.0, min(1.0, time_left / ref))
-            floor = max(0.01, base_floor * decay_ratio)
+            floor = max(hard_min_floor, base_floor * decay_ratio)
             if floor != base_floor:
                 log.info(f"{label}: adaptive floor {base_floor:.2f} → {floor:.2f} "
                          f"(decay={decay_ratio:.2f}, {time_left:.0f}s left)")
+            if floor <= hard_min_floor:
+                self._throttled_warn(
+                    f"liq_floor_hard_min_{label}",
+                    f"{label}: liquidation floor hit hard minimum {hard_min_floor:.2f} "
+                    f"(base={base_floor:.2f}, decay={decay_ratio:.2f}, cost_basis={cost_basis:.2f})",
+                    cooldown=30.0,
+                )
 
             # Adjust floor for taker fee when in taker mode
             if use_taker:
@@ -930,14 +1015,16 @@ class MarketMaker:
                 # ── Phase 2: Taker ──
                 if not best_bid or best_bid <= 0:
                     if time_left < 5:
-                        log.warning(f"{label}: No best_bid, last resort sell at $0.01 ({time_left:.0f}s left)")
-                        best_bid = 0.01
+                        log.critical(
+                            f"{label}: No bid available for liquidation, holding to resolution "
+                            f"({time_left:.0f}s left)"
+                        )
                     else:
                         self._throttled_warn(
                             f"no_bid_{label}",
                             f"{label}: No best_bid for taker liquidation ({time_left:.0f}s left)",
                         )
-                        continue
+                    continue
 
                 if best_bid < floor and cfg.liq_abandon_below_floor:
                     if time_left > 5:
@@ -1028,6 +1115,10 @@ class MarketMaker:
                                         cfg.liq_gradual_chunks)
             self._liq_last_chunk_time = now
 
+        if balance_fetch_failed and not placed_any and not self._liquidation_order_ids:
+            log.error("Liquidation deferred: token balance fetch failed, retrying next chunk")
+            return
+
         if not has_real_balance:
             log.info("Liquidation complete — no inventory remaining")
             self._is_closing = False
@@ -1038,6 +1129,9 @@ class MarketMaker:
             pm_min = self.market.min_order_size if self.market else 5.0
             up_rem = await self.order_mgr.get_token_balance(self.market.up_token_id)
             dn_rem = await self.order_mgr.get_token_balance(self.market.dn_token_id)
+            if up_rem is None or dn_rem is None:
+                log.error("Liquidation: failed to fetch remaining balances for dust check; retrying next chunk")
+                return
             all_dust = (up_rem < pm_min and dn_rem < pm_min)
             if all_dust:
                 fv_up_d, fv_dn_d = self._compute_fv()

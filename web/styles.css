@@ -558,7 +558,132 @@ body {
     font-variant-numeric: tabular-nums;
 }
 
-/* ── 9. Orders Panel (full width) ──────────────────────────── */
+/* ── 9. Inventory + Orders Row ─────────────────────────────── */
+.inv-orders-row {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: var(--sp-3);
+    margin: 0 var(--sp-4) var(--sp-3);
+}
+
+.inventory-panel .portfolio-content {
+    padding: var(--sp-3);
+}
+
+.port-row {
+    padding: var(--sp-2) 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.port-row:last-of-type,
+.port-row.usdc-row {
+    border-bottom: none;
+}
+
+.port-header {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+}
+
+.port-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.port-dot.up-dot { background: var(--success); }
+.port-dot.dn-dot { background: var(--destructive); }
+.port-dot.usdc-dot { background: var(--accent); }
+
+.port-name {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    color: var(--text-secondary);
+    flex: 1;
+}
+
+.port-val {
+    font-family: var(--font-mono);
+    font-size: var(--text-base);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+}
+
+.port-detail {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    padding-left: 20px;
+    margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+}
+
+.port-detail strong {
+    color: var(--text-primary);
+}
+
+.port-meta {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    padding-left: 20px;
+    margin-top: 1px;
+}
+
+.port-meta strong {
+    color: var(--info);
+    font-family: var(--font-mono);
+}
+
+.port-footer {
+    padding-top: var(--sp-2);
+    border-top: 1px solid var(--border);
+    margin-top: var(--sp-1);
+}
+
+.port-delta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: var(--sp-1) 0 var(--sp-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+}
+
+.port-delta-label {
+    font-size: 0.6875rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-family: var(--font-sans);
+    color: var(--text-muted);
+    font-weight: 500;
+}
+
+.port-delta strong {
+    color: var(--text-primary);
+    font-weight: 700;
+}
+
+.liq-lock-row {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-2) 0;
+    font-size: var(--text-xs);
+    font-family: var(--font-mono);
+    color: var(--warning);
+}
+
+.liq-lock-row strong {
+    color: var(--text-primary);
+}
+
+.orders-panel-inline .orders-container {
+    max-height: 300px;
+}
+
 .orders-panel-new {
     margin: 0 var(--sp-4) var(--sp-3);
 }
@@ -1328,11 +1453,20 @@ body {
     .config-sections { grid-template-columns: 1fr 1fr; }
 }
 
+@media (max-width: 900px) {
+    .inv-orders-row {
+        grid-template-columns: 1fr;
+    }
+}
+
 @media (max-width: 768px) {
     .pnl-big-cards {
         grid-template-columns: 1fr;
     }
     .two-col-row {
+        grid-template-columns: 1fr;
+    }
+    .inv-orders-row {
         grid-template-columns: 1fr;
     }
     .settings-row-1 { flex-direction: column; align-items: stretch; }

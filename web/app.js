@@ -411,7 +411,7 @@ function updateUI(s) {
         setNumberAnimated('pm-dn', s.pm_prices.dn || 0, '', 4);
     }
 
-    // Inventory (animated)
+    // Inventory / Portfolio (animated)
     if (s.inventory) {
         setNumberAnimated('inv-up', s.inventory.up_shares || 0, '', 1);
         setNumberAnimated('inv-dn', s.inventory.dn_shares || 0, '', 1);
@@ -421,6 +421,16 @@ function updateUI(s) {
         // Avg entry prices
         setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '\u2014');
         setText('inv-dn-avg', s.inventory.dn_avg_entry != null ? s.inventory.dn_avg_entry.toFixed(4) : '\u2014');
+        // Portfolio: mark prices, worth, total
+        const upP = s.pm_prices?.up || 0;
+        const dnP = s.pm_prices?.dn || 0;
+        const upW = (s.inventory.up_shares || 0) * upP;
+        const dnW = (s.inventory.dn_shares || 0) * dnP;
+        setText('inv-up-mark', upP > 0 ? upP.toFixed(4) : '\u2014');
+        setText('inv-dn-mark', dnP > 0 ? dnP.toFixed(4) : '\u2014');
+        setNumberAnimated('inv-up-worth', upW, '$', 2);
+        setNumberAnimated('inv-dn-worth', dnW, '$', 2);
+        setNumberAnimated('inv-total-value', upW + dnW + (s.inventory.usdc || 0), '$', 2);
     }
 
     // Liquidation lock
@@ -587,6 +597,11 @@ function updateUI(s) {
         setConfigIfNotFocused('cfg-max-loss', s.config.max_loss_per_fill_usd);
         setConfigIfNotFocused('cfg-take-profit', s.config.take_profit_usd);
         setConfigIfNotFocused('cfg-trail-stop', (s.config.trailing_stop_pct || 0) * 100);
+
+        // Session limit (top-level state, not in MMConfig)
+        if (s.session_limit != null) {
+            setConfigIfNotFocused('cfg-session-limit', s.session_limit);
+        }
 
         // Update enabled button state
         const enabledBtn = document.getElementById('cfg-enabled-btn');
@@ -1000,6 +1015,7 @@ async function saveConfig() {
         max_loss_per_fill_usd: parseFloat(document.getElementById('cfg-max-loss').value),
         take_profit_usd: parseFloat(document.getElementById('cfg-take-profit').value) || 0,
         trailing_stop_pct: (parseFloat(document.getElementById('cfg-trail-stop').value) || 0) / 100,
+        session_limit: parseFloat(document.getElementById('cfg-session-limit').value) || 25,
     };
     const r = await fetch(`${API_BASE}/api/mm/config`, {
         method: 'POST',

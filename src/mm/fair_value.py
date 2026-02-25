@@ -10,10 +10,13 @@ We use a simplified log-normal model (similar to Black-Scholes digital option)
 plus TA signal adjustments.
 """
 from __future__ import annotations
+import logging
 import math
 from typing import Optional
 
 import indicators as ind
+
+log = logging.getLogger("mm.fair_value")
 
 
 def _norm_cdf(x: float) -> float:
@@ -35,8 +38,8 @@ def _norm_cdf(x: float) -> float:
 class FairValueEngine:
     """Compute fair value for UP/DN tokens based on Binance data."""
 
-    def __init__(self, vol_window: int = 20, vol_floor: float = 0.0001,
-                 vol_cap: float = 0.01, signal_weight: float = 0.03):
+    def __init__(self, vol_window: int = 20, vol_floor: float = 0.001,
+                 vol_cap: float = 0.05, signal_weight: float = 0.03):
         """
         Args:
             vol_window: Number of klines for realized vol calculation
@@ -98,6 +101,11 @@ class FairValueEngine:
             Probability in [0.01, 0.99]
         """
         if mid <= 0 or strike <= 0:
+            if strike <= 0:
+                log.warning(
+                    "binary_fair_value called with non-positive strike (strike=%.6f), returning 0.5",
+                    strike,
+                )
             return 0.5
 
         # Time to expiry in "kline units" (fraction of window)

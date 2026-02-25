@@ -266,6 +266,45 @@ class OrderManager:
                     collateral, usdc_avail,
                 )
 
+        # BUY balance pre-check (live only): avoid spamming PM API with 400 errors
+        if quote.side == "BUY" and not is_mock:
+            usdc_bal = await self.get_usdc_balance()
+            if usdc_bal is None:
+                log.warning("BUY pre-check skipped: failed to fetch USDC balance")
+            else:
+                # Subtract collateral already locked in active BUY orders
+                active_buy_collateral = sum(
+                    self.required_collateral(q)
+                    for q in self._active_orders.values()
+                    if q.side == "BUY"
+                )
+                available = usdc_bal - active_buy_collateral
+                if collateral > available + 0.50:
+                    if available > 1.0 and quote.price > 0:
+                        max_size = available / quote.price
+                        pm_min = 5.0
+                        if max_size >= pm_min:
+                            self._throttled_warn(
+                                "buy_balance_cap",
+                                f"BUY balance cap: need ${collateral:.2f} but only "
+                                f"${available:.2f} available — reducing {quote.size:.1f} → {max_size:.1f}",
+                            )
+                            quote.size = round(max_size, 2)
+                        else:
+                            self._throttled_warn(
+                                "buy_balance_skip",
+                                f"BUY skipped: need ${collateral:.2f} but only "
+                                f"${available:.2f} available (max_size={max_size:.1f} < min {pm_min})",
+                            )
+                            return None
+                    else:
+                        self._throttled_warn(
+                            "buy_no_usdc",
+                            f"BUY skipped: need ${collateral:.2f} but only "
+                            f"${available:.2f} USDC available",
+                        )
+                        return None
+
         # Ensure allowance for SELL orders on conditional tokens
         if quote.side == "SELL" and not is_mock:
             if not await self.ensure_sell_allowance(quote.token_id):
@@ -276,7 +315,9 @@ class OrderManager:
             sell_collateral = quote.size * (1.0 - quote.price)
             if sell_collateral > 0.01:
                 usdc_bal = await self.get_usdc_balance()
-                if usdc_bal < sell_collateral:
+                if usdc_bal is None:
+                    log.warning("SELL pre-check skipped: failed to fetch USDC balance")
+                elif usdc_bal < sell_collateral:
                     if usdc_bal > 0.01 and quote.price < 1.0:
                         max_affordable = usdc_bal / (1.0 - quote.price)
                         pm_min = 5.0
@@ -436,7 +477,7 @@ class OrderManager:
             log.debug(f"Failed to get full book for {token_id[:12]}...: {e}")
             return empty
 
-    async def get_token_balance(self, token_id: str) -> float:
+    async def get_token_balance(self, token_id: str) -> Optional[float]:
         """Fetch real PM token balance in shares for a conditional token."""
         try:
             if hasattr(self.client, "_orders"):
@@ -455,9 +496,9 @@ class OrderManager:
             return float(result["balance"]) / 1e6
         except Exception as e:
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
-            return 0.0
+            return None
 
-    async def get_usdc_balance(self) -> float:
+    async def get_usdc_balance(self) -> Optional[float]:
         """Fetch real USDC (collateral) balance on Polymarket."""
         try:
             if hasattr(self.client, "_orders"):
@@ -470,10 +511,12 @@ class OrderManager:
             )
             return float(result.get("balance", 0)) / 1e6
         except Exception as e:
-            log.debug(f"Failed to fetch USDC balance: {e}")
-            return 0.0
+            log.warning(f"Failed to fetch USDC balance: {e}")
+            return None
 
-    async def get_all_token_balances(self, up_token_id: str, dn_token_id: str) -> tuple[float, float]:
+    async def get_all_token_balances(
+        self, up_token_id: str, dn_token_id: str
+    ) -> tuple[Optional[float], Optional[float]]:
         """Fetch both UP and DN token balances.
 
         Live mode: fetches PM balances via API.
@@ -488,7 +531,7 @@ class OrderManager:
             self.get_token_balance(up_token_id),
             self.get_token_balance(dn_token_id),
         )
-        return float(up), float(dn)
+        return up, dn
 
     async def place_quotes(self, *quotes: Quote) -> list[str]:
         """Place multiple orders (potentially batch).
@@ -525,7 +568,9 @@ class OrderManager:
         cancelled = 0
         try:
             # Try batch cancel first
-            await asyncio.to_thread(self.client.cancel_all)
+            batch_resp = await asyncio.to_thread(self.client.cancel_all)
+            if isinstance(batch_resp, dict) and batch_resp.get("error"):
+                raise RuntimeError(f"batch cancel response error: {batch_resp.get('error')}")
             cancelled = len(ids)
             self._active_orders.clear()
             self._order_post_only.clear()
@@ -550,7 +595,18 @@ class OrderManager:
         """
         # Cancel old orders in parallel
         if old_ids:
-            await asyncio.gather(*(self.cancel_order(oid) for oid in old_ids if oid))
+            cancel_results = await asyncio.gather(
+                *(self.cancel_order(oid) for oid in old_ids if oid)
+            )
+            # If ANY cancel failed, don't place replacements — wait for next tick
+            if not all(cancel_results):
+                failed = sum(1 for r in cancel_results if not r)
+                self._log.warning(
+                    "cancel_replace: %d/%d cancels failed, skipping new placements",
+                    failed,
+                    len(cancel_results),
+                )
+                return []
 
         # Place new orders sequentially (budget safety)
         results = []

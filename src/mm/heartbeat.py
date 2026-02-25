@@ -8,6 +8,7 @@ This runs a background loop sending heartbeats at regular intervals.
 from __future__ import annotations
 import asyncio
 import logging
+import re
 import time
 import uuid
 from typing import Any, Callable
@@ -67,6 +68,17 @@ class HeartbeatManager:
         log.info("Heartbeat ID force-regenerated: %s…", self._heartbeat_id[:8])
         return self._heartbeat_id
 
+    @staticmethod
+    def _extract_server_heartbeat_id(error_str: str) -> str | None:
+        """Extract heartbeat_id UUID from PM error response string."""
+        # Match UUID pattern in 'heartbeat_id': '...' or "heartbeat_id": "..."
+        m = re.search(
+            r"['\"]?heartbeat_id['\"]?\s*[:=]\s*['\"]?"
+            r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+            error_str, re.IGNORECASE,
+        )
+        return m.group(1) if m else None
+
     async def _send_heartbeat(self) -> bool:
         """Send a single heartbeat.
 
@@ -88,16 +100,40 @@ class HeartbeatManager:
         except Exception as e:
             self._error_count += 1
             self._consecutive_failures += 1
-            err_lower = str(e).lower()
-            # PM invalidated our heartbeat ID — regenerate a fresh one
+            err_str = str(e)
+            err_lower = err_str.lower()
+            # PM says our ID is invalid — try to extract the server's active ID
             if "invalid" in err_lower or "not found" in err_lower:
                 old_id = self._heartbeat_id[:8]
-                self._heartbeat_id = str(uuid.uuid4())
-                log.info("Heartbeat ID regenerated: %s… → %s… (was: %s)",
-                         old_id, self._heartbeat_id[:8], e)
-                self._consecutive_failures = 0
-                return True
-            log.warning(f"Heartbeat failed: {e}")
+                # Extract server's heartbeat_id from error like:
+                # {'heartbeat_id': '154cd958-...'}
+                server_id = self._extract_server_heartbeat_id(err_str)
+                if server_id and server_id != self._heartbeat_id:
+                    self._heartbeat_id = server_id
+                    log.info("Heartbeat ID adopted from server: %s… → %s… (server had: %s)",
+                             old_id, self._heartbeat_id[:8], server_id[:12])
+                else:
+                    self._heartbeat_id = str(uuid.uuid4())
+                    log.info("Heartbeat ID regenerated: %s… → %s…",
+                             old_id, self._heartbeat_id[:8])
+                # Immediately retry with the new ID (PM timeout is ~10s, can't wait)
+                try:
+                    is_mock = hasattr(self.client, '_orders')
+                    if is_mock:
+                        await asyncio.to_thread(self.client.post_heartbeat)
+                    else:
+                        await asyncio.to_thread(
+                            self.client.post_heartbeat, self._heartbeat_id
+                        )
+                    self._last_heartbeat = time.time()
+                    self._heartbeat_count += 1
+                    self._consecutive_failures = 0
+                    return True
+                except Exception as retry_err:
+                    log.warning("Heartbeat retry with new ID also failed: %s", retry_err)
+                    self._consecutive_failures += 1
+                    return False
+            log.warning("Heartbeat failed: %s", e)
             if self._consecutive_failures >= 3:
                 log.critical(
                     "Heartbeat failed %s times in a row; orders may have been cancelled",

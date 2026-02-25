@@ -14,7 +14,7 @@ class CostBasis:
     @property
     def avg_entry_price(self) -> float:
         if self.total_shares <= 0:
-            return 0.5
+            return 0.0
         return self.total_cost / self.total_shares
 
     def record_buy(self, price: float, size: float, fee: float) -> None:
@@ -98,6 +98,8 @@ class Inventory:
             else:
                 self.dn_shares += fill.size
             self.usdc -= fill.notional + fill.fee
+            if self.usdc < 0:
+                self.usdc = 0.0  # Floor at zero — real balance checked via API
             cost.record_buy(fill.price, fill.size, fill.fee)
         else:  # SELL
             if token_type == "up":
@@ -110,10 +112,28 @@ class Inventory:
     def reconcile(self, real_up: float, real_dn: float,
                   real_usdc: float | None = None) -> None:
         """Update shares (and optionally USDC) to match actual PM balance."""
+        old_up = self.up_shares
+        old_dn = self.dn_shares
         self.up_shares = real_up
         self.dn_shares = real_dn
         if real_usdc is not None:
             self.usdc = real_usdc
+
+        # Sync CostBasis.total_shares with actual share count
+        # This keeps avg_entry_price correct after reconciliation
+        if self.up_cost.total_shares > 0 and real_up != old_up:
+            if real_up <= 0:
+                self.up_cost.reset()
+            elif real_up < self.up_cost.total_shares:
+                # Shares decreased externally — reduce cost proportionally
+                self.up_cost.record_sell(self.up_cost.total_shares - real_up)
+
+        if self.dn_cost.total_shares > 0 and real_dn != old_dn:
+            if real_dn <= 0:
+                self.dn_cost.reset()
+            elif real_dn < self.dn_cost.total_shares:
+                # Shares decreased externally — reduce cost proportionally
+                self.dn_cost.record_sell(self.dn_cost.total_shares - real_dn)
 
 
 @dataclass

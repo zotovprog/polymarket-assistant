@@ -1,11 +1,45 @@
 """Market Making configuration with runtime-adjustable parameters."""
 from __future__ import annotations
+import logging
+import math
 from dataclasses import dataclass, asdict
+from typing import Any, ClassVar
+
+
+log = logging.getLogger("mm.config")
 
 
 @dataclass
 class MMConfig:
     """All MM parameters — can be updated at runtime via API."""
+
+    # Backward-compatible aliases accepted by update().
+    UPDATE_ALIASES: ClassVar[dict[str, str]] = {
+        "refresh_interval_s": "requote_interval_sec",
+        "liq_chunk_interval_s": "liq_chunk_interval_sec",
+    }
+
+    # Safety bounds for critical runtime-adjustable parameters.
+    VALIDATION_BOUNDS: ClassVar[dict[str, tuple[float, float]]] = {
+        "half_spread_bps": (5.0, 5000.0),
+        "order_size_usd": (1.0, 500.0),
+        "max_position_usd": (5.0, 5000.0),
+        "layers": (1.0, 10.0),
+        "layer_spacing_bps": (1.0, 1000.0),
+        "skew_bps_per_unit": (0.0, 500.0),
+        "refresh_interval_s": (0.5, 60.0),
+        "max_drawdown_usd": (1.0, 1000.0),
+        "volatility_pause_mult": (1.0, 20.0),
+        "max_loss_per_fill_usd": (0.5, 100.0),
+        "take_profit_usd": (0.0, 10000.0),
+        "trailing_stop_pct": (0.0, 1.0),
+        "gamma_bps": (0.0, 500.0),
+        "gamma_decay": (0.0, 1.0),
+        "liq_chunk_pct": (0.01, 1.0),
+        "liq_chunk_interval_s": (1.0, 300.0),
+        "liq_gradual_chunks": (1.0, 50.0),
+        "liq_max_discount_from_fv": (0.0, 0.5),
+    }
 
     # ── Spread ───────────────────────────────────────────────────
     half_spread_bps: float = 300.0       # 3% half-spread default (safe for 15m binaries)
@@ -33,7 +67,7 @@ class MMConfig:
     use_gtd: bool = True                 # use GTD order type
 
     # ── Risk ─────────────────────────────────────────────────────
-    max_drawdown_usd: float = 50.0       # max session drawdown
+    max_drawdown_usd: float = 15.0       # max session drawdown (conservative default)
     volatility_pause_mult: float = 3.0   # pause if vol > N × avg
     max_loss_per_fill_usd: float = 5.0   # Max acceptable loss on single fill
     take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)
@@ -74,10 +108,82 @@ class MMConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "MMConfig":
         valid = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in valid})
+        cfg = cls(**{k: v for k, v in d.items() if k in valid})
+        cfg.validate()
+        return cfg
 
     def update(self, **kwargs) -> None:
         """Update parameters at runtime."""
+        normalized: dict[str, Any] = {}
         for k, v in kwargs.items():
-            if hasattr(self, k):
-                setattr(self, k, type(getattr(self, k))(v))
+            target_key = self.UPDATE_ALIASES.get(k, k)
+            # Canonical keys win over aliases when both are provided.
+            if k in self.UPDATE_ALIASES and target_key in normalized:
+                continue
+            normalized[target_key] = v
+
+        for k, v in normalized.items():
+            if not hasattr(self, k):
+                continue
+            current = getattr(self, k)
+            try:
+                if isinstance(current, bool):
+                    if isinstance(v, str):
+                        parsed = v.strip().lower()
+                        if parsed in {"1", "true", "yes", "on"}:
+                            casted = True
+                        elif parsed in {"0", "false", "no", "off"}:
+                            casted = False
+                        else:
+                            raise ValueError(f"invalid bool string: {v!r}")
+                    else:
+                        casted = bool(v)
+                else:
+                    casted = type(current)(v)
+            except (TypeError, ValueError):
+                log.warning("Ignoring invalid MMConfig value for %s=%r", k, v)
+                continue
+            setattr(self, k, casted)
+
+        self.validate()
+
+    def _clamp_numeric(self, field_name: str, min_value: float, max_value: float) -> None:
+        if not hasattr(self, field_name):
+            return
+
+        raw = getattr(self, field_name)
+        if isinstance(raw, bool):
+            return
+
+        default_value = getattr(type(self), field_name, raw)
+        is_int_field = isinstance(default_value, int) and not isinstance(default_value, bool)
+
+        try:
+            numeric_value = float(raw)
+            if not math.isfinite(numeric_value):
+                raise ValueError("non-finite value")
+        except (TypeError, ValueError):
+            numeric_value = float(min_value)
+            log.warning(
+                "MMConfig %s=%r is invalid; clamped to %.6g",
+                field_name, raw, numeric_value,
+            )
+
+        clamped = min(max(numeric_value, min_value), max_value)
+        if clamped != numeric_value:
+            log.warning(
+                "MMConfig %s=%.6g out of bounds [%.6g, %.6g]; clamped to %.6g",
+                field_name, numeric_value, min_value, max_value, clamped,
+            )
+
+        setattr(self, field_name, int(round(clamped)) if is_int_field else float(clamped))
+
+    def validate(self) -> None:
+        """Clamp critical parameters to safe ranges."""
+        seen: set[str] = set()
+        for raw_field, (min_value, max_value) in self.VALIDATION_BOUNDS.items():
+            field_name = self.UPDATE_ALIASES.get(raw_field, raw_field)
+            if field_name in seen:
+                continue
+            seen.add(field_name)
+            self._clamp_numeric(field_name, min_value, max_value)
