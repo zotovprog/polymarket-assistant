@@ -17,6 +17,7 @@ Build:
     - echo "$SMTH_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$SMTH_REGISTRY_USER" --password-stdin
     - >
       docker build -f Dockerfile --target production
+      --build-arg GIT_HASH=${CI_COMMIT_SHORT_SHA}
       --tag ${IMAGE_NAME}:${CI_PIPELINE_IID}
       --label CI_PROJECT_ID=${CI_PROJECT_ID}
       .
