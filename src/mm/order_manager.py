@@ -28,10 +28,25 @@ try:
         BalanceAllowanceParams,
         OrderArgs,
         OrderType,
+        PostOrdersArgs,
     )
     _HAS_CLOB_TYPES = True
+    _HAS_POST_ORDERS_ARGS = True
 except ImportError:
-    _HAS_CLOB_TYPES = False
+    try:
+        from py_clob_client.clob_types import (  # type: ignore[no-redef]
+            AssetType,
+            BalanceAllowanceParams,
+            OrderArgs,
+            OrderType,
+        )
+        PostOrdersArgs = None  # type: ignore[assignment]
+        _HAS_CLOB_TYPES = True
+        _HAS_POST_ORDERS_ARGS = False
+    except ImportError:
+        PostOrdersArgs = None  # type: ignore[assignment]
+        _HAS_CLOB_TYPES = False
+        _HAS_POST_ORDERS_ARGS = False
 
 
 class TradeLedger:
@@ -176,6 +191,8 @@ class OrderManager:
                 p for p in params
                 if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
             ]
+            if "args" in names:
+                modes.append("args_kw")
             if positional:
                 modes.append("batch_only")
             if "orders" in names:
@@ -201,15 +218,46 @@ class OrderManager:
                 modes.append(mode)
         return modes
 
+    @staticmethod
+    def _is_payload_shape_error(exc: Exception) -> bool:
+        """Errors indicating payload format mismatch for current client version."""
+        msg = str(exc).lower()
+        return "has no attribute" in msg and "ordertype" in msg
+
+    def _build_post_orders_args(self, batch: list[Any], order_type: Any, post_only: bool) -> list[Any]:
+        """Wrap signed orders into PostOrdersArgs when supported by client version."""
+        if not _HAS_POST_ORDERS_ARGS or PostOrdersArgs is None:
+            return batch
+
+        wrapped: list[Any] = []
+        try:
+            for signed in batch:
+                wrapped.append(
+                    PostOrdersArgs(
+                        order=signed,
+                        orderType=order_type,
+                        postOnly=bool(post_only),
+                    )
+                )
+            return wrapped
+        except Exception:
+            return batch
+
     async def _post_orders_compat(self, batch: list[Any], order_type: Any, post_only: bool) -> Any:
         """Call client.post_orders across py-clob-client API variants."""
         modes = self._post_orders_mode_candidates()
+        has_args_mode = "args_kw" in modes
         last_type_error: TypeError | None = None
+        last_payload_error: Exception | None = None
+        batch_args = self._build_post_orders_args(batch, order_type, post_only)
 
         for mode in modes:
             try:
-                if mode == "batch_only":
-                    resp = await asyncio.to_thread(self.client.post_orders, batch)
+                if mode == "args_kw":
+                    resp = await asyncio.to_thread(self.client.post_orders, args=batch_args)
+                elif mode == "batch_only":
+                    payload = batch_args if has_args_mode else batch
+                    resp = await asyncio.to_thread(self.client.post_orders, payload)
                 elif mode == "orders_kw":
                     resp = await asyncio.to_thread(self.client.post_orders, orders=batch)
                 elif mode == "signed_orders_kw":
@@ -235,14 +283,19 @@ class OrderManager:
                     log.info("Resolved post_orders mode: %s", mode)
                 self._post_orders_mode = mode
                 return resp
-            except TypeError as exc:
-                if not self._is_signature_type_error(exc):
-                    raise
-                last_type_error = exc
-                continue
+            except Exception as exc:
+                if isinstance(exc, TypeError) and self._is_signature_type_error(exc):
+                    last_type_error = exc
+                    continue
+                if self._is_payload_shape_error(exc):
+                    last_payload_error = exc
+                    continue
+                raise
 
         if last_type_error is not None:
             raise last_type_error
+        if last_payload_error is not None:
+            raise last_payload_error
         raise RuntimeError("Failed to resolve compatible post_orders signature")
 
     @property
