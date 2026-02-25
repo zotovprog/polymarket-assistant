@@ -588,6 +588,11 @@ class MarketMaker:
                     else:
                         self._reconcile_stable_count = 0
                         self._reconcile_prev_pm = None
+        elif not is_live:
+            # Paper mode: sync from mock client balance + internal inventory
+            self._cached_usdc_balance = self.order_mgr.client.get_balance()
+            self._cached_pm_up_shares = self.inventory.up_shares
+            self._cached_pm_dn_shares = self.inventory.dn_shares
 
         _t_reconcile = time.perf_counter()
 
@@ -1198,6 +1203,11 @@ class MarketMaker:
                     self._cached_pm_dn_shares = real_dn
             except Exception as e:
                 log.warning("Post-order balance refresh failed: %s", e)
+        else:
+            # Paper mode: sync from mock client balance + internal inventory
+            self._cached_usdc_balance = self.order_mgr.client.get_balance()
+            self._cached_pm_up_shares = self.inventory.up_shares
+            self._cached_pm_dn_shares = self.inventory.dn_shares
 
         # 9. Latency metrics
         total_ms = (_t_orders - _t0) * 1000
