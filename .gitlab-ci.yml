@@ -30,7 +30,7 @@ Deploy:
     - job: Build
   tags:
     - shell
-    - polybot1
+    - polybot2
   environment:
     name: prod
   variables:
