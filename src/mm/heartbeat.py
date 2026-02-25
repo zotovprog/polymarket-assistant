@@ -132,6 +132,17 @@ class HeartbeatManager:
                 except Exception as retry_err:
                     log.warning("Heartbeat retry with new ID also failed: %s", retry_err)
                     self._consecutive_failures += 1
+                    # Check failure threshold (same as main path below)
+                    if self._consecutive_failures >= 3:
+                        log.critical(
+                            "Heartbeat failed %s times in a row; orders may have been cancelled",
+                            self._consecutive_failures,
+                        )
+                        if self._on_failure:
+                            try:
+                                self._on_failure()
+                            except Exception as cb_err:
+                                log.error(f"Heartbeat failure callback error: {cb_err}", exc_info=True)
                     return False
             log.warning("Heartbeat failed: %s", e)
             if self._consecutive_failures >= 3:

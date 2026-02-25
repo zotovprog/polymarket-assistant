@@ -56,7 +56,7 @@ class MarketMaker:
         self.heartbeat = HeartbeatManager(
             clob_client,
             config.heartbeat_interval_sec,
-            on_failure=self._on_heartbeat_failure,
+            on_failure=self._schedule_heartbeat_failure,
         )
         self.rebate = RebateTracker(clob_client)
         self.quality_analyzer = MarketQualityAnalyzer(config)
@@ -68,6 +68,7 @@ class MarketMaker:
         self._paused = False
         self._pause_reason = ""
         self._task: Optional[asyncio.Task] = None
+        self._heartbeat_failure_task: Optional[asyncio.Task] = None
         self._started_at: float = 0.0
         self._is_closing = False
         self._liquidation_attempted = False
@@ -75,6 +76,9 @@ class MarketMaker:
         self._cached_usdc_balance: float = 0.0
         self._starting_usdc_pm: float = 0.0
         self._last_quality: MarketQuality | None = None
+        self._quality_error_count: int = 0
+        self._quality_success_count: int = 0
+        self._quality_pause_active: bool = False
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
@@ -123,18 +127,48 @@ class MarketMaker:
             self._warn_cooldowns[key] = now
             log.warning(msg)
 
-    def _on_heartbeat_failure(self) -> None:
-        log.warning("Heartbeat lost — orders likely cancelled by PM, pausing bot")
-        self._current_quotes = {
-            "up": (None, None),
-            "dn": (None, None),
-        }
-        # PM auto-cancels all orders on heartbeat failure — clear our tracking
-        self.order_mgr._active_orders.clear()
-        self.order_mgr._order_post_only.clear()
-        # Pause the bot until heartbeat recovers
+    def _schedule_heartbeat_failure(self) -> None:
+        """Schedule async heartbeat failure handler from sync callback context."""
+        if self._heartbeat_failure_task and not self._heartbeat_failure_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.error("Heartbeat failure callback invoked without a running event loop")
+            return
+        self._heartbeat_failure_task = loop.create_task(self._on_heartbeat_failure())
+
+    async def _on_heartbeat_failure(self) -> None:
+        """Handle fatal heartbeat failure (triggered after 3 consecutive misses)."""
+        reason = "Heartbeat failed 3 consecutive times"
+        log.warning("Heartbeat failure callback triggered: %s", reason)
+        try:
+            await self._emergency_shutdown(reason)
+        finally:
+            # Always clear local order/quote state even if exchange cancel raised.
+            self.order_mgr.clear_local_order_tracking()
+            self._current_quotes = {
+                "up": (None, None),
+                "dn": (None, None),
+            }
+
+    async def _emergency_shutdown(self, reason: str) -> None:
+        """Best-effort fatal shutdown with explicit order and heartbeat cleanup."""
+        log.critical("EMERGENCY SHUTDOWN: %s", reason)
+        try:
+            await self.order_mgr.cancel_all(force_exchange=True)
+        except Exception as e:
+            log.error("Emergency cancel_all failed: %s", e, exc_info=True)
+
+        try:
+            await self.heartbeat.stop()
+        except Exception as e:
+            log.error("Emergency heartbeat stop failed: %s", e, exc_info=True)
+
+        self._running = False
         self._paused = True
-        self._pause_reason = "Heartbeat failure — orders auto-cancelled by PM"
+        self._pause_reason = reason
+        self._is_closing = True
 
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
@@ -176,6 +210,7 @@ class MarketMaker:
         self._started_at = time.time()
         self._paused = False
         self._pause_reason = ""
+        self._heartbeat_failure_task = None
         self._tick_count = 0
         self._is_closing = False
         self._liquidation_attempted = False
@@ -184,6 +219,9 @@ class MarketMaker:
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
         self._one_sided_counter = 0
+        self._quality_error_count = 0
+        self._quality_success_count = 0
+        self._quality_pause_active = False
         self.risk_mgr.reset()
 
         # Set budget cap on order manager (enforced at placement time)
@@ -379,7 +417,8 @@ class MarketMaker:
         # Uses debounce: only reconcile if PM values are stable for 3+ consecutive checks
         # to avoid oscillation from PM balance API lagging behind fill detection.
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live and self._tick_count % 5 == 0 and not self._is_closing:
+        reconcile_requested = self.order_mgr.reconcile_requested
+        if is_live and not self._is_closing and (self._tick_count % 5 == 0 or reconcile_requested):
             real_up, real_dn = await self.order_mgr.get_all_token_balances(
                 self.market.up_token_id,
                 self.market.dn_token_id,
@@ -395,41 +434,53 @@ class MarketMaker:
                 self._reconcile_stable_count = 0
                 self._reconcile_prev_pm = None
             else:
-                up_diff = abs(real_up - self.inventory.up_shares)
-                dn_diff = abs(real_dn - self.inventory.dn_shares)
-                if up_diff > 1.0 or dn_diff > 1.0:
-                    prev = self._reconcile_prev_pm
-                    pm_stable = (prev is not None
-                                 and abs(real_up - prev[0]) < 0.5
-                                 and abs(real_dn - prev[1]) < 0.5)
-                    self._reconcile_prev_pm = (real_up, real_dn)
-
-                    if pm_stable:
-                        self._reconcile_stable_count += 1
-                    else:
-                        self._reconcile_stable_count = 1
-
-                    if self._reconcile_stable_count >= 3:
-                        log.warning(
-                            "Inventory reconcile (confirmed %d checks): "
-                            "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
-                            self._reconcile_stable_count,
-                            self.inventory.up_shares, self.inventory.dn_shares,
-                            real_up, real_dn,
-                        )
-                        self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
-                        self._reconcile_stable_count = 0
-                        self._reconcile_prev_pm = None
-                    else:
-                        log.info(
-                            "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
-                            self._reconcile_stable_count,
-                            self.inventory.up_shares, self.inventory.dn_shares,
-                            real_up, real_dn,
-                        )
-                else:
+                if reconcile_requested:
+                    log.warning(
+                        "Forced reconcile after anomalous fill: internal UP=%.2f DN=%.2f "
+                        "→ PM UP=%.2f DN=%.2f",
+                        self.inventory.up_shares, self.inventory.dn_shares,
+                        real_up, real_dn,
+                    )
+                    self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
                     self._reconcile_stable_count = 0
                     self._reconcile_prev_pm = None
+                    self.order_mgr.clear_reconcile_request()
+                else:
+                    up_diff = abs(real_up - self.inventory.up_shares)
+                    dn_diff = abs(real_dn - self.inventory.dn_shares)
+                    if up_diff > 1.0 or dn_diff > 1.0:
+                        prev = self._reconcile_prev_pm
+                        pm_stable = (prev is not None
+                                     and abs(real_up - prev[0]) < 0.5
+                                     and abs(real_dn - prev[1]) < 0.5)
+                        self._reconcile_prev_pm = (real_up, real_dn)
+
+                        if pm_stable:
+                            self._reconcile_stable_count += 1
+                        else:
+                            self._reconcile_stable_count = 1
+
+                        if self._reconcile_stable_count >= 3:
+                            log.warning(
+                                "Inventory reconcile (confirmed %d checks): "
+                                "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
+                                self._reconcile_stable_count,
+                                self.inventory.up_shares, self.inventory.dn_shares,
+                                real_up, real_dn,
+                            )
+                            self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                            self._reconcile_stable_count = 0
+                            self._reconcile_prev_pm = None
+                        else:
+                            log.info(
+                                "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                                self._reconcile_stable_count,
+                                self.inventory.up_shares, self.inventory.dn_shares,
+                                real_up, real_dn,
+                            )
+                    else:
+                        self._reconcile_stable_count = 0
+                        self._reconcile_prev_pm = None
 
         _t_reconcile = time.perf_counter()
 
@@ -563,12 +614,12 @@ class MarketMaker:
             await self.order_mgr.cancel_all()
             log.warning(f"MM PAUSED: {reason}")
             return
-        elif not should_pause and self._paused:
+        elif not should_pause and self._paused and not self._quality_pause_active:
             self._paused = False
             self._pause_reason = ""
             log.info("MM RESUMED")
 
-        if self._paused and not _inv_limit_suppress:
+        if self._paused and not _inv_limit_suppress and not self._quality_pause_active:
             return
 
         # ── One-sided exposure check ──────────────────────────────
@@ -614,6 +665,22 @@ class MarketMaker:
                 dn_book = await self.order_mgr.get_full_book(self.market.dn_token_id)
                 self._last_quality = self.quality_analyzer.analyze(
                     up_book, dn_book, fv_up, fv_dn)
+                self._quality_error_count = 0
+                if self._quality_pause_active:
+                    self._quality_success_count += 1
+                    log.info(
+                        "Market quality recovery check %d/3 passed",
+                        self._quality_success_count,
+                    )
+                    if self._quality_success_count >= 3:
+                        self._quality_pause_active = False
+                        self._quality_success_count = 0
+                        if not should_pause and self._pause_reason == "Market quality degraded":
+                            self._paused = False
+                            self._pause_reason = ""
+                            log.info("MM RESUMED: market quality recovered")
+                else:
+                    self._quality_success_count = 0
 
                 should_exit, reason = self.quality_analyzer.check_exit_conditions(
                     up_book, dn_book, fv_up, fv_dn, self.inventory)
@@ -631,7 +698,24 @@ class MarketMaker:
                     self._current_quotes = {"up": (None, None), "dn": (None, None)}
                     return
             except Exception as e:
-                log.debug(f"Quality check error: {e}")
+                self._quality_error_count += 1
+                self._quality_success_count = 0
+                log.error(
+                    "Quality check error (%d/3): %s",
+                    self._quality_error_count, e,
+                )
+                if self._quality_error_count >= 3:
+                    if not self._quality_pause_active:
+                        self._quality_pause_active = True
+                        self._paused = True
+                        self._pause_reason = "Market quality degraded"
+                        await self.order_mgr.cancel_all()
+                        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                    log.critical("Market quality degraded, pausing")
+                return
+
+        if self._quality_pause_active:
+            return
 
         # 6. Generate quotes (with USDC budget cap)
         order_collateral = sum(
@@ -724,16 +808,38 @@ class MarketMaker:
                          else self.inventory.dn_shares)
             if new_ask and token_bal > 0:
                 new_ask.size = round(min(new_ask.size, token_bal), 2)
-            ask_size = new_ask.size if new_ask else 0
-            ask_price = new_ask.price if new_ask else 0
-            need_ask = (self.quote_engine.should_requote(cur_ask, new_ask)
+            ask_size = new_ask.size if new_ask else 0.0
+            ask_price = new_ask.price if new_ask else 0.0
+            current_ask_size = cur_ask.size if (cur_ask and cur_ask.order_id) else 0.0
+            material_ask_size_change = (
+                new_ask is not None
+                and cur_ask is not None
+                and cur_ask.order_id is not None
+                and abs(ask_size - current_ask_size) > 2.0
+            )
+            need_ask = ((self.quote_engine.should_requote(cur_ask, new_ask)
+                         or material_ask_size_change)
                         and token_bal > 0 and new_ask is not None)
+
+            oversized_live_ask = bool(
+                cur_ask and cur_ask.order_id and cur_ask.size > (token_bal + 0.5)
+            )
+            if oversized_live_ask:
+                log.warning(
+                    "Cancelling oversized %s ask: live_size=%.2f inventory=%.2f",
+                    token_key.upper(),
+                    cur_ask.size if cur_ask else 0.0,
+                    token_bal,
+                )
+                if token_bal > 0 and new_ask is not None:
+                    need_ask = True
+
             if need_ask and (ask_size * ask_price) < self.config.min_order_size_usd:
                 need_ask = False
-
             # Also cancel stale ask if we no longer have inventory
             stale_ask = (cur_ask and cur_ask.order_id
-                         and token_bal <= 0 and not need_ask)
+                         and (token_bal <= 0 or oversized_live_ask)
+                         and not need_ask)
 
             if need_bid or need_ask or stale_bid or stale_ask:
                 self._requote_count += 1
@@ -752,10 +858,13 @@ class MarketMaker:
 
                 new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
 
-                # Update current quotes tracking
-                updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
-                updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
-                self._current_quotes[token_key] = (updated_bid, updated_ask)
+                # Only update tracking when cancel_replace actually placed orders
+                if new_ids:
+                    updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
+                    updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
+                    self._current_quotes[token_key] = (updated_bid, updated_ask)
+                # If cancel_replace failed (returned []), leave _current_quotes unchanged
+                # so next tick retries the cancel+replace
 
         _t_orders = time.perf_counter()
 
@@ -877,9 +986,9 @@ class MarketMaker:
             _pos_val = self.inventory.up_shares * _pm_up + self.inventory.dn_shares * _pm_dn
             _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_usdc_pm
             if _liq_pnl < -2 * self.config.max_drawdown_usd:
-                log.critical("CATASTROPHIC LOSS during liquidation: sPnL=$%.2f, abandoning", _liq_pnl)
-                self._is_closing = False
-                self._running = False
+                await self._emergency_shutdown(
+                    f"CATASTROPHIC LOSS during liquidation: sPnL=${_liq_pnl:.2f}"
+                )
                 return
             elif _liq_pnl < -self.config.max_drawdown_usd and not use_taker:
                 log.warning("Max drawdown exceeded during liquidation: sPnL=$%.2f, forcing taker mode", _liq_pnl)
@@ -960,6 +1069,7 @@ class MarketMaker:
         has_real_balance = False
         placed_any = False
         balance_fetch_failed = False
+        completion_threshold = 0.5
 
         for label, token_id in [
             ("UP", self.market.up_token_id),
@@ -970,7 +1080,7 @@ class MarketMaker:
                 log.error("%s balance fetch failed during liquidation; retrying next chunk", label)
                 balance_fetch_failed = True
                 continue
-            if real_balance <= 0.1:
+            if real_balance <= completion_threshold:
                 log.info(f"No real balance for {label}")
                 continue
 
@@ -1034,10 +1144,16 @@ class MarketMaker:
                             f"waiting ({time_left:.0f}s left, {real_balance:.1f} shares)")
                         continue
                     else:
-                        # < 5 seconds — force sell to avoid frozen tokens
+                        # < 5 seconds — force sell but enforce absolute minimum
+                        absolute_min = max(0.03, floor * 0.8)
+                        if best_bid < absolute_min:
+                            log.critical(
+                                f"{label} HOLD: best_bid={best_bid:.2f} < absolute_min={absolute_min:.2f}, "
+                                f"holding to resolution ({time_left:.0f}s left, {real_balance:.1f} shares)")
+                            continue
                         log.warning(
-                            f"{label} FORCE SELL: best_bid={best_bid:.2f} < floor={floor:.2f}, "
-                            f"but only {time_left:.0f}s left ({real_balance:.1f} shares)")
+                            f"{label} FORCE SELL: best_bid={best_bid:.2f} >= absolute_min={absolute_min:.2f}, "
+                            f"({time_left:.0f}s left, {real_balance:.1f} shares)")
                         sell_price = best_bid
                         post_only = False
                         phase = "FORCE_TAKER"
@@ -1120,9 +1236,34 @@ class MarketMaker:
             return
 
         if not has_real_balance:
-            log.info("Liquidation complete — no inventory remaining")
-            self._is_closing = False
-            return
+            real_up_chk, real_dn_chk = await self.order_mgr.get_all_token_balances(
+                self.market.up_token_id,
+                self.market.dn_token_id,
+            )
+            if real_up_chk is None or real_dn_chk is None:
+                log.warning("Liquidation completion check deferred: failed to fetch PM balances")
+                return
+
+            internal_up = self.inventory.up_shares
+            internal_dn = self.inventory.dn_shares
+            internal_clear = internal_up <= completion_threshold and internal_dn <= completion_threshold
+            real_clear = real_up_chk <= completion_threshold and real_dn_chk <= completion_threshold
+
+            if internal_clear and not real_clear:
+                log.warning(
+                    "Internal inventory shows 0 but PM has real balance: "
+                    "internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                    internal_up,
+                    internal_dn,
+                    real_up_chk,
+                    real_dn_chk,
+                )
+                return
+
+            if internal_clear and real_clear:
+                log.info("Liquidation complete — no inventory remaining")
+                self._is_closing = False
+                return
 
         # Check if all remaining balances are "dust" — below PM minimum, can't sell
         if has_real_balance and not placed_any and not self._liquidation_order_ids:

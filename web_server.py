@@ -567,6 +567,8 @@ class MMRuntime:
         self._start_balance: float = 0.0  # PM USDC balance at session start
         self._strike_invalid: bool = False
         self._strike_retry_task: asyncio.Task | None = None
+        self._last_good_tick_size: float = 0.01
+        self._last_good_min_order_size: float = 5.0
 
     @property
     def is_running(self) -> bool:
@@ -576,6 +578,16 @@ class MMRuntime:
     def _is_valid_strike(strike: float) -> bool:
         """Strike sanity bounds for tradable windows."""
         return 0.0 < float(strike) <= 200000.0
+
+    @staticmethod
+    def _is_valid_tick_size(tick_size: float) -> bool:
+        """PM tick size guardrail: expected values are typically 0.001 or 0.01."""
+        return 0.0 < float(tick_size) <= 0.01
+
+    @staticmethod
+    def _is_valid_min_order_size(min_order_size: float) -> bool:
+        """Sanity bounds for PM min_order_size to avoid pathological API values."""
+        return 0.0 < float(min_order_size) <= 100.0
 
     async def _cancel_strike_retry_task(self) -> None:
         """Stop background strike recovery loop if active."""
@@ -742,13 +754,29 @@ class MMRuntime:
             # One-time on-chain approvals for SELL orders (neg-risk markets)
             log.info("Checking on-chain approvals for neg-risk trading...")
             from mm.approvals import _do_approvals
-            approval_result = await asyncio.to_thread(_do_approvals, PM_PRIVATE_KEY)
-            if approval_result.get("error"):
-                raise HTTPException(status_code=500, detail=f"Approval setup failed: {approval_result['error']}")
-            if not approval_result.get("all_ok", False):
-                log.warning(f"Some approvals failed: {approval_result}")
-            else:
-                log.info(f"All approvals OK: {approval_result}")
+            raw_approval_result: Any
+            try:
+                raw_approval_result = await asyncio.to_thread(_do_approvals, PM_PRIVATE_KEY)
+            except Exception as e:
+                raw_approval_result = {"error": str(e)}
+
+            approval_result = (
+                raw_approval_result
+                if isinstance(raw_approval_result, dict)
+                else {"raw": str(raw_approval_result)}
+            )
+
+            if approval_result.get("error") or not approval_result.get("all_ok", False):
+                log.critical("Cannot start live: on-chain approvals failed: %s", approval_result)
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error": "Cannot start live: on-chain approvals failed",
+                        "details": approval_result,
+                    },
+                )
+
+            log.info("All approvals OK: %s", approval_result)
 
         # Validate
         if coin not in config.COINS:
@@ -1281,6 +1309,17 @@ class MMRuntime:
         import requests as _req
 
         # 1. tick_size + min_order_size from PM order book API
+        safe_tick_size = 0.01
+        safe_min_order_size = 5.0
+        if not self._is_valid_tick_size(self._last_good_tick_size):
+            self._last_good_tick_size = safe_tick_size
+        if not self._is_valid_min_order_size(self._last_good_min_order_size):
+            self._last_good_min_order_size = safe_min_order_size
+
+        # Start from last-known-good (defaults on cold start).
+        market.tick_size = self._last_good_tick_size
+        market.min_order_size = self._last_good_min_order_size
+
         try:
             resp = await asyncio.to_thread(
                 lambda: _req.get(
@@ -1289,18 +1328,65 @@ class MMRuntime:
                     timeout=10,
                 )
             )
-            if resp.ok:
+            if not resp.ok:
+                log.error(
+                    "Failed to fetch PM book params (status=%s), using last-known-good "
+                    "tick_size=%s min_order_size=%s",
+                    resp.status_code, market.tick_size, market.min_order_size,
+                )
+            else:
                 data = resp.json()
-                if "tick_size" in data:
-                    market.tick_size = float(data["tick_size"])
-                if "min_order_size" in data:
-                    market.min_order_size = float(data["min_order_size"])
+
+                raw_tick_size = data.get("tick_size")
+                if raw_tick_size is not None:
+                    try:
+                        tick_size = float(raw_tick_size)
+                        if self._is_valid_tick_size(tick_size):
+                            market.tick_size = tick_size
+                            self._last_good_tick_size = tick_size
+                        else:
+                            market.tick_size = safe_tick_size
+                            log.error(
+                                "Invalid tick_size from PM (%s), using safe default %s",
+                                raw_tick_size, safe_tick_size,
+                            )
+                    except (TypeError, ValueError):
+                        market.tick_size = safe_tick_size
+                        log.error(
+                            "Non-numeric tick_size from PM (%s), using safe default %s",
+                            raw_tick_size, safe_tick_size,
+                        )
+
+                raw_min_order_size = data.get("min_order_size")
+                if raw_min_order_size is not None:
+                    try:
+                        min_order_size = float(raw_min_order_size)
+                        if self._is_valid_min_order_size(min_order_size):
+                            market.min_order_size = min_order_size
+                            self._last_good_min_order_size = min_order_size
+                        else:
+                            market.min_order_size = safe_min_order_size
+                            log.error(
+                                "Invalid min_order_size from PM (%s), using safe default %s",
+                                raw_min_order_size, safe_min_order_size,
+                            )
+                    except (TypeError, ValueError):
+                        market.min_order_size = safe_min_order_size
+                        log.error(
+                            "Non-numeric min_order_size from PM (%s), using safe default %s",
+                            raw_min_order_size, safe_min_order_size,
+                        )
+
                 log.info(
                     "PM book params: tick_size=%s, min_order_size=%s",
                     market.tick_size, market.min_order_size,
                 )
         except Exception as e:
-            log.warning("Failed to fetch tick_size from PM: %s — using default %s", e, market.tick_size)
+            log.error(
+                "Failed to fetch PM book params: %s, using last-known-good "
+                "tick_size=%s min_order_size=%s",
+                e, market.tick_size, market.min_order_size,
+            )
 
         # 2. market_type + resolution_source from PM event description
         try:
@@ -1508,9 +1594,10 @@ async def index():
 async def login(req: LoginRequest, response: Response):
     if req.key != ACCESS_KEY:
         raise HTTPException(status_code=401, detail="invalid key")
+    is_https = os.environ.get("HTTPS_MODE", "").lower() in ("1", "true", "yes")
     response.set_cookie(
         AUTH_COOKIE, req.key,
-        httponly=True, samesite="strict", max_age=86400 * 30,
+        httponly=True, samesite="strict", secure=is_https, max_age=86400 * 30,
     )
     return {"ok": True}
 
@@ -1537,13 +1624,18 @@ async def mm_start(req: StartRequest, request: Request):
     # Re-enable after Kill All
     _runtime.mm_config.enabled = True
     _runtime.mm_config.auto_next_window = True
-    result = await _runtime.start(
-        req.coin,
-        req.timeframe,
-        req.paper_mode,
-        req.initial_usdc,
-        dev=req.dev,
-    )
+    try:
+        result = await _runtime.start(
+            req.coin,
+            req.timeframe,
+            req.paper_mode,
+            req.initial_usdc,
+            dev=req.dev,
+        )
+    except HTTPException as e:
+        if isinstance(e.detail, dict) and e.detail.get("error") == "Cannot start live: on-chain approvals failed":
+            return JSONResponse(e.detail, status_code=e.status_code)
+        raise
     return {"ok": True, "state": result}
 
 
@@ -1590,7 +1682,10 @@ async def mm_emergency(request: Request):
         _runtime.mm._paused = True
         _runtime.mm._pause_reason = "Emergency stop"
         _runtime.mm._running = False  # Actually stop the tick loop
+        # Clear runtime state so start() doesn't return "Already running"
+        _runtime._running = False
         return {"ok": True, "cancelled": cancelled}
+    _runtime._running = False
     return {"ok": True, "cancelled": 0}
 
 
@@ -1686,13 +1781,13 @@ async def health():
 async def ws_endpoint(websocket: WebSocket):
     """WebSocket for real-time dashboard updates.
 
-    Auth via query param ?token= OR cookie pm_web_auth.
+    Auth via x-access-key header OR cookie pm_web_auth.
     Client can send "ping" → server replies {"type":"pong"}.
     """
-    # Auth check
-    token = websocket.query_params.get("token", "")
+    query_token = websocket.query_params.get("token")
     cookie = websocket.cookies.get(AUTH_COOKIE, "")
-    if token != ACCESS_KEY and cookie != ACCESS_KEY:
+    header = websocket.headers.get("x-access-key", "")
+    if cookie != ACCESS_KEY and header != ACCESS_KEY and query_token != ACCESS_KEY:
         await websocket.close(code=1008, reason="unauthorized")
         return
 

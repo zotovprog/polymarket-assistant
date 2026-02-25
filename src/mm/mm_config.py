@@ -28,6 +28,8 @@ class MMConfig:
         "layer_spacing_bps": (1.0, 1000.0),
         "skew_bps_per_unit": (0.0, 500.0),
         "refresh_interval_s": (0.5, 60.0),
+        "heartbeat_interval_sec": (1.0, 30.0),
+        "session_limit": (0.0, 100000.0),
         "max_drawdown_usd": (1.0, 1000.0),
         "volatility_pause_mult": (1.0, 20.0),
         "max_loss_per_fill_usd": (0.5, 100.0),

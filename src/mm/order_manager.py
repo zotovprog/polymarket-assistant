@@ -58,6 +58,7 @@ class OrderManager:
         self._fill_ws_running = False
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
+        self._reconcile_requested: bool = False
 
     def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
         """Log a warning at most once per cooldown period."""
@@ -73,6 +74,38 @@ class OrderManager:
     @property
     def active_orders(self) -> dict[str, Quote]:
         return dict(self._active_orders)
+
+    @property
+    def reconcile_requested(self) -> bool:
+        """Whether an external inventory reconcile should be forced soon."""
+        return self._reconcile_requested
+
+    def clear_reconcile_request(self) -> None:
+        """Clear a previously raised reconcile request."""
+        self._reconcile_requested = False
+
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_fill_price(cls, order: dict[str, Any], fallback: float) -> float:
+        """Best-effort fill price from exchange payload, with quote fallback."""
+        for key in (
+            "fill_price",
+            "matched_price",
+            "last_trade_price",
+            "avg_price",
+            "average_price",
+            "price",
+        ):
+            px = cls._safe_float(order.get(key))
+            if px is not None and px > 0:
+                return px
+        return fallback
 
     async def _retry(self, coro_func, *args, max_retries: int = 3,
                      base_delay: float = 0.5, **kwargs):
@@ -311,35 +344,64 @@ class OrderManager:
                 log.warning(f"Cannot place SELL — allowance setup failed for {quote.token_id[:12]}...")
                 return None
 
-            # SELL balance pre-check: SELL requires size*(1-price) USDC collateral
-            sell_collateral = quote.size * (1.0 - quote.price)
-            if sell_collateral > 0.01:
+            # SELL pre-check:
+            # - Inventory-backed close: require enough free tokens, skip USDC collateral check.
+            # - True short SELL: only short remainder requires USDC collateral.
+            free_inventory = 0.0
+            token_bal = await self.get_token_balance(quote.token_id)
+            active_sell_exposure = sum(
+                q.size
+                for q in self._active_orders.values()
+                if q.side == "SELL" and q.token_id == quote.token_id
+            )
+            local_inventory = quote.size + active_sell_exposure
+            # If token balance unavailable, fall back to local inventory for close detection
+            if token_bal is None:
+                # Use local inventory estimate — safer than assuming short
+                token_balance_for_close_check = local_inventory if local_inventory > 0 else 0.0
+            else:
+                token_balance_for_close_check = token_bal
+            free_inventory = max(0.0, token_balance_for_close_check - active_sell_exposure)
+            if free_inventory + 0.01 >= quote.size:
+                log.debug(
+                    "SELL pre-check: inventory-backed close %.2f shares "
+                    "(token=%.2f active_sell=%.2f) — skipping USDC collateral check",
+                    quote.size,
+                    token_balance_for_close_check,
+                    active_sell_exposure,
+                )
+
+            short_size = max(0.0, quote.size - free_inventory)
+            short_collateral = short_size * (1.0 - quote.price)
+
+            if short_collateral > 0.01:
                 usdc_bal = await self.get_usdc_balance()
                 if usdc_bal is None:
                     log.warning("SELL pre-check skipped: failed to fetch USDC balance")
-                elif usdc_bal < sell_collateral:
+                elif usdc_bal < short_collateral:
                     if usdc_bal > 0.01 and quote.price < 1.0:
-                        max_affordable = usdc_bal / (1.0 - quote.price)
+                        max_short_affordable = usdc_bal / (1.0 - quote.price)
+                        max_total_size = free_inventory + max_short_affordable
                         pm_min = 5.0
-                        if max_affordable >= pm_min:
+                        if max_total_size >= pm_min:
                             self._throttled_warn(
                                 "sell_balance_cap",
-                                f"SELL balance cap: need ${sell_collateral:.2f} but only "
-                                f"${usdc_bal:.2f} USDC — reducing {quote.size:.1f} → {max_affordable:.1f}",
+                                f"SELL balance cap (short leg): need ${short_collateral:.2f} but only "
+                                f"${usdc_bal:.2f} USDC — reducing {quote.size:.1f} → {max_total_size:.1f}",
                             )
-                            quote.size = round(max_affordable, 2)
+                            quote.size = round(max_total_size, 2)
                         else:
                             self._throttled_warn(
                                 "sell_balance_skip",
-                                f"SELL skipped: need ${sell_collateral:.2f} USDC but only "
-                                f"${usdc_bal:.2f} (max_affordable={max_affordable:.1f} < min {pm_min})",
+                                f"SELL skipped: short leg needs ${short_collateral:.2f} USDC but only "
+                                f"${usdc_bal:.2f} (max_size={max_total_size:.1f} < min {pm_min})",
                             )
                             return None
                     else:
                         self._throttled_warn(
                             "sell_no_usdc",
-                            f"SELL skipped: no USDC for collateral "
-                            f"(need ${sell_collateral:.2f}, have ${usdc_bal:.2f})",
+                            f"SELL skipped: no USDC for short collateral "
+                            f"(need ${short_collateral:.2f}, have ${usdc_bal:.2f})",
                         )
                         return None
 
@@ -559,12 +621,33 @@ class OrderManager:
             log.warning(f"Cancel failed for {order_id[:12]}...: {e}")
             return False
 
-    async def cancel_all(self) -> int:
-        """Cancel all active orders. Returns count of cancelled."""
-        if not self._active_orders:
+    def clear_local_order_tracking(self) -> None:
+        """Drop in-memory order-tracking state without touching balances."""
+        self._active_orders.clear()
+        self._order_post_only.clear()
+        self._filled_order_ids.clear()
+        self._partial_fill_reported.clear()
+        self._pending_cancels.clear()
+        self._reconcile_requested = False
+        while not self._ws_fills_queue.empty():
+            try:
+                self._ws_fills_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def cancel_all(self, *, force_exchange: bool = False) -> int:
+        """Cancel active orders.
+
+        Args:
+            force_exchange: If True, call exchange `cancel_all` even when local
+                tracking is empty.
+
+        Returns count of locally tracked orders cancelled.
+        """
+        ids = list(self._active_orders.keys())
+        if not ids and not force_exchange:
             return 0
 
-        ids = list(self._active_orders.keys())
         cancelled = 0
         try:
             # Try batch cancel first
@@ -572,10 +655,15 @@ class OrderManager:
             if isinstance(batch_resp, dict) and batch_resp.get("error"):
                 raise RuntimeError(f"batch cancel response error: {batch_resp.get('error')}")
             cancelled = len(ids)
-            self._active_orders.clear()
-            self._order_post_only.clear()
-            log.info(f"Batch cancelled {cancelled} orders")
+            self.clear_local_order_tracking()
+            if cancelled > 0:
+                log.info(f"Batch cancelled {cancelled} orders")
+            elif force_exchange:
+                log.info("Forced batch cancel submitted with no locally tracked orders")
         except Exception as e:
+            if not ids:
+                log.error("Forced batch cancel failed with no local order IDs: %s", e)
+                raise
             log.warning(f"Batch cancel failed: {e}, trying individual...")
             for oid in ids:
                 if await self.cancel_order(oid):
@@ -737,21 +825,55 @@ class OrderManager:
                 if order is None:
                     continue
                 status = order.get("status", "")
-                size_matched = float(order.get("size_matched", 0))
+                size_matched_raw = order.get("size_matched", 0)
+                size_matched = self._safe_float(size_matched_raw)
+                if size_matched is None:
+                    self._reconcile_requested = True
+                    log.error(
+                        "Anomalous fill: invalid size_matched (%s) for order %s",
+                        size_matched_raw,
+                        order_id[:12],
+                    )
+                    continue
 
                 # Track how much we already reported for this order
                 prev_matched = self._partial_fill_reported.get(order_id, 0.0)
+                remaining_size = max(0.0, quote.size - prev_matched)
                 new_fill_size = size_matched - prev_matched
 
+                if new_fill_size > remaining_size + 0.1:
+                    self._reconcile_requested = True
+                    log.error(
+                        "Anomalous fill: size_matched exceeds order remainder "
+                        "(order=%s size_matched=%.4f already_filled=%.4f remaining=%.4f original=%.4f)",
+                        order_id[:12],
+                        size_matched,
+                        prev_matched,
+                        remaining_size,
+                        quote.size,
+                    )
+                    continue
+                if new_fill_size < -0.1:
+                    self._reconcile_requested = True
+                    log.error(
+                        "Anomalous fill: size_matched regressed "
+                        "(order=%s size_matched=%.4f already_filled=%.4f)",
+                        order_id[:12],
+                        size_matched,
+                        prev_matched,
+                    )
+                    continue
+
                 if new_fill_size >= 0.01:
+                    fill_price = self._extract_fill_price(order, quote.price)
                     is_maker = self._order_post_only.get(order_id, True)
-                    notional = quote.price * new_fill_size
+                    notional = fill_price * new_fill_size
                     fee = 0.0 if is_maker else notional * self.config.taker_fee_rate
                     fill = Fill(
                         ts=time.time(),
                         side=quote.side,
                         token_id=quote.token_id,
-                        price=quote.price,
+                        price=fill_price,
                         size=round(new_fill_size, 4),
                         fee=fee,
                         order_id=order_id,
@@ -762,9 +884,9 @@ class OrderManager:
 
                     # Track session spending for budget cap
                     if quote.side == "BUY":
-                        self._session_spent += new_fill_size * quote.price
+                        self._session_spent += new_fill_size * fill_price
                     elif quote.side == "SELL":
-                        self._session_spent = max(0.0, self._session_spent - new_fill_size * quote.price)
+                        self._session_spent = max(0.0, self._session_spent - new_fill_size * fill_price)
 
                     # Mock balance tracking mirrors fill-side share movements.
                     if hasattr(self.client, "_orders"):
@@ -820,10 +942,7 @@ class OrderManager:
 
     def reset(self) -> None:
         """Clear tracked order state between windows."""
-        self._active_orders.clear()
-        self._order_post_only.clear()
-        self._filled_order_ids.clear()
-        self._partial_fill_reported.clear()
+        self.clear_local_order_tracking()
         self._mock_token_balances.clear()
         self._allowance_set.clear()
         self._session_spent = 0.0
