@@ -603,10 +603,16 @@ class MarketMaker:
 
         # 5. Check risk limits
         # Compute session PnL from real PM balance for risk checks (immune to reconciliation oscillation)
+        # NOTE: PM balance-allowance returns AVAILABLE USDC (minus collateral locked in active orders).
+        # We must add back order collateral to get the true portfolio value.
         _pm_up = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
         _pm_dn = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
         _pos_value = self.inventory.up_shares * _pm_up + self.inventory.dn_shares * _pm_dn
-        _session_pnl = (self._cached_usdc_balance + _pos_value) - self._starting_usdc_pm if self._starting_usdc_pm > 0 else None
+        _ord_collateral = sum(
+            self.order_mgr.required_collateral(q)
+            for q in self.order_mgr.active_orders.values()
+        )
+        _session_pnl = (self._cached_usdc_balance + _pos_value + _ord_collateral) - self._starting_usdc_pm if self._starting_usdc_pm > 0 else None
 
         should_pause, reason = self.risk_mgr.should_pause(
             self.inventory, vol, fv_up, fv_dn, session_pnl=_session_pnl)
@@ -1172,11 +1178,16 @@ class MarketMaker:
         taker_threshold = cfg.liq_taker_threshold_sec
         use_taker = time_left <= taker_threshold
         # Emergency drawdown check during liquidation
+        # Add back order collateral (PM balance reports available, not total)
         if self._starting_usdc_pm > 0 and self._cached_usdc_balance > 0:
             _pm_up = self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") else 0.5
             _pm_dn = self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5
             _pos_val = self.inventory.up_shares * _pm_up + self.inventory.dn_shares * _pm_dn
-            _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_usdc_pm
+            _ord_coll = sum(
+                self.order_mgr.required_collateral(q)
+                for q in self.order_mgr.active_orders.values()
+            )
+            _liq_pnl = (self._cached_usdc_balance + _pos_val + _ord_coll) - self._starting_usdc_pm
             if _liq_pnl < -2 * self.config.max_drawdown_usd:
                 await self._emergency_shutdown(
                     f"CATASTROPHIC LOSS during liquidation: sPnL=${_liq_pnl:.2f}"
@@ -1568,12 +1579,18 @@ class MarketMaker:
         ]
 
         # Real session PnL based on PM balances
-        # = (current_usdc + position_value_at_pm_prices) - starting_usdc
+        # = (current_usdc + position_value + order_collateral) - starting_usdc
+        # PM balance-allowance returns available USDC (minus collateral locked in orders),
+        # so we add back order collateral to get the true account value.
         _pm_up_price = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
         _pm_dn_price = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
         _position_value = (self.inventory.up_shares * _pm_up_price +
                            self.inventory.dn_shares * _pm_dn_price)
-        _session_pnl = (self._cached_usdc_balance + _position_value) - self._starting_usdc_pm
+        _ord_collateral = sum(
+            self.order_mgr.required_collateral(q)
+            for q in self.order_mgr.active_orders.values()
+        )
+        _session_pnl = (self._cached_usdc_balance + _position_value + _ord_collateral) - self._starting_usdc_pm
 
         return {
             # Market info
@@ -1643,7 +1660,7 @@ class MarketMaker:
             "avg_spread_bps": round(avg_spread, 1),
             "session_pnl": round(_session_pnl, 4),
             "starting_usdc_pm": round(self._starting_usdc_pm, 2),
-            "portfolio_value": round(self._cached_usdc_balance + _position_value, 2),
+            "portfolio_value": round(self._cached_usdc_balance + _position_value + _ord_collateral, 2),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,
