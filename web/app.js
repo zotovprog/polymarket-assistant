@@ -575,6 +575,12 @@ function updateUI(s) {
         risk.innerHTML = '<i class="fas fa-shield-alt"></i> Idle';
     }
 
+    // App version in footer
+    if (s.app_version) {
+        const verEl = document.getElementById('app-version');
+        if (verEl) verEl.textContent = 'v' + s.app_version + (s.app_git_hash ? ' (' + s.app_git_hash + ')' : '');
+    }
+
     // Update config inputs (only if not focused)
     if (s.config) {
         setConfigIfNotFocused('cfg-spread', s.config.half_spread_bps);

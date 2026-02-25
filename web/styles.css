@@ -1409,6 +1409,14 @@ body {
 .risk-warning { color: var(--warning); }
 .risk-danger  { color: var(--destructive); }
 
+.app-version {
+    margin-left: auto;
+    color: var(--text-muted);
+    opacity: 0.6;
+    font-size: var(--text-xs);
+    cursor: default;
+}
+
 /* ── 22. Credential Badge ──────────────────────────────────── */
 .cred-badge {
     display: inline-flex;

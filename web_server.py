@@ -37,6 +37,7 @@ from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
+from version import __version__ as APP_VERSION, __git_hash__ as APP_GIT_HASH
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
@@ -1073,6 +1074,8 @@ class MMRuntime:
                 if hasattr(client, "balance"):
                     snap["mock_usdc_balance"] = float(client.balance)
             snap["feeds"] = self._build_feeds_dict()
+            snap["app_version"] = APP_VERSION
+            snap["app_git_hash"] = APP_GIT_HASH
             return snap
 
         result = {
@@ -1088,6 +1091,8 @@ class MMRuntime:
             "config": self.mm_config.to_dict(),
         }
         result["feeds"] = self._build_feeds_dict()
+        result["app_version"] = APP_VERSION
+        result["app_git_hash"] = APP_GIT_HASH
         if self._watching and self.feed_state:
             st = self.feed_state
             result["fair_value"]["binance_mid"] = st.mid
@@ -1596,7 +1601,7 @@ async def index():
     index_file = WEB_DIR / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file))
-    return JSONResponse({"status": "Polymarket MM API", "version": "2.0"})
+    return JSONResponse({"status": "Polymarket MM API", "version": APP_VERSION, "git_hash": APP_GIT_HASH})
 
 
 @app.post("/api/auth/login")
