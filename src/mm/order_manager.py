@@ -265,6 +265,7 @@ class OrderManager:
         self._active_orders[order_id] = quote
         self._order_post_only[order_id] = post_only
         self._notify_heartbeat_id(resp)
+        self.invalidate_usdc_cache()
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
         return order_id
@@ -666,6 +667,7 @@ class OrderManager:
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
             self._notify_heartbeat_id(resp)
+            self.invalidate_usdc_cache()
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
         except Exception as e:
@@ -804,10 +806,23 @@ class OrderManager:
                             msg = json.loads(raw)
                             event_type = msg.get("event_type", "")
                             if event_type == "trade":
-                                await self._ws_fills_queue.put(msg)
+                                # PM docs: order ids are in taker_order_id and maker_orders[].order_id
+                                ids = set()
+                                tid = msg.get("taker_order_id")
+                                if tid:
+                                    ids.add(tid)
+                                for mo in (msg.get("maker_orders") or []):
+                                    oid = mo.get("order_id")
+                                    if oid:
+                                        ids.add(oid)
+                                if not ids:
+                                    # Can't map trade to our orders — request reconcile
+                                    self._reconcile_requested = True
+                                for oid in ids:
+                                    await self._ws_fills_queue.put({"order_id": oid, "raw": msg})
                                 log.info(
-                                    "Fill WS: trade event — order=%s size=%s price=%s",
-                                    str(msg.get("order_id", ""))[:12],
+                                    "Fill WS: trade event — matched_orders=%d size=%s price=%s",
+                                    len(ids),
                                     msg.get("size", "?"),
                                     msg.get("price", "?"),
                                 )
@@ -972,7 +987,7 @@ class OrderManager:
                         if hasattr(self.client, "_orders"):
                             if quote.side == "BUY":
                                 # BUY taker: fee deducted in shares
-                                actual_size = net_shares_after_buy_fee(new_fill_size) if not is_maker else new_fill_size
+                                actual_size = net_shares_after_buy_fee(new_fill_size, fill_price) if not is_maker else new_fill_size
                                 cur = self._mock_token_balances.get(quote.token_id, 0.0)
                                 self._mock_token_balances[quote.token_id] = cur + actual_size
                             else:  # SELL

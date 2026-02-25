@@ -19,3 +19,4 @@ backtest/sweep_results*.json
 .DS_Store
 .pytest_cache/
 
+audit/

@@ -108,7 +108,7 @@ class Inventory:
             else:
                 # Taker: fee is in shares; fill.fee is the USD-equivalent
                 from .pm_fees import net_shares_after_buy_fee
-                received_shares = net_shares_after_buy_fee(fill.size)
+                received_shares = net_shares_after_buy_fee(fill.size, fill.price)
                 usdc_cost = fill.notional  # USDC cost = size * price, no extra fee
             if token_type == "up":
                 self.up_shares += received_shares

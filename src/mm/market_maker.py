@@ -252,8 +252,17 @@ class MarketMaker:
             # Wait for valid PM prices (WS feed) before computing starting portfolio
             _fv_up, _fv_dn = 0.0, 0.0
             for _price_attempt in range(10):
-                _fv_up = getattr(self.feed_state, "pm_up", 0.0) or 0.0
-                _fv_dn = getattr(self.feed_state, "pm_dn", 0.0) or 0.0
+                # Keep startup valuation aligned with snapshot marks (bid-first).
+                _fv_up = (
+                    getattr(self.feed_state, "pm_up_bid", None)
+                    or getattr(self.feed_state, "pm_up", 0.0)
+                    or 0.0
+                )
+                _fv_dn = (
+                    getattr(self.feed_state, "pm_dn_bid", None)
+                    or getattr(self.feed_state, "pm_dn", 0.0)
+                    or 0.0
+                )
                 if _fv_up > 0 and _fv_dn > 0:
                     break
                 log.info("Waiting for PM prices before starting (attempt %d/10)...", _price_attempt + 1)
@@ -1584,8 +1593,9 @@ class MarketMaker:
 
             # Adjust floor for taker fee when in taker mode
             if use_taker:
-                from .pm_fees import TAKER_FEE_PCT
-                floor = floor * (1.0 + TAKER_FEE_PCT / 100.0)
+                from .pm_fees import fee_usdc, DEFAULT_BASE_FEE_BPS
+                _fee_for_floor = fee_usdc(floor, 1.0, DEFAULT_BASE_FEE_BPS)
+                floor = floor + _fee_for_floor
 
             if use_taker:
                 # ── Phase 2: Taker ──
@@ -1852,6 +1862,10 @@ class MarketMaker:
                            self._cached_pm_dn_shares * _pm_dn_price)
         _current_portfolio = self._cached_usdc_balance + _position_value
         _session_pnl = _current_portfolio - self._starting_portfolio_pm if self._starting_portfolio_pm > 0 else 0.0
+        _cost_basis = float(self.inventory.up_cost.total_cost + self.inventory.dn_cost.total_cost)
+        _unrealized_pnl = _position_value - _cost_basis
+        _realized_pnl = _session_pnl - _unrealized_pnl
+        _cash_change = self._cached_usdc_balance - self._starting_usdc_pm
 
         return {
             # Market info
@@ -1920,8 +1934,11 @@ class MarketMaker:
             # PnL & Risk (override fill-based with PM-balance-based)
             **risk_stats,
             "total_pnl": round(_session_pnl, 4),
-            "unrealized_pnl": round(_position_value, 4),
-            "realized_pnl": round(_session_pnl - _position_value, 4),
+            "unrealized_pnl": round(_unrealized_pnl, 4),
+            "realized_pnl": round(_realized_pnl, 4),
+            "cash_change_usdc": round(_cash_change, 4),
+            "position_value": round(_position_value, 4),
+            "position_cost_basis": round(_cost_basis, 4),
             "avg_spread_bps": round(avg_spread, 1),
             "session_pnl": round(_session_pnl, 4),
             "starting_usdc_pm": round(self._starting_usdc_pm, 2),
