@@ -306,7 +306,17 @@ class MockClobClient:
         return self._usdc_balance
 
     def get_balance(self) -> float:
-        return self._usdc_balance
+        """Return TOTAL USDC including collateral locked in open BUY orders.
+
+        Matches real PM get_balance_allowance(COLLATERAL) which reports
+        the full on-chain balance, not available-minus-locked.
+        """
+        locked = sum(
+            o["collateral"]
+            for o in self._orders.values()
+            if o.get("status") == "LIVE" and o.get("side") == "BUY"
+        )
+        return self._usdc_balance + locked
 
     def set_fair_values(
         self,
