@@ -632,15 +632,11 @@ class MarketMaker:
 
         # 5. Check risk limits
         # Compute session PnL using REAL PM balances (not internal inventory which may drift).
-        # Portfolio = USDC (available) + order collateral (locked) + real token values.
+        # USDC balance is refreshed after order placement each tick, so it's always current.
         _pm_up = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
         _pm_dn = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
         _pos_value = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
-        _ord_collateral = sum(
-            self.order_mgr.required_collateral(q)
-            for q in self.order_mgr.active_orders.values()
-        )
-        _current_portfolio = self._cached_usdc_balance + _pos_value + _ord_collateral
+        _current_portfolio = self._cached_usdc_balance + _pos_value
         _session_pnl = (_current_portfolio - self._starting_portfolio_pm) if self._starting_portfolio_pm > 0 else None
 
         should_pause, reason = self.risk_mgr.should_pause(
@@ -1103,6 +1099,26 @@ class MarketMaker:
             if len(self._spread_samples) > 1000:
                 self._spread_samples = self._spread_samples[-500:]
 
+        # 8b. Refresh PM balances AFTER order placement for accurate PnL.
+        # USDC changes when orders are placed/filled; token balances change on fills.
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        if is_live and not self._is_closing:
+            try:
+                (real_up, real_dn), usdc_bal = await asyncio.gather(
+                    self.order_mgr.get_all_token_balances(
+                        self.market.up_token_id, self.market.dn_token_id,
+                    ),
+                    self.order_mgr.get_usdc_balance(),
+                )
+                if usdc_bal is not None:
+                    self._cached_usdc_balance = usdc_bal
+                if real_up is not None:
+                    self._cached_pm_up_shares = real_up
+                if real_dn is not None:
+                    self._cached_pm_dn_shares = real_dn
+            except Exception as e:
+                log.warning("Post-order balance refresh failed: %s", e)
+
         # 9. Latency metrics
         total_ms = (_t_orders - _t0) * 1000
         self._last_tick_ms = total_ms
@@ -1212,11 +1228,7 @@ class MarketMaker:
             _pm_up = self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") else 0.5
             _pm_dn = self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5
             _pos_val = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
-            _ord_coll = sum(
-                self.order_mgr.required_collateral(q)
-                for q in self.order_mgr.active_orders.values()
-            )
-            _liq_pnl = (self._cached_usdc_balance + _pos_val + _ord_coll) - self._starting_portfolio_pm
+            _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_portfolio_pm
             if _liq_pnl < -2 * self.config.max_drawdown_usd:
                 await self._emergency_shutdown(
                     f"CATASTROPHIC LOSS during liquidation: sPnL=${_liq_pnl:.2f}"
@@ -1608,17 +1620,12 @@ class MarketMaker:
         ]
 
         # Real session PnL based on PM balances (not internal inventory)
-        # Portfolio = USDC (available) + order collateral (locked) + real PM token values
-        # Starting portfolio includes pre-existing tokens
+        # USDC is refreshed every tick after order placement, so no need to add order collateral.
         _pm_up_price = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
         _pm_dn_price = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
         _position_value = (self._cached_pm_up_shares * _pm_up_price +
                            self._cached_pm_dn_shares * _pm_dn_price)
-        _ord_collateral = sum(
-            self.order_mgr.required_collateral(q)
-            for q in self.order_mgr.active_orders.values()
-        )
-        _current_portfolio = self._cached_usdc_balance + _position_value + _ord_collateral
+        _current_portfolio = self._cached_usdc_balance + _position_value
         _session_pnl = _current_portfolio - self._starting_portfolio_pm if self._starting_portfolio_pm > 0 else 0.0
 
         return {
@@ -1690,7 +1697,7 @@ class MarketMaker:
             "session_pnl": round(_session_pnl, 4),
             "starting_usdc_pm": round(self._starting_usdc_pm, 2),
             "starting_portfolio_pm": round(self._starting_portfolio_pm, 2),
-            "portfolio_value": round(_current_portfolio, 2),
+            "portfolio_value": round(self._cached_usdc_balance + _position_value, 2),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,
