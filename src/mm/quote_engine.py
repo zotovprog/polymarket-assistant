@@ -140,14 +140,14 @@ class QuoteEngine:
                 "force_taker_lagging": False,
             }
 
-        # Tier 3 keeps aggressive spread profile and enables hard balancing actions.
+        # Tier 3 keeps aggressive spread profile with leading-buy suppression.
         return {
             "leading_spread_mult": 2.0,
             "lagging_spread_mult": 0.3,
             "skew_mult": 3.0,
             "tier": 3,
             "suppress_leading_buy": True,
-            "force_taker_lagging": True,
+            "force_taker_lagging": False,
         }
 
     def generate_quotes(self, fair_value: float,

@@ -16,6 +16,7 @@ import websockets
 
 from .types import Quote, Fill
 from .mm_config import MMConfig
+from .pm_fees import taker_fee_usd, net_shares_after_buy_fee
 
 log = logging.getLogger("mm.orders")
 
@@ -57,6 +58,10 @@ class OrderManager:
         self._fill_ws_task: asyncio.Task | None = None
         self._fill_ws_running = False
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
+        self._last_fill_check_ts: float = 0.0
+        self._usdc_balance_cache: float | None = None
+        self._usdc_balance_cache_ts: float = 0.0
+        self._usdc_cache_ttl: float = 5.0  # Cache USDC balance for 5 seconds
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
         self._reconcile_requested: bool = False
         self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
@@ -587,19 +592,39 @@ class OrderManager:
 
     async def get_usdc_balance(self) -> Optional[float]:
         """Fetch real USDC (collateral) balance on Polymarket."""
+        now = time.time()
+        if (
+            self._usdc_balance_cache is not None
+            and (now - self._usdc_balance_cache_ts) < self._usdc_cache_ttl
+        ):
+            return self._usdc_balance_cache
+
         try:
             if hasattr(self.client, "_orders"):
-                return float(getattr(self.client, '_usdc_balance', 0.0))
+                balance = float(getattr(self.client, '_usdc_balance', 0.0))
+                self._usdc_balance_cache = balance
+                self._usdc_balance_cache_ts = now
+                return balance
             if not _HAS_CLOB_TYPES:
+                self._usdc_balance_cache = 0.0
+                self._usdc_balance_cache_ts = now
                 return 0.0
             result = await asyncio.to_thread(
                 self.client.get_balance_allowance,
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
             )
-            return float(result.get("balance", 0)) / 1e6
+            balance = float(result.get("balance", 0)) / 1e6
+            self._usdc_balance_cache = balance
+            self._usdc_balance_cache_ts = now
+            return balance
         except Exception as e:
             log.warning(f"Failed to fetch USDC balance: {e}")
             return None
+
+    def invalidate_usdc_cache(self) -> None:
+        """Force next USDC balance read to refresh from source."""
+        self._usdc_balance_cache = None
+        self._usdc_balance_cache_ts = 0.0
 
     async def get_all_token_balances(
         self, up_token_id: str, dn_token_id: str
@@ -819,6 +844,11 @@ class OrderManager:
         Tracks previously reported size_matched per order to emit
         incremental fill events for partial fills.
         """
+        now = time.time()
+        has_ws_notifications = not self._ws_fills_queue.empty()
+        if not has_ws_notifications and (now - self._last_fill_check_ts) < 2.0:
+            return []
+
         # Drain WS fill events — collect order IDs that definitely have updates
         ws_priority_ids: set[str] = set()
         while not self._ws_fills_queue.empty():
@@ -846,6 +876,7 @@ class OrderManager:
                 order_data.append((order_id, quote))
 
         if order_data:
+            self._last_fill_check_ts = time.time()
             fetch_results = await asyncio.gather(
                 *(
                     self._retry(
@@ -917,8 +948,7 @@ class OrderManager:
                     if new_fill_size >= 0.01:
                         fill_price = self._extract_fill_price(order, quote.price)
                         is_maker = self._order_post_only.get(order_id, True)
-                        notional = fill_price * new_fill_size
-                        fee = 0.0 if is_maker else notional * self.config.taker_fee_rate
+                        fee = 0.0 if is_maker else taker_fee_usd(fill_price, new_fill_size, quote.side)
                         fill = Fill(
                             ts=time.time(),
                             side=quote.side,
@@ -940,9 +970,14 @@ class OrderManager:
 
                         # Mock balance tracking mirrors fill-side share movements.
                         if hasattr(self.client, "_orders"):
-                            signed_size = new_fill_size if quote.side == "BUY" else -new_fill_size
-                            cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                            self._mock_token_balances[quote.token_id] = cur + signed_size
+                            if quote.side == "BUY":
+                                # BUY taker: fee deducted in shares
+                                actual_size = net_shares_after_buy_fee(new_fill_size) if not is_maker else new_fill_size
+                                cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                                self._mock_token_balances[quote.token_id] = cur + actual_size
+                            else:  # SELL
+                                cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                                self._mock_token_balances[quote.token_id] = cur - new_fill_size
 
                     if status in ("MATCHED", "CLOSED"):
                         self._filled_order_ids.add(order_id)
@@ -995,6 +1030,8 @@ class OrderManager:
         self.clear_local_order_tracking()
         self._mock_token_balances.clear()
         self._allowance_set.clear()
+        self.invalidate_usdc_cache()
+        self._last_fill_check_ts = 0.0
         self._session_spent = 0.0
         self._warn_cooldowns = {}
 

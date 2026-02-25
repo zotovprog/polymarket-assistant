@@ -90,17 +90,34 @@ class Inventory:
     def update_from_fill(self, fill: Fill, token_type: str) -> None:
         """Update inventory after a fill.
         token_type: 'up' or 'dn'
+
+        PM fee mechanics:
+        - BUY taker: fee deducted in shares (receive size * 0.98), USDC cost = size * price only
+        - BUY maker: no fee, receive full size, USDC cost = size * price
+        - SELL taker: fee deducted from USDC proceeds
+        - SELL maker: no fee
         """
         cost = self.up_cost if token_type == "up" else self.dn_cost
         if fill.side == "BUY":
-            if token_type == "up":
-                self.up_shares += fill.size
+            # For BUY taker: PM deducts fee in shares, not USDC.
+            # net_shares = fill.size if maker, fill.size * 0.98 if taker.
+            # USDC cost is always size * price (fee NOT deducted from USDC).
+            if fill.is_maker or fill.fee == 0:
+                received_shares = fill.size
+                usdc_cost = fill.notional
             else:
-                self.dn_shares += fill.size
-            self.usdc -= fill.notional + fill.fee
+                # Taker: fee is in shares; fill.fee is the USD-equivalent
+                from .pm_fees import net_shares_after_buy_fee
+                received_shares = net_shares_after_buy_fee(fill.size)
+                usdc_cost = fill.notional  # USDC cost = size * price, no extra fee
+            if token_type == "up":
+                self.up_shares += received_shares
+            else:
+                self.dn_shares += received_shares
+            self.usdc -= usdc_cost
             if self.usdc < 0:
                 self.usdc = 0.0  # Floor at zero — real balance checked via API
-            cost.record_buy(fill.price, fill.size, fill.fee)
+            cost.record_buy(fill.price, received_shares, fill.fee)
         else:  # SELL
             if token_type == "up":
                 self.up_shares = max(0.0, self.up_shares - fill.size)

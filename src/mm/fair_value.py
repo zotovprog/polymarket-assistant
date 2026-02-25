@@ -38,14 +38,14 @@ def _norm_cdf(x: float) -> float:
 class FairValueEngine:
     """Compute fair value for UP/DN tokens based on Binance data."""
 
-    def __init__(self, vol_window: int = 20, vol_floor: float = 0.001,
-                 vol_cap: float = 0.05, signal_weight: float = 0.03):
+    def __init__(self, vol_window: int = 20, vol_floor: float = 0.0003,
+                 vol_cap: float = 0.05, signal_weight: float = 0.0):
         """
         Args:
             vol_window: Number of klines for realized vol calculation
             vol_floor: Minimum per-kline vol (prevents FV collapsing to 0/1)
             vol_cap: Maximum per-kline vol
-            signal_weight: Max adjustment from TA signals (±3%)
+            signal_weight: Max adjustment from TA signals (0 = disabled)
 
         Note: vol is per-kline (typically per-minute for 1m klines).
         Typical BTC per-minute vol: 0.0003-0.0006.
@@ -138,7 +138,7 @@ class FairValueEngine:
         Returns adjusted FV clamped to [0.01, 0.99].
         """
         adj = 0.0
-        w = self.signal_weight  # max ±3%
+        w = self.signal_weight  # max ±signal_weight
 
         # RSI
         rsi_v = ind.rsi(klines)

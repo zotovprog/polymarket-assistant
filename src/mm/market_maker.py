@@ -49,7 +49,10 @@ class MarketMaker:
         self._log = log
 
         # Sub-engines
-        self.fair_value = FairValueEngine()
+        self.fair_value = FairValueEngine(
+            vol_floor=self.config.fv_vol_floor,
+            signal_weight=self.config.fv_signal_weight,
+        )
         self.quote_engine = QuoteEngine(config)
         self.order_mgr = OrderManager(clob_client, config)
         self.risk_mgr = RiskManager(config)
@@ -455,9 +458,13 @@ class MarketMaker:
                 self._closing_start_time_left = max(time_left, 1.0)
                 self._merge_failed_this_cycle = False
                 fv_up, fv_dn = self._compute_fv()
+                best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
                 self._liq_lock = self.risk_mgr.lock_pnl(
                     self.inventory, fv_up, fv_dn,
-                    self.config.liq_price_floor_margin)
+                    margin=self.config.liq_price_floor_margin,
+                    best_bid_up=best_bid_up,
+                    best_bid_dn=best_bid_dn,
+                )
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
                 await self.order_mgr.cancel_all()
@@ -489,9 +496,13 @@ class MarketMaker:
             self._closing_start_time_left = time_left
             self._merge_failed_this_cycle = False
             fv_up_close, fv_dn_close = self._compute_fv()
+            best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
             self._liq_lock = self.risk_mgr.lock_pnl(
                 self.inventory, fv_up_close, fv_dn_close,
-                self.config.liq_price_floor_margin)
+                margin=self.config.liq_price_floor_margin,
+                best_bid_up=best_bid_up,
+                best_bid_dn=best_bid_dn,
+            )
             self._liq_chunk_index = 0
             self._liq_last_chunk_time = 0.0
             log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders "
@@ -501,6 +512,9 @@ class MarketMaker:
 
         # 2. Check for fills (always, including closing mode)
         fills = await self.order_mgr.check_fills()
+        if fills:
+            # Fills change available collateral; force fresh read on next USDC check.
+            self.order_mgr.invalidate_usdc_cache()
         for fill in fills:
             token_type = "up" if fill.token_id == self.market.up_token_id else "dn"
             self.inventory.update_from_fill(fill, token_type)
@@ -520,7 +534,7 @@ class MarketMaker:
         # to avoid oscillation from PM balance API lagging behind fill detection.
         is_live = not hasattr(self.order_mgr.client, "_orders")
         reconcile_requested = self.order_mgr.reconcile_requested
-        if is_live and not self._is_closing and (self._tick_count % 5 == 0 or reconcile_requested):
+        if is_live and not self._is_closing and (self._tick_count % 15 == 0 or reconcile_requested):
             (real_up, real_dn), usdc_bal = await asyncio.gather(
                 self.order_mgr.get_all_token_balances(
                     self.market.up_token_id,
@@ -630,6 +644,16 @@ class MarketMaker:
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
+        # Also check PM price staleness — stale PM mids cause incorrect quoting
+        pm_last_update = getattr(st, "pm_last_update_ts", 0.0) or 0.0
+        pm_staleness = now - pm_last_update if pm_last_update > 0 else 0.0
+        if pm_last_update > 0 and pm_staleness > 15.0:
+            self._throttled_warn(
+                "pm_stale",
+                f"PM prices stale ({pm_staleness:.0f}s) — will use Binance FV as fallback",
+                cooldown=10.0,
+            )
+
         bids = list(st.bids) if st.bids else []
         asks = list(st.asks) if st.asks else []
         trades = list(st.trades) if st.trades else []
@@ -677,6 +701,38 @@ class MarketMaker:
                 pm_prices=pm_prices,
             )
 
+        # 3c. PM-anchored mids for quote generation (fallback to model FV).
+        # Only use PM prices if they are fresh (< 15s old).
+        pm_fresh = pm_last_update > 0 and pm_staleness < 15.0
+        pm_up_bid = getattr(st, "pm_up_bid", None)
+        pm_up_ask = getattr(st, "pm_up", None)
+        pm_dn_bid = getattr(st, "pm_dn_bid", None)
+        pm_dn_ask = getattr(st, "pm_dn", None)
+
+        if pm_fresh and pm_up_bid is not None and pm_up_ask is not None and pm_up_bid > 0 and pm_up_ask > 0:
+            pm_mid_up = (pm_up_bid + pm_up_ask) / 2.0
+        else:
+            pm_mid_up = fv_up
+
+        if pm_fresh and pm_dn_bid is not None and pm_dn_ask is not None and pm_dn_bid > 0 and pm_dn_ask > 0:
+            pm_mid_dn = (pm_dn_bid + pm_dn_ask) / 2.0
+        else:
+            pm_mid_dn = fv_dn
+
+        up_divergence = abs(fv_up - pm_mid_up)
+        dn_divergence = abs(fv_dn - pm_mid_dn)
+        widen_spread_tick = (up_divergence > 0.05) or (dn_divergence > 0.05)
+        if widen_spread_tick:
+            diverged = []
+            if up_divergence > 0.05:
+                diverged.append(f"UP={up_divergence:.3f}")
+            if dn_divergence > 0.05:
+                diverged.append(f"DN={dn_divergence:.3f}")
+            log.warning(
+                "Model/PM mid divergence > 5%% (%s); widening quotes x2 for this tick",
+                ", ".join(diverged),
+            )
+
         # 4. Compute volatility
         vol = self.fair_value.realized_vol(klines)
         self.risk_mgr.record_vol(vol)
@@ -684,8 +740,9 @@ class MarketMaker:
         # 5. Check risk limits
         # Compute session PnL using REAL PM balances (not internal inventory which may drift).
         # USDC balance is refreshed after order placement each tick, so it's always current.
-        _pm_up = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
-        _pm_dn = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
+        # Use BID prices for valuation — that's where we'd actually sell.
+        _pm_up = getattr(st, "pm_up_bid", None) or (st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up)
+        _pm_dn = getattr(st, "pm_dn_bid", None) or (st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn)
         _pos_value = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
         _current_portfolio = self._cached_usdc_balance + _pos_value
         _session_pnl = (_current_portfolio - self._starting_portfolio_pm) if self._starting_portfolio_pm > 0 else None
@@ -724,9 +781,13 @@ class MarketMaker:
                 self._paused = False
                 self._pause_reason = ""
                 # Lock prices at trigger time
+                best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
                 self._liq_lock = self.risk_mgr.lock_pnl(
                     self.inventory, fv_up, fv_dn,
-                    self.config.liq_price_floor_margin)
+                    margin=self.config.liq_price_floor_margin,
+                    best_bid_up=best_bid_up,
+                    best_bid_dn=best_bid_dn,
+                )
                 log.info(
                     "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
                     "UP_floor=%.2f DN_floor=%.2f",
@@ -808,8 +869,13 @@ class MarketMaker:
                     f"One-sided exposure for {self._one_sided_counter} ticks "
                     f"({time_left:.0f}s left): "
                     f"UP={up_sh:.1f} DN={dn_sh:.1f} — early close")
+                best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
                 self._liq_lock = self.risk_mgr.lock_pnl(
-                    self.inventory, fv_up, fv_dn, self.config.liq_price_floor_margin)
+                    self.inventory, fv_up, fv_dn,
+                    margin=self.config.liq_price_floor_margin,
+                    best_bid_up=best_bid_up,
+                    best_bid_dn=best_bid_dn,
+                )
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
                 self._is_closing = True
@@ -852,9 +918,13 @@ class MarketMaker:
                     up_book, dn_book, fv_up, fv_dn, self.inventory)
                 if should_exit:
                     log.warning(f"Early exit: {reason}")
+                    best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
                     self._liq_lock = self.risk_mgr.lock_pnl(
                         self.inventory, fv_up, fv_dn,
-                        self.config.liq_price_floor_margin)
+                        margin=self.config.liq_price_floor_margin,
+                        best_bid_up=best_bid_up,
+                        best_bid_dn=best_bid_dn,
+                    )
                     self._liq_chunk_index = 0
                     self._liq_last_chunk_time = 0.0
                     self._is_closing = True
@@ -900,6 +970,8 @@ class MarketMaker:
             imbalance,
             imbalance_duration,
         )
+        # Imbalance handling must remain passive (spread/skew only), never taker-forced.
+        self._imbalance_adjustments["force_taker_lagging"] = False
         tier = int(self._imbalance_adjustments.get("tier", 0))
         if tier != prev_tier:
             leading_key = "up" if self.inventory.up_shares > self.inventory.dn_shares else (
@@ -932,7 +1004,7 @@ class MarketMaker:
             if q.side == "BUY"
         )
         all_quotes = self.quote_engine.generate_all_quotes(
-            fv_up, fv_dn,
+            pm_mid_up, pm_mid_dn,
             self.market.up_token_id, self.market.dn_token_id,
             self.inventory,
             vol, self.risk_mgr.avg_volatility,
@@ -982,6 +1054,9 @@ class MarketMaker:
                 lagging_token,
                 float(self._imbalance_adjustments.get("lagging_spread_mult", 1.0)),
             )
+        if widen_spread_tick:
+            _apply_spread_multiplier("up", 2.0)
+            _apply_spread_multiplier("dn", 2.0)
         if leading_token and self._imbalance_adjustments.get("suppress_leading_buy", False):
             lead_bid, lead_ask = all_quotes[leading_token]
             all_quotes[leading_token] = (None, lead_ask)
@@ -1187,7 +1262,7 @@ class MarketMaker:
         # 8b. Refresh PM balances AFTER order placement for accurate PnL.
         # USDC changes when orders are placed/filled; token balances change on fills.
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live:
+        if is_live and (fills or self._tick_count % 5 == 0):
             try:
                 (real_up, real_dn), usdc_bal = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(
@@ -1203,7 +1278,7 @@ class MarketMaker:
                     self._cached_pm_dn_shares = real_dn
             except Exception as e:
                 log.warning("Post-order balance refresh failed: %s", e)
-        else:
+        elif not is_live:
             # Paper mode: sync from mock client balance + internal inventory
             self._cached_usdc_balance = self.order_mgr.client.get_balance()
             self._cached_pm_up_shares = self.inventory.up_shares
@@ -1256,6 +1331,20 @@ class MarketMaker:
             bids, asks, trades,
         )
 
+    async def _get_liq_lock_best_bids(self) -> tuple[float | None, float | None]:
+        """Fetch current best bids for both tokens to derive liquidation floors."""
+        if not self.market:
+            return None, None
+        try:
+            up_book, dn_book = await asyncio.gather(
+                self.order_mgr.get_book_summary(self.market.up_token_id),
+                self.order_mgr.get_book_summary(self.market.dn_token_id),
+            )
+            return up_book.get("best_bid"), dn_book.get("best_bid")
+        except Exception as e:
+            log.warning("Failed to fetch best bids for liquidation lock: %s", e)
+            return None, None
+
     async def _liquidate_inventory(self) -> None:
         """Smart liquidation with merge + 3-phase SELL exit.
 
@@ -1281,7 +1370,8 @@ class MarketMaker:
             return
         merge_amount = min(up_bal, dn_bal)
 
-        if merge_amount >= 1.0 and self.market.condition_id and not self._merge_failed_this_cycle:
+        # Merge first when both sides have meaningful size, then liquidate only leftovers.
+        if merge_amount > 0.5 and self.market.condition_id and not self._merge_failed_this_cycle:
             try:
                 result = await self.order_mgr.merge_positions(
                     self.market.condition_id, merge_amount, self._private_key)
@@ -1315,8 +1405,8 @@ class MarketMaker:
         # Emergency drawdown check during liquidation
         # Use real PM balances (not internal inventory) and starting portfolio (with tokens)
         if self._starting_portfolio_pm > 0 and self._cached_usdc_balance > 0:
-            _pm_up = self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") else 0.5
-            _pm_dn = self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5
+            _pm_up = getattr(self.feed_state, "pm_up_bid", None) or (self.feed_state.pm_up if hasattr(self.feed_state, "pm_up") else 0.5)
+            _pm_dn = getattr(self.feed_state, "pm_dn_bid", None) or (self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5)
             _pos_val = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
             _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_portfolio_pm
             if _liq_pnl < -2 * self.config.max_drawdown_usd:
@@ -1461,6 +1551,9 @@ class MarketMaker:
             fv = fv_up if is_up else fv_dn
             book = await self.order_mgr.get_book_summary(token_id)
             best_bid = book["best_bid"]
+            if best_bid is None or best_bid <= 0:
+                log.warning("no liquidity for %s", label)
+                continue
 
             # Determine price floor from lock or cost basis
             floor = 0.01
@@ -1491,23 +1584,11 @@ class MarketMaker:
 
             # Adjust floor for taker fee when in taker mode
             if use_taker:
-                floor = floor + self.config.taker_fee_rate * floor
+                from .pm_fees import TAKER_FEE_PCT
+                floor = floor * (1.0 + TAKER_FEE_PCT / 100.0)
 
             if use_taker:
                 # ── Phase 2: Taker ──
-                if not best_bid or best_bid <= 0:
-                    if time_left < 5:
-                        log.critical(
-                            f"{label}: No bid available for liquidation, holding to resolution "
-                            f"({time_left:.0f}s left)"
-                        )
-                    else:
-                        self._throttled_warn(
-                            f"no_bid_{label}",
-                            f"{label}: No best_bid for taker liquidation ({time_left:.0f}s left)",
-                        )
-                    continue
-
                 if best_bid < floor and cfg.liq_abandon_below_floor:
                     if time_left > 5:
                         # Still time — wait for price recovery
@@ -1718,6 +1799,21 @@ class MarketMaker:
             except Exception:
                 pass
 
+        pm_up_bid = getattr(st, "pm_up_bid", None)
+        pm_up_ask = getattr(st, "pm_up", None)
+        pm_dn_bid = getattr(st, "pm_dn_bid", None)
+        pm_dn_ask = getattr(st, "pm_dn", None)
+
+        if pm_up_bid is not None and pm_up_ask is not None and pm_up_bid > 0 and pm_up_ask > 0:
+            pm_mid_up = (pm_up_bid + pm_up_ask) / 2.0
+        else:
+            pm_mid_up = fv_up
+
+        if pm_dn_bid is not None and pm_dn_ask is not None and pm_dn_bid > 0 and pm_dn_ask > 0:
+            pm_mid_dn = (pm_dn_bid + pm_dn_ask) / 2.0
+        else:
+            pm_mid_dn = fv_dn
+
         # PnL
         risk_stats = self.risk_mgr.get_stats(self.inventory, fv_up, fv_dn)
 
@@ -1749,8 +1845,9 @@ class MarketMaker:
 
         # Real session PnL based on PM balances (not internal inventory)
         # USDC is refreshed every tick after order placement, so no need to add order collateral.
-        _pm_up_price = st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up
-        _pm_dn_price = st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn
+        # Use BID prices — that's the exit price for long positions (conservative valuation).
+        _pm_up_price = getattr(st, "pm_up_bid", None) or (st.pm_up if hasattr(st, "pm_up") and st.pm_up else fv_up)
+        _pm_dn_price = getattr(st, "pm_dn_bid", None) or (st.pm_dn if hasattr(st, "pm_dn") and st.pm_dn else fv_dn)
         _position_value = (self._cached_pm_up_shares * _pm_up_price +
                            self._cached_pm_dn_shares * _pm_dn_price)
         _current_portfolio = self._cached_usdc_balance + _position_value
@@ -1775,6 +1872,10 @@ class MarketMaker:
             "fair_value": {
                 "up": round(fv_up, 4),
                 "dn": round(fv_dn, 4),
+                "model_fv_up": round(fv_up, 4),
+                "model_fv_dn": round(fv_dn, 4),
+                "pm_mid_up": round(pm_mid_up, 4),
+                "pm_mid_dn": round(pm_mid_dn, 4),
                 "binance_mid": round(st.mid, 2) if st.mid else 0,
                 "volatility": round(vol, 6),
             },

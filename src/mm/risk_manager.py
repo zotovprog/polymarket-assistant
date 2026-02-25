@@ -172,16 +172,25 @@ class RiskManager:
         return self._fills
 
     def lock_pnl(self, inventory: Inventory, fv_up: float, fv_dn: float,
-                 margin: float = 0.01) -> LiquidationLock:
+                 margin: float = 0.01,
+                 best_bid_up: float | None = None,
+                 best_bid_dn: float | None = None) -> LiquidationLock:
         """Snapshot prices at liquidation trigger time."""
+        def _min_sell_floor(avg_entry: float, best_bid: float | None) -> float:
+            cost_floor = max(0.01, avg_entry + margin)
+            if best_bid is None or best_bid <= 0.02:
+                return cost_floor
+            market_floor = max(0.01, best_bid - 0.02)
+            return min(cost_floor, market_floor)
+
         pnl = self.compute_pnl(inventory, fv_up, fv_dn)
         lock = LiquidationLock(
             triggered_at=time.time(),
             trigger_pnl=pnl["total_pnl"],
             up_avg_entry=inventory.up_cost.avg_entry_price,
             dn_avg_entry=inventory.dn_cost.avg_entry_price,
-            min_sell_price_up=max(0.01, inventory.up_cost.avg_entry_price + margin),
-            min_sell_price_dn=max(0.01, inventory.dn_cost.avg_entry_price + margin),
+            min_sell_price_up=_min_sell_floor(inventory.up_cost.avg_entry_price, best_bid_up),
+            min_sell_price_dn=_min_sell_floor(inventory.dn_cost.avg_entry_price, best_bid_dn),
         )
         self._liquidation_lock = lock
         return lock
