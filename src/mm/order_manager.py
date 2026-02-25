@@ -804,20 +804,32 @@ class OrderManager:
                             msg = json.loads(raw)
                             event_type = msg.get("event_type", "")
                             if event_type == "trade":
-                                await self._ws_fills_queue.put(msg)
-                                log.info(
-                                    "Fill WS: trade event — order=%s size=%s price=%s",
-                                    str(msg.get("order_id", ""))[:12],
-                                    msg.get("size", "?"),
-                                    msg.get("price", "?"),
-                                )
-                                if self._on_fill_callback:
-                                    try:
-                                        self._on_fill_callback()
-                                    except Exception:
-                                        pass
-                            elif event_type == "order" and msg.get("status") in ("MATCHED", "CLOSED"):
-                                await self._ws_fills_queue.put(msg)
+                                # PM WS uses maker_order_id / taker_order_id (not order_id)
+                                oid = (msg.get("maker_order_id") or msg.get("taker_order_id")
+                                       or msg.get("order_id") or "")
+                                msg["_resolved_order_id"] = oid
+                                is_ours = bool(oid and oid in self._active_orders)
+                                if is_ours:
+                                    await self._ws_fills_queue.put(msg)
+                                    log.info(
+                                        "Fill WS: OUR fill — order=%s size=%s price=%s",
+                                        str(oid)[:12],
+                                        msg.get("size", "?"),
+                                        msg.get("price", "?"),
+                                    )
+                                    if self._on_fill_callback:
+                                        try:
+                                            self._on_fill_callback()
+                                        except Exception:
+                                            pass
+                            elif event_type == "order":
+                                oid = msg.get("order_id", "")
+                                status = msg.get("status", "")
+                                if oid and oid in self._active_orders:
+                                    await self._ws_fills_queue.put(msg)
+                                    if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
+                                        log.info("Fill WS: order status — id=%s status=%s",
+                                                 str(oid)[:12], status)
                         except json.JSONDecodeError:
                             continue
             except Exception as e:
@@ -838,159 +850,171 @@ class OrderManager:
             self._fill_ws_task = None
 
     async def check_fills(self) -> list[Fill]:
-        """Poll for fills on active orders.
+        """Detect fills via WS events (primary) with HTTP fallback for stale orders.
 
-        Returns list of new fills detected, including partial fills.
-        Tracks previously reported size_matched per order to emit
-        incremental fill events for partial fills.
+        WS trade events provide real-time fill data — no HTTP needed.
+        HTTP polling only runs every 30s for orders with no WS activity.
         """
         now = time.time()
-        has_ws_notifications = not self._ws_fills_queue.empty()
-        if not has_ws_notifications and (now - self._last_fill_check_ts) < 2.0:
-            return []
+        fills = []
+        to_remove = []
+        ws_processed_oids: set[str] = set()
 
-        # Drain WS fill events — collect order IDs that definitely have updates
-        ws_priority_ids: set[str] = set()
+        # ── 1. Process WS events directly (primary — zero HTTP) ──────
         while not self._ws_fills_queue.empty():
             try:
                 ws_msg = self._ws_fills_queue.get_nowait()
-                oid = ws_msg.get("order_id", "")
-                if oid and oid in self._active_orders:
-                    ws_priority_ids.add(oid)
             except asyncio.QueueEmpty:
                 break
-        if ws_priority_ids:
-            log.info("Fill WS: %d orders with pending updates", len(ws_priority_ids))
 
-        fills = []
-        to_remove = []
+            event_type = ws_msg.get("event_type", "")
 
-        # Check WS-notified orders first, then remaining active orders
-        check_order = list(ws_priority_ids)
-        check_order.extend(oid for oid in self._active_orders if oid not in ws_priority_ids)
-
-        order_data = []
-        for order_id in check_order:
-            quote = self._active_orders.get(order_id)
-            if quote:
-                order_data.append((order_id, quote))
-
-        if order_data:
-            self._last_fill_check_ts = time.time()
-            fetch_results = await asyncio.gather(
-                *(
-                    self._retry(
-                        asyncio.to_thread,
-                        self.client.get_order,
-                        order_id,
-                    )
-                    for order_id, _ in order_data
-                ),
-                return_exceptions=True,
-            )
-
-            for (order_id, quote), order_result in zip(order_data, fetch_results):
-                if isinstance(order_result, Exception):
-                    log.debug(f"Error checking order {order_id[:12]}...: {order_result}")
+            if event_type == "trade":
+                oid = ws_msg.get("_resolved_order_id", "")
+                if not oid or oid not in self._active_orders:
                     continue
+                quote = self._active_orders[oid]
+                ws_processed_oids.add(oid)
 
-                try:
-                    order = order_result
-                    if order is None:
-                        continue
-                    status = order.get("status", "")
-                    size_matched_raw = order.get("size_matched", 0)
-                    size_matched = self._safe_float(size_matched_raw)
-                    if size_matched is None:
-                        self._reconcile_requested = True
-                        log.error(
-                            "Anomalous fill: invalid size_matched (%s) for order %s",
-                            size_matched_raw,
-                            order_id[:12],
+                fill_size = self._safe_float(ws_msg.get("size", 0))
+                fill_price = self._safe_float(ws_msg.get("price", 0))
+                if not fill_size or fill_size <= 0:
+                    continue
+                if not fill_price or fill_price <= 0:
+                    fill_price = quote.price
+
+                prev_matched = self._partial_fill_reported.get(oid, 0.0)
+                self._partial_fill_reported[oid] = prev_matched + fill_size
+
+                is_maker = self._order_post_only.get(oid, True)
+                fee = 0.0 if is_maker else taker_fee_usd(fill_price, fill_size, quote.side)
+                fill = Fill(
+                    ts=now, side=quote.side, token_id=quote.token_id,
+                    price=fill_price, size=round(fill_size, 4),
+                    fee=fee, order_id=oid, is_maker=is_maker,
+                )
+                fills.append(fill)
+
+                if quote.side == "BUY":
+                    self._session_spent += fill_size * fill_price
+                elif quote.side == "SELL":
+                    self._session_spent = max(0.0, self._session_spent - fill_size * fill_price)
+
+                if hasattr(self.client, "_orders"):
+                    if quote.side == "BUY":
+                        actual_size = net_shares_after_buy_fee(fill_size) if not is_maker else fill_size
+                        cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                        self._mock_token_balances[quote.token_id] = cur + actual_size
+                    else:
+                        cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                        self._mock_token_balances[quote.token_id] = cur - fill_size
+
+                if (prev_matched + fill_size) >= quote.size - 0.01:
+                    self._filled_order_ids.add(oid)
+                    to_remove.append(oid)
+                    self._partial_fill_reported.pop(oid, None)
+
+            elif event_type == "order":
+                oid = ws_msg.get("order_id", "")
+                if not oid or oid not in self._active_orders:
+                    continue
+                ws_processed_oids.add(oid)
+                status = ws_msg.get("status", "")
+
+                if status in ("MATCHED", "CLOSED"):
+                    # Catch any missed fill volume via size_matched
+                    size_matched = self._safe_float(ws_msg.get("size_matched", 0))
+                    if size_matched and size_matched > 0:
+                        quote = self._active_orders[oid]
+                        prev = self._partial_fill_reported.get(oid, 0.0)
+                        missed = size_matched - prev
+                        if missed >= 0.01:
+                            fill_price = self._extract_fill_price(ws_msg, quote.price)
+                            is_maker = self._order_post_only.get(oid, True)
+                            fee = 0.0 if is_maker else taker_fee_usd(fill_price, missed, quote.side)
+                            fills.append(Fill(
+                                ts=now, side=quote.side, token_id=quote.token_id,
+                                price=fill_price, size=round(missed, 4),
+                                fee=fee, order_id=oid, is_maker=is_maker,
+                            ))
+                            if quote.side == "BUY":
+                                self._session_spent += missed * fill_price
+                            elif quote.side == "SELL":
+                                self._session_spent = max(0.0, self._session_spent - missed * fill_price)
+                    self._filled_order_ids.add(oid)
+                    to_remove.append(oid)
+                    self._partial_fill_reported.pop(oid, None)
+                elif status in ("CANCELLED", "EXPIRED"):
+                    to_remove.append(oid)
+                    self._partial_fill_reported.pop(oid, None)
+
+        if ws_processed_oids:
+            log.info("WS fills processed: %d orders", len(ws_processed_oids))
+
+        # ── 2. HTTP fallback: poll stale orders (>30s, no WS activity) ─
+        stale_cutoff = 30.0
+        if (now - self._last_fill_check_ts) >= stale_cutoff and self._active_orders:
+            stale = [
+                (oid, q) for oid, q in self._active_orders.items()
+                if oid not in ws_processed_oids
+                and oid not in set(to_remove)
+                and (now - (q.placed_at or now)) > stale_cutoff
+            ]
+            if stale:
+                self._last_fill_check_ts = now
+                log.info("HTTP fallback: polling %d stale orders", len(stale))
+                fetch_results = await asyncio.gather(
+                    *(
+                        asyncio.wait_for(
+                            asyncio.to_thread(self.client.get_order, oid),
+                            timeout=10.0,
                         )
+                        for oid, _ in stale
+                    ),
+                    return_exceptions=True,
+                )
+                for (oid, quote), result in zip(stale, fetch_results):
+                    if isinstance(result, Exception) or result is None:
                         continue
+                    status = result.get("status", "")
+                    size_matched = self._safe_float(result.get("size_matched", 0)) or 0.0
+                    prev = self._partial_fill_reported.get(oid, 0.0)
+                    new_fill = size_matched - prev
 
-                    # Track how much we already reported for this order
-                    prev_matched = self._partial_fill_reported.get(order_id, 0.0)
-                    remaining_size = max(0.0, quote.size - prev_matched)
-                    new_fill_size = size_matched - prev_matched
-
-                    if new_fill_size > remaining_size + 0.1:
-                        self._reconcile_requested = True
-                        log.error(
-                            "Anomalous fill: size_matched exceeds order remainder "
-                            "(order=%s size_matched=%.4f already_filled=%.4f remaining=%.4f original=%.4f)",
-                            order_id[:12],
-                            size_matched,
-                            prev_matched,
-                            remaining_size,
-                            quote.size,
-                        )
-                        # Still clean up completed/cancelled orders to prevent drift
-                        if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
-                            to_remove.append(order_id)
-                            self._partial_fill_reported.pop(order_id, None)
-                        continue
-                    if new_fill_size < -0.1:
-                        self._reconcile_requested = True
-                        log.error(
-                            "Anomalous fill: size_matched regressed "
-                            "(order=%s size_matched=%.4f already_filled=%.4f)",
-                            order_id[:12],
-                            size_matched,
-                            prev_matched,
-                        )
-                        if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
-                            to_remove.append(order_id)
-                            self._partial_fill_reported.pop(order_id, None)
-                        continue
-
-                    if new_fill_size >= 0.01:
-                        fill_price = self._extract_fill_price(order, quote.price)
-                        is_maker = self._order_post_only.get(order_id, True)
-                        fee = 0.0 if is_maker else taker_fee_usd(fill_price, new_fill_size, quote.side)
-                        fill = Fill(
-                            ts=time.time(),
-                            side=quote.side,
-                            token_id=quote.token_id,
-                            price=fill_price,
-                            size=round(new_fill_size, 4),
-                            fee=fee,
-                            order_id=order_id,
-                            is_maker=is_maker,
-                        )
-                        fills.append(fill)
-                        self._partial_fill_reported[order_id] = size_matched
-
-                        # Track session spending for budget cap
+                    if new_fill >= 0.01:
+                        fill_price = self._extract_fill_price(result, quote.price)
+                        is_maker = self._order_post_only.get(oid, True)
+                        fee = 0.0 if is_maker else taker_fee_usd(fill_price, new_fill, quote.side)
+                        fills.append(Fill(
+                            ts=now, side=quote.side, token_id=quote.token_id,
+                            price=fill_price, size=round(new_fill, 4),
+                            fee=fee, order_id=oid, is_maker=is_maker,
+                        ))
+                        self._partial_fill_reported[oid] = size_matched
                         if quote.side == "BUY":
-                            self._session_spent += new_fill_size * fill_price
+                            self._session_spent += new_fill * fill_price
                         elif quote.side == "SELL":
-                            self._session_spent = max(0.0, self._session_spent - new_fill_size * fill_price)
-
-                        # Mock balance tracking mirrors fill-side share movements.
+                            self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
                         if hasattr(self.client, "_orders"):
                             if quote.side == "BUY":
-                                # BUY taker: fee deducted in shares
-                                actual_size = net_shares_after_buy_fee(new_fill_size) if not is_maker else new_fill_size
+                                actual = net_shares_after_buy_fee(new_fill) if not is_maker else new_fill
                                 cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                                self._mock_token_balances[quote.token_id] = cur + actual_size
-                            else:  # SELL
+                                self._mock_token_balances[quote.token_id] = cur + actual
+                            else:
                                 cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                                self._mock_token_balances[quote.token_id] = cur - new_fill_size
+                                self._mock_token_balances[quote.token_id] = cur - new_fill
 
                     if status in ("MATCHED", "CLOSED"):
-                        self._filled_order_ids.add(order_id)
-                        to_remove.append(order_id)
-                        self._partial_fill_reported.pop(order_id, None)
+                        self._filled_order_ids.add(oid)
+                        to_remove.append(oid)
+                        self._partial_fill_reported.pop(oid, None)
                     elif status in ("CANCELLED", "EXPIRED"):
-                        to_remove.append(order_id)
-                        self._partial_fill_reported.pop(order_id, None)
+                        to_remove.append(oid)
+                        self._partial_fill_reported.pop(oid, None)
+            else:
+                self._last_fill_check_ts = now
 
-                except Exception as e:
-                    log.debug(f"Error checking order {order_id[:12]}...: {e}")
-
-        for oid in to_remove:
+        for oid in set(to_remove):
             self._active_orders.pop(oid, None)
             self._order_post_only.pop(oid, None)
 

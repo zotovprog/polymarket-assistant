@@ -581,7 +581,7 @@ class MarketMaker:
                         else:
                             self._reconcile_stable_count = 1
 
-                        if self._reconcile_stable_count >= 3:
+                        if self._reconcile_stable_count >= 1:
                             log.warning(
                                 "Inventory reconcile (confirmed %d checks): "
                                 "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
@@ -594,7 +594,7 @@ class MarketMaker:
                             self._reconcile_prev_pm = None
                         else:
                             log.info(
-                                "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                                "Inventory drift (%d/1): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
                                 self._reconcile_stable_count,
                                 self.inventory.up_shares, self.inventory.dn_shares,
                                 real_up, real_dn,
@@ -1137,11 +1137,13 @@ class MarketMaker:
         if self._emergency_flag:
             return
 
-        # 7. Place or update orders
-        # On Polymarket: SELL requires token inventory. Use BUY-only strategy:
-        #   BUY UP @ bid_up  +  BUY DN @ bid_dn
-        # BUY DN @ P implicitly provides ask-side for UP at (1 - P).
-        # When both fill: hold UP+DN = $1, paid bid_up+bid_dn < $1 → profit.
+        # 7. Place or update orders — parallel cancel+place across UP and DN
+        # Collect all operations first, then execute cancels→places in parallel
+        # to cut tick latency in half (was sequential UP then DN).
+        pending_cancels: list[str] = []
+        pending_places: list[tuple[Quote, bool | None, bool]] = []  # (quote, post_only, fallback_taker)
+        pending_updates: dict[str, tuple] = {}  # token_key -> (bid, ask)
+
         for token_key in ("up", "dn"):
             new_bid, new_ask = all_quotes[token_key]
             cur_bid, cur_ask = self._current_quotes.get(token_key, (None, None))
@@ -1149,18 +1151,15 @@ class MarketMaker:
 
             need_bid = self.quote_engine.should_requote(cur_bid, new_bid)
             if use_taker_bid and new_bid is not None:
-                # Force refresh while in taker mode so lagging-side BUY keeps crossing.
                 need_bid = True
             bid_notional = (new_bid.size * new_bid.price) if new_bid else 0.0
             if need_bid and bid_notional < self.config.min_order_size_usd:
                 need_bid = False
 
-            # Cancel stale bid when new bid is too small or None
             stale_bid = (not need_bid and cur_bid and cur_bid.order_id
                          and (new_bid is None
                               or bid_notional < self.config.min_order_size_usd))
 
-            # SELL: cap size at available inventory (partial sells OK)
             token_bal = (self.inventory.up_shares if token_key == "up"
                          else self.inventory.dn_shares)
             if new_ask and token_bal > 0:
@@ -1193,61 +1192,56 @@ class MarketMaker:
 
             if need_ask and (ask_size * ask_price) < self.config.min_order_size_usd:
                 need_ask = False
-            # Also cancel stale ask if we no longer have inventory
             stale_ask = (cur_ask and cur_ask.order_id
                          and (token_bal <= 0 or oversized_live_ask)
                          and not need_ask)
 
             if need_bid or need_ask or stale_bid or stale_ask:
                 self._requote_count += 1
-                # Cancel old orders
-                old_ids = []
                 if (need_bid or stale_bid) and cur_bid and cur_bid.order_id:
-                    old_ids.append(cur_bid.order_id)
+                    pending_cancels.append(cur_bid.order_id)
                 if (need_ask or stale_ask) and cur_ask and cur_ask.order_id:
-                    old_ids.append(cur_ask.order_id)
+                    pending_cancels.append(cur_ask.order_id)
 
-                new_quotes = []
-                if need_bid:
-                    new_quotes.append(new_bid)
-                if need_ask:
-                    new_quotes.append(new_ask)
+                if need_bid and new_bid is not None:
+                    po = False if use_taker_bid else None
+                    ft = True if use_taker_bid else False
+                    pending_places.append((new_bid, po, ft))
+                if need_ask and new_ask is not None:
+                    pending_places.append((new_ask, None, False))
 
-                if use_taker_bid and need_bid:
-                    # cancel_replace cannot set per-order post_only, so handle taker bid manually.
-                    if old_ids:
-                        cancel_results = await asyncio.gather(
-                            *(self.order_mgr.cancel_order(oid) for oid in old_ids if oid)
-                        )
-                        if not all(cancel_results):
-                            failed = sum(1 for r in cancel_results if not r)
-                            log.warning(
-                                "taker cancel/replace: %d/%d cancels failed, skipping new placements",
-                                failed,
-                                len(cancel_results),
-                            )
-                            continue
-                    if need_bid and new_bid is not None:
-                        await self.order_mgr.place_order(
-                            new_bid,
-                            post_only=False,
-                            fallback_taker=True,
-                        )
-                    if need_ask and new_ask is not None:
-                        await self.order_mgr.place_order(new_ask)
-                    updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
-                    updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
-                    self._current_quotes[token_key] = (updated_bid, updated_ask)
-                else:
-                    new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
+                updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
+                updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
+                pending_updates[token_key] = (updated_bid, updated_ask)
 
-                    # Only update tracking when cancel_replace actually placed orders
-                    if new_ids is not None:
-                        updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
-                        updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
-                        self._current_quotes[token_key] = (updated_bid, updated_ask)
-                    # If cancel_replace failed (returned []), leave _current_quotes unchanged
-                    # so next tick retries the cancel+replace
+        # Cancel all old orders in parallel (UP + DN at once)
+        if pending_cancels:
+            cancel_results = await asyncio.gather(
+                *(self.order_mgr.cancel_order(oid) for oid in pending_cancels if oid),
+                return_exceptions=True,
+            )
+            cancel_ok = all(not isinstance(r, Exception) and r for r in cancel_results)
+            if not cancel_ok:
+                failed = sum(1 for r in cancel_results if isinstance(r, Exception) or not r)
+                log.warning("Parallel cancel: %d/%d failed, skipping placements",
+                            failed, len(cancel_results))
+                pending_places.clear()
+                pending_updates.clear()
+
+        # Place all new orders in parallel (UP + DN at once)
+        if pending_places:
+            place_results = await asyncio.gather(
+                *(self.order_mgr.place_order(q, post_only=po, fallback_taker=ft)
+                  for q, po, ft in pending_places),
+                return_exceptions=True,
+            )
+            place_failed = sum(1 for r in place_results if isinstance(r, Exception) or r is None)
+            if place_failed:
+                log.warning("Parallel place: %d/%d orders failed", place_failed, len(place_results))
+
+        # Update quote tracking
+        for tk, (bid, ask) in pending_updates.items():
+            self._current_quotes[tk] = (bid, ask)
 
         _t_orders = time.perf_counter()
 
@@ -1262,7 +1256,7 @@ class MarketMaker:
         # 8b. Refresh PM balances AFTER order placement for accurate PnL.
         # USDC changes when orders are placed/filled; token balances change on fills.
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live and (fills or self._tick_count % 5 == 0):
+        if is_live and (fills or self._tick_count % 15 == 0):
             try:
                 (real_up, real_dn), usdc_bal = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(

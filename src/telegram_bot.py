@@ -58,11 +58,13 @@ class TelegramBotManager:
     # ── Poll loop ───────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
+        _backoff = 5.0
         while self._running:
             try:
                 updates = await self._tg.get_updates(
                     offset=self._offset, timeout=30,
                 )
+                _backoff = 5.0  # reset on success
                 for upd in updates:
                     self._offset = upd["update_id"] + 1
                     try:
@@ -72,8 +74,15 @@ class TelegramBotManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.warning("Poll error: %s", e)
-                await asyncio.sleep(5.0)
+                err_str = str(e)
+                if "409" in err_str or "Conflict" in err_str:
+                    # Another bot instance is polling — back off exponentially
+                    log.warning("Telegram 409 conflict — another instance running, backing off %.0fs", _backoff)
+                    await asyncio.sleep(_backoff)
+                    _backoff = min(_backoff * 2, 300.0)  # max 5 min
+                else:
+                    log.warning("Poll error: %s", e)
+                    await asyncio.sleep(5.0)
 
     async def _handle(self, upd: dict) -> None:
         if "callback_query" in upd:
