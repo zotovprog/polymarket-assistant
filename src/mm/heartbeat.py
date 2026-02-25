@@ -40,6 +40,7 @@ class HeartbeatManager:
         self._heartbeat_count: int = 0
         self._error_count: int = 0
         self._consecutive_failures: int = 0
+        self._id_refresh_count: int = 0  # ID adopted from server (not errors)
         self._heartbeat_id: str = str(uuid.uuid4())  # Stable ID for session
 
     @property
@@ -57,6 +58,7 @@ class HeartbeatManager:
             "last_heartbeat": self._last_heartbeat,
             "heartbeat_count": self._heartbeat_count,
             "error_count": self._error_count,
+            "id_refresh_count": self._id_refresh_count,
             "interval_sec": self.interval,
             "heartbeat_id": self._heartbeat_id[:8] + "...",
         }
@@ -67,6 +69,18 @@ class HeartbeatManager:
         self._consecutive_failures = 0
         log.info("Heartbeat ID force-regenerated: %s…", self._heartbeat_id[:8])
         return self._heartbeat_id
+
+    def update_id(self, new_id: str) -> None:
+        """Update heartbeat ID from external source (e.g. order response).
+
+        Call this after order placement/cancellation if PM response
+        contains a new heartbeat_id. Prevents stale-ID errors on next cycle.
+        """
+        if new_id and new_id != self._heartbeat_id:
+            old = self._heartbeat_id[:8]
+            self._heartbeat_id = new_id
+            self._id_refresh_count += 1
+            log.debug("Heartbeat ID updated externally: %s… → %s…", old, new_id[:8])
 
     @staticmethod
     def _extract_server_heartbeat_id(error_str: str) -> str | None:
@@ -98,25 +112,22 @@ class HeartbeatManager:
             self._consecutive_failures = 0
             return True
         except Exception as e:
-            self._error_count += 1
             self._consecutive_failures += 1
             err_str = str(e)
             err_lower = err_str.lower()
             # PM says our ID is invalid — try to extract the server's active ID
             if "invalid" in err_lower or "not found" in err_lower:
                 old_id = self._heartbeat_id[:8]
-                # Extract server's heartbeat_id from error like:
-                # {'heartbeat_id': '154cd958-...'}
                 server_id = self._extract_server_heartbeat_id(err_str)
                 if server_id and server_id != self._heartbeat_id:
                     self._heartbeat_id = server_id
-                    log.info("Heartbeat ID adopted from server: %s… → %s… (server had: %s)",
-                             old_id, self._heartbeat_id[:8], server_id[:12])
+                    log.debug("Heartbeat ID adopted from server: %s… → %s…",
+                              old_id, self._heartbeat_id[:8])
                 else:
                     self._heartbeat_id = str(uuid.uuid4())
-                    log.info("Heartbeat ID regenerated: %s… → %s…",
-                             old_id, self._heartbeat_id[:8])
-                # Immediately retry with the new ID (PM timeout is ~10s, can't wait)
+                    log.debug("Heartbeat ID regenerated: %s… → %s…",
+                              old_id, self._heartbeat_id[:8])
+                # Immediately retry with the new ID
                 try:
                     is_mock = hasattr(self.client, '_orders')
                     if is_mock:
@@ -128,11 +139,12 @@ class HeartbeatManager:
                     self._last_heartbeat = time.time()
                     self._heartbeat_count += 1
                     self._consecutive_failures = 0
+                    self._id_refresh_count += 1
                     return True
                 except Exception as retry_err:
                     log.warning("Heartbeat retry with new ID also failed: %s", retry_err)
+                    self._error_count += 1
                     self._consecutive_failures += 1
-                    # Check failure threshold (same as main path below)
                     if self._consecutive_failures >= 3:
                         log.critical(
                             "Heartbeat failed %s times in a row; orders may have been cancelled",
@@ -144,6 +156,8 @@ class HeartbeatManager:
                             except Exception as cb_err:
                                 log.error(f"Heartbeat failure callback error: {cb_err}", exc_info=True)
                     return False
+            # Non-ID error — real failure
+            self._error_count += 1
             log.warning("Heartbeat failed: %s", e)
             if self._consecutive_failures >= 3:
                 log.critical(
@@ -191,4 +205,5 @@ class HeartbeatManager:
         """Reset counters."""
         self._heartbeat_count = 0
         self._error_count = 0
+        self._id_refresh_count = 0
         self._last_heartbeat = 0.0

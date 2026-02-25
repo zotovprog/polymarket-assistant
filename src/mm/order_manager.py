@@ -59,6 +59,30 @@ class OrderManager:
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
         self._reconcile_requested: bool = False
+        self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
+
+    def set_heartbeat_id_callback(self, callback) -> None:
+        """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
+        self._on_heartbeat_id = callback
+
+    @staticmethod
+    def _extract_heartbeat_id(resp: Any) -> str | None:
+        """Extract heartbeat_id from PM API response if present."""
+        if isinstance(resp, dict):
+            hb_id = resp.get("heartbeat_id")
+            if hb_id and isinstance(hb_id, str) and len(hb_id) >= 32:
+                return hb_id
+        return None
+
+    def _notify_heartbeat_id(self, resp: Any) -> None:
+        """If PM response contains a heartbeat_id, notify the HeartbeatManager."""
+        if self._on_heartbeat_id:
+            hb_id = self._extract_heartbeat_id(resp)
+            if hb_id:
+                try:
+                    self._on_heartbeat_id(hb_id)
+                except Exception:
+                    pass
 
     def _throttled_warn(self, key: str, msg: str, cooldown: float = 30.0):
         """Log a warning at most once per cooldown period."""
@@ -235,6 +259,7 @@ class OrderManager:
         quote.placed_at = time.time()
         self._active_orders[order_id] = quote
         self._order_post_only[order_id] = post_only
+        self._notify_heartbeat_id(resp)
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
         return order_id
@@ -609,12 +634,13 @@ class OrderManager:
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel a single order."""
         try:
-            await asyncio.wait_for(
+            resp = await asyncio.wait_for(
                 asyncio.to_thread(self.client.cancel, order_id),
                 timeout=10.0,
             )
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
+            self._notify_heartbeat_id(resp)
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
         except Exception as e:
@@ -654,6 +680,7 @@ class OrderManager:
             batch_resp = await asyncio.to_thread(self.client.cancel_all)
             if isinstance(batch_resp, dict) and batch_resp.get("error"):
                 raise RuntimeError(f"batch cancel response error: {batch_resp.get('error')}")
+            self._notify_heartbeat_id(batch_resp)
             cancelled = len(ids)
             self.clear_local_order_tracking()
             if cancelled > 0:

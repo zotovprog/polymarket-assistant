@@ -238,6 +238,9 @@ class MarketMaker:
         # Wire fill callback → trigger immediate requote
         self.order_mgr.set_fill_callback(lambda: self._requote_event.set())
 
+        # Wire heartbeat ID sync: order/cancel responses may contain new ID
+        self.order_mgr.set_heartbeat_id_callback(self.heartbeat.update_id)
+
         # Start heartbeat
         self.heartbeat.start()
 
