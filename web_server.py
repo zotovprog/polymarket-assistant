@@ -37,7 +37,9 @@ from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
-from version import __version__ as APP_VERSION, __git_hash__ as APP_GIT_HASH
+from version import __version__ as APP_VERSION, git_hash as _git_hash_fn
+
+APP_GIT_HASH = _git_hash_fn()  # Resolve once at startup
 
 # ── Logging ─────────────────────────────────────────────────────
 logging.basicConfig(
