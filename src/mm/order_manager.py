@@ -672,7 +672,7 @@ class OrderManager:
         return cancelled
 
     async def cancel_replace(self, old_ids: list[str],
-                              new_quotes: list[Quote]) -> list[str]:
+                              new_quotes: list[Quote]) -> list[str] | None:
         """Cancel old orders and place new ones.
 
         Cancels run in parallel. Placements run sequentially to avoid
@@ -694,7 +694,7 @@ class OrderManager:
                     failed,
                     len(cancel_results),
                 )
-                return []
+                return None
 
         # Place new orders sequentially (budget safety)
         results = []

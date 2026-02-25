@@ -912,6 +912,15 @@ class MMRuntime:
             if not mm._running:
                 log.info(f"Monitor: mm._running=False, _is_closing={mm._is_closing}")
             if not mm._running and (mm._is_closing or (mm.market and mm.market.time_remaining <= 0)):
+                # Don't auto-restart after emergency shutdown
+                if mm._emergency_stopped:
+                    log.warning("Monitor: emergency shutdown detected, NOT auto-restarting")
+                    self._running = False
+                    await self._cancel_strike_retry_task()
+                    for t in self._feed_tasks:
+                        t.cancel()
+                    self._feed_tasks.clear()
+                    break
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
                 await self._send_window_summary()
                 self._running = False
@@ -1677,6 +1686,7 @@ async def mm_emergency(request: Request):
     """Emergency stop — cancel all orders immediately."""
     _require_auth(request)
     if _runtime.mm:
+        _runtime.mm._emergency_flag = True  # Stop in-flight tick from placing orders
         cancelled = await _runtime.mm.order_mgr.cancel_all()
         await _runtime.mm.heartbeat.stop()
         _runtime.mm._paused = True

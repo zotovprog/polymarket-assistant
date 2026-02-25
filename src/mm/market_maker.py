@@ -65,6 +65,8 @@ class MarketMaker:
         self.inventory = Inventory()
         self.market: Optional[MarketInfo] = None
         self._running = False
+        self._emergency_flag = False
+        self._emergency_stopped = False
         self._paused = False
         self._pause_reason = ""
         self._task: Optional[asyncio.Task] = None
@@ -155,6 +157,9 @@ class MarketMaker:
     async def _emergency_shutdown(self, reason: str) -> None:
         """Best-effort fatal shutdown with explicit order and heartbeat cleanup."""
         log.critical("EMERGENCY SHUTDOWN: %s", reason)
+        self._emergency_flag = True  # Signal in-flight tick to stop placing orders
+        self._emergency_stopped = True
+        self._is_closing = True
         try:
             await self.order_mgr.cancel_all(force_exchange=True)
         except Exception as e:
@@ -196,6 +201,8 @@ class MarketMaker:
             raise ValueError("Market info not set — call set_market() first")
 
         self._running = True
+        self._emergency_flag = False
+        self._emergency_stopped = False
         # Snapshot starting USDC for real session PnL
         try:
             starting_usdc = await self.order_mgr.get_usdc_balance()
@@ -784,6 +791,10 @@ class MarketMaker:
             all_quotes[token_key] = (bid, ask)
         _t_quotes = time.perf_counter()
 
+        # Abort if emergency shutdown was triggered during this tick
+        if self._emergency_flag:
+            return
+
         # 7. Place or update orders
         # On Polymarket: SELL requires token inventory. Use BUY-only strategy:
         #   BUY UP @ bid_up  +  BUY DN @ bid_dn
@@ -859,7 +870,7 @@ class MarketMaker:
                 new_ids = await self.order_mgr.cancel_replace(old_ids, new_quotes)
 
                 # Only update tracking when cancel_replace actually placed orders
-                if new_ids:
+                if new_ids is not None:
                     updated_bid = new_bid if need_bid else (None if stale_bid else cur_bid)
                     updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                     self._current_quotes[token_key] = (updated_bid, updated_ask)
