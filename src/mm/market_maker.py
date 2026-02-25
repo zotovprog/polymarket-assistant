@@ -35,6 +35,8 @@ from .pnl_decomposition import PnLDecomposition
 from .event_requote import EventRequoter
 
 log = logging.getLogger("mm.engine")
+BINANCE_FEED_STALE_SEC = 15.0
+BINANCE_FEED_STARTUP_GRACE_SEC = 20.0
 
 
 class SREMetrics:
@@ -1058,13 +1060,15 @@ class MarketMaker:
         # 1. Defensive copies of feed data
         mid = st.mid
         now = time.time()
-        last_ok_ts = getattr(st, "binance_ob_last_ok_ts", 0.0) or 0.0
+        last_ob_ok_ts = getattr(st, "binance_ob_last_ok_ts", 0.0) or 0.0
+        last_ws_ok_ts = getattr(st, "binance_ws_last_ok_ts", 0.0) or 0.0
+        last_ok_ts = max(last_ob_ok_ts, last_ws_ok_ts)
         if last_ok_ts > 0:
             staleness = now - last_ok_ts
-            is_stale = staleness > 5.0
+            is_stale = staleness > BINANCE_FEED_STALE_SEC
         else:
             staleness = now - self._started_at if self._started_at > 0 else 0.0
-            is_stale = staleness > 10.0
+            is_stale = staleness > BINANCE_FEED_STARTUP_GRACE_SEC
 
         if is_stale:
             log.warning("Binance feed stale (%.1fs), cancelling orders and skipping tick", staleness)

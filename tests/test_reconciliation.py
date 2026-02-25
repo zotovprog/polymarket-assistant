@@ -273,3 +273,37 @@ def test_drawdown_forces_taker_in_liquidation():
     # Bot should have abandoned liquidation
     assert mm._is_closing is False
     assert mm._running is False
+
+
+def test_binance_stale_uses_fresh_ws_timestamp():
+    """Do not trigger stale-cancel when OB is older but WS stream is fresh."""
+    mm = _make_mm(live=False)
+    mm.feed_state.mid = 0.0
+    mm.feed_state.binance_ob_last_ok_ts = time.time() - 6.0
+    mm.feed_state.binance_ws_last_ok_ts = time.time() - 1.0
+    mm.feed_state.pm_up = None
+    mm.feed_state.pm_dn = None
+    mm.order_mgr.client.get_balance = lambda: 100.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+
+    asyncio.run(mm._tick())
+    mm.order_mgr.cancel_all.assert_not_awaited()
+
+
+def test_binance_stale_cancels_when_all_streams_old():
+    """Safety cancel still triggers when both OB and WS become stale."""
+    mm = _make_mm(live=False)
+    mm.feed_state.mid = 0.0
+    mm.feed_state.binance_ob_last_ok_ts = time.time() - 16.0
+    mm.feed_state.binance_ws_last_ok_ts = time.time() - 16.0
+    mm.feed_state.pm_up = None
+    mm.feed_state.pm_dn = None
+    mm.order_mgr.client.get_balance = lambda: 100.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+
+    asyncio.run(mm._tick())
+    mm.order_mgr.cancel_all.assert_awaited_once()

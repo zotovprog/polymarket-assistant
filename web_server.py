@@ -849,6 +849,20 @@ class MMRuntime:
         finally:
             self._strike_retry_task = None
 
+    async def _stop_feed_tasks(self) -> None:
+        """Cancel feed tasks and let them clean up connection state."""
+        if not self._feed_tasks:
+            return
+        tasks = list(self._feed_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._feed_tasks.clear()
+        if self.feed_state:
+            self.feed_state.binance_ws_connected = False
+            self.feed_state.binance_ob_connected = False
+            self.feed_state.pm_connected = False
+
     def _ensure_strike_retry_task(self) -> None:
         """Launch strike recovery loop when window is in watch mode."""
         if self._strike_retry_task and not self._strike_retry_task.done():
@@ -1178,9 +1192,7 @@ class MMRuntime:
                     log.warning("Monitor: emergency shutdown detected, NOT auto-restarting")
                     self._running = False
                     await self._cancel_strike_retry_task()
-                    for t in self._feed_tasks:
-                        t.cancel()
-                    self._feed_tasks.clear()
+                    await self._stop_feed_tasks()
                     break
                 log.info("Window expired — MM stopped. Cleaning up feeds.")
                 redeem_elapsed = 0.0
@@ -1205,9 +1217,7 @@ class MMRuntime:
                 await self._send_window_summary()
                 self._running = False
                 await self._cancel_strike_retry_task()
-                for t in self._feed_tasks:
-                    t.cancel()
-                self._feed_tasks.clear()
+                await self._stop_feed_tasks()
 
                 # Natural window expiry sets mm._running=False without calling mm.stop(),
                 # so heartbeat can still be alive. Stop it before rotating window.
@@ -1321,9 +1331,7 @@ class MMRuntime:
         if self.mm:
             await self.mm.stop()
 
-        for t in self._feed_tasks:
-            t.cancel()
-        self._feed_tasks.clear()
+        await self._stop_feed_tasks()
 
         # Tear down MongoLogger
         if self._mongo_log_handler:
@@ -1394,14 +1402,16 @@ class MMRuntime:
                 "connected": st.binance_ws_connected,
                 "msg_count": st.binance_ws_msg_count,
                 "error_count": st.binance_ws_error_count,
-                "latency_ms": round((now - st.binance_ob_last_ok_ts) * 1000) if st.binance_ob_last_ok_ts else None,
+                "latency_ms": round((now - st.binance_ws_last_ok_ts) * 1000) if st.binance_ws_last_ok_ts else None,
                 "uptime_sec": round(now - st.binance_ws_connected_at) if st.binance_ws_connected_at else 0,
             },
             "binance_ob": {
+                "connected": st.binance_ob_connected,
                 "ready": st.binance_ob_ready,
                 "msg_count": st.binance_ob_msg_count,
                 "error_count": st.binance_ob_error_count,
                 "last_update_ms_ago": round((now - st.binance_ob_last_ok_ts) * 1000) if st.binance_ob_last_ok_ts else None,
+                "uptime_sec": round(now - st.binance_ob_connected_at) if st.binance_ob_connected_at else 0,
             },
             "polymarket": {
                 "connected": st.pm_connected,
@@ -1454,9 +1464,7 @@ class MMRuntime:
         """Stop watch mode feeds."""
         await self._cancel_strike_retry_task()
         self._strike_invalid = False
-        for t in self._feed_tasks:
-            t.cancel()
-        self._feed_tasks.clear()
+        await self._stop_feed_tasks()
         self._watching = False
         self.feed_state = None
         log.info("Watch mode stopped")

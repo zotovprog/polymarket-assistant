@@ -29,6 +29,7 @@ class State:
         self.pm_dn_bid: float | None = None
 
         self.binance_ws_connected: bool = False
+        self.binance_ob_connected: bool = False
         self.binance_ob_ready: bool = False
         self.binance_ob_last_ok_ts: float = 0.0
         self.pm_connected: bool = False
@@ -42,6 +43,8 @@ class State:
         self.binance_ws_msg_count: int = 0
         self.binance_ws_error_count: int = 0
         self.binance_ws_connected_at: float = 0.0
+        self.binance_ws_last_ok_ts: float = 0.0
+        self.binance_ob_connected_at: float = 0.0
 
         self.binance_ob_msg_count: int = 0
         self.binance_ob_error_count: int = 0
@@ -52,6 +55,9 @@ class State:
 
 
 OB_POLL_INTERVAL = 2
+BINANCE_OB_IDLE_RECONNECT_SEC = 12.0
+BINANCE_WS_IDLE_RECONNECT_SEC = 20.0
+PM_WS_IDLE_RECONNECT_SEC = 30.0
 
 
 def _fetch_binance_depth(url: str, symbol: str) -> dict:
@@ -119,8 +125,20 @@ async def ob_poller(symbol: str, state: State):
                 async with session.ws_connect(ws_url, heartbeat=20, receive_timeout=70) as ws:
                     print(f"  [Binance OB] connected – {symbol}")
                     reconnect_delay = 1
+                    state.binance_ob_connected = True
+                    state.binance_ob_connected_at = time.time()
 
-                    async for msg in ws:
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(
+                                ws.receive(),
+                                timeout=BINANCE_OB_IDLE_RECONNECT_SEC,
+                            )
+                        except asyncio.TimeoutError as e:
+                            raise ConnectionError(
+                                f"orderbook stream idle for >{BINANCE_OB_IDLE_RECONNECT_SEC:.0f}s"
+                            ) from e
+
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
                             bids_raw = data.get("bids") or data.get("b") or []
@@ -135,9 +153,11 @@ async def ob_poller(symbol: str, state: State):
                         ):
                             raise ConnectionError("orderbook stream disconnected")
         except asyncio.CancelledError:
+            state.binance_ob_connected = False
             raise
         except Exception as e:
             state.binance_ob_error_count += 1
+            state.binance_ob_connected = False
             delay = reconnect_delay or OB_POLL_INTERVAL
             print(f"  [Binance OB] disconnected: {e}. Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
@@ -152,6 +172,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
         f"{sym}@kline_{kline_iv}",
     ])
     url = f"{ws_base}?streams={streams}"
+    reconnect_delay = 1
 
     while True:
         try:
@@ -164,49 +185,74 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                 print(f"  [Binance WS] connected – {symbol}")
                 state.binance_ws_connected = True
                 state.binance_ws_connected_at = time.time()
+                reconnect_delay = 1
 
                 while True:
-                    try:
-                        data   = json.loads(await ws.recv())
-                        stream = data.get("stream", "")
-                        pay    = data["data"]
-                        state.binance_ws_msg_count += 1
+                    raw = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=BINANCE_WS_IDLE_RECONNECT_SEC,
+                    )
+                    data = json.loads(raw)
+                    stream = data.get("stream", "")
+                    pay = data["data"]
+                    state.binance_ws_msg_count += 1
+                    state.binance_ws_last_ok_ts = time.time()
 
-                        if "@trade" in stream:
-                            state.trades.append({
-                                "t":      pay["T"] / 1000.0,
-                                "price":  float(pay["p"]),
-                                "qty":    float(pay["q"]),
-                                "is_buy": not pay["m"],
-                            })
-                            if len(state.trades) > 5000:
-                                cut = time.time() - config.TRADE_TTL
-                                state.trades = [t for t in state.trades if t["t"] >= cut]
+                    if "@trade" in stream:
+                        ts = pay["T"] / 1000.0
+                        trade_price = float(pay["p"])
+                        state.trades.append({
+                            "t": ts,
+                            "price": trade_price,
+                            "qty": float(pay["q"]),
+                            "is_buy": not pay["m"],
+                        })
+                        if state.mid <= 0 and trade_price > 0:
+                            state.mid = trade_price
+                        if len(state.trades) > 5000:
+                            cut = time.time() - config.TRADE_TTL
+                            state.trades = [t for t in state.trades if t["t"] >= cut]
 
-                        elif "@kline" in stream:
-                            k = pay["k"]
-                            candle = {
-                                "t": k["t"] / 1000.0,
-                                "o": float(k["o"]), "h": float(k["h"]),
-                                "l": float(k["l"]), "c": float(k["c"]),
-                                "v": float(k["v"]),
-                            }
-                            state.cur_kline = candle
-                            if k["x"]:
-                                state.klines.append(candle)
-                                state.klines = state.klines[-config.KLINE_MAX:]
+                    elif "@kline" in stream:
+                        k = pay["k"]
+                        candle = {
+                            "t": k["t"] / 1000.0,
+                            "o": float(k["o"]), "h": float(k["h"]),
+                            "l": float(k["l"]), "c": float(k["c"]),
+                            "v": float(k["v"]),
+                        }
+                        state.cur_kline = candle
+                        if k["x"]:
+                            state.klines.append(candle)
+                            state.klines = state.klines[-config.KLINE_MAX:]
 
-                    except websockets.exceptions.ConnectionClosed:
-                        state.binance_ws_error_count += 1
-                        print(f"  [Binance WS] connection closed, reconnecting...")
-                        state.binance_ws_connected = False
-                        break
-
+        except asyncio.CancelledError:
+            state.binance_ws_connected = False
+            raise
+        except websockets.exceptions.ConnectionClosed as e:
+            state.binance_ws_error_count += 1
+            state.binance_ws_connected = False
+            delay = reconnect_delay
+            print(f"  [Binance WS] connection closed: {e}, reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
+            reconnect_delay = min(max(delay * 2, 1), 10)
+        except asyncio.TimeoutError:
+            state.binance_ws_error_count += 1
+            state.binance_ws_connected = False
+            delay = reconnect_delay
+            print(
+                f"  [Binance WS] idle for >{BINANCE_WS_IDLE_RECONNECT_SEC:.0f}s, "
+                f"reconnecting in {delay}s..."
+            )
+            await asyncio.sleep(delay)
+            reconnect_delay = min(max(delay * 2, 1), 10)
         except Exception as e:
             state.binance_ws_error_count += 1
-            print(f"  [Binance WS] connection error: {e}, reconnecting in 5s...")
             state.binance_ws_connected = False
-            await asyncio.sleep(5)
+            delay = reconnect_delay
+            print(f"  [Binance WS] connection error: {e}, reconnecting in {delay}s...")
+            await asyncio.sleep(delay)
+            reconnect_delay = min(max(delay * 2, 1), 10)
 
 
 async def bootstrap(symbol: str, interval: str, state: State):
@@ -468,6 +514,7 @@ async def pm_feed(state: State):
         return
 
     _last_msg_log_ts = 0.0
+    reconnect_delay = 1
 
     while True:
         # Pick up current token IDs (may have been updated by trading_loop)
@@ -495,6 +542,8 @@ async def pm_feed(state: State):
                 state.pm_connected = True
                 state.pm_connected_at = time.time()
                 state.pm_msg_count = 0
+                reconnect_delay = 1
+                last_msg_ts = time.time()
 
                 while True:
                     # Check if trading_loop requested reconnect (new window = new tokens)
@@ -507,6 +556,7 @@ async def pm_feed(state: State):
                     try:
                         raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
                         state.pm_msg_count += 1
+                        last_msg_ts = time.time()
 
                         # Throttled debug log: show message stats every 60s
                         now = time.time()
@@ -542,7 +592,15 @@ async def pm_feed(state: State):
                                     _pm_set_bid(ch["asset_id"], float(ch["best_bid"]), state)
 
                     except asyncio.TimeoutError:
-                        # No message in 30s — check reconnect flag and loop
+                        # Keep loop responsive for reconnect flag, but force a
+                        # reconnect if feed is silent for too long.
+                        if (time.time() - last_msg_ts) >= PM_WS_IDLE_RECONNECT_SEC:
+                            state.pm_error_count += 1
+                            print(
+                                f"  [PM] idle for >{PM_WS_IDLE_RECONNECT_SEC:.0f}s, reconnecting..."
+                            )
+                            state.pm_connected = False
+                            break
                         continue
 
                     except websockets.exceptions.ConnectionClosed:
@@ -551,11 +609,16 @@ async def pm_feed(state: State):
                         state.pm_connected = False
                         break
 
+        except asyncio.CancelledError:
+            state.pm_connected = False
+            raise
         except Exception as e:
             state.pm_error_count += 1
-            print(f"  [PM] connection error: {e}, reconnecting in 5s...")
+            delay = reconnect_delay
+            print(f"  [PM] connection error: {e}, reconnecting in {delay}s...")
             state.pm_connected = False
-            await asyncio.sleep(5)
+            await asyncio.sleep(delay)
+            reconnect_delay = min(max(delay * 2, 1), 10)
 
 
 def _pm_apply(asset, asks, bids, state):
