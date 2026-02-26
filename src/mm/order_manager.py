@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import time
 from typing import Any, Optional
 import websockets
@@ -18,6 +19,7 @@ import websockets
 from .types import Quote, Fill
 from .mm_config import MMConfig
 from .pm_fees import taker_fee_usd, net_shares_after_buy_fee
+from .runtime_metrics import runtime_metrics
 
 log = logging.getLogger("mm.orders")
 
@@ -109,11 +111,13 @@ class OrderManager:
         self._log = log
         self._active_orders: dict[str, Quote] = {}  # order_id -> Quote
         self._order_post_only: dict[str, bool] = {}  # order_id -> placement post_only flag
+        self._recent_orders: dict[str, tuple[Quote, float]] = {}  # order_id -> (Quote, removed_ts)
         self._filled_order_ids: set[str] = set()
         self._partial_fill_reported: dict[str, float] = {}  # order_id -> last reported size_matched
         self._pending_cancels: set[str] = set()
         self._mock_token_balances: dict[str, float] = {}
         self._allowance_set: set[str] = set()  # token IDs with allowance already set
+        self._allowance_cap_shares: dict[str, float] = {}  # token_id -> last confirmed sellable size via allowance
         self._session_budget: float = 0.0  # Hard USDC budget cap (0 = no limit)
         self._session_spent: float = 0.0   # Total USDC committed to BUY orders this session
         self._warn_cooldowns: dict[str, float] = {}
@@ -122,10 +126,13 @@ class OrderManager:
         self._ws_fills_queue: asyncio.Queue = asyncio.Queue()
         self.trade_ledger = TradeLedger()
         self._last_fill_check_ts: float = 0.0
+        self._last_recent_poll_ts: float = 0.0
         self._usdc_balance_cache: float | None = None
         self._usdc_available_cache: float | None = None
         self._usdc_balance_cache_ts: float = 0.0
         self._usdc_cache_ttl: float = 5.0  # Cache USDC balance for 5 seconds
+        self._recent_order_retention_sec: float = 120.0
+        self._recent_poll_interval_sec: float = 3.0
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
         self._reconcile_requested: bool = False
         self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
@@ -346,6 +353,47 @@ class OrderManager:
             return f"{raw[:max_len]}...<truncated>"
         return raw
 
+    @staticmethod
+    def _clone_quote(quote: Quote) -> Quote:
+        """Detach quote snapshot for post-cancel fill reconciliation."""
+        return Quote(
+            side=quote.side,
+            token_id=quote.token_id,
+            price=float(quote.price),
+            size=float(quote.size),
+            order_id=quote.order_id,
+            placed_at=float(quote.placed_at or 0.0),
+        )
+
+    def _track_recent_order(self, order_id: str, quote: Quote | None) -> None:
+        """Keep recently removed order for late fill accounting."""
+        if not order_id or quote is None:
+            return
+        self._recent_orders[order_id] = (self._clone_quote(quote), time.time())
+
+    def _prune_recent_orders(self, now: float | None = None) -> None:
+        """Drop expired recently removed orders."""
+        ts = now if now is not None else time.time()
+        ttl = max(5.0, float(self._recent_order_retention_sec))
+        stale_ids = [
+            oid
+            for oid, (_q, removed_ts) in self._recent_orders.items()
+            if (ts - removed_ts) > ttl
+        ]
+        for oid in stale_ids:
+            self._recent_orders.pop(oid, None)
+            self._partial_fill_reported.pop(oid, None)
+
+    def _get_tracked_quote(self, order_id: str) -> Quote | None:
+        """Lookup order in active set first, then recently cancelled set."""
+        quote = self._active_orders.get(order_id)
+        if quote is not None:
+            return quote
+        recent = self._recent_orders.get(order_id)
+        if recent is not None:
+            return recent[0]
+        return None
+
     @classmethod
     def _extract_batch_reject_reason(cls, payload: Any) -> str:
         """Best-effort reject reason extraction from post_orders item payload."""
@@ -394,6 +442,11 @@ class OrderManager:
         - block retries when quote is too aggressive vs current BBO,
         - block retries when estimated taker fee exceeds max_loss_per_fill_usd.
         """
+        # Safety policy: in maker mode we do not silently convert rejected
+        # post-only quotes into taker orders.
+        if bool(getattr(self.config, "use_post_only", True)):
+            return None
+
         reason_l = (reason or "").lower()
         if "crosses book" not in reason_l:
             return None
@@ -620,13 +673,17 @@ class OrderManager:
             if q.side == "SELL" and q.token_id == quote.token_id
         )
         free_inventory = max(0.0, float(token_bal) - active_sell_exposure)
-        if free_inventory + 0.01 >= quote.size:
+        if free_inventory >= quote.size:
             return True
 
         pm_min = 5.0
         if free_inventory >= pm_min:
             old = quote.size
-            quote.size = round(free_inventory, 2)
+            # Round down to avoid tiny float overshoot (e.g. 6.56 becoming 6.57).
+            trimmed = math.floor(free_inventory * 100.0) / 100.0
+            if trimmed < pm_min:
+                trimmed = pm_min
+            quote.size = round(trimmed, 2)
             self._throttled_warn(
                 "sell_close_only_trimmed",
                 (
@@ -740,21 +797,32 @@ class OrderManager:
             available = total
         return total, available
 
-    async def ensure_sell_allowance(self, token_id: str) -> bool:
+    async def ensure_sell_allowance(
+        self,
+        token_id: str,
+        *,
+        required_shares: float | None = None,
+        force_refresh: bool = False,
+    ) -> bool:
         """Ensure ERC1155 operator allowance is set for SELL orders on this token.
 
         Polymarket CLOB requires operator approval before you can SELL conditional tokens.
         This calls update_balance_allowance() which is idempotent (safe to call multiple times).
-        Results are cached per token_id to avoid redundant API calls.
+        Results are cached per token_id to avoid redundant API calls, but cache is
+        bypassed when required size exceeds last confirmed allowance capacity.
 
         Returns True if allowance is OK, False on failure.
         """
         if hasattr(self.client, "_orders"):  # Mock client
             return True
-        if token_id in self._allowance_set:
-            return True
         if not _HAS_CLOB_TYPES:
             return False
+
+        req_shares = max(0.0, float(required_shares or 0.0))
+        if token_id in self._allowance_set and not force_refresh:
+            cached_cap = max(0.0, float(self._allowance_cap_shares.get(token_id, 0.0)))
+            if req_shares <= 0.0 or req_shares <= (cached_cap + 0.01):
+                return True
 
         try:
             # Check current allowance
@@ -765,13 +833,25 @@ class OrderManager:
                     token_id=token_id,
                 ),
             )
-            allowance = float(result.get("allowance", 0))
-            balance = float(result.get("balance", 0))
+            allowance_raw = max(0.0, float(result.get("allowance", 0)))
+            balance_raw = max(0.0, float(result.get("balance", 0)))
+            req_raw = max(0.0, req_shares * 1e6)
+            required_raw = max(balance_raw, req_raw)
 
-            log.info(f"Token {token_id[:12]}... balance={balance/1e6:.2f} allowance={allowance/1e6:.2f}")
+            log.info(
+                "Token %s... balance=%.2f allowance=%.2f required=%.2f",
+                token_id[:12],
+                balance_raw / 1e6,
+                allowance_raw / 1e6,
+                required_raw / 1e6,
+            )
 
-            if allowance <= 0 or allowance < balance:
-                log.info(f"Setting allowance for {token_id[:12]}...")
+            if allowance_raw <= 0 or allowance_raw + 1 < required_raw:
+                log.info(
+                    "Setting allowance for %s... (required %.2f shares)",
+                    token_id[:12],
+                    required_raw / 1e6,
+                )
                 await asyncio.to_thread(
                     self.client.update_balance_allowance,
                     BalanceAllowanceParams(
@@ -780,8 +860,12 @@ class OrderManager:
                     ),
                 )
                 log.info(f"Allowance updated for {token_id[:12]}...")
+                # update_balance_allowance is async on-chain; assume at least required amount
+                allowance_raw = max(allowance_raw, required_raw)
 
+            cap_shares = max(0.0, allowance_raw / 1e6)
             self._allowance_set.add(token_id)
+            self._allowance_cap_shares[token_id] = cap_shares
             return True
         except Exception as e:
             log.error(f"Failed to ensure allowance for {token_id[:12]}...: {e}")
@@ -941,7 +1025,10 @@ class OrderManager:
 
         # Ensure allowance for SELL orders on conditional tokens
         if quote.side == "SELL" and not is_mock:
-            if not await self.ensure_sell_allowance(quote.token_id):
+            if not await self.ensure_sell_allowance(
+                quote.token_id,
+                required_shares=quote.size,
+            ):
                 log.warning(f"Cannot place SELL — allowance setup failed for {quote.token_id[:12]}...")
                 return None
             if not await self._enforce_close_only_sell(quote):
@@ -1116,7 +1203,10 @@ class OrderManager:
 
             # Ensure allowance for SELL orders.
             if quote.side == "SELL":
-                if not await self.ensure_sell_allowance(quote.token_id):
+                if not await self.ensure_sell_allowance(
+                    quote.token_id,
+                    required_shares=quote.size,
+                ):
                     self._throttled_warn(
                         "batch_sell_allowance",
                         f"Batch SELL skipped — allowance setup failed for {quote.token_id[:12]}...",
@@ -1174,15 +1264,6 @@ class OrderManager:
                     order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
                         reason = self._extract_batch_reject_reason(order_resp)
-                        retry_oid = None
-                        if use_post_only:
-                            retry_oid = await self._retry_batch_reject_as_taker(
-                                quote,
-                                reason=reason,
-                            )
-                        if retry_oid:
-                            results[idx] = retry_oid
-                            continue
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
@@ -1210,15 +1291,6 @@ class OrderManager:
                         )
                     else:
                         reason = self._extract_batch_reject_reason(order_resp)
-                        retry_oid = None
-                        if use_post_only:
-                            retry_oid = await self._retry_batch_reject_as_taker(
-                                quote,
-                                reason=reason,
-                            )
-                        if retry_oid:
-                            results[idx] = retry_oid
-                            continue
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
@@ -1270,6 +1342,7 @@ class OrderManager:
                 except Exception:
                     pass
             for oid in cancelled_ids:
+                self._track_recent_order(oid, self._active_orders.get(oid))
                 self._active_orders.pop(oid, None)
                 self._order_post_only.pop(oid, None)
             return len(cancelled_ids)
@@ -1297,8 +1370,10 @@ class OrderManager:
                         pass
 
         for oid in cancelled_ids:
+            self._track_recent_order(oid, self._active_orders.get(oid))
             self._active_orders.pop(oid, None)
             self._order_post_only.pop(oid, None)
+            self._pending_cancels.discard(oid)
 
         return len(cancelled_ids)
 
@@ -1509,6 +1584,9 @@ class OrderManager:
                 asyncio.to_thread(self.client.cancel, order_id),
                 timeout=10.0,
             )
+            quote = self._active_orders.get(order_id)
+            if quote is not None:
+                self._track_recent_order(order_id, quote)
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
             self._notify_heartbeat_id(resp)
@@ -1518,7 +1596,12 @@ class OrderManager:
             log.warning(f"Cancel failed for {order_id[:12]}...: {e}")
             return False
 
-    def clear_local_order_tracking(self) -> None:
+    def clear_local_order_tracking(
+        self,
+        *,
+        clear_recent: bool = False,
+        clear_ws_queue: bool = False,
+    ) -> None:
         """Drop in-memory order-tracking state without touching balances."""
         self._active_orders.clear()
         self._order_post_only.clear()
@@ -1526,11 +1609,14 @@ class OrderManager:
         self._partial_fill_reported.clear()
         self._pending_cancels.clear()
         self._reconcile_requested = False
-        while not self._ws_fills_queue.empty():
-            try:
-                self._ws_fills_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        if clear_recent:
+            self._recent_orders.clear()
+        if clear_ws_queue:
+            while not self._ws_fills_queue.empty():
+                try:
+                    self._ws_fills_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
     async def cancel_all(self, *, force_exchange: bool = False) -> int:
         """Cancel active orders.
@@ -1546,6 +1632,7 @@ class OrderManager:
             return 0
 
         cancelled = 0
+        existing = dict(self._active_orders)
         try:
             # Try batch cancel first
             batch_resp = await asyncio.to_thread(self.client.cancel_all)
@@ -1553,7 +1640,12 @@ class OrderManager:
                 raise RuntimeError(f"batch cancel response error: {batch_resp.get('error')}")
             self._notify_heartbeat_id(batch_resp)
             cancelled = len(ids)
-            self.clear_local_order_tracking()
+            for oid, quote in existing.items():
+                self._track_recent_order(oid, quote)
+            for oid in ids:
+                self._active_orders.pop(oid, None)
+                self._order_post_only.pop(oid, None)
+                self._pending_cancels.discard(oid)
             if cancelled > 0:
                 log.info(f"Batch cancelled {cancelled} orders")
             elif force_exchange:
@@ -1628,6 +1720,7 @@ class OrderManager:
         url = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
         log.info("Fill WS: connecting to %s", url)
         while self._fill_ws_running:
+            runtime_metrics.incr("orders.fill_ws.loop")
             try:
                 async with websockets.connect(
                     url,
@@ -1651,6 +1744,7 @@ class OrderManager:
                     msg_since_yield = 0
 
                     async for raw in ws:
+                        runtime_metrics.incr("orders.fill_ws.msg_recv")
                         msg_since_yield += 1
                         if msg_since_yield >= 200:
                             msg_since_yield = 0
@@ -1663,8 +1757,9 @@ class OrderManager:
                                 oid = (msg.get("maker_order_id") or msg.get("taker_order_id")
                                        or msg.get("order_id") or "")
                                 msg["_resolved_order_id"] = oid
-                                is_ours = bool(oid and oid in self._active_orders)
+                                is_ours = bool(oid and self._get_tracked_quote(oid) is not None)
                                 if is_ours:
+                                    runtime_metrics.incr("orders.fill_ws.ours_fill")
                                     await self._ws_fills_queue.put(msg)
                                     log.info(
                                         "Fill WS: OUR fill — order=%s size=%s price=%s",
@@ -1680,14 +1775,17 @@ class OrderManager:
                             elif event_type == "order":
                                 oid = msg.get("order_id", "")
                                 status = msg.get("status", "")
-                                if oid and oid in self._active_orders:
+                                if oid and self._get_tracked_quote(oid) is not None:
+                                    runtime_metrics.incr("orders.fill_ws.order_event")
                                     await self._ws_fills_queue.put(msg)
                                     if status in ("MATCHED", "CLOSED", "CANCELLED", "EXPIRED"):
                                         log.info("Fill WS: order status — id=%s status=%s",
                                                  str(oid)[:12], status)
                         except json.JSONDecodeError:
+                            runtime_metrics.incr("orders.fill_ws.decode_error")
                             continue
             except Exception as e:
+                runtime_metrics.incr("orders.fill_ws.error")
                 if self._fill_ws_running:
                     log.warning("Fill WS disconnected: %s — reconnecting in 5s", e)
                     if self._on_ws_reconnect:
@@ -1716,6 +1814,7 @@ class OrderManager:
         HTTP polling only runs every 30s for orders with no WS activity.
         """
         now = time.time()
+        self._prune_recent_orders(now)
         fills = []
         to_remove = []
         ws_processed_oids: set[str] = set()
@@ -1731,9 +1830,9 @@ class OrderManager:
 
             if event_type == "trade":
                 oid = ws_msg.get("_resolved_order_id", "")
-                if not oid or oid not in self._active_orders:
+                quote = self._get_tracked_quote(oid)
+                if not oid or quote is None:
                     continue
-                quote = self._active_orders[oid]
                 ws_processed_oids.add(oid)
 
                 fill_size = self._safe_float(ws_msg.get("size", 0))
@@ -1799,7 +1898,8 @@ class OrderManager:
 
             elif event_type == "order":
                 oid = ws_msg.get("order_id", "")
-                if not oid or oid not in self._active_orders:
+                quote = self._get_tracked_quote(oid)
+                if not oid or quote is None:
                     continue
                 ws_processed_oids.add(oid)
                 status = ws_msg.get("status", "")
@@ -1808,7 +1908,6 @@ class OrderManager:
                     # Catch any missed fill volume via size_matched
                     size_matched = self._safe_float(ws_msg.get("size_matched", 0))
                     if size_matched and size_matched > 0:
-                        quote = self._active_orders[oid]
                         prev = self._partial_fill_reported.get(oid, 0.0)
                         missed = size_matched - prev
                         if missed >= 0.01:
@@ -1854,96 +1953,116 @@ class OrderManager:
         if ws_processed_oids:
             log.info("WS fills processed: %d orders", len(ws_processed_oids))
 
-        # ── 2. HTTP fallback: poll stale orders (>30s, no WS activity) ─
+        # ── 2. HTTP fallback:
+        # active orders (stale >30s) + recently cancelled orders (short-interval polling)
         stale_cutoff = 30.0
+        removed_set = set(to_remove)
+        poll_map: dict[str, Quote] = {}
+
         if (now - self._last_fill_check_ts) >= stale_cutoff and self._active_orders:
-            stale = [
-                (oid, q) for oid, q in self._active_orders.items()
-                if oid not in ws_processed_oids
-                and oid not in set(to_remove)
-                and (now - (q.placed_at or now)) > stale_cutoff
-            ]
-            if stale:
-                self._last_fill_check_ts = now
-                log.info("HTTP fallback: polling %d stale orders", len(stale))
-                fetch_results = await asyncio.gather(
-                    *(
-                        asyncio.wait_for(
-                            asyncio.to_thread(self.client.get_order, oid),
-                            timeout=10.0,
-                        )
-                        for oid, _ in stale
-                    ),
-                    return_exceptions=True,
-                )
-                for (oid, quote), result in zip(stale, fetch_results):
-                    if isinstance(result, Exception) or result is None:
-                        continue
-                    status = result.get("status", "")
-                    size_matched = self._safe_float(result.get("size_matched", 0)) or 0.0
-                    prev = self._partial_fill_reported.get(oid, 0.0)
-                    new_fill = size_matched - prev
+            self._last_fill_check_ts = now
+            for oid, quote in self._active_orders.items():
+                if (
+                    oid in ws_processed_oids
+                    or oid in removed_set
+                    or (now - (quote.placed_at or now)) <= stale_cutoff
+                ):
+                    continue
+                poll_map[oid] = quote
 
-                    if new_fill >= 0.01:
-                        fill_price = self._extract_fill_price(result, quote.price)
-                        is_maker = self._order_post_only.get(oid, True)
-                        fee = (
-                            0.0
-                            if is_maker
-                            else taker_fee_usd(fill_price, new_fill, quote.side, token_id=quote.token_id)
-                        )
-                        fill = Fill(
-                            ts=now, side=quote.side, token_id=quote.token_id,
-                            price=fill_price, size=round(new_fill, 4),
-                            fee=fee, order_id=oid, is_maker=is_maker,
-                        )
-                        fills.append(fill)
-                        trade_id = self._build_ledger_trade_id(
-                            "http_poll", result, oid, new_fill, fill_price, prev
-                        )
-                        self.trade_ledger.record({
-                            "id": trade_id,
-                            "order_id": fill.order_id,
-                            "ts": fill.ts,
-                            "side": fill.side,
-                            "token_id": fill.token_id,
-                            "price": fill.price,
-                            "size": fill.size,
-                            "fee": fill.fee,
-                            "is_maker": fill.is_maker,
-                            "source": "http",
-                        })
-                        self._partial_fill_reported[oid] = size_matched
+        recent_due = (
+            bool(self._recent_orders)
+            and (now - self._last_recent_poll_ts) >= max(1.0, float(self._recent_poll_interval_sec))
+        )
+        if recent_due:
+            self._last_recent_poll_ts = now
+            for oid, (quote, _removed_ts) in self._recent_orders.items():
+                if oid in ws_processed_oids or oid in removed_set:
+                    continue
+                poll_map.setdefault(oid, quote)
+
+        if poll_map:
+            poll_items = list(poll_map.items())
+            log.info("HTTP fallback: polling %d tracked orders", len(poll_items))
+            fetch_results = await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        asyncio.to_thread(self.client.get_order, oid),
+                        timeout=10.0,
+                    )
+                    for oid, _ in poll_items
+                ),
+                return_exceptions=True,
+            )
+            for (oid, quote), result in zip(poll_items, fetch_results):
+                if isinstance(result, Exception) or result is None:
+                    continue
+                status = result.get("status", "")
+                size_matched = self._safe_float(result.get("size_matched", 0)) or 0.0
+                prev = self._partial_fill_reported.get(oid, 0.0)
+                new_fill = size_matched - prev
+
+                if new_fill >= 0.01:
+                    fill_price = self._extract_fill_price(result, quote.price)
+                    is_maker = self._order_post_only.get(oid, True)
+                    fee = (
+                        0.0
+                        if is_maker
+                        else taker_fee_usd(fill_price, new_fill, quote.side, token_id=quote.token_id)
+                    )
+                    fill = Fill(
+                        ts=now, side=quote.side, token_id=quote.token_id,
+                        price=fill_price, size=round(new_fill, 4),
+                        fee=fee, order_id=oid, is_maker=is_maker,
+                    )
+                    fills.append(fill)
+                    trade_id = self._build_ledger_trade_id(
+                        "http_poll", result, oid, new_fill, fill_price, prev
+                    )
+                    self.trade_ledger.record({
+                        "id": trade_id,
+                        "order_id": fill.order_id,
+                        "ts": fill.ts,
+                        "side": fill.side,
+                        "token_id": fill.token_id,
+                        "price": fill.price,
+                        "size": fill.size,
+                        "fee": fill.fee,
+                        "is_maker": fill.is_maker,
+                        "source": "http",
+                    })
+                    self._partial_fill_reported[oid] = size_matched
+                    if quote.side == "BUY":
+                        self._session_spent += new_fill * fill_price
+                    elif quote.side == "SELL":
+                        self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
+                    if hasattr(self.client, "_orders"):
                         if quote.side == "BUY":
-                            self._session_spent += new_fill * fill_price
-                        elif quote.side == "SELL":
-                            self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
-                        if hasattr(self.client, "_orders"):
-                            if quote.side == "BUY":
-                                actual = (
-                                    net_shares_after_buy_fee(new_fill, fill_price, token_id=quote.token_id)
-                                    if not is_maker
-                                    else new_fill
-                                )
-                                cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                                self._mock_token_balances[quote.token_id] = cur + actual
-                            else:
-                                cur = self._mock_token_balances.get(quote.token_id, 0.0)
-                                self._mock_token_balances[quote.token_id] = cur - new_fill
+                            actual = (
+                                net_shares_after_buy_fee(new_fill, fill_price, token_id=quote.token_id)
+                                if not is_maker
+                                else new_fill
+                            )
+                            cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                            self._mock_token_balances[quote.token_id] = cur + actual
+                        else:
+                            cur = self._mock_token_balances.get(quote.token_id, 0.0)
+                            self._mock_token_balances[quote.token_id] = cur - new_fill
 
-                    if status in ("MATCHED", "CLOSED"):
-                        self._filled_order_ids.add(oid)
-                        to_remove.append(oid)
-                        self._partial_fill_reported.pop(oid, None)
-                    elif status in ("CANCELLED", "EXPIRED"):
-                        to_remove.append(oid)
-                        self._partial_fill_reported.pop(oid, None)
-            else:
-                self._last_fill_check_ts = now
+                if status in ("MATCHED", "CLOSED"):
+                    self._filled_order_ids.add(oid)
+                    to_remove.append(oid)
+                    self._partial_fill_reported.pop(oid, None)
+                elif status in ("CANCELLED", "EXPIRED"):
+                    to_remove.append(oid)
+                    self._partial_fill_reported.pop(oid, None)
 
         for oid in set(to_remove):
             self._active_orders.pop(oid, None)
             self._order_post_only.pop(oid, None)
+            self._recent_orders.pop(oid, None)
+
+        self._prune_recent_orders(now)
 
         return fills
 
@@ -2079,11 +2198,13 @@ class OrderManager:
 
     def reset(self) -> None:
         """Clear tracked order state between windows."""
-        self.clear_local_order_tracking()
+        self.clear_local_order_tracking(clear_recent=True, clear_ws_queue=True)
         self._mock_token_balances.clear()
         self._allowance_set.clear()
+        self._allowance_cap_shares.clear()
         self.invalidate_usdc_cache()
         self._last_fill_check_ts = 0.0
+        self._last_recent_poll_ts = 0.0
         self._session_spent = 0.0
         self._warn_cooldowns = {}
 

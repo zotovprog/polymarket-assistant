@@ -379,6 +379,7 @@ function updateUI(s) {
         btn.innerHTML = '<i class="fas fa-play"></i> Start';
         btn.classList.remove('running');
     }
+    updateSystemAlert(s.alerts);
 
     // Uptime
     if (s.uptime_sec) {
@@ -633,6 +634,21 @@ function updateUI(s) {
 
     // Charts
     updateCharts(s);
+}
+
+function updateSystemAlert(alerts) {
+    const el = document.getElementById('system-alert-banner');
+    if (!el) return;
+    if (!alerts || alerts.length === 0) {
+        el.classList.add('hidden');
+        el.classList.remove('error');
+        el.textContent = '';
+        return;
+    }
+    const top = alerts[0];
+    el.classList.toggle('error', top.level === 'error');
+    el.textContent = `Alert: ${top.message || 'unknown'}`;
+    el.classList.remove('hidden');
 }
 
 // ── Helpers ──────────────────────────────────────────

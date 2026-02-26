@@ -3,6 +3,7 @@ import json
 import time
 from collections import deque
 import os
+import re
 
 import aiohttp
 import requests
@@ -10,6 +11,7 @@ import websockets
 from datetime import datetime, timezone, timedelta
 
 import config
+from mm.runtime_metrics import runtime_metrics
 
 
 class State:
@@ -61,9 +63,18 @@ OB_POLL_INTERVAL = 2
 BINANCE_OB_IDLE_RECONNECT_SEC = 12.0
 BINANCE_WS_IDLE_RECONNECT_SEC = 20.0
 PM_WS_IDLE_RECONNECT_SEC = 30.0
-PM_WS_PROCESS_MIN_INTERVAL_SEC = 0.05
+BINANCE_OB_PROCESS_MIN_INTERVAL_SEC = max(
+    0.01,
+    float(os.environ.get("BINANCE_OB_PROCESS_MIN_INTERVAL_SEC", "0.05")),
+)
+PM_WS_PROCESS_MIN_INTERVAL_SEC = max(
+    0.01,
+    float(os.environ.get("PM_WS_PROCESS_MIN_INTERVAL_SEC", "0.20")),
+)
 BINANCE_TRADE_MIN_INTERVAL_SEC = 0.05
 BINANCE_ENDPOINT_CACHE_TTL_SEC = 300.0
+BINANCE_WS_MAX_QUEUE = max(1, int(os.environ.get("BINANCE_WS_MAX_QUEUE", "128")))
+PM_WS_MAX_QUEUE = max(1, int(os.environ.get("PM_WS_MAX_QUEUE", "64")))
 BINANCE_TRADE_STREAM_ENABLED = os.environ.get(
     "BINANCE_TRADE_STREAM_ENABLED", "0"
 ).lower() in ("1", "true", "yes", "on")
@@ -169,6 +180,9 @@ async def ob_poller(symbol: str, state: State):
                     reconnect_delay = 1
                     state.binance_ob_connected = True
                     state.binance_ob_connected_at = time.time()
+                    msg_since_yield = 0
+                    dropped_since_yield = 0
+                    last_processed_ts = 0.0
 
                     while True:
                         try:
@@ -182,11 +196,27 @@ async def ob_poller(symbol: str, state: State):
                             ) from e
 
                         if msg.type == aiohttp.WSMsgType.TEXT:
+                            runtime_metrics.incr("feeds.binance_ob.msg_recv")
+                            now = time.time()
+                            msg_since_yield += 1
+                            if msg_since_yield >= 200:
+                                msg_since_yield = 0
+                                await asyncio.sleep(0)
+                            if (now - last_processed_ts) < BINANCE_OB_PROCESS_MIN_INTERVAL_SEC:
+                                runtime_metrics.incr("feeds.binance_ob.msg_drop")
+                                dropped_since_yield += 1
+                                if dropped_since_yield >= 200:
+                                    dropped_since_yield = 0
+                                    await asyncio.sleep(0)
+                                continue
+                            dropped_since_yield = 0
                             data = json.loads(msg.data)
                             bids_raw = data.get("bids") or data.get("b") or []
                             asks_raw = data.get("asks") or data.get("a") or []
                             if bids_raw and asks_raw:
                                 await _apply_depth(bids_raw, asks_raw)
+                                runtime_metrics.incr("feeds.binance_ob.msg_process")
+                                last_processed_ts = now
                         elif msg.type in (
                             aiohttp.WSMsgType.CLOSE,
                             aiohttp.WSMsgType.CLOSING,
@@ -198,6 +228,7 @@ async def ob_poller(symbol: str, state: State):
             state.binance_ob_connected = False
             raise
         except Exception as e:
+            runtime_metrics.incr("feeds.binance_ob.error")
             state.binance_ob_error_count += 1
             state.binance_ob_connected = False
             delay = reconnect_delay or OB_POLL_INTERVAL
@@ -223,7 +254,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                 ping_interval=20,
                 ping_timeout=60,
                 close_timeout=10,
-                max_queue=256,
+                max_queue=BINANCE_WS_MAX_QUEUE,
             ) as ws:
                 state.binance_ws_connected = True
                 state.binance_ws_connected_at = time.time()
@@ -233,12 +264,14 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                 else:
                     print(f"  [Binance WS] connected – {symbol} (kline-only)")
                 msg_since_yield = 0
+                dropped_trade_since_yield = 0
 
                 while True:
                     raw = await asyncio.wait_for(
                         ws.recv(),
                         timeout=BINANCE_WS_IDLE_RECONNECT_SEC,
                     )
+                    runtime_metrics.incr("feeds.binance_ws.msg_recv")
                     data = json.loads(raw)
                     stream = data.get("stream", "")
                     pay = data["data"]
@@ -257,8 +290,13 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                             state.mid = trade_price
                         # Downsample ultra-fast trade stream to avoid CPU saturation.
                         if (ts - state.binance_last_trade_sample_ts) < BINANCE_TRADE_MIN_INTERVAL_SEC:
-                            await asyncio.sleep(0)
+                            runtime_metrics.incr("feeds.binance_ws.trade_drop")
+                            dropped_trade_since_yield += 1
+                            if dropped_trade_since_yield >= 200:
+                                dropped_trade_since_yield = 0
+                                await asyncio.sleep(0)
                             continue
+                        dropped_trade_since_yield = 0
                         state.binance_last_trade_sample_ts = ts
                         state.trades.append({
                             "t": ts,
@@ -266,6 +304,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                             "qty": float(pay["q"]),
                             "is_buy": not pay["m"],
                         })
+                        runtime_metrics.incr("feeds.binance_ws.trade_process")
 
                     elif "@kline" in stream:
                         k = pay["k"]
@@ -276,6 +315,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                             "v": float(k["v"]),
                         }
                         state.cur_kline = candle
+                        runtime_metrics.incr("feeds.binance_ws.kline_process")
                         if k["x"]:
                             state.klines.append(candle)
                             state.klines = state.klines[-config.KLINE_MAX:]
@@ -284,6 +324,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
             state.binance_ws_connected = False
             raise
         except websockets.exceptions.ConnectionClosed as e:
+            runtime_metrics.incr("feeds.binance_ws.error")
             state.binance_ws_error_count += 1
             state.binance_ws_connected = False
             delay = reconnect_delay
@@ -291,6 +332,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
             await asyncio.sleep(delay)
             reconnect_delay = min(max(delay * 2, 1), 10)
         except asyncio.TimeoutError:
+            runtime_metrics.incr("feeds.binance_ws.error")
             state.binance_ws_error_count += 1
             state.binance_ws_connected = False
             delay = reconnect_delay
@@ -301,6 +343,7 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
             await asyncio.sleep(delay)
             reconnect_delay = min(max(delay * 2, 1), 10)
         except Exception as e:
+            runtime_metrics.incr("feeds.binance_ws.error")
             state.binance_ws_error_count += 1
             state.binance_ws_connected = False
             delay = reconnect_delay
@@ -406,14 +449,46 @@ def fetch_pm_event_data(coin: str, tf: str) -> dict | None:
     if slug is None:
         return None
     try:
-        data = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 1}, timeout=5).json()
-        if not data or data[0].get("ticker") != slug:
-            print(f"  [PM] no active market for slug: {slug}")
-            return None
-        return data[0]
+        resp = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 1}, timeout=5)
+        data = resp.json()
+        if isinstance(data, list) and data and data[0].get("ticker") == slug:
+            return data[0]
     except Exception as e:
-        print(f"  [PM] event fetch failed ({slug}): {e}")
-        return None
+        print(f"  [PM] gamma event fetch failed ({slug}): {e}")
+
+    # Fallback: CLOB active sampling markets (Gamma REST can be unavailable/blocked).
+    try:
+        sm_resp = requests.get("https://clob.polymarket.com/sampling-markets", timeout=8)
+        sm_data = sm_resp.json()
+        markets = sm_data.get("data", []) if isinstance(sm_data, dict) else []
+        if not isinstance(markets, list):
+            markets = []
+
+        for m in markets:
+            if isinstance(m, dict) and m.get("market_slug") == slug:
+                return m
+
+        prefix = f"{config.COIN_PM[coin]}-updown-{tf}-"
+        candidates = [
+            m for m in markets
+            if isinstance(m, dict) and str(m.get("market_slug", "")).startswith(prefix)
+        ]
+        if candidates:
+            def _slug_ts(m: dict) -> int:
+                ms = str(m.get("market_slug", ""))
+                mat = re.search(r"-(\d{9,12})$", ms)
+                return int(mat.group(1)) if mat else 0
+
+            best = max(candidates, key=_slug_ts)
+            print(
+                f"  [PM] slug miss ({slug}); using nearest active market {best.get('market_slug')}"
+            )
+            return best
+    except Exception as e:
+        print(f"  [PM] sampling-markets fallback failed ({slug}): {e}")
+
+    print(f"  [PM] no active market for slug: {slug}")
+    return None
 
 
 def fetch_pm_tokens(coin: str, tf: str) -> tuple:
@@ -427,10 +502,45 @@ def fetch_pm_tokens(coin: str, tf: str) -> tuple:
     if event_data is None:
         return None, None, None
     try:
-        market = event_data["markets"][0]
-        ids = json.loads(market["clobTokenIds"])
-        condition_id = market.get("conditionId", "")
-        return ids[0], ids[1], condition_id
+        # Gamma legacy shape.
+        if "markets" in event_data:
+            market = event_data["markets"][0]
+            ids = json.loads(market["clobTokenIds"])
+            condition_id = market.get("conditionId", "")
+            return ids[0], ids[1], condition_id
+
+        # CLOB sampling-markets shape.
+        tokens = event_data.get("tokens", [])
+        if not isinstance(tokens, list) or len(tokens) < 2:
+            raise ValueError("sampling market has no token pair")
+
+        up_id: str | None = None
+        dn_id: str | None = None
+        for t in tokens:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("token_id", "")).strip()
+            outcome = str(t.get("outcome", "")).strip().lower()
+            if not tid:
+                continue
+            if outcome in ("yes", "up", "above", "higher"):
+                up_id = tid
+            elif outcome in ("no", "down", "below", "lower"):
+                dn_id = tid
+
+        if not up_id:
+            up_id = str(tokens[0].get("token_id", "")).strip()
+        if not dn_id:
+            dn_id = str(tokens[1].get("token_id", "")).strip()
+        if not up_id or not dn_id:
+            raise ValueError("sampling market token ids missing")
+
+        condition_id = (
+            event_data.get("condition_id")
+            or event_data.get("conditionId")
+            or ""
+        )
+        return up_id, dn_id, condition_id
     except Exception as e:
         print(f"  [PM] token extraction failed: {e}")
         return None, None, None
@@ -468,7 +578,12 @@ def _fetch_pm_strike_once(coin: str, tf: str) -> tuple[float, float, float]:
     try:
         from datetime import datetime, timezone, timedelta
 
-        end_date_str = event_data.get("endDate", "")
+        end_date_str = (
+            event_data.get("endDate")
+            or event_data.get("end_date_iso")
+            or event_data.get("endDateIso")
+            or ""
+        )
         if not end_date_str:
             return 0.0, 0, 0
 
@@ -588,7 +703,7 @@ async def pm_feed(state: State):
                 ping_timeout=30,
                 close_timeout=5,
                 open_timeout=15,
-                max_queue=256,
+                max_queue=PM_WS_MAX_QUEUE,
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                 print(
@@ -601,6 +716,7 @@ async def pm_feed(state: State):
                 reconnect_delay = 1
                 last_msg_ts = time.time()
                 msg_since_yield = 0
+                dropped_burst_since_yield = 0
 
                 while True:
                     # Check if trading_loop requested reconnect (new window = new tokens)
@@ -612,6 +728,7 @@ async def pm_feed(state: State):
 
                     try:
                         raw_msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        runtime_metrics.incr("feeds.pm.msg_recv")
                         now = time.time()
                         state.pm_msg_count += 1
                         last_msg_ts = now
@@ -623,11 +740,18 @@ async def pm_feed(state: State):
                         # Coalesce PM bursts: process at most ~20Hz and drop
                         # intermediate updates under heavy flow to keep API responsive.
                         if (now - _last_processed_ts) < PM_WS_PROCESS_MIN_INTERVAL_SEC:
-                            # Yield when dropping bursts so API handlers stay responsive.
-                            await asyncio.sleep(0)
+                            runtime_metrics.incr("feeds.pm.msg_drop")
+                            dropped_burst_since_yield += 1
+                            if dropped_burst_since_yield >= 200:
+                                # Yield periodically under heavy burst drops without
+                                # allocating a sleep coroutine for every skipped frame.
+                                dropped_burst_since_yield = 0
+                                await asyncio.sleep(0)
                             continue
 
+                        dropped_burst_since_yield = 0
                         raw = json.loads(raw_msg)
+                        runtime_metrics.incr("feeds.pm.msg_process")
                         _last_processed_ts = now
 
                         # Throttled debug log: show message stats every 60s
@@ -675,6 +799,7 @@ async def pm_feed(state: State):
                         continue
 
                     except websockets.exceptions.ConnectionClosed:
+                        runtime_metrics.incr("feeds.pm.error")
                         state.pm_error_count += 1
                         print(f"  [PM] connection closed after {state.pm_msg_count} msgs, reconnecting...")
                         state.pm_connected = False
@@ -684,6 +809,7 @@ async def pm_feed(state: State):
             state.pm_connected = False
             raise
         except Exception as e:
+            runtime_metrics.incr("feeds.pm.error")
             state.pm_error_count += 1
             delay = reconnect_delay
             print(f"  [PM] connection error: {e}, reconnecting in {delay}s...")

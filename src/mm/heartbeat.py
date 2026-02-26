@@ -97,6 +97,19 @@ class HeartbeatManager:
         )
         return m.group(1) if m else None
 
+    @staticmethod
+    def _extract_heartbeat_id_from_response(payload: Any) -> str | None:
+        """Best-effort heartbeat_id extraction from successful PM response."""
+        if not isinstance(payload, dict):
+            return None
+        candidate = payload.get("heartbeat_id") or payload.get("heartbeatId")
+        if not isinstance(candidate, str):
+            return None
+        hb_id = candidate.strip()
+        if len(hb_id) < 32:
+            return None
+        return hb_id
+
     async def _send_heartbeat(self) -> bool:
         """Send a single heartbeat.
 
@@ -105,12 +118,17 @@ class HeartbeatManager:
         """
         try:
             is_mock = hasattr(self.client, '_orders')
+            resp = None
             if is_mock:
-                await asyncio.to_thread(self.client.post_heartbeat)
+                resp = await asyncio.to_thread(self.client.post_heartbeat)
             else:
-                await asyncio.to_thread(
+                resp = await asyncio.to_thread(
                     self.client.post_heartbeat, self._heartbeat_id
                 )
+            new_hb = self._extract_heartbeat_id_from_response(resp)
+            if new_hb and new_hb != self._heartbeat_id:
+                self._heartbeat_id = new_hb
+                self._id_refresh_count += 1
             self._last_heartbeat = time.time()
             self._heartbeat_count += 1
             self._consecutive_failures = 0
@@ -134,16 +152,20 @@ class HeartbeatManager:
                 # Immediately retry with the new ID
                 try:
                     is_mock = hasattr(self.client, '_orders')
+                    retry_resp = None
                     if is_mock:
-                        await asyncio.to_thread(self.client.post_heartbeat)
+                        retry_resp = await asyncio.to_thread(self.client.post_heartbeat)
                     else:
-                        await asyncio.to_thread(
+                        retry_resp = await asyncio.to_thread(
                             self.client.post_heartbeat, self._heartbeat_id
                         )
+                    retry_hb = self._extract_heartbeat_id_from_response(retry_resp)
+                    if retry_hb and retry_hb != self._heartbeat_id:
+                        self._heartbeat_id = retry_hb
+                        self._id_refresh_count += 1
                     self._last_heartbeat = time.time()
                     self._heartbeat_count += 1
                     self._consecutive_failures = 0
-                    self._id_refresh_count += 1
                     return True
                 except Exception as retry_err:
                     log.warning("Heartbeat retry with new ID also failed: %s", retry_err)

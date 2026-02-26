@@ -34,6 +34,7 @@ from .market_quality import MarketQualityAnalyzer, MarketQuality
 from .markout_tca import MarkoutTracker
 from .pnl_decomposition import PnLDecomposition
 from .event_requote import EventRequoter
+from .runtime_metrics import runtime_metrics
 
 log = logging.getLogger("mm.engine")
 BINANCE_FEED_STALE_SEC = 15.0
@@ -219,6 +220,9 @@ class MarketMaker:
         self._reconcile_prev_pm: tuple[float, float] | None = None
         self._reconcile_stable_count: int = 0
         self._reconcile_guard_until: float = 0.0
+        self._critical_drift_pause_active: bool = False
+        self._critical_drift_recovery_streak: int = 0
+        self._critical_drift_recovery_required: int = 2
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
         self.sre_metrics = SREMetrics()
@@ -317,6 +321,45 @@ class MarketMaker:
             return False
         return True
 
+    def _critical_drift_threshold(self) -> float:
+        return max(
+            0.5,
+            float(getattr(self.config, "critical_reconcile_drift_shares", 1.5) or 1.5),
+        )
+
+    def _update_critical_drift_recovery(self, *, real_up: float, real_dn: float, source: str) -> None:
+        """Keep MM paused until drift stays reconciled across multiple checks."""
+        if not self._critical_drift_pause_active:
+            return
+
+        clear_threshold = max(0.25, 0.25 * self._critical_drift_threshold())
+        up_diff = abs(float(self.inventory.up_shares) - float(real_up))
+        dn_diff = abs(float(self.inventory.dn_shares) - float(real_dn))
+        if up_diff <= clear_threshold and dn_diff <= clear_threshold:
+            self._critical_drift_recovery_streak += 1
+            if self._critical_drift_recovery_streak >= self._critical_drift_recovery_required:
+                self._critical_drift_pause_active = False
+                self._critical_drift_recovery_streak = 0
+                if self._paused and self._pause_reason.startswith("Critical inventory drift"):
+                    self._paused = False
+                    self._pause_reason = ""
+                log.warning(
+                    "Critical drift pause cleared (%s): UP diff=%.3f DN diff=%.3f",
+                    source,
+                    up_diff,
+                    dn_diff,
+                )
+            return
+
+        if self._critical_drift_recovery_streak:
+            log.warning(
+                "Critical drift still unstable (%s): UP diff=%.3f DN diff=%.3f (reset recovery streak)",
+                source,
+                up_diff,
+                dn_diff,
+            )
+        self._critical_drift_recovery_streak = 0
+
     async def _handle_critical_inventory_drift(
         self,
         *,
@@ -324,36 +367,36 @@ class MarketMaker:
         real_dn: float,
         source: str,
     ) -> bool:
-        """Hard-stop when internal inventory overstates real PM balances.
+        """Hard-stop when internal inventory diverges materially from PM balances.
 
-        This prevents accidental naked SELLs when local state diverges from wallet reality.
+        This prevents trading decisions on stale state in both directions
+        (internal > PM and internal < PM).
         Returns True when emergency drift handling was applied and tick should abort.
         """
-        threshold = max(
-            0.5,
-            float(getattr(self.config, "critical_reconcile_drift_shares", 1.5) or 1.5),
-        )
-        up_excess = max(0.0, float(self.inventory.up_shares) - float(real_up))
-        dn_excess = max(0.0, float(self.inventory.dn_shares) - float(real_dn))
-        if up_excess < threshold and dn_excess < threshold:
+        threshold = self._critical_drift_threshold()
+        up_diff = abs(float(self.inventory.up_shares) - float(real_up))
+        dn_diff = abs(float(self.inventory.dn_shares) - float(real_dn))
+        if up_diff < threshold and dn_diff < threshold:
             return False
 
         log.error(
             "CRITICAL inventory drift (%s): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f "
-            "(excess up=%.2f dn=%.2f, threshold=%.2f)",
+            "(abs_diff up=%.2f dn=%.2f, threshold=%.2f)",
             source,
             self.inventory.up_shares,
             self.inventory.dn_shares,
             real_up,
             real_dn,
-            up_excess,
-            dn_excess,
+            up_diff,
+            dn_diff,
             threshold,
         )
+        self._critical_drift_pause_active = True
+        self._critical_drift_recovery_streak = 0
         self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
-        self._arm_reconcile_guard(up_excess, dn_excess, f"critical-{source}")
+        self._arm_reconcile_guard(up_diff, dn_diff, f"critical-{source}")
         self._paused = True
-        self._pause_reason = "Critical inventory drift: local state > PM wallet"
+        self._pause_reason = "Critical inventory drift: waiting for full reconcile"
         await self._cancel_all_guarded()
         self._current_quotes = {"up": (None, None), "dn": (None, None)}
         self._one_sided_counter = 0
@@ -911,6 +954,25 @@ class MarketMaker:
                 ),
             )
             preexisting_exposure = _token_value + reserved_collateral
+            flat_start_enabled = bool(getattr(self.config, "require_flat_start", True))
+            flat_start_max_shares = max(
+                0.0,
+                float(getattr(self.config, "flat_start_max_shares", 0.25) or 0.25),
+            )
+            if flat_start_enabled and (
+                self._cached_pm_up_shares > flat_start_max_shares
+                or self._cached_pm_dn_shares > flat_start_max_shares
+            ):
+                raise StartBlockedError(
+                    "Start blocked: non-flat wallet inventory detected "
+                    "(UP=%.2f DN=%.2f, allowed<=%.2f). "
+                    "Close/merge/redeem positions before starting or disable require_flat_start."
+                    % (
+                        self._cached_pm_up_shares,
+                        self._cached_pm_dn_shares,
+                        flat_start_max_shares,
+                    )
+                )
             if session_budget > 0 and preexisting_exposure > (session_budget + 0.01):
                 raise StartBlockedError(
                     "Start blocked: pre-existing exposure $%.2f (tokens=$%.2f reserved=$%.2f) "
@@ -966,6 +1028,8 @@ class MarketMaker:
         self._catastrophic_count = 0
         self._paused = False
         self._pause_reason = ""
+        self._critical_drift_pause_active = False
+        self._critical_drift_recovery_streak = 0
         self._heartbeat_failure_task = None
         self._tick_count = 0
         self._merge_check_counter = 0
@@ -1043,19 +1107,24 @@ class MarketMaker:
 
     async def stop(self, liquidate: bool = True) -> None:
         """Graceful shutdown: liquidate inventory, cancel orders, stop heartbeat."""
-        if not self._running:
+        if not self._running and not liquidate:
             return
 
+        was_running = self._running
         self._running = False
-        log.info("MarketMaker stopping...")
+        if was_running:
+            log.info("MarketMaker stopping...")
+        else:
+            log.info("MarketMaker stop requested while loop already stopped — cleanup continues")
 
         # Cancel main loop
-        if self._task:
+        if self._task and not self._task.done():
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        self._task = None
 
         # Cancel all orders first
         cancelled = await self._cancel_all_guarded()
@@ -1090,18 +1159,27 @@ class MarketMaker:
         log.info("Quote loop started")
         try:
             while self._running:
+                runtime_metrics.incr("mm.run_loop.iter")
                 loop_started_at = time.monotonic()
                 try:
                     try:
                         tick_timeout = 15.0 if self._is_closing else 10.0
+                        tick_started_at = time.monotonic()
                         await asyncio.wait_for(self._tick(), timeout=tick_timeout)
+                        runtime_metrics.incr("mm.run_loop.tick_ok")
+                        runtime_metrics.observe_ms(
+                            "mm.run_loop.tick_duration_ms",
+                            (time.monotonic() - tick_started_at) * 1000.0,
+                        )
                     except asyncio.TimeoutError:
+                        runtime_metrics.incr("mm.run_loop.tick_timeout")
                         self.sre_metrics.record_tick_timeout()
                         self._log.warning("_tick() timed out after %.0fs, skipping iteration",
                                           15.0 if self._is_closing else 10.0)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
+                    runtime_metrics.incr("mm.run_loop.error")
                     log.error(f"Tick error: {e}", exc_info=True)
 
                 # Closing mode does not need event-driven requote bursts.
@@ -1337,6 +1415,15 @@ class MarketMaker:
                     self._reconcile_stable_count = 0
                     self._reconcile_prev_pm = None
                     self.order_mgr.clear_reconcile_request()
+                    return
+                self._update_critical_drift_recovery(
+                    real_up=real_up,
+                    real_dn=real_dn,
+                    source="periodic_reconcile",
+                )
+                if self._critical_drift_pause_active:
+                    self.order_mgr.clear_reconcile_request()
+                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
                     return
                 if reconcile_requested:
                     forced_up_diff = abs(real_up - self.inventory.up_shares)
@@ -1708,7 +1795,12 @@ class MarketMaker:
             await self._cancel_all_guarded()
             log.warning(f"MM PAUSED: {reason}")
             return
-        elif not should_pause and self._paused and not self._quality_pause_active:
+        elif (
+            not should_pause
+            and self._paused
+            and not self._quality_pause_active
+            and not self._critical_drift_pause_active
+        ):
             self._paused = False
             self._pause_reason = ""
             log.info("MM RESUMED")
@@ -2001,7 +2093,11 @@ class MarketMaker:
 
         self._taker_quotes = []
         taker_lagging_key: str | None = None
-        if lagging_token and self._imbalance_adjustments.get("force_taker_lagging", False):
+        if (
+            lagging_token
+            and self._imbalance_adjustments.get("force_taker_lagging", False)
+            and not bool(getattr(self.config, "use_post_only", True))
+        ):
             lag_bid, _ = all_quotes[lagging_token]
             if lag_bid is not None:
                 self._taker_quotes.append(lag_bid)
@@ -2305,6 +2401,14 @@ class MarketMaker:
                         real_dn=real_dn,
                         source="post_order_refresh",
                     ):
+                        return
+                    self._update_critical_drift_recovery(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="post_order_refresh",
+                    )
+                    if self._critical_drift_pause_active:
+                        self._current_quotes = {"up": (None, None), "dn": (None, None)}
                         return
             except Exception as e:
                 log.warning("Post-order balance refresh failed: %s", e)
@@ -2636,8 +2740,14 @@ class MarketMaker:
         # 5. Pre-flight: ensure allowance (one-time, cached)
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live:
-            await self.order_mgr.ensure_sell_allowance(self.market.up_token_id)
-            await self.order_mgr.ensure_sell_allowance(self.market.dn_token_id)
+            await self.order_mgr.ensure_sell_allowance(
+                self.market.up_token_id,
+                required_shares=max(0.0, float(up_bal)),
+            )
+            await self.order_mgr.ensure_sell_allowance(
+                self.market.dn_token_id,
+                required_shares=max(0.0, float(dn_bal)),
+            )
 
         # 6. Compute fair values for pricing
         fv_up, fv_dn = self._compute_fv()
@@ -2826,7 +2936,7 @@ class MarketMaker:
                 size=sell_size,
                 token_id=token_id,
             )
-            order_id = await self._place_order_guarded(sell_quote, post_only=post_only, fallback_taker=True)
+            order_id = await self._place_order_guarded(sell_quote, post_only=post_only, fallback_taker=False)
             if order_id:
                 self._liquidation_order_ids.add(order_id)
                 placed_any = True
@@ -2995,6 +3105,8 @@ class MarketMaker:
         self._reconcile_prev_pm = None
         self._reconcile_stable_count = 0
         self._reconcile_guard_until = 0.0
+        self._critical_drift_pause_active = False
+        self._critical_drift_recovery_streak = 0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0

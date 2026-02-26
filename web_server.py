@@ -16,6 +16,7 @@ import sys
 import time
 import logging
 import math
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +37,7 @@ from mm.types import MarketInfo, Inventory
 from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
 from mm.market_selector import MarketSelector
+from mm.runtime_metrics import runtime_metrics
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
 from version import __version__ as APP_VERSION, git_hash as _git_hash_fn
@@ -184,6 +186,9 @@ class ConfigUpdateRequest(BaseModel):
     max_loss_per_fill_usd: Optional[float] = Field(default=None)
     take_profit_usd: Optional[float] = Field(default=None)
     trailing_stop_pct: Optional[float] = Field(default=None)
+    critical_reconcile_drift_shares: Optional[float] = None
+    require_flat_start: Optional[bool] = None
+    flat_start_max_shares: Optional[float] = None
     max_one_sided_ticks: Optional[int] = None
     close_window_sec: Optional[float] = None
     auto_next_window: Optional[bool] = None
@@ -240,6 +245,8 @@ class ConfigUpdateRequest(BaseModel):
         "max_loss_per_fill_usd",
         "take_profit_usd",
         "trailing_stop_pct",
+        "critical_reconcile_drift_shares",
+        "flat_start_max_shares",
         "close_window_sec",
         "resolution_wait_sec",
         "liq_chunk_interval_sec",
@@ -639,6 +646,7 @@ class MMRuntime:
         self._last_good_tick_size: float = 0.01
         self._last_good_min_order_size: float = 5.0
         self._last_market_selection: dict[str, Any] | None = None
+        self._alerts: dict[str, dict[str, Any]] = {}
 
     @property
     def is_running(self) -> bool:
@@ -665,6 +673,23 @@ class MMRuntime:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    def set_alert(self, source: str, message: str, level: str = "warning") -> None:
+        """Set/update a dashboard-visible runtime alert by source key."""
+        self._alerts[source] = {
+            "source": source,
+            "level": level,
+            "message": message,
+            "ts": time.time(),
+        }
+
+    def clear_alert(self, source: str) -> None:
+        self._alerts.pop(source, None)
+
+    def list_alerts(self) -> list[dict[str, Any]]:
+        alerts = list(self._alerts.values())
+        alerts.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
+        return alerts
 
     async def _fetch_public_book_metrics(self, token_id: str) -> dict[str, float]:
         """Fetch best bid/ask and coarse depth from public PM orderbook."""
@@ -1105,10 +1130,19 @@ class MMRuntime:
                     timeout=45.0,
                 )
             else:
-                log.warning("PM tokens not found, using placeholder")
+                msg = "PM tokens not found for current window"
+                if not paper_mode:
+                    log.error("%s — refusing live start", msg)
+                    await self._stop_feed_tasks()
+                    raise HTTPException(status_code=503, detail=msg)
+                log.warning("%s, using placeholder", msg)
                 self._strike_invalid = False
                 market = self._build_placeholder_market(coin, timeframe)
         except Exception as e:
+            if not paper_mode:
+                log.error("PM token fetch failed in live mode: %s", e)
+                await self._stop_feed_tasks()
+                raise HTTPException(status_code=503, detail=f"PM token fetch failed: {e}")
             log.warning(f"PM token fetch failed: {e}")
             self._strike_invalid = False
             market = self._build_placeholder_market(coin, timeframe)
@@ -1365,7 +1399,6 @@ class MMRuntime:
 
     async def stop(self) -> dict:
         """Stop market maker and feeds."""
-        snap = self.snapshot()
         await self._cancel_strike_retry_task()
         self._strike_invalid = False
 
@@ -1387,7 +1420,7 @@ class MMRuntime:
 
         self._running = False
         log.info("MM stopped")
-        return snap
+        return self.snapshot()
 
     def snapshot(self) -> dict:
         """Get current state for API."""
@@ -1404,6 +1437,9 @@ class MMRuntime:
             snap["feeds"] = self._build_feeds_dict()
             snap["app_version"] = APP_VERSION
             snap["app_git_hash"] = APP_GIT_HASH
+            snap["alerts"] = self.list_alerts()
+            if "_tg_bot" in globals():
+                snap["telegram_bot"] = _tg_bot.status
             if self._last_market_selection:
                 snap["market_selector"] = self._last_market_selection
             return snap
@@ -1423,6 +1459,9 @@ class MMRuntime:
         result["feeds"] = self._build_feeds_dict()
         result["app_version"] = APP_VERSION
         result["app_git_hash"] = APP_GIT_HASH
+        result["alerts"] = self.list_alerts()
+        if "_tg_bot" in globals():
+            result["telegram_bot"] = _tg_bot.status
         if self._last_market_selection:
             result["market_selector"] = self._last_market_selection
         if self._watching and self.feed_state:
@@ -1923,10 +1962,15 @@ async def _ws_broadcast_loop():
         await asyncio.sleep(1.0)
 
 # ── Telegram Bot (interactive management) ──────────────────────
+def _on_telegram_conflict(reason: str) -> None:
+    _runtime.set_alert("telegram_conflict", reason, level="warning")
+
+
 _tg_bot = TelegramBotManager(
     notifier=_telegram,
     get_runtime=lambda: _runtime,
     access_key=ACCESS_KEY,
+    on_conflict=_on_telegram_conflict,
 )
 
 
@@ -2114,6 +2158,50 @@ async def get_logs(request: Request, limit: int = 200, level: str = ""):
     return {"logs": entries, "total": len(_log_handler.buffer)}
 
 
+def _task_coro_label(task: asyncio.Task) -> str:
+    """Stable short label for asyncio task grouping in debug endpoints."""
+    try:
+        coro = task.get_coro()
+        qual = getattr(coro, "__qualname__", None) or getattr(coro, "__name__", None) or type(coro).__name__
+        code = getattr(coro, "cr_code", None)
+        if code is not None:
+            return f"{qual} ({Path(code.co_filename).name}:{code.co_firstlineno})"
+        return str(qual)
+    except Exception:
+        return "unknown"
+
+
+@app.get("/api/debug/runtime-metrics")
+async def debug_runtime_metrics(
+    request: Request,
+    reset: bool = False,
+    top_n: int = 50,
+):
+    """Runtime counters/rates + asyncio task breakdown for CPU hot-path debugging."""
+    _require_auth(request)
+    top_n = max(1, min(int(top_n), 500))
+    metrics = runtime_metrics.snapshot(reset=reset, top_n=top_n)
+
+    task_counts: collections.Counter[str] = collections.Counter()
+    try:
+        loop = asyncio.get_running_loop()
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task_counts[_task_coro_label(task)] += 1
+        top_tasks = [
+            {"coro": name, "count": int(cnt)}
+            for name, cnt in task_counts.most_common(top_n)
+        ]
+        metrics["asyncio"] = {
+            "pending_tasks": len(pending),
+            "top_tasks": top_tasks,
+            "threads": threading.active_count(),
+        }
+    except Exception as e:
+        metrics["asyncio"] = {"error": str(e)}
+    return metrics
+
+
 # ── Health ──────────────────────────────────────────────────────
 @app.get("/api/health")
 async def health():
@@ -2185,6 +2273,7 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
     await _runtime.load_config()
+    _runtime.clear_alert("telegram_conflict")
     if _telegram.enabled:
         await _tg_bot.start()
         log.info("Telegram bot polling started")

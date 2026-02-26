@@ -234,6 +234,28 @@ def test_critical_inventory_drift_triggers_pause_and_cancel():
     assert mm.inventory.dn_shares == pytest.approx(0.0)
 
 
+def test_critical_inventory_drift_triggers_when_internal_is_below_pm():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0  # stop after reconcile path
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(9.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    _run_tick_with_reconcile_gate(mm)
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._paused is True
+    assert "Critical inventory drift" in mm._pause_reason
+    assert mm.inventory.up_shares == pytest.approx(9.0)
+    assert mm.inventory.dn_shares == pytest.approx(0.0)
+
+
 def test_toxic_divergence_no_trade_cancels_quotes_when_flat():
     mm = _make_mm(live=True)
     mm._running = True

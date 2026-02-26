@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+import time
+from typing import Any, Callable
+
+from mm.runtime_metrics import runtime_metrics
 
 log = logging.getLogger("tg.bot")
 
@@ -18,13 +21,22 @@ log = logging.getLogger("tg.bot")
 class TelegramBotManager:
     """Interactive Telegram bot with single-message UI."""
 
-    def __init__(self, notifier, get_runtime, access_key: str = ""):
+    def __init__(
+        self,
+        notifier,
+        get_runtime,
+        access_key: str = "",
+        on_conflict: Callable[[str], None] | None = None,
+    ):
         self._tg = notifier
         self._get_runtime = get_runtime
         self._access_key = access_key
+        self._on_conflict = on_conflict
         self._running = False
         self._task: asyncio.Task | None = None
         self._offset: int | None = None
+        self._disabled_reason: str = ""
+        self._disabled_at: float = 0.0
         # Track the live message per chat for edit-in-place
         self._live_msg: dict[int, int] = {}  # chat_id -> message_id
         # Current view per chat: "status" | "settings"
@@ -36,6 +48,14 @@ class TelegramBotManager:
             "mode": "paper",
             "limit": 25.0,
             "dev": True,
+        }
+
+    @property
+    def status(self) -> dict[str, Any]:
+        return {
+            "running": self._running,
+            "disabled_reason": self._disabled_reason,
+            "disabled_at": self._disabled_at,
         }
 
     async def start(self) -> None:
@@ -58,28 +78,44 @@ class TelegramBotManager:
     # ── Poll loop ───────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
-        _backoff = 5.0
         while self._running:
+            runtime_metrics.incr("tg.poll.loop")
             try:
                 updates = await self._tg.get_updates(
                     offset=self._offset, timeout=30,
                 )
-                _backoff = 5.0  # reset on success
+                runtime_metrics.incr("tg.poll.success")
+                if updates:
+                    runtime_metrics.incr("tg.poll.updates", n=len(updates))
                 for upd in updates:
                     self._offset = upd["update_id"] + 1
                     try:
                         await self._handle(upd)
                     except Exception as e:
+                        runtime_metrics.incr("tg.poll.update_error")
                         log.warning("Update error: %s", e)
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                runtime_metrics.incr("tg.poll.error")
                 err_str = str(e)
                 if "409" in err_str or "Conflict" in err_str:
-                    # Another bot instance is polling — back off exponentially
-                    log.warning("Telegram 409 conflict — another instance running, backing off %.0fs", _backoff)
-                    await asyncio.sleep(_backoff)
-                    _backoff = min(_backoff * 2, 300.0)  # max 5 min
+                    runtime_metrics.incr("tg.poll.conflict_409")
+                    self._disabled_reason = (
+                        "Telegram polling disabled: 409 Conflict "
+                        "(another bot instance is using getUpdates)"
+                    )
+                    self._disabled_at = time.time()
+                    self._running = False
+                    # Disable outgoing notifications too; avoid further API pressure.
+                    self._tg.enabled = False
+                    log.error(self._disabled_reason)
+                    if self._on_conflict:
+                        try:
+                            self._on_conflict(self._disabled_reason)
+                        except Exception as cb_err:
+                            log.warning("Telegram conflict callback error: %s", cb_err)
+                    break
                 else:
                     log.warning("Poll error: %s", e)
                     await asyncio.sleep(5.0)

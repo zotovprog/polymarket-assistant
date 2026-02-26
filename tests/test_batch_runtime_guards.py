@@ -128,6 +128,44 @@ class _LiveBatchCaptureClient:
         return {"orders": [{"orderID": "oid-1"} for _ in signed_orders]}
 
 
+class _DummyAssetType:
+    CONDITIONAL = "CONDITIONAL"
+
+
+class _DummyBalanceAllowanceParams:
+    def __init__(self, asset_type=None, token_id=None):
+        self.asset_type = asset_type
+        self.token_id = token_id
+
+
+class _AllowanceClient:
+    def __init__(self):
+        self.get_calls = 0
+        self.update_calls = 0
+
+    def get_balance_allowance(self, _params):
+        self.get_calls += 1
+        return {"allowance": 0, "balance": 5_290_000}
+
+    def update_balance_allowance(self, _params):
+        self.update_calls += 1
+        return {"success": True}
+
+
+class _LateFillClient:
+    """Live-like client for late fill reconciliation on recently cancelled orders."""
+
+    def __init__(self):
+        self.get_order_calls = 0
+
+    def cancel_all(self):
+        return {"success": True}
+
+    def get_order(self, _oid):
+        self.get_order_calls += 1
+        return {"status": "MATCHED", "size_matched": "10", "price": "0.50"}
+
+
 def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
@@ -146,7 +184,7 @@ def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     assert "raw=" in messages
 
 
-def test_place_orders_batch_crosses_book_retries_as_taker(monkeypatch):
+def test_place_orders_batch_crosses_book_stays_maker_only(monkeypatch):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
     monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
@@ -157,9 +195,8 @@ def test_place_orders_batch_crosses_book_retries_as_taker(monkeypatch):
 
     result = asyncio.run(om.place_orders_batch([quote], post_only=True))
 
-    assert result[0] is not None
-    assert result[0].startswith("taker-")
-    assert client.single_post_calls == 1
+    assert result == [None]
+    assert client.single_post_calls == 0
 
 
 def test_place_orders_batch_crosses_book_retry_blocked_by_price_guard(monkeypatch):
@@ -180,6 +217,29 @@ def test_place_orders_batch_crosses_book_retry_blocked_by_price_guard(monkeypatc
 
 
 @pytest.mark.anyio
+async def test_ensure_sell_allowance_uses_cached_cap_for_equal_required_size(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "AssetType", _DummyAssetType, raising=False)
+    monkeypatch.setattr(
+        order_manager_mod,
+        "BalanceAllowanceParams",
+        _DummyBalanceAllowanceParams,
+        raising=False,
+    )
+
+    client = _AllowanceClient()
+    om = order_manager_mod.OrderManager(client, MMConfig())
+
+    ok_first = await om.ensure_sell_allowance("tok_123", required_shares=5.29)
+    ok_second = await om.ensure_sell_allowance("tok_123", required_shares=5.29)
+
+    assert ok_first is True
+    assert ok_second is True
+    assert client.update_calls == 1
+    assert client.get_calls == 1
+
+
+@pytest.mark.anyio
 async def test_place_order_blocks_naked_sell_in_close_only_mode():
     om = order_manager_mod.OrderManager(object(), MMConfig())
     om.ensure_sell_allowance = AsyncMock(return_value=True)
@@ -191,6 +251,21 @@ async def test_place_order_blocks_naked_sell_in_close_only_mode():
 
     assert oid is None
     om._place_order_inner.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_place_order_trims_close_only_sell_to_available_inventory():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=6.567)
+    om._place_order_inner = AsyncMock(return_value="oid-trim")
+
+    quote = Quote(side="SELL", token_id="dn_tok_123", price=0.80, size=8.0)
+    oid = await om.place_order(quote)
+
+    assert oid == "oid-trim"
+    assert quote.size == pytest.approx(6.56)
+    om._place_order_inner.assert_awaited_once()
 
 
 def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):
@@ -208,6 +283,28 @@ def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):
 
     assert result == [None]
     assert client.create_calls == 0
+
+
+@pytest.mark.anyio
+async def test_check_fills_reconciles_late_fill_after_cancel_all():
+    om = order_manager_mod.OrderManager(_LateFillClient(), MMConfig())
+    oid = "oid-late-fill"
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0, order_id=oid)
+    quote.placed_at = 1.0
+    om._active_orders[oid] = quote
+    om._order_post_only[oid] = True
+
+    cancelled = await om.cancel_all()
+    assert cancelled == 1
+    assert oid in om._recent_orders
+    assert oid not in om._active_orders
+
+    fills = await om.check_fills()
+    assert len(fills) == 1
+    assert fills[0].order_id == oid
+    assert fills[0].side == "BUY"
+    assert fills[0].size == pytest.approx(10.0)
+    assert oid not in om._recent_orders
 
 
 @pytest.mark.anyio

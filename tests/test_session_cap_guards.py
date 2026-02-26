@@ -117,6 +117,62 @@ async def test_start_blocks_when_preexisting_exposure_exceeds_session_cap():
     assert mm._running is False
 
 
+@pytest.mark.anyio
+async def test_start_blocks_when_non_flat_inventory_and_flat_guard_enabled():
+    mm = _make_mm()
+    mm.inventory.initial_usdc = 42.0
+    mm.config.require_flat_start = True
+    mm.config.flat_start_max_shares = 0.25
+
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.6, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(42.0, 42.0))
+    mm._refresh_fee_rate_cache = AsyncMock(return_value=None)
+    mm.heartbeat.start = lambda: None
+    mm.order_mgr.set_fill_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_ws_reconnect_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_heartbeat_id_callback = lambda *_args, **_kwargs: None
+
+    async def _noop_run_loop():
+        return None
+
+    mm._run_loop = _noop_run_loop
+
+    with pytest.raises(StartBlockedError, match="non-flat wallet inventory"):
+        await mm.start()
+
+    assert mm._running is False
+
+
+@pytest.mark.anyio
+async def test_start_allows_non_flat_inventory_when_flat_guard_disabled():
+    mm = _make_mm()
+    mm.inventory.initial_usdc = 42.0
+    mm.config.require_flat_start = False
+    mm.config.flat_start_max_shares = 0.25
+
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.6, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(42.0, 42.0))
+    mm._refresh_fee_rate_cache = AsyncMock(return_value=None)
+    mm.heartbeat.start = lambda: None
+    mm.order_mgr.set_fill_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_ws_reconnect_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_heartbeat_id_callback = lambda *_args, **_kwargs: None
+
+    async def _noop_run_loop():
+        return None
+
+    mm._run_loop = _noop_run_loop
+
+    await mm.start()
+    if mm._task:
+        await mm._task
+    mm._running = False
+
+    assert mm.inventory.up_shares == pytest.approx(0.6)
+
+
 def test_session_exposure_cap_suppresses_all_buys_when_cap_is_exhausted():
     mm = _make_mm()
     mm.inventory.initial_usdc = 15.0
