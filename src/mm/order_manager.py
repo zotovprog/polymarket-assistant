@@ -845,7 +845,8 @@ class OrderManager:
 
         # BUY balance pre-check (live only): avoid spamming PM API with 400 errors
         if quote.side == "BUY" and not is_mock:
-            usdc_bal = await self.get_usdc_available_balance()
+            # Force fresh balance read for live BUY pre-check to avoid stale cache overspend windows.
+            usdc_bal = await self.get_usdc_available_balance(force_refresh=True)
             if usdc_bal is None:
                 log.warning("BUY pre-check skipped: failed to fetch USDC balance")
             else:
@@ -919,7 +920,8 @@ class OrderManager:
             short_collateral = short_size * (1.0 - quote.price)
 
             if short_collateral > 0.01:
-                usdc_bal = await self.get_usdc_available_balance()
+                # Force fresh balance read for live short-collateral check.
+                usdc_bal = await self.get_usdc_available_balance(force_refresh=True)
                 if usdc_bal is None:
                     log.warning("SELL pre-check skipped: failed to fetch USDC balance")
                 elif usdc_bal < short_collateral:
@@ -1347,10 +1349,16 @@ class OrderManager:
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
             return None
 
-    async def get_usdc_balances(self) -> tuple[Optional[float], Optional[float]]:
+    async def get_usdc_balances(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> tuple[Optional[float], Optional[float]]:
         """Fetch real USDC balances on Polymarket: (total, available)."""
         now = time.time()
         if (
+            not force_refresh
+            and
             self._usdc_balance_cache is not None
             and self._usdc_available_cache is not None
             and (now - self._usdc_balance_cache_ts) < self._usdc_cache_ttl
@@ -1386,14 +1394,14 @@ class OrderManager:
             log.warning(f"Failed to fetch USDC balance: {e}")
             return None, None
 
-    async def get_usdc_balance(self) -> Optional[float]:
+    async def get_usdc_balance(self, *, force_refresh: bool = False) -> Optional[float]:
         """Fetch total USDC collateral balance on Polymarket."""
-        total, _available = await self.get_usdc_balances()
+        total, _available = await self.get_usdc_balances(force_refresh=force_refresh)
         return total
 
-    async def get_usdc_available_balance(self) -> Optional[float]:
+    async def get_usdc_available_balance(self, *, force_refresh: bool = False) -> Optional[float]:
         """Fetch available/free USDC balance on Polymarket."""
-        _total, available = await self.get_usdc_balances()
+        _total, available = await self.get_usdc_balances(force_refresh=force_refresh)
         return available
 
     def invalidate_usdc_cache(self) -> None:
@@ -1559,7 +1567,11 @@ class OrderManager:
         log.info("Fill WS: connecting to %s", url)
         while self._fill_ws_running:
             try:
-                async with websockets.connect(url, ping_interval=10) as ws:
+                async with websockets.connect(
+                    url,
+                    ping_interval=10,
+                    max_queue=256,
+                ) as ws:
                     auth = {}
                     if api_key:
                         auth = {
@@ -1574,8 +1586,13 @@ class OrderManager:
                     }
                     await ws.send(json.dumps(sub_msg))
                     log.info("Fill WS: subscribed to user channel")
+                    msg_since_yield = 0
 
                     async for raw in ws:
+                        msg_since_yield += 1
+                        if msg_since_yield >= 200:
+                            msg_since_yield = 0
+                            await asyncio.sleep(0)
                         try:
                             msg = json.loads(raw)
                             event_type = msg.get("event_type", "")

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import time
+from collections import deque
+import os
 
 import aiohttp
 import requests
@@ -16,7 +18,7 @@ class State:
         self.asks: list[tuple[float, float]] = []
         self.mid: float = 0.0
 
-        self.trades: list[dict] = []
+        self.trades = deque(maxlen=5000)
 
         self.klines: list[dict] = []
         self.cur_kline: dict | None = None
@@ -45,6 +47,7 @@ class State:
         self.binance_ws_connected_at: float = 0.0
         self.binance_ws_last_ok_ts: float = 0.0
         self.binance_ob_connected_at: float = 0.0
+        self.binance_last_trade_sample_ts: float = 0.0
 
         self.binance_ob_msg_count: int = 0
         self.binance_ob_error_count: int = 0
@@ -58,6 +61,15 @@ OB_POLL_INTERVAL = 2
 BINANCE_OB_IDLE_RECONNECT_SEC = 12.0
 BINANCE_WS_IDLE_RECONNECT_SEC = 20.0
 PM_WS_IDLE_RECONNECT_SEC = 30.0
+PM_WS_PROCESS_MIN_INTERVAL_SEC = 0.05
+BINANCE_TRADE_MIN_INTERVAL_SEC = 0.05
+BINANCE_ENDPOINT_CACHE_TTL_SEC = 300.0
+BINANCE_TRADE_STREAM_ENABLED = os.environ.get(
+    "BINANCE_TRADE_STREAM_ENABLED", "0"
+).lower() in ("1", "true", "yes", "on")
+
+_binance_rest_cache: tuple[str, float] | None = None
+_binance_ws_cache: tuple[str, float] | None = None
 
 
 def _fetch_binance_depth(url: str, symbol: str) -> dict:
@@ -91,8 +103,38 @@ def _pick_binance_ws() -> str:
     return config.BINANCE_WS_FALLBACK
 
 
+async def _pick_binance_rest_async(force_refresh: bool = False) -> str:
+    """Resolve Binance REST endpoint without blocking event loop."""
+    global _binance_rest_cache
+    now = time.time()
+    if (
+        not force_refresh
+        and _binance_rest_cache
+        and (now - _binance_rest_cache[1]) < BINANCE_ENDPOINT_CACHE_TTL_SEC
+    ):
+        return _binance_rest_cache[0]
+    rest = await asyncio.to_thread(_pick_binance_rest)
+    _binance_rest_cache = (rest, now)
+    return rest
+
+
+async def _pick_binance_ws_async(force_refresh: bool = False) -> str:
+    """Resolve Binance WS endpoint without blocking event loop."""
+    global _binance_ws_cache
+    now = time.time()
+    if (
+        not force_refresh
+        and _binance_ws_cache
+        and (now - _binance_ws_cache[1]) < BINANCE_ENDPOINT_CACHE_TTL_SEC
+    ):
+        return _binance_ws_cache[0]
+    ws_base = await asyncio.to_thread(_pick_binance_ws)
+    _binance_ws_cache = (ws_base, now)
+    return ws_base
+
+
 async def ob_poller(symbol: str, state: State):
-    binance_rest = _pick_binance_rest()
+    binance_rest = await _pick_binance_rest_async()
     rest_url = f"{binance_rest}/depth"
     ws_base = "wss://stream.binance.us:9443" if "binance.us" in binance_rest else "wss://stream.binance.com:9443"
     ws_url = f"{ws_base}/ws/{symbol.lower()}@depth20@100ms"
@@ -165,12 +207,12 @@ async def ob_poller(symbol: str, state: State):
 
 
 async def binance_feed(symbol: str, kline_iv: str, state: State):
-    ws_base = _pick_binance_ws()
+    ws_base = await _pick_binance_ws_async()
     sym = symbol.lower()
-    streams = "/".join([
-        f"{sym}@trade",
-        f"{sym}@kline_{kline_iv}",
-    ])
+    streams = [f"{sym}@kline_{kline_iv}"]
+    if BINANCE_TRADE_STREAM_ENABLED:
+        streams.insert(0, f"{sym}@trade")
+    streams = "/".join(streams)
     url = f"{ws_base}?streams={streams}"
     reconnect_delay = 1
 
@@ -180,12 +222,17 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                 url,
                 ping_interval=20,
                 ping_timeout=60,
-                close_timeout=10
+                close_timeout=10,
+                max_queue=256,
             ) as ws:
-                print(f"  [Binance WS] connected – {symbol}")
                 state.binance_ws_connected = True
                 state.binance_ws_connected_at = time.time()
                 reconnect_delay = 1
+                if BINANCE_TRADE_STREAM_ENABLED:
+                    print(f"  [Binance WS] connected – {symbol} (trade+kline)")
+                else:
+                    print(f"  [Binance WS] connected – {symbol} (kline-only)")
+                msg_since_yield = 0
 
                 while True:
                     raw = await asyncio.wait_for(
@@ -197,21 +244,28 @@ async def binance_feed(symbol: str, kline_iv: str, state: State):
                     pay = data["data"]
                     state.binance_ws_msg_count += 1
                     state.binance_ws_last_ok_ts = time.time()
+                    msg_since_yield += 1
+                    if msg_since_yield >= 200:
+                        # Avoid starving the event loop under burst traffic.
+                        msg_since_yield = 0
+                        await asyncio.sleep(0)
 
                     if "@trade" in stream:
                         ts = pay["T"] / 1000.0
                         trade_price = float(pay["p"])
+                        if state.mid <= 0 and trade_price > 0:
+                            state.mid = trade_price
+                        # Downsample ultra-fast trade stream to avoid CPU saturation.
+                        if (ts - state.binance_last_trade_sample_ts) < BINANCE_TRADE_MIN_INTERVAL_SEC:
+                            await asyncio.sleep(0)
+                            continue
+                        state.binance_last_trade_sample_ts = ts
                         state.trades.append({
                             "t": ts,
                             "price": trade_price,
                             "qty": float(pay["q"]),
                             "is_buy": not pay["m"],
                         })
-                        if state.mid <= 0 and trade_price > 0:
-                            state.mid = trade_price
-                        if len(state.trades) > 5000:
-                            cut = time.time() - config.TRADE_TTL
-                            state.trades = [t for t in state.trades if t["t"] >= cut]
 
                     elif "@kline" in stream:
                         k = pay["k"]
@@ -514,6 +568,7 @@ async def pm_feed(state: State):
         return
 
     _last_msg_log_ts = 0.0
+    _last_processed_ts = 0.0
     reconnect_delay = 1
 
     while True:
@@ -533,6 +588,7 @@ async def pm_feed(state: State):
                 ping_timeout=30,
                 close_timeout=5,
                 open_timeout=15,
+                max_queue=256,
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
                 print(
@@ -544,6 +600,7 @@ async def pm_feed(state: State):
                 state.pm_msg_count = 0
                 reconnect_delay = 1
                 last_msg_ts = time.time()
+                msg_since_yield = 0
 
                 while True:
                     # Check if trading_loop requested reconnect (new window = new tokens)
@@ -554,12 +611,26 @@ async def pm_feed(state: State):
                         break
 
                     try:
-                        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        now = time.time()
                         state.pm_msg_count += 1
-                        last_msg_ts = time.time()
+                        last_msg_ts = now
+                        msg_since_yield += 1
+                        if msg_since_yield >= 200:
+                            msg_since_yield = 0
+                            await asyncio.sleep(0)
+
+                        # Coalesce PM bursts: process at most ~20Hz and drop
+                        # intermediate updates under heavy flow to keep API responsive.
+                        if (now - _last_processed_ts) < PM_WS_PROCESS_MIN_INTERVAL_SEC:
+                            # Yield when dropping bursts so API handlers stay responsive.
+                            await asyncio.sleep(0)
+                            continue
+
+                        raw = json.loads(raw_msg)
+                        _last_processed_ts = now
 
                         # Throttled debug log: show message stats every 60s
-                        now = time.time()
                         if now - _last_msg_log_ts >= 60:
                             if isinstance(raw, list):
                                 print(

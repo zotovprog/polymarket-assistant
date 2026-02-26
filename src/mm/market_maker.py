@@ -154,6 +154,7 @@ class MarketMaker:
         self.heartbeat = HeartbeatManager(
             clob_client,
             config.heartbeat_interval_sec,
+            failure_threshold=max(1, int(getattr(config, "heartbeat_failures_before_shutdown", 3))),
             on_failure=self._schedule_heartbeat_failure,
         )
         self.rebate = RebateTracker(clob_client)
@@ -200,6 +201,7 @@ class MarketMaker:
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
+        self._liq_last_attempt_time: float = 0.0
         self._one_sided_counter: int = 0
         self._merge_failed_this_cycle: bool = False
         self._closing_start_time_left: float = 0.0
@@ -672,8 +674,9 @@ class MarketMaker:
             )
 
     async def _on_heartbeat_failure(self) -> None:
-        """Handle fatal heartbeat failure (triggered after 3 consecutive misses)."""
-        reason = "Heartbeat failed 3 consecutive times"
+        """Handle fatal heartbeat failure (triggered after configured threshold)."""
+        threshold = int(self.heartbeat.stats.get("failure_threshold", 3) or 3)
+        reason = f"Heartbeat failed {threshold} consecutive times"
         log.warning("Heartbeat failure callback triggered: %s", reason)
         try:
             await self._emergency_shutdown(reason)
@@ -717,6 +720,8 @@ class MarketMaker:
     def _event_requote_snapshot(self, had_fill: bool = False) -> list[Any]:
         """Evaluate event-driven requote conditions from current feed state."""
         if not bool(getattr(self.config, "event_requote_enabled", True)):
+            return []
+        if self._is_closing:
             return []
         st = self.feed_state
 
@@ -931,6 +936,7 @@ class MarketMaker:
         self._liq_lock = None
         self._liq_chunk_index = 0
         self._liq_last_chunk_time = 0.0
+        self._liq_last_attempt_time = 0.0
         self._one_sided_counter = 0
         self._quality_error_count = 0
         self._quality_success_count = 0
@@ -1040,6 +1046,7 @@ class MarketMaker:
         log.info("Quote loop started")
         try:
             while self._running:
+                loop_started_at = time.monotonic()
                 try:
                     try:
                         tick_timeout = 15.0 if self._is_closing else 10.0
@@ -1052,6 +1059,23 @@ class MarketMaker:
                     break
                 except Exception as e:
                     log.error(f"Tick error: {e}", exc_info=True)
+
+                # Closing mode does not need event-driven requote bursts.
+                # Keep a bounded cadence so API handlers remain responsive.
+                if self._is_closing:
+                    if self.market and self.market.time_remaining <= float(
+                        getattr(self.config, "liq_taker_threshold_sec", 10.0)
+                    ):
+                        close_sleep = 0.5
+                    else:
+                        close_sleep = max(
+                            1.0,
+                            min(float(getattr(self.config, "liq_chunk_interval_sec", 5.0)), 3.0),
+                        )
+                    elapsed = time.monotonic() - loop_started_at
+                    if elapsed < close_sleep:
+                        await asyncio.sleep(close_sleep - elapsed)
+                    continue
 
                 # Wait until explicit trigger, event-driven market movement, or timeout.
                 sleep_budget = self.quote_engine.jitter_requote_interval(
@@ -1076,6 +1100,12 @@ class MarketMaker:
                     if remaining <= 0:
                         break
                     await asyncio.sleep(min(poll_interval, remaining))
+
+                # Bound max loop frequency under event storms to keep API responsive.
+                min_loop_interval = max(0.50, poll_interval)
+                elapsed = time.monotonic() - loop_started_at
+                if elapsed < min_loop_interval:
+                    await asyncio.sleep(min_loop_interval - elapsed)
         except asyncio.CancelledError:
             pass
         log.info("Quote loop ended")
@@ -1156,6 +1186,7 @@ class MarketMaker:
             )
             self._liq_chunk_index = 0
             self._liq_last_chunk_time = 0.0
+            self._liq_last_attempt_time = 0.0
             log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders "
                      f"(lock: pnl=${self._liq_lock.trigger_pnl:.2f})")
             await self._cancel_all_guarded()
@@ -1215,13 +1246,28 @@ class MarketMaker:
         is_live = not hasattr(self.order_mgr.client, "_orders")
         reconcile_requested = self.order_mgr.reconcile_requested or merge_reconcile_requested
         if is_live and not self._is_closing and (self._tick_count % 15 == 0 or reconcile_requested):
-            (real_up, real_dn), usdc_pair = await asyncio.gather(
-                self.order_mgr.get_all_token_balances(
-                    self.market.up_token_id,
-                    self.market.dn_token_id,
-                ),
-                self.order_mgr.get_usdc_balances(),
-            )
+            try:
+                (real_up, real_dn), usdc_pair = await asyncio.gather(
+                    self.order_mgr.get_all_token_balances(
+                        self.market.up_token_id,
+                        self.market.dn_token_id,
+                    ),
+                    self.order_mgr.get_usdc_balances(),
+                )
+            except Exception as e:
+                self.sre_metrics.record_api_call(False)
+                log.error(
+                    "Skipping inventory reconcile: failed to fetch PM balances (%s)",
+                    e,
+                )
+                self._reconcile_stable_count = 0
+                self._reconcile_prev_pm = None
+                if self.order_mgr.active_order_ids:
+                    await self._cancel_all_guarded()
+                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
+
+            self.sre_metrics.record_api_call(True)
             usdc_bal, usdc_available = usdc_pair
             if usdc_bal is not None:
                 self._cached_usdc_balance = usdc_bal
@@ -1336,6 +1382,30 @@ class MarketMaker:
             return
 
         st = self.feed_state
+
+        if is_live:
+            available_usdc = (
+                self._cached_usdc_available_balance
+                if self._cached_usdc_available_balance is not None
+                else self._cached_usdc_balance
+            )
+            min_usdc_to_quote = max(0.5, float(getattr(self.config, "min_order_size_usd", 2.0)))
+            has_sellable_inventory = (
+                self.inventory.up_shares > 0.5 or self.inventory.dn_shares > 0.5
+            )
+            if available_usdc < min_usdc_to_quote and not has_sellable_inventory:
+                self._throttled_warn(
+                    "low_usdc_quote_skip",
+                    (
+                        f"Skipping quote: free USDC ${available_usdc:.2f} "
+                        f"< min_order_size_usd ${min_usdc_to_quote:.2f}"
+                    ),
+                    cooldown=5.0,
+                )
+                if self.order_mgr.active_order_ids:
+                    await self._cancel_all_guarded()
+                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
 
         # 1. Defensive copies of feed data
         mid = st.mid
@@ -1818,12 +1888,19 @@ class MarketMaker:
         # Pre-fetch book summaries in parallel if WS data is stale.
         books_cache = {}
         if not ws_fresh:
-            up_summary, dn_summary = await asyncio.gather(
-                self.order_mgr.get_book_summary(self.market.up_token_id),
-                self.order_mgr.get_book_summary(self.market.dn_token_id),
-            )
-            books_cache["up"] = up_summary
-            books_cache["dn"] = dn_summary
+            try:
+                up_summary, dn_summary = await asyncio.gather(
+                    self.order_mgr.get_book_summary(self.market.up_token_id),
+                    self.order_mgr.get_book_summary(self.market.dn_token_id),
+                )
+                books_cache["up"] = up_summary
+                books_cache["dn"] = dn_summary
+            except Exception as e:
+                self.sre_metrics.record_api_call(False)
+                log.error("Book fetch failed (prefetch): %s", e)
+                await self._cancel_all_guarded()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
         for token_key, token_id in [
             ("up", self.market.up_token_id),
             ("dn", self.market.dn_token_id),
@@ -1833,11 +1910,18 @@ class MarketMaker:
             if ws_fresh and ws_bid is not None and ws_ask is not None:
                 book = {"best_bid": ws_bid, "best_ask": ws_ask}
             else:
-                book = (
-                    books_cache[token_key]
-                    if token_key in books_cache
-                    else await self.order_mgr.get_book_summary(token_id)
-                )
+                try:
+                    book = (
+                        books_cache[token_key]
+                        if token_key in books_cache
+                        else await self.order_mgr.get_book_summary(token_id)
+                    )
+                except Exception as e:
+                    self.sre_metrics.record_api_call(False)
+                    log.error("Book fetch failed for %s: %s", token_key.upper(), e)
+                    await self._cancel_all_guarded()
+                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                    return
             bid, ask = all_quotes[token_key]
             bid, ask = self.quote_engine.clamp_to_book(
                 bid, ask, book["best_bid"], book["best_ask"],
@@ -2256,6 +2340,18 @@ class MarketMaker:
         if not self.market:
             return
 
+        cfg = self.config
+        time_left = self.market.time_remaining
+        min_attempt_interval = (
+            0.5
+            if time_left <= float(getattr(cfg, "liq_taker_threshold_sec", 10.0))
+            else max(1.0, min(float(getattr(cfg, "liq_chunk_interval_sec", 5.0)), 3.0))
+        )
+        now = time.time()
+        if self._liq_last_attempt_time > 0 and (now - self._liq_last_attempt_time) < min_attempt_interval:
+            return
+        self._liq_last_attempt_time = now
+
         # ── Phase 0: Merge YES+NO pairs → USDC ──────────────────
         up_bal = await self.order_mgr.get_token_balance(self.market.up_token_id)
         dn_bal = await self.order_mgr.get_token_balance(self.market.dn_token_id)
@@ -2294,13 +2390,16 @@ class MarketMaker:
                     for tid in [self.market.up_token_id, self.market.dn_token_id]:
                         cur = self.order_mgr._mock_token_balances.get(tid, 0.0)
                         self.order_mgr._mock_token_balances[tid] = max(0.0, cur - merge_amount)
+                # Keep local phase balances in sync to avoid double-merge in dust preflight.
+                up_bal = max(0.0, up_bal - merge_amount)
+                dn_bal = max(0.0, dn_bal - merge_amount)
+                self._cached_pm_up_shares = up_bal
+                self._cached_pm_dn_shares = dn_bal
             else:
                 self._merge_failed_this_cycle = True
                 log.warning("Merge failed (will not retry this cycle): %s",
                             result.get("error", "unknown"))
 
-        time_left = self.market.time_remaining
-        cfg = self.config
         taker_threshold = cfg.liq_taker_threshold_sec
         use_taker = time_left <= taker_threshold
         # Emergency drawdown check during liquidation
@@ -2375,7 +2474,6 @@ class MarketMaker:
             self._liquidation_order_ids.clear()
 
         # 3. If limit orders are still live, wait for chunk interval then cancel & re-place
-        now = time.time()
         if self._liquidation_order_ids and not use_taker:
             elapsed = now - self._liq_last_chunk_time if self._liq_last_chunk_time else 0
             if elapsed < cfg.liq_chunk_interval_sec:
@@ -2403,7 +2501,8 @@ class MarketMaker:
         if up_bal < pm_min_pf and dn_bal < pm_min_pf and (up_bal > 0.1 or dn_bal > 0.1):
             # Try merging dust pairs first (if both > 0)
             dust_merge = min(up_bal, dn_bal)
-            if dust_merge >= 0.5 and self.market.condition_id and not self._merge_failed_this_cycle:
+            # Keep dust merge threshold aligned with regular merge logic (>= 1 whole pair).
+            if dust_merge >= 1.0 and self.market.condition_id and not self._merge_failed_this_cycle:
                 try:
                     r = await self.order_mgr.merge_positions(
                         self.market.condition_id, dust_merge, self._private_key)
@@ -2648,7 +2747,6 @@ class MarketMaker:
                         await self._cancel_order_guarded(oid)
                     self._liquidation_order_ids.clear()
                 log.info("Liquidation complete — PM inventory cleared")
-                self._is_closing = False
                 return
 
         # Check if all remaining balances are "dust" — below PM minimum, can't sell

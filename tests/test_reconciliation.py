@@ -358,9 +358,88 @@ def test_drawdown_forces_taker_in_liquidation():
 
     asyncio.run(mm._liquidate_inventory())
 
-    # Bot should have abandoned liquidation
-    assert mm._is_closing is False
+    # Bot should remain in closing mode until window transition/end.
+    assert mm._is_closing is True
     assert mm._running is False
+
+
+def test_event_requote_suppressed_while_closing():
+    mm = _make_mm(live=False)
+    mm._is_closing = True
+
+    events = mm._event_requote_snapshot(had_fill=False)
+
+    assert events == []
+
+
+def test_run_loop_throttles_event_storm():
+    mm = _make_mm(live=False)
+    mm.config.event_poll_interval_sec = 0.25
+    mm._running = True
+    mm._is_closing = False
+    mm._requote_event.clear()
+
+    ticks = {"count": 0}
+
+    async def _fake_tick():
+        ticks["count"] += 1
+        if ticks["count"] >= 2:
+            mm._running = False
+
+    class _Event:
+        event_type = "book_change"
+        timestamp = time.time()
+        detail = {}
+
+    mm._tick = _fake_tick  # type: ignore[assignment]
+    mm._event_requote_snapshot = lambda had_fill=False: [_Event()]  # type: ignore[assignment]
+
+    started = time.monotonic()
+    asyncio.run(mm._run_loop())
+    elapsed = time.monotonic() - started
+
+    assert ticks["count"] == 2
+    assert elapsed >= 0.20
+
+
+def test_liquidation_attempt_throttle_prevents_hot_retry():
+    mm = _make_mm(live=True)
+    mm._is_closing = True
+    mm.market.window_end = time.time() + 60.0
+    mm.config.liq_chunk_interval_sec = 5.0
+    mm.config.liq_taker_threshold_sec = 10.0
+
+    mm.order_mgr.get_token_balance = AsyncMock(return_value=0.0)
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": None, "best_ask": None})
+    mm.order_mgr.ensure_sell_allowance = AsyncMock(return_value=True)
+
+    asyncio.run(mm._liquidate_inventory())
+    first_calls = mm.order_mgr.get_token_balance.await_count
+
+    # Immediate second attempt should be skipped by liquidation throttle.
+    asyncio.run(mm._liquidate_inventory())
+    assert mm.order_mgr.get_token_balance.await_count == first_calls
+
+
+def test_tick_skips_quote_when_low_usdc_and_no_inventory():
+    mm = _make_mm(live=True)
+    mm._started_at = time.time()
+    mm.feed_state.mid = 100.0
+    mm._cached_usdc_balance = 1.0
+    mm._cached_usdc_available_balance = 1.0
+    mm.config.min_order_size_usd = 2.0
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.place_orders_batch = AsyncMock(return_value=[])
+    mm._cancel_all_guarded = AsyncMock(return_value=0)  # type: ignore[assignment]
+
+    asyncio.run(mm._tick())
+
+    mm.order_mgr.place_orders_batch.assert_not_awaited()
+    mm._cancel_all_guarded.assert_not_awaited()
 
 
 def test_binance_stale_uses_fresh_ws_timestamp():

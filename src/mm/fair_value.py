@@ -190,7 +190,7 @@ class FairValueEngine:
         # as long as strike is set correctly in MarketInfo.
         base = self.binary_fair_value(mid, strike, time_remaining_sec, klines)
 
-        if bids and asks and trades:
+        if self.signal_weight > 0 and bids and asks and trades:
             fv_up = self.adjust_for_signals(base, bids, asks, mid, trades, klines)
         else:
             fv_up = base

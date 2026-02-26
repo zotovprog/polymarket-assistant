@@ -23,16 +23,19 @@ class HeartbeatManager:
         self,
         clob_client: Any,
         interval_sec: int = 55,
+        failure_threshold: int = 3,
         on_failure: Callable[[], None] | None = None,
     ):
         """
         Args:
             clob_client: py_clob_client.ClobClient instance
             interval_sec: Seconds between heartbeats (CLOB timeout is ~10s, send every 5s)
-            on_failure: Optional callback fired after 3 consecutive heartbeat failures
+            failure_threshold: Consecutive failures before triggering on_failure
+            on_failure: Optional callback fired after failure_threshold heartbeat failures
         """
         self.client = clob_client
         self.interval = interval_sec
+        self._failure_threshold = max(1, int(failure_threshold))
         self._on_failure = on_failure
         self._task: asyncio.Task | None = None
         self._running = False
@@ -60,6 +63,7 @@ class HeartbeatManager:
             "error_count": self._error_count,
             "id_refresh_count": self._id_refresh_count,
             "interval_sec": self.interval,
+            "failure_threshold": self._failure_threshold,
             "heartbeat_id": self._heartbeat_id[:8] + "...",
         }
 
@@ -145,7 +149,7 @@ class HeartbeatManager:
                     log.warning("Heartbeat retry with new ID also failed: %s", retry_err)
                     self._error_count += 1
                     self._consecutive_failures += 1
-                    if self._consecutive_failures >= 3:
+                    if self._consecutive_failures >= self._failure_threshold:
                         log.critical(
                             "Heartbeat failed %s times in a row; orders may have been cancelled",
                             self._consecutive_failures,
@@ -159,7 +163,7 @@ class HeartbeatManager:
             # Non-ID error — real failure
             self._error_count += 1
             log.warning("Heartbeat failed: %s", e)
-            if self._consecutive_failures >= 3:
+            if self._consecutive_failures >= self._failure_threshold:
                 log.critical(
                     "Heartbeat failed %s times in a row; orders may have been cancelled",
                     self._consecutive_failures,

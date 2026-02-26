@@ -172,6 +172,7 @@ class ConfigUpdateRequest(BaseModel):
     event_fallback_interval_sec: Optional[float] = None
     gtd_duration_sec: Optional[int] = None
     heartbeat_interval_sec: Optional[int] = None
+    heartbeat_failures_before_shutdown: Optional[int] = None
     use_post_only: Optional[bool] = None
     use_gtd: Optional[bool] = None
     price_jitter_enabled: Optional[bool] = None
@@ -272,6 +273,7 @@ class ConfigUpdateRequest(BaseModel):
     @field_validator(
         "gtd_duration_sec",
         "heartbeat_interval_sec",
+        "heartbeat_failures_before_shutdown",
         "max_one_sided_ticks",
         "liq_gradual_chunks",
         "price_jitter_ticks",
@@ -1089,8 +1091,19 @@ class MMRuntime:
                 self._feed_tasks.append(t3)
 
                 # Build market info from token IDs
-                market = self._build_market_info_from_tokens(
-                    coin, timeframe, up_id, dn_id, condition_id=cond_id)
+                # _build_market_info_from_tokens() performs blocking HTTP strike fetch;
+                # run it off the event loop to keep API handlers responsive at startup.
+                market = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._build_market_info_from_tokens,
+                        coin,
+                        timeframe,
+                        up_id,
+                        dn_id,
+                        condition_id=cond_id,
+                    ),
+                    timeout=45.0,
+                )
             else:
                 log.warning("PM tokens not found, using placeholder")
                 self._strike_invalid = False
@@ -1600,6 +1613,9 @@ class MMRuntime:
 
         Fetches the actual strike price from Binance candle open
         and window timing from PM event endDate.
+
+        NOTE: This method performs blocking HTTP calls via feeds.fetch_pm_strike().
+        Always call it via asyncio.to_thread() from async code.
         """
         strike, window_start, window_end = feeds.fetch_pm_strike(coin, timeframe)
 

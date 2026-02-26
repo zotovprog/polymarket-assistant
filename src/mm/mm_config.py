@@ -51,6 +51,7 @@ class MMConfig:
         "event_poll_interval_sec": (0.05, 5.0),
         "event_fallback_interval_sec": (0.5, 60.0),
         "heartbeat_interval_sec": (1.0, 30.0),
+        "heartbeat_failures_before_shutdown": (1.0, 10.0),
         "session_limit": (0.0, 100000.0),
         "max_drawdown_usd": (1.0, 1000.0),
         "volatility_pause_mult": (1.0, 20.0),
@@ -115,6 +116,7 @@ class MMConfig:
     # ── Order Types ──────────────────────────────────────────────
     gtd_duration_sec: int = 120          # Shorter GTD lifetime keeps stale orders off-book
     heartbeat_interval_sec: int = 5      # heartbeat interval (PM timeout ~10s)
+    heartbeat_failures_before_shutdown: int = 3  # Consecutive heartbeat failures before emergency shutdown
     use_post_only: bool = True           # force post-only (maker) orders
     use_gtd: bool = True                 # use GTD order type
     price_jitter_enabled: bool = True
