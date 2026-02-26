@@ -12,7 +12,7 @@ import pytest
 from mm.market_maker import MarketMaker
 from mm.mm_config import MMConfig
 from mm.risk_manager import RiskManager
-from mm.types import Fill, Inventory, MarketInfo
+from mm.types import Fill, Inventory, MarketInfo, Quote
 
 
 @dataclass
@@ -187,6 +187,28 @@ def test_reconcile_guard_pauses_liquidation_tick():
     asyncio.run(mm._tick())
 
     mm._liquidate_inventory.assert_not_awaited()
+
+
+def test_reconcile_guard_freezes_quotes_and_cancels_active_orders():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = False
+    mm._reconcile_guard_until = time.time() + 8.0
+
+    live_bid = Quote(side="BUY", token_id=mm.market.up_token_id, price=0.50, size=5.0, order_id="oid-1")
+    mm.order_mgr._active_orders = {"oid-1": live_bid}
+    mm._current_quotes = {
+        "up": (live_bid, None),
+        "dn": (None, None),
+    }
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    asyncio.run(mm._tick())
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
 
 
 def test_session_pnl_prevents_false_drawdown():

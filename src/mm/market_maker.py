@@ -40,6 +40,10 @@ BINANCE_FEED_STALE_SEC = 15.0
 BINANCE_FEED_STARTUP_GRACE_SEC = 20.0
 
 
+class StartBlockedError(RuntimeError):
+    """Raised when session safety checks block MM startup."""
+
+
 class SREMetrics:
     """Track operational health metrics for the MM bot."""
 
@@ -850,6 +854,21 @@ class MarketMaker:
                 _fv_up = _fv_up if _fv_up > 0 else 0.5
                 _fv_dn = _fv_dn if _fv_dn > 0 else 0.5
             _token_value = self._cached_pm_up_shares * _fv_up + self._cached_pm_dn_shares * _fv_dn
+            reserved_collateral = max(
+                0.0,
+                starting_usdc - (
+                    starting_usdc_available
+                    if starting_usdc_available is not None
+                    else starting_usdc
+                ),
+            )
+            preexisting_exposure = _token_value + reserved_collateral
+            if session_budget > 0 and preexisting_exposure > (session_budget + 0.01):
+                raise StartBlockedError(
+                    "Start blocked: pre-existing exposure $%.2f (tokens=$%.2f reserved=$%.2f) "
+                    "exceeds session cap $%.2f. Close/redeem positions before starting."
+                    % (preexisting_exposure, _token_value, reserved_collateral, session_budget)
+                )
             self._starting_portfolio_pm = starting_usdc + _token_value
             # Initialize internal inventory from PM balances (pre-existing tokens
             # from previous sessions must be tracked to avoid phantom PnL)
@@ -878,6 +897,9 @@ class MarketMaker:
                     session_budget,
                     starting_usdc,
                 )
+        except StartBlockedError:
+            self._running = False
+            raise
         except Exception:
             self._starting_usdc_pm = 0.0
             self._starting_portfolio_pm = 0.0
@@ -1299,6 +1321,18 @@ class MarketMaker:
                 return
             # Continuously try to sell remaining inventory each tick
             await self._liquidate_inventory()
+            return
+
+        if self._reconcile_guard_active():
+            guard_left = max(0.0, self._reconcile_guard_until - time.time())
+            self._throttled_warn(
+                "quote_reconcile_guard",
+                f"Quote placement paused for {guard_left:.1f}s after reconcile drift",
+                cooldown=2.0,
+            )
+            if self.order_mgr.active_order_ids:
+                await self._cancel_all_guarded()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
         st = self.feed_state

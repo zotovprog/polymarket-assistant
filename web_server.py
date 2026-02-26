@@ -1129,7 +1129,21 @@ class MMRuntime:
         if not paper_mode and PM_PRIVATE_KEY:
             self.mm._private_key = PM_PRIVATE_KEY
 
-        await self.mm.start()
+        try:
+            await self.mm.start()
+        except HTTPException:
+            self.mm = None
+            self._running = False
+            await self._cancel_strike_retry_task()
+            await self._stop_feed_tasks()
+            raise
+        except Exception as e:
+            log.error("MM start failed: %s", e)
+            self.mm = None
+            self._running = False
+            await self._cancel_strike_retry_task()
+            await self._stop_feed_tasks()
+            raise HTTPException(status_code=400, detail=str(e))
         self._running = True
         if self._strike_invalid:
             self._ensure_strike_retry_task()

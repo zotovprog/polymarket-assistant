@@ -18,7 +18,7 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm.market_maker import MarketMaker
+from mm.market_maker import MarketMaker, StartBlockedError
 from mm.mm_config import MMConfig
 from mm.types import MarketInfo, Quote
 
@@ -90,6 +90,31 @@ async def test_start_keeps_requested_session_budget_when_wallet_is_larger():
     assert mm.inventory.initial_usdc == pytest.approx(15.0)
     assert mm.order_mgr._session_budget == pytest.approx(15.0)
     assert mm._starting_usdc_pm == pytest.approx(42.0)
+
+
+@pytest.mark.anyio
+async def test_start_blocks_when_preexisting_exposure_exceeds_session_cap():
+    mm = _make_mm()
+    mm.inventory.initial_usdc = 15.0
+
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(20.0, 20.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(42.0, 42.0))
+    mm._refresh_fee_rate_cache = AsyncMock(return_value=None)
+    mm.heartbeat.start = lambda: None
+    mm.order_mgr.set_fill_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_ws_reconnect_callback = lambda *_args, **_kwargs: None
+    mm.order_mgr.set_heartbeat_id_callback = lambda *_args, **_kwargs: None
+
+    async def _noop_run_loop():
+        return None
+
+    mm._run_loop = _noop_run_loop
+
+    with pytest.raises(StartBlockedError):
+        await mm.start()
+
+    assert mm._running is False
 
 
 def test_session_exposure_cap_suppresses_all_buys_when_cap_is_exhausted():
