@@ -2038,6 +2038,9 @@ class MarketMaker:
         if up_bal is None or dn_bal is None:
             log.error("Liquidation: failed to fetch token balances; retrying next chunk")
             return
+        # Keep PM-cache inventory in sync during closing; regular reconcile is disabled in _is_closing.
+        self._cached_pm_up_shares = max(0.0, up_bal)
+        self._cached_pm_dn_shares = max(0.0, dn_bal)
         merge_amount = min(up_bal, dn_bal)
 
         # Merge first when both sides have meaningful size, then liquidate only leftovers.
@@ -2223,6 +2226,11 @@ class MarketMaker:
                 log.error("%s balance fetch failed during liquidation; retrying next chunk", label)
                 balance_fetch_failed = True
                 continue
+            # Keep PM-cache inventory fresh even when balance is tiny/zero.
+            if token_id == self.market.up_token_id:
+                self._cached_pm_up_shares = max(0.0, real_balance)
+            else:
+                self._cached_pm_dn_shares = max(0.0, real_balance)
             if real_balance <= completion_threshold:
                 log.info(f"No real balance for {label}")
                 continue
@@ -2380,6 +2388,8 @@ class MarketMaker:
                 log.warning("Liquidation completion check deferred: failed to fetch PM balances")
                 return
 
+            self._cached_pm_up_shares = max(0.0, real_up_chk)
+            self._cached_pm_dn_shares = max(0.0, real_dn_chk)
             internal_up = self.inventory.up_shares
             internal_dn = self.inventory.dn_shares
             internal_clear = internal_up <= completion_threshold and internal_dn <= completion_threshold
@@ -2396,8 +2406,22 @@ class MarketMaker:
                 )
                 return
 
-            if internal_clear and real_clear:
-                log.info("Liquidation complete — no inventory remaining")
+            if real_clear:
+                if not internal_clear:
+                    log.warning(
+                        "Liquidation complete by PM balance, forcing internal reconcile to zero: "
+                        "internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                        internal_up,
+                        internal_dn,
+                        real_up_chk,
+                        real_dn_chk,
+                    )
+                    self.inventory.reconcile(0.0, 0.0, self._cached_usdc_balance)
+                if self._liquidation_order_ids:
+                    for oid in list(self._liquidation_order_ids):
+                        await self.order_mgr.cancel_order(oid)
+                    self._liquidation_order_ids.clear()
+                log.info("Liquidation complete — PM inventory cleared")
                 self._is_closing = False
                 return
 
