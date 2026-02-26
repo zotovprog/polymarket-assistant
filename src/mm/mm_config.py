@@ -75,6 +75,10 @@ class MMConfig:
         "rebate_score_timeout_sec": (0.5, 15.0),
         "market_selector_min_score": (0.0, 1.0),
         "redeem_retry_interval_sec": (2.0, 120.0),
+        "toxic_divergence_threshold": (0.02, 0.40),
+        "toxic_divergence_ticks": (1.0, 120.0),
+        "critical_reconcile_drift_shares": (0.5, 50.0),
+        "one_sided_protect_ticks": (1.0, 600.0),
     }
 
     # ── Spread ───────────────────────────────────────────────────
@@ -131,6 +135,11 @@ class MMConfig:
     max_loss_per_fill_usd: float = 5.0   # Max acceptable loss on single fill
     take_profit_usd: float = 0.0       # Exit if total_pnl >= this (0 = disabled)
     trailing_stop_pct: float = 0.0     # Exit if PnL drops this fraction from peak (0 = disabled)
+    allow_short_sells: bool = False    # Safety: close-only SELLs by default (no naked shorting)
+    toxic_divergence_threshold: float = 0.10  # No-trade threshold for persistent FV/PM divergence
+    toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
+    critical_reconcile_drift_shares: float = 1.5  # Immediate pause if internal>real by this many shares
+    one_sided_protect_ticks: int = 30          # Start anti-expansion protection before hard-close trigger
     taker_fee_rate: float = 0.02  # Fallback only; primary PM taker fee logic lives in pm_fees.py
 
     # ── Liquidation ─────────────────────────────────────────

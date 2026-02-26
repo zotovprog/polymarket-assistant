@@ -123,6 +123,7 @@ def _make_risk_setup() -> tuple[RiskManager, Inventory]:
 
 def test_debounce_prevents_oscillation():
     mm = _make_mm(live=True)
+    mm.config.critical_reconcile_drift_shares = 100.0
     mm.feed_state.mid = 0.0  # stop _tick() right after reconciliation logic
     mm.inventory.up_shares = 14.96
     mm.inventory.dn_shares = 0.0
@@ -209,6 +210,56 @@ def test_reconcile_guard_freezes_quotes_and_cancels_active_orders():
 
     mm.order_mgr.cancel_all.assert_awaited_once()
     assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
+
+
+def test_critical_inventory_drift_triggers_pause_and_cancel():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0  # stop after reconcile path
+    mm.inventory.up_shares = 9.0
+    mm.inventory.dn_shares = 0.0
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    _run_tick_with_reconcile_gate(mm)
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._paused is True
+    assert "Critical inventory drift" in mm._pause_reason
+    assert mm.inventory.up_shares == pytest.approx(0.0)
+    assert mm.inventory.dn_shares == pytest.approx(0.0)
+
+
+def test_toxic_divergence_no_trade_cancels_quotes_when_flat():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.toxic_divergence_threshold = 0.02
+    mm.config.toxic_divergence_ticks = 1
+    mm._cached_usdc_balance = 100.0
+    mm._cached_usdc_available_balance = 100.0
+    mm.feed_state.mid = 100.0
+    mm.feed_state.pm_up = 0.50
+    mm.feed_state.pm_dn = 0.50
+    mm.feed_state.pm_up_bid = 0.49
+    mm.feed_state.pm_dn_bid = 0.49
+    mm.feed_state.pm_last_update_ts = time.time()
+
+    stale_bid = Quote(side="BUY", token_id=mm.market.up_token_id, price=0.40, size=5.0, order_id="oid-1")
+    mm.order_mgr._active_orders = {"oid-1": stale_bid}
+    mm._current_quotes = {"up": (stale_bid, None), "dn": (None, None)}
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    asyncio.run(mm._tick())
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
+    assert mm._toxic_divergence_count >= 1
 
 
 def test_session_pnl_prevents_false_drawdown():

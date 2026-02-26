@@ -226,6 +226,7 @@ class MarketMaker:
         self._trade_backfill_interval_sec: float = 60.0
         self._toxicity_spread_mult: float = 1.0
         self._toxicity_mode: str = "normal"
+        self._toxic_divergence_count: int = 0
         self._last_requote_events: list[dict[str, Any]] = []
 
         # Current quotes (for dashboard)
@@ -314,6 +315,48 @@ class MarketMaker:
         if time_left <= max(5.0, float(self.config.liq_taker_threshold_sec)):
             self._reconcile_guard_until = 0.0
             return False
+        return True
+
+    async def _handle_critical_inventory_drift(
+        self,
+        *,
+        real_up: float,
+        real_dn: float,
+        source: str,
+    ) -> bool:
+        """Hard-stop when internal inventory overstates real PM balances.
+
+        This prevents accidental naked SELLs when local state diverges from wallet reality.
+        Returns True when emergency drift handling was applied and tick should abort.
+        """
+        threshold = max(
+            0.5,
+            float(getattr(self.config, "critical_reconcile_drift_shares", 1.5) or 1.5),
+        )
+        up_excess = max(0.0, float(self.inventory.up_shares) - float(real_up))
+        dn_excess = max(0.0, float(self.inventory.dn_shares) - float(real_dn))
+        if up_excess < threshold and dn_excess < threshold:
+            return False
+
+        log.error(
+            "CRITICAL inventory drift (%s): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f "
+            "(excess up=%.2f dn=%.2f, threshold=%.2f)",
+            source,
+            self.inventory.up_shares,
+            self.inventory.dn_shares,
+            real_up,
+            real_dn,
+            up_excess,
+            dn_excess,
+            threshold,
+        )
+        self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+        self._arm_reconcile_guard(up_excess, dn_excess, f"critical-{source}")
+        self._paused = True
+        self._pause_reason = "Critical inventory drift: local state > PM wallet"
+        await self._cancel_all_guarded()
+        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+        self._one_sided_counter = 0
         return True
 
     def _session_budget_cap(self) -> float:
@@ -930,6 +973,7 @@ class MarketMaker:
         self._last_trade_backfill_ts = 0.0
         self._toxicity_spread_mult = 1.0
         self._toxicity_mode = "normal"
+        self._toxic_divergence_count = 0
         self._is_closing = False
         self._liquidation_attempted = False
         self._liquidation_order_ids = set()
@@ -1285,6 +1329,15 @@ class MarketMaker:
                 # Cache real PM token balances for accurate PnL calculation
                 self._cached_pm_up_shares = real_up
                 self._cached_pm_dn_shares = real_dn
+                if await self._handle_critical_inventory_drift(
+                    real_up=real_up,
+                    real_dn=real_dn,
+                    source="periodic_reconcile",
+                ):
+                    self._reconcile_stable_count = 0
+                    self._reconcile_prev_pm = None
+                    self.order_mgr.clear_reconcile_request()
+                    return
                 if reconcile_requested:
                     forced_up_diff = abs(real_up - self.inventory.up_shares)
                     forced_dn_diff = abs(real_dn - self.inventory.dn_shares)
@@ -1391,7 +1444,12 @@ class MarketMaker:
             )
             min_usdc_to_quote = max(0.5, float(getattr(self.config, "min_order_size_usd", 2.0)))
             has_sellable_inventory = (
-                self.inventory.up_shares > 0.5 or self.inventory.dn_shares > 0.5
+                (
+                    self._cached_pm_up_shares if is_live else self.inventory.up_shares
+                ) > 0.5
+                or (
+                    self._cached_pm_dn_shares if is_live else self.inventory.dn_shares
+                ) > 0.5
             )
             if available_usdc < min_usdc_to_quote and not has_sellable_inventory:
                 self._throttled_warn(
@@ -1507,6 +1565,46 @@ class MarketMaker:
                 "Model/PM mid divergence > 5%% (%s); widening quotes x2 for this tick",
                 ", ".join(diverged),
             )
+        max_divergence = max(up_divergence, dn_divergence)
+        toxic_divergence_threshold = max(
+            0.02,
+            float(getattr(self.config, "toxic_divergence_threshold", 0.10) or 0.10),
+        )
+        toxic_divergence_ticks = max(
+            1,
+            int(getattr(self.config, "toxic_divergence_ticks", 8) or 8),
+        )
+        if max_divergence >= toxic_divergence_threshold:
+            self._toxic_divergence_count += 1
+        else:
+            self._toxic_divergence_count = 0
+        toxic_entry_block = self._toxic_divergence_count >= toxic_divergence_ticks
+        if toxic_entry_block:
+            has_inventory_for_unwind = (
+                self._cached_pm_up_shares > 0.5
+                or self._cached_pm_dn_shares > 0.5
+                or self.inventory.up_shares > 0.5
+                or self.inventory.dn_shares > 0.5
+            )
+            self._throttled_warn(
+                "toxic_divergence_no_trade",
+                (
+                    "Toxic divergence no-trade: max_div=%.3f threshold=%.3f "
+                    "(%d/%d ticks)"
+                )
+                % (
+                    max_divergence,
+                    toxic_divergence_threshold,
+                    self._toxic_divergence_count,
+                    toxic_divergence_ticks,
+                ),
+                cooldown=3.0,
+            )
+            if not has_inventory_for_unwind:
+                if self.order_mgr.active_order_ids:
+                    await self._cancel_all_guarded()
+                self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                return
 
         # 4. Compute volatility
         vol = self.fair_value.realized_vol(klines)
@@ -1628,8 +1726,8 @@ class MarketMaker:
             self._catastrophic_count = 0
 
         # ── One-sided exposure check ──────────────────────────────
-        up_sh = self.inventory.up_shares
-        dn_sh = self.inventory.dn_shares
+        up_sh = self._cached_pm_up_shares if is_live else self.inventory.up_shares
+        dn_sh = self._cached_pm_dn_shares if is_live else self.inventory.dn_shares
         has_position = (up_sh > 0.5 or dn_sh > 0.5)
         is_one_sided = has_position and (up_sh < 0.5 or dn_sh < 0.5)
 
@@ -1666,6 +1764,20 @@ class MarketMaker:
                 return
         else:
             self._one_sided_counter = 0
+        one_sided_protect_ticks = max(
+            1,
+            int(
+                getattr(
+                    self.config,
+                    "one_sided_protect_ticks",
+                    max(1, int(self.config.max_one_sided_ticks * 0.25)),
+                )
+                or max(1, int(self.config.max_one_sided_ticks * 0.25))
+            ),
+        )
+        protect_one_sided_entries = bool(
+            is_one_sided and self._one_sided_counter >= one_sided_protect_ticks
+        )
 
         # ── Market quality check (every N ticks, live only) ─────────
         is_live = not hasattr(self.order_mgr.client, "_orders")
@@ -1860,6 +1972,22 @@ class MarketMaker:
         if leading_token and self._imbalance_adjustments.get("suppress_leading_buy", False):
             lead_bid, lead_ask = all_quotes[leading_token]
             all_quotes[leading_token] = (None, lead_ask)
+        if protect_one_sided_entries and leading_token in ("up", "dn"):
+            lead_bid, lead_ask = all_quotes[leading_token]
+            if lead_bid is not None:
+                self._throttled_warn(
+                    "one_sided_entry_block",
+                    (
+                        f"One-sided protection: blocking {leading_token.upper()} BUY "
+                        f"(ticks={self._one_sided_counter}, threshold={one_sided_protect_ticks})"
+                    ),
+                    cooldown=5.0,
+                )
+                all_quotes[leading_token] = (None, lead_ask)
+        if toxic_entry_block:
+            # In toxic regime, do not add new exposure; keep asks for inventory unwind.
+            all_quotes["up"] = (None, all_quotes["up"][1])
+            all_quotes["dn"] = (None, all_quotes["dn"][1])
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
@@ -1989,8 +2117,19 @@ class MarketMaker:
                               or bid_notional < self.config.min_order_size_usd
                               or bid_size < pm_min_size))
 
-            token_bal = (self.inventory.up_shares if token_key == "up"
-                         else self.inventory.dn_shares)
+            if is_live:
+                token_bal = (
+                    self._cached_pm_up_shares
+                    if token_key == "up"
+                    else self._cached_pm_dn_shares
+                )
+            else:
+                token_bal = (
+                    self.inventory.up_shares
+                    if token_key == "up"
+                    else self.inventory.dn_shares
+                )
+            token_bal = max(0.0, float(token_bal))
             if new_ask and token_bal > 0:
                 new_ask.size = round(min(new_ask.size, token_bal), 2)
             if new_ask and 0 < new_ask.size < pm_min_size and token_bal >= pm_min_size:
@@ -2160,6 +2299,13 @@ class MarketMaker:
                     self._cached_pm_up_shares = real_up
                 if real_dn is not None:
                     self._cached_pm_dn_shares = real_dn
+                if real_up is not None and real_dn is not None:
+                    if await self._handle_critical_inventory_drift(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="post_order_refresh",
+                    ):
+                        return
             except Exception as e:
                 log.warning("Post-order balance refresh failed: %s", e)
         elif not is_live:
@@ -2853,6 +2999,7 @@ class MarketMaker:
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0
         self._toxicity_mode = "normal"
+        self._toxic_divergence_count = 0
         self.event_requoter = EventRequoter(
             pm_mid_threshold_bps=self.config.event_pm_mid_threshold_bps,
             binance_threshold_bps=self.config.event_binance_threshold_bps,

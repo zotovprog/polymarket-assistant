@@ -591,6 +591,62 @@ class OrderManager:
         else:
             return quote.size * (1.0 - quote.price)
 
+    async def _enforce_close_only_sell(self, quote: Quote) -> bool:
+        """Enforce close-only SELL behavior when shorting is disabled.
+
+        Returns True when SELL can proceed (possibly with reduced size),
+        False when SELL must be skipped.
+        """
+        if quote.side != "SELL":
+            return True
+        if bool(getattr(self.config, "allow_short_sells", False)):
+            return True
+
+        token_bal = await self.get_token_balance(quote.token_id)
+        if token_bal is None:
+            self._throttled_warn(
+                "sell_close_only_balance_unavailable",
+                (
+                    f"SELL blocked (close-only): failed to fetch token balance for "
+                    f"{quote.token_id[:12]}..."
+                ),
+                cooldown=10.0,
+            )
+            return False
+
+        active_sell_exposure = sum(
+            max(0.0, float(q.size))
+            for q in self._active_orders.values()
+            if q.side == "SELL" and q.token_id == quote.token_id
+        )
+        free_inventory = max(0.0, float(token_bal) - active_sell_exposure)
+        if free_inventory + 0.01 >= quote.size:
+            return True
+
+        pm_min = 5.0
+        if free_inventory >= pm_min:
+            old = quote.size
+            quote.size = round(free_inventory, 2)
+            self._throttled_warn(
+                "sell_close_only_trimmed",
+                (
+                    f"SELL trimmed (close-only) {quote.token_id[:8]} "
+                    f"{old:.1f}→{quote.size:.1f} shares (free={free_inventory:.1f})"
+                ),
+                cooldown=5.0,
+            )
+            return True
+
+        self._throttled_warn(
+            "sell_close_only_blocked",
+            (
+                f"SELL blocked (close-only) {quote.token_id[:8]} "
+                f"need={quote.size:.1f} free={free_inventory:.1f}"
+            ),
+            cooldown=5.0,
+        )
+        return False
+
     def estimate_reserved_collateral(
         self,
         token_balances: Optional[dict[str, float]] = None,
@@ -888,6 +944,8 @@ class OrderManager:
             if not await self.ensure_sell_allowance(quote.token_id):
                 log.warning(f"Cannot place SELL — allowance setup failed for {quote.token_id[:12]}...")
                 return None
+            if not await self._enforce_close_only_sell(quote):
+                return None
 
             # SELL pre-check:
             # - Inventory-backed close: require enough free tokens, skip USDC collateral check.
@@ -916,10 +974,11 @@ class OrderManager:
                     active_sell_exposure,
                 )
 
+            allow_short_sells = bool(getattr(self.config, "allow_short_sells", False))
             short_size = max(0.0, quote.size - free_inventory)
             short_collateral = short_size * (1.0 - quote.price)
 
-            if short_collateral > 0.01:
+            if allow_short_sells and short_collateral > 0.01:
                 # Force fresh balance read for live short-collateral check.
                 usdc_bal = await self.get_usdc_available_balance(force_refresh=True)
                 if usdc_bal is None:
@@ -1062,6 +1121,9 @@ class OrderManager:
                         "batch_sell_allowance",
                         f"Batch SELL skipped — allowance setup failed for {quote.token_id[:12]}...",
                     )
+                    signed_orders.append(None)
+                    continue
+                if not await self._enforce_close_only_sell(quote):
                     signed_orders.append(None)
                     continue
 

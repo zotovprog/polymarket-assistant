@@ -109,6 +109,25 @@ class _LiveCrossBookRejectClient:
         return _Book(bid=self.bid, ask=self.ask)
 
 
+class _LiveBatchCaptureClient:
+    """Live-like client that tracks whether create_order was reached."""
+
+    def __init__(self):
+        self.create_calls = 0
+
+    def create_order(self, order_args):
+        self.create_calls += 1
+        return {
+            "token_id": order_args.token_id,
+            "price": order_args.price,
+            "size": order_args.size,
+            "side": order_args.side,
+        }
+
+    def post_orders(self, signed_orders):
+        return {"orders": [{"orderID": "oid-1"} for _ in signed_orders]}
+
+
 def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
@@ -158,6 +177,37 @@ def test_place_orders_batch_crosses_book_retry_blocked_by_price_guard(monkeypatc
 
     assert result == [None]
     assert client.single_post_calls == 0
+
+
+@pytest.mark.anyio
+async def test_place_order_blocks_naked_sell_in_close_only_mode():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=0.0)
+    om._place_order_inner = AsyncMock(return_value="should-not-place")
+
+    quote = Quote(side="SELL", token_id="dn_tok_123", price=0.80, size=8.0)
+    oid = await om.place_order(quote)
+
+    assert oid is None
+    om._place_order_inner.assert_not_awaited()
+
+
+def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
+
+    client = _LiveBatchCaptureClient()
+    om = order_manager_mod.OrderManager(client, MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=0.0)
+
+    quote = Quote(side="SELL", token_id="dn_tok_123", price=0.80, size=8.0)
+    result = asyncio.run(om.place_orders_batch([quote], post_only=True))
+
+    assert result == [None]
+    assert client.create_calls == 0
 
 
 @pytest.mark.anyio
