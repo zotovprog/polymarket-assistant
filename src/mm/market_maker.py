@@ -175,6 +175,7 @@ class MarketMaker:
         self._pause_reason = ""
         self._task: Optional[asyncio.Task] = None
         self._heartbeat_failure_task: Optional[asyncio.Task] = None
+        self._order_ops_lock: asyncio.Lock = asyncio.Lock()
         self._started_at: float = 0.0
         self._is_closing = False
         self._liquidation_attempted = False
@@ -641,6 +642,31 @@ class MarketMaker:
             return
         self._heartbeat_failure_task = loop.create_task(self._on_heartbeat_failure())
 
+    async def _cancel_all_guarded(self, *, force_exchange: bool = False) -> int:
+        """Serialize cancel-all calls with placement flow to avoid race conditions."""
+        async with self._order_ops_lock:
+            return await self.order_mgr.cancel_all(force_exchange=force_exchange)
+
+    async def _cancel_order_guarded(self, order_id: str) -> bool:
+        """Serialize single-order cancels with placement flow."""
+        async with self._order_ops_lock:
+            return await self.order_mgr.cancel_order(order_id)
+
+    async def _place_order_guarded(
+        self,
+        quote: Quote,
+        *,
+        post_only: bool | None = None,
+        fallback_taker: bool = False,
+    ) -> Optional[str]:
+        """Serialize order placement and skip if emergency shutdown is active."""
+        async with self._order_ops_lock:
+            if self._emergency_flag:
+                return None
+            return await self.order_mgr.place_order(
+                quote, post_only=post_only, fallback_taker=fallback_taker
+            )
+
     async def _on_heartbeat_failure(self) -> None:
         """Handle fatal heartbeat failure (triggered after 3 consecutive misses)."""
         reason = "Heartbeat failed 3 consecutive times"
@@ -649,11 +675,12 @@ class MarketMaker:
             await self._emergency_shutdown(reason)
         finally:
             # Always clear local order/quote state even if exchange cancel raised.
-            self.order_mgr.clear_local_order_tracking()
-            self._current_quotes = {
-                "up": (None, None),
-                "dn": (None, None),
-            }
+            async with self._order_ops_lock:
+                self.order_mgr.clear_local_order_tracking()
+                self._current_quotes = {
+                    "up": (None, None),
+                    "dn": (None, None),
+                }
 
     async def _emergency_shutdown(self, reason: str) -> None:
         """Best-effort fatal shutdown with explicit order and heartbeat cleanup."""
@@ -661,10 +688,16 @@ class MarketMaker:
         self._emergency_flag = True  # Signal in-flight tick to stop placing orders
         self._emergency_stopped = True
         self._is_closing = True
-        try:
-            await self.order_mgr.cancel_all(force_exchange=True)
-        except Exception as e:
-            log.error("Emergency cancel_all failed: %s", e, exc_info=True)
+        async with self._order_ops_lock:
+            try:
+                await self.order_mgr.cancel_all(force_exchange=True)
+            except Exception as e:
+                log.error("Emergency cancel_all failed: %s", e, exc_info=True)
+            self.order_mgr.clear_local_order_tracking()
+            self._current_quotes = {
+                "up": (None, None),
+                "dn": (None, None),
+            }
 
         try:
             await self.heartbeat.stop()
@@ -754,7 +787,7 @@ class MarketMaker:
         # Cancel ALL existing orders first — prevents stale orders from previous
         # crashed sessions (GTD orders can survive up to 5 minutes after crash)
         try:
-            cancelled = await self.order_mgr.cancel_all(force_exchange=True)
+            cancelled = await self._cancel_all_guarded(force_exchange=True)
             if cancelled:
                 log.info("Startup: cancelled %d stale orders from previous session", cancelled)
                 await asyncio.sleep(1.0)  # Wait for PM to settle after cancels
@@ -953,7 +986,7 @@ class MarketMaker:
                 pass
 
         # Cancel all orders first
-        cancelled = await self.order_mgr.cancel_all()
+        cancelled = await self._cancel_all_guarded()
         log.info(f"Cancelled {cancelled} orders on shutdown")
 
         # Liquidate remaining inventory before full stop
@@ -969,7 +1002,7 @@ class MarketMaker:
                 await self.order_mgr.check_fills()
 
         # Final cancel of any remaining orders
-        await self.order_mgr.cancel_all()
+        await self._cancel_all_guarded()
 
         # Stop fill WebSocket
         await self.order_mgr.stop_fill_ws()
@@ -1063,7 +1096,7 @@ class MarketMaker:
                 )
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
-                await self.order_mgr.cancel_all()
+                await self._cancel_all_guarded()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 log.warning("Window expired — entering closing mode")
 
@@ -1103,7 +1136,7 @@ class MarketMaker:
             self._liq_last_chunk_time = 0.0
             log.info(f"Closing mode: {time_left:.0f}s remaining — cancelling all orders "
                      f"(lock: pnl=${self._liq_lock.trigger_pnl:.2f})")
-            await self.order_mgr.cancel_all()
+            await self._cancel_all_guarded()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
 
         # 2. Check for fills (always, including closing mode)
@@ -1285,7 +1318,7 @@ class MarketMaker:
 
         if is_stale:
             log.warning("Binance feed stale (%.1fs), cancelling orders and skipping tick", staleness)
-            await self.order_mgr.cancel_all()
+            await self._cancel_all_guarded()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
@@ -1316,7 +1349,7 @@ class MarketMaker:
                 "invalid_strike",
                 "Strike invalid/unavailable — cancelling all orders and staying in watch mode",
             )
-            await self.order_mgr.cancel_all()
+            await self._cancel_all_guarded()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
@@ -1442,34 +1475,35 @@ class MarketMaker:
                 self._is_closing = True
                 self._closing_start_time_left = self.market.time_remaining
                 self._merge_failed_this_cycle = False
-                await self.order_mgr.cancel_all()
+                await self._cancel_all_guarded()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 return
 
-        # Inventory limit: don't fully pause — suppress BUY on overloaded side
-        _inv_limit_suppress: set[str] = set()  # token keys to suppress BUY
+        # Inventory limit: hard-stop and enter closing/liquidation mode.
         if should_pause and "Inventory limit" in reason:
-            max_sh = self.config.max_inventory_shares
-            if self.inventory.up_shares > max_sh:
-                _inv_limit_suppress.add("up")
-            if self.inventory.dn_shares > max_sh:
-                _inv_limit_suppress.add("dn")
-            # Net delta breach: suppress BUY on the leading (higher shares) side
-            if "net delta" in reason:
-                if self.inventory.up_shares >= self.inventory.dn_shares:
-                    _inv_limit_suppress.add("up")
-                else:
-                    _inv_limit_suppress.add("dn")
-            # Mark as "soft pause" for UI, but keep quoting
+            log.warning("Inventory hard-stop triggered: %s", reason)
             self._paused = True
-            self._pause_reason = reason + " (selling to reduce)"
-            should_pause = False  # don't block quoting below
-            log.info(f"Inventory limit — suppressing BUY on {_inv_limit_suppress}, continuing to quote")
+            self._pause_reason = reason
+            best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
+            self._liq_lock = self.risk_mgr.lock_pnl(
+                self.inventory, fv_up, fv_dn,
+                margin=self.config.liq_price_floor_margin,
+                best_bid_up=best_bid_up,
+                best_bid_dn=best_bid_dn,
+            )
+            self._liq_chunk_index = 0
+            self._liq_last_chunk_time = 0.0
+            self._is_closing = True
+            self._closing_start_time_left = self.market.time_remaining
+            self._merge_failed_this_cycle = False
+            await self._cancel_all_guarded()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
 
         if should_pause and not self._paused:
             self._paused = True
             self._pause_reason = reason
-            await self.order_mgr.cancel_all()
+            await self._cancel_all_guarded()
             log.warning(f"MM PAUSED: {reason}")
             return
         elif not should_pause and self._paused and not self._quality_pause_active:
@@ -1477,7 +1511,7 @@ class MarketMaker:
             self._pause_reason = ""
             log.info("MM RESUMED")
 
-        if self._paused and not _inv_limit_suppress and not self._quality_pause_active:
+        if self._paused and not self._quality_pause_active:
             return
 
         # Reset catastrophic counter when PnL is healthy.
@@ -1523,7 +1557,7 @@ class MarketMaker:
                 self._is_closing = True
                 self._closing_start_time_left = time_left
                 self._merge_failed_this_cycle = False
-                await self.order_mgr.cancel_all()
+                await self._cancel_all_guarded()
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 return
         else:
@@ -1572,7 +1606,7 @@ class MarketMaker:
                     self._is_closing = True
                     self._closing_start_time_left = self.market.time_remaining
                     self._merge_failed_this_cycle = False
-                    await self.order_mgr.cancel_all()
+                    await self._cancel_all_guarded()
                     self._current_quotes = {"up": (None, None), "dn": (None, None)}
                     return
             except Exception as e:
@@ -1587,7 +1621,7 @@ class MarketMaker:
                         self._quality_pause_active = True
                         self._paused = True
                         self._pause_reason = "Market quality degraded"
-                        await self.order_mgr.cancel_all()
+                        await self._cancel_all_guarded()
                         self._current_quotes = {"up": (None, None), "dn": (None, None)}
                     log.critical("Market quality degraded, pausing")
                 return
@@ -1652,7 +1686,7 @@ class MarketMaker:
                     "Entry settle active: waiting %.1fs before quoting this window",
                     max(0.0, remaining),
                 )
-            await self.order_mgr.cancel_all()
+            await self._cancel_all_guarded()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
@@ -1722,14 +1756,6 @@ class MarketMaker:
         if leading_token and self._imbalance_adjustments.get("suppress_leading_buy", False):
             lead_bid, lead_ask = all_quotes[leading_token]
             all_quotes[leading_token] = (None, lead_ask)
-
-        # 6a-pre. Suppress BUY on inventory-overloaded sides
-        if _inv_limit_suppress:
-            for tk in _inv_limit_suppress:
-                bid, ask = all_quotes[tk]
-                if bid is not None:
-                    log.info(f"Suppressing BUY {tk.upper()} due to inventory limit")
-                    all_quotes[tk] = (None, ask)
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
@@ -1909,65 +1935,81 @@ class MarketMaker:
                 updated_ask = new_ask if need_ask else (None if stale_ask else cur_ask)
                 pending_updates[token_key] = (updated_bid, updated_ask)
 
-        # Cancel old orders via batch API.
-        if pending_cancels:
-            pending_cancels = list(dict.fromkeys(oid for oid in pending_cancels if oid))
-            cancelled = await self.order_mgr.cancel_orders_batch(pending_cancels)
-            self.sre_metrics.record_api_call(cancelled == len(pending_cancels))
-            if cancelled < len(pending_cancels):
-                failed = len(pending_cancels) - cancelled
-                log.warning(
-                    "Batch cancel: %d/%d failed, skipping placements",
-                    failed, len(pending_cancels),
-                )
-                pending_places.clear()
-                pending_updates.clear()
+        if pending_cancels or pending_places:
+            async with self._order_ops_lock:
+                if self._emergency_flag:
+                    return
 
-        # Place new orders safely:
-        # - maker orders via batch API (fewer HTTP calls),
-        # - taker/special orders sequentially (avoid budget races).
-        if pending_places:
-            maker_batch_quotes: list[Quote] = []
-            sequential_places: list[tuple[Quote, bool | None, bool, bool]] = []
-            for q, po, ft, ioc_like in pending_places:
-                if (po is None or po is True) and not ft and not ioc_like:
-                    maker_batch_quotes.append(q)
-                else:
-                    sequential_places.append((q, po, ft, ioc_like))
+                # Cancel old orders via batch API.
+                if pending_cancels:
+                    pending_cancels = list(dict.fromkeys(oid for oid in pending_cancels if oid))
+                    cancelled = await self.order_mgr.cancel_orders_batch(pending_cancels)
+                    self.sre_metrics.record_api_call(cancelled == len(pending_cancels))
+                    if self._emergency_flag:
+                        return
+                    if cancelled < len(pending_cancels):
+                        failed = len(pending_cancels) - cancelled
+                        log.warning(
+                            "Batch cancel: %d/%d failed, skipping placements",
+                            failed, len(pending_cancels),
+                        )
+                        pending_places.clear()
+                        pending_updates.clear()
 
-            place_failed = 0
-            place_total = 0
+                # Place new orders safely:
+                # - maker orders via batch API (fewer HTTP calls),
+                # - taker/special orders sequentially (avoid budget races).
+                if pending_places:
+                    maker_batch_quotes: list[Quote] = []
+                    sequential_places: list[tuple[Quote, bool | None, bool, bool]] = []
+                    for q, po, ft, ioc_like in pending_places:
+                        if (po is None or po is True) and not ft and not ioc_like:
+                            maker_batch_quotes.append(q)
+                        else:
+                            sequential_places.append((q, po, ft, ioc_like))
 
-            if maker_batch_quotes:
-                batch_ids = await self.order_mgr.place_orders_batch(
-                    maker_batch_quotes,
-                    post_only=self.config.use_post_only,
-                )
-                place_total += len(batch_ids)
-                place_failed += sum(1 for oid in batch_ids if not oid)
+                    place_failed = 0
+                    place_total = 0
 
-            for q, po, ft, ioc_like in sequential_places:
-                oid = await self.order_mgr.place_order(q, post_only=po, fallback_taker=ft)
-                place_total += 1
-                if not oid:
-                    place_failed += 1
-                    continue
-                if ioc_like:
-                    # IOC-like behavior: taker-second-leg should not rest in book.
-                    try:
-                        await self.order_mgr.cancel_order(oid)
-                    except Exception:
-                        pass
+                    if maker_batch_quotes:
+                        batch_ids = await self.order_mgr.place_orders_batch(
+                            maker_batch_quotes,
+                            post_only=self.config.use_post_only,
+                        )
+                        place_total += len(batch_ids)
+                        place_failed += sum(1 for oid in batch_ids if not oid)
+                        if self._emergency_flag:
+                            return
 
-            if place_total > 0:
-                self.sre_metrics.record_api_call(place_failed == 0)
+                    for q, po, ft, ioc_like in sequential_places:
+                        oid = await self.order_mgr.place_order(q, post_only=po, fallback_taker=ft)
+                        place_total += 1
+                        if self._emergency_flag:
+                            return
+                        if not oid:
+                            place_failed += 1
+                            continue
+                        if ioc_like:
+                            # IOC-like behavior: taker-second-leg should not rest in book.
+                            try:
+                                await self.order_mgr.cancel_order(oid)
+                            except Exception:
+                                pass
+                            if self._emergency_flag:
+                                return
 
-            if place_failed:
-                log.warning("Order placement: %d/%d orders failed", place_failed, place_total)
+                    if place_total > 0:
+                        self.sre_metrics.record_api_call(place_failed == 0)
 
-        # Update quote tracking
-        for tk, (bid, ask) in pending_updates.items():
-            self._current_quotes[tk] = (bid, ask)
+                    if place_failed:
+                        log.warning("Order placement: %d/%d orders failed", place_failed, place_total)
+
+                # Update quote tracking while order lock is held to avoid state races.
+                for tk, (bid, ask) in pending_updates.items():
+                    self._current_quotes[tk] = (bid, ask)
+        else:
+            for tk, (bid, ask) in pending_updates.items():
+                self._current_quotes[tk] = (bid, ask)
 
         _t_orders = time.perf_counter()
 
@@ -2295,7 +2337,7 @@ class MarketMaker:
             log.info("Switching to taker liquidation — cancelling %d limit orders",
                      len(self._liquidation_order_ids))
             for oid in list(self._liquidation_order_ids):
-                await self.order_mgr.cancel_order(oid)
+                await self._cancel_order_guarded(oid)
             self._liquidation_order_ids.clear()
 
         # 3. If limit orders are still live, wait for chunk interval then cancel & re-place
@@ -2310,7 +2352,7 @@ class MarketMaker:
             log.info("Cancelling %d stale liq orders after %.1fs, re-placing",
                      len(self._liquidation_order_ids), elapsed)
             for oid in list(self._liquidation_order_ids):
-                await self.order_mgr.cancel_order(oid)
+                await self._cancel_order_guarded(oid)
             self._liquidation_order_ids.clear()
 
         # 5. Pre-flight: ensure allowance (one-time, cached)
@@ -2505,7 +2547,7 @@ class MarketMaker:
                 size=sell_size,
                 token_id=token_id,
             )
-            order_id = await self.order_mgr.place_order(sell_quote, post_only=post_only, fallback_taker=True)
+            order_id = await self._place_order_guarded(sell_quote, post_only=post_only, fallback_taker=True)
             if order_id:
                 self._liquidation_order_ids.add(order_id)
                 placed_any = True
@@ -2569,7 +2611,7 @@ class MarketMaker:
                     self.inventory.reconcile(0.0, 0.0, self._cached_usdc_balance)
                 if self._liquidation_order_ids:
                     for oid in list(self._liquidation_order_ids):
-                        await self.order_mgr.cancel_order(oid)
+                        await self._cancel_order_guarded(oid)
                     self._liquidation_order_ids.clear()
                 log.info("Liquidation complete — PM inventory cleared")
                 self._is_closing = False
@@ -2659,7 +2701,7 @@ class MarketMaker:
         log.info(f"Window transition: {new_market.coin} {new_market.timeframe}")
 
         # Cancel all existing orders
-        await self.order_mgr.cancel_all()
+        await self._cancel_all_guarded()
         self._current_quotes = {"up": (None, None), "dn": (None, None)}
 
         # Reset cost basis, risk state, and liquidation state for new window

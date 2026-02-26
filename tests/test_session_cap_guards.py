@@ -170,3 +170,35 @@ async def test_liquidation_catastrophic_uses_single_drawdown_threshold():
     mm._emergency_shutdown.assert_awaited_once()
     reason = mm._emergency_shutdown.await_args.args[0]
     assert "CATASTROPHIC LOSS confirmed" in reason
+
+
+@pytest.mark.anyio
+async def test_inventory_limit_triggers_hard_close_and_cancel():
+    mm = _make_mm()
+    mm.config.max_inventory_shares = 5.0
+    mm.inventory.up_shares = 12.0
+    mm.inventory.dn_shares = 0.0
+    mm.inventory.usdc = 15.0
+    mm._cached_pm_up_shares = 12.0
+    mm._cached_pm_dn_shares = 0.0
+    mm._cached_usdc_balance = 15.0
+    mm._cached_usdc_available_balance = 15.0
+
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(12.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(15.0, 15.0))
+    mm._get_liq_lock_best_bids = AsyncMock(return_value=(0.50, 0.50))
+    mm._maybe_backfill_trades = AsyncMock(return_value=None)
+    mm.markout_tracker.check_markouts = AsyncMock(return_value=None)
+
+    mm._compute_fv = lambda: (0.50, 0.50)
+    mm.fair_value.realized_vol = lambda _klines: 0.0005
+
+    await mm._tick()
+
+    mm.order_mgr.cancel_all.assert_awaited()
+    assert mm._is_closing is True
+    assert mm._paused is True
+    assert "Inventory limit" in mm._pause_reason
+    assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}

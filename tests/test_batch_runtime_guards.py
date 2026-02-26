@@ -62,6 +62,53 @@ class _LiveRejectClient:
         }
 
 
+class _Level:
+    def __init__(self, price: float):
+        self.price = str(price)
+
+
+class _Book:
+    def __init__(self, *, bid: float, ask: float):
+        self.bids = [_Level(bid)]
+        self.asks = [_Level(ask)]
+
+
+class _LiveCrossBookRejectClient:
+    """Live-like client: batch post-only rejects, single taker succeeds."""
+
+    def __init__(self, *, bid: float = 0.50, ask: float = 0.51):
+        self.bid = bid
+        self.ask = ask
+        self.single_post_calls = 0
+
+    def create_order(self, order_args):
+        return {
+            "token_id": order_args.token_id,
+            "price": order_args.price,
+            "size": order_args.size,
+            "side": order_args.side,
+        }
+
+    def post_orders(self, signed_orders):
+        return {
+            "orders": [
+                {
+                    "errorMsg": "invalid post-only order: order crosses book",
+                    "status": "",
+                    "orderID": "",
+                }
+                for _ in signed_orders
+            ]
+        }
+
+    def post_order(self, *_args, **_kwargs):
+        self.single_post_calls += 1
+        return {"orderID": f"taker-{self.single_post_calls}"}
+
+    def get_order_book(self, _token_id):
+        return _Book(bid=self.bid, ask=self.ask)
+
+
 def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
@@ -78,6 +125,39 @@ def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     assert "Batch reject BUY" in messages
     assert "price outside bounds" in messages
     assert "raw=" in messages
+
+
+def test_place_orders_batch_crosses_book_retries_as_taker(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
+
+    client = _LiveCrossBookRejectClient(bid=0.50, ask=0.51)
+    om = order_manager_mod.OrderManager(client, MMConfig())
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.51, size=5.0)
+
+    result = asyncio.run(om.place_orders_batch([quote], post_only=True))
+
+    assert result[0] is not None
+    assert result[0].startswith("taker-")
+    assert client.single_post_calls == 1
+
+
+def test_place_orders_batch_crosses_book_retry_blocked_by_price_guard(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
+
+    client = _LiveCrossBookRejectClient(bid=0.49, ask=0.50)
+    cfg = MMConfig()
+    cfg.requote_threshold_bps = 20.0  # strict guard for this test
+    om = order_manager_mod.OrderManager(client, cfg)
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.70, size=5.0)
+
+    result = asyncio.run(om.place_orders_batch([quote], post_only=True))
+
+    assert result == [None]
+    assert client.single_post_calls == 0
 
 
 @pytest.mark.anyio

@@ -381,6 +381,101 @@ class OrderManager:
 
         return "missing order id / unknown reject reason"
 
+    async def _retry_batch_reject_as_taker(
+        self,
+        quote: Quote,
+        *,
+        reason: str,
+    ) -> Optional[str]:
+        """Retry a batch post-only reject as taker with guardrails.
+
+        Guardrails:
+        - only for crossing-book rejects,
+        - block retries when quote is too aggressive vs current BBO,
+        - block retries when estimated taker fee exceeds max_loss_per_fill_usd.
+        """
+        reason_l = (reason or "").lower()
+        if "crosses book" not in reason_l:
+            return None
+
+        max_cross_bps = max(
+            5.0,
+            float(getattr(self.config, "requote_threshold_bps", 25.0) or 25.0),
+        )
+        max_fee_usd = max(0.0, float(getattr(self.config, "max_loss_per_fill_usd", 0.0) or 0.0))
+
+        best_bid: float | None = None
+        best_ask: float | None = None
+        try:
+            book = await self.get_book_summary(quote.token_id)
+            if isinstance(book, dict):
+                best_bid = self._safe_float(book.get("best_bid"))
+                best_ask = self._safe_float(book.get("best_ask"))
+        except Exception:
+            best_bid = None
+            best_ask = None
+
+        estimated_fill_price = quote.price
+        if quote.side == "BUY" and best_ask is not None and best_ask > 0:
+            max_allowed = best_ask * (1.0 + max_cross_bps / 10000.0)
+            if quote.price > max_allowed + 1e-9:
+                log.warning(
+                    "Batch taker retry blocked BUY %s %.1f@%.2f: "
+                    "cross too wide vs ask=%.2f (max=%0.4f, limit=%0.4f)",
+                    quote.token_id[:8],
+                    quote.size,
+                    quote.price,
+                    best_ask,
+                    max_cross_bps,
+                    max_allowed,
+                )
+                return None
+            estimated_fill_price = min(quote.price, best_ask)
+        elif quote.side == "SELL" and best_bid is not None and best_bid > 0:
+            min_allowed = best_bid * (1.0 - max_cross_bps / 10000.0)
+            if quote.price < min_allowed - 1e-9:
+                log.warning(
+                    "Batch taker retry blocked SELL %s %.1f@%.2f: "
+                    "cross too wide vs bid=%.2f (max=%0.4f, limit=%0.4f)",
+                    quote.token_id[:8],
+                    quote.size,
+                    quote.price,
+                    best_bid,
+                    max_cross_bps,
+                    min_allowed,
+                )
+                return None
+            estimated_fill_price = max(quote.price, best_bid)
+
+        est_fee = taker_fee_usd(
+            estimated_fill_price,
+            quote.size,
+            quote.side,
+            token_id=quote.token_id,
+        )
+        if max_fee_usd > 0 and est_fee > max_fee_usd + 1e-9:
+            log.warning(
+                "Batch taker retry blocked %s %s %.1f@%.2f: "
+                "estimated fee $%.4f > max_loss_per_fill_usd $%.4f",
+                quote.side,
+                quote.token_id[:8],
+                quote.size,
+                quote.price,
+                est_fee,
+                max_fee_usd,
+            )
+            return None
+
+        log.info(
+            "Batch reject fallback: retrying as taker %s %s %.1f@%.2f (reason=%s)",
+            quote.side,
+            quote.token_id[:8],
+            quote.size,
+            quote.price,
+            reason,
+        )
+        return await self.place_order(quote, post_only=False, fallback_taker=False)
+
     @classmethod
     def _extract_fill_price(cls, order: dict[str, Any], fallback: float) -> float:
         """Best-effort fill price from exchange payload, with quote fallback."""
@@ -1015,6 +1110,15 @@ class OrderManager:
                     order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
                         reason = self._extract_batch_reject_reason(order_resp)
+                        retry_oid = None
+                        if use_post_only:
+                            retry_oid = await self._retry_batch_reject_as_taker(
+                                quote,
+                                reason=reason,
+                            )
+                        if retry_oid:
+                            results[idx] = retry_oid
+                            continue
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
@@ -1042,6 +1146,15 @@ class OrderManager:
                         )
                     else:
                         reason = self._extract_batch_reject_reason(order_resp)
+                        retry_oid = None
+                        if use_post_only:
+                            retry_oid = await self._retry_batch_reject_as_taker(
+                                quote,
+                                reason=reason,
+                            )
+                        if retry_oid:
+                            results[idx] = retry_oid
+                            continue
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
