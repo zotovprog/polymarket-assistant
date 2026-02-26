@@ -179,6 +179,7 @@ class MarketMaker:
         self._liquidation_attempted = False
         self._liquidation_order_ids: set[str] = set()
         self._cached_usdc_balance: float = 0.0
+        self._cached_usdc_available_balance: float | None = None
         self._cached_pm_up_shares: float = 0.0
         self._cached_pm_dn_shares: float = 0.0
         self._starting_usdc_pm: float = 0.0
@@ -642,17 +643,21 @@ class MarketMaker:
 
         # Snapshot starting portfolio (USDC + token values) for real session PnL
         try:
-            (real_up, real_dn), starting_usdc = await asyncio.gather(
+            (real_up, real_dn), usdc_pair = await asyncio.gather(
                 self.order_mgr.get_all_token_balances(
                     self.market.up_token_id, self.market.dn_token_id,
                 ),
-                self.order_mgr.get_usdc_balance(),
+                self.order_mgr.get_usdc_balances(),
             )
+            starting_usdc, starting_usdc_available = usdc_pair
             if starting_usdc is None:
                 log.warning("Failed to fetch starting USDC balance, defaulting to 0.0")
                 starting_usdc = 0.0
             self._starting_usdc_pm = starting_usdc
             self._cached_usdc_balance = starting_usdc
+            self._cached_usdc_available_balance = (
+                starting_usdc_available if starting_usdc_available is not None else starting_usdc
+            )
             self._cached_pm_up_shares = real_up if real_up is not None else 0.0
             self._cached_pm_dn_shares = real_dn if real_dn is not None else 0.0
             # Always initialize internal inventory from real PM balances to avoid stale state.
@@ -706,6 +711,7 @@ class MarketMaker:
             self._starting_usdc_pm = 0.0
             self._starting_portfolio_pm = 0.0
             self._cached_usdc_balance = 0.0
+            self._cached_usdc_available_balance = 0.0
             self._cached_pm_up_shares = 0.0
             self._cached_pm_dn_shares = 0.0
             self.inventory.up_shares = 0.0
@@ -1016,17 +1022,21 @@ class MarketMaker:
         is_live = not hasattr(self.order_mgr.client, "_orders")
         reconcile_requested = self.order_mgr.reconcile_requested or merge_reconcile_requested
         if is_live and not self._is_closing and (self._tick_count % 15 == 0 or reconcile_requested):
-            (real_up, real_dn), usdc_bal = await asyncio.gather(
+            (real_up, real_dn), usdc_pair = await asyncio.gather(
                 self.order_mgr.get_all_token_balances(
                     self.market.up_token_id,
                     self.market.dn_token_id,
                 ),
-                self.order_mgr.get_usdc_balance(),
+                self.order_mgr.get_usdc_balances(),
             )
+            usdc_bal, usdc_available = usdc_pair
             if usdc_bal is not None:
                 self._cached_usdc_balance = usdc_bal
+                self.inventory.usdc = usdc_bal
             else:
                 log.warning("Failed to refresh USDC balance, keeping previous cached value")
+            if usdc_available is not None:
+                self._cached_usdc_available_balance = usdc_available
 
             if real_up is None or real_dn is None:
                 log.error("Skipping inventory reconcile: failed to fetch PM token balances")
@@ -1090,6 +1100,8 @@ class MarketMaker:
         elif not is_live:
             # Paper mode: sync from mock client balance + internal inventory
             self._cached_usdc_balance = self.order_mgr.client.get_balance()
+            self._cached_usdc_available_balance = self._cached_usdc_balance
+            self.inventory.usdc = self._cached_usdc_balance
             self._cached_pm_up_shares = self.inventory.up_shares
             self._cached_pm_dn_shares = self.inventory.dn_shares
 
@@ -1824,14 +1836,18 @@ class MarketMaker:
         is_live = not hasattr(self.order_mgr.client, "_orders")
         if is_live and (fills or self._tick_count % 15 == 0):
             try:
-                (real_up, real_dn), usdc_bal = await asyncio.gather(
+                (real_up, real_dn), usdc_pair = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(
                         self.market.up_token_id, self.market.dn_token_id,
                     ),
-                    self.order_mgr.get_usdc_balance(),
+                    self.order_mgr.get_usdc_balances(),
                 )
+                usdc_bal, usdc_available = usdc_pair
                 if usdc_bal is not None:
                     self._cached_usdc_balance = usdc_bal
+                    self.inventory.usdc = usdc_bal
+                if usdc_available is not None:
+                    self._cached_usdc_available_balance = usdc_available
                 if real_up is not None:
                     self._cached_pm_up_shares = real_up
                 if real_dn is not None:
@@ -1841,6 +1857,8 @@ class MarketMaker:
         elif not is_live:
             # Paper mode: sync from mock client balance + internal inventory
             self._cached_usdc_balance = self.order_mgr.client.get_balance()
+            self._cached_usdc_available_balance = self._cached_usdc_balance
+            self.inventory.usdc = self._cached_usdc_balance
             self._cached_pm_up_shares = self.inventory.up_shares
             self._cached_pm_dn_shares = self.inventory.dn_shares
 
@@ -2076,11 +2094,14 @@ class MarketMaker:
                 if self._catastrophic_count >= self._catastrophic_threshold:
                     # Fresh recheck: re-fetch balances before final decision
                     try:
-                        fresh_usdc = await self.order_mgr.get_usdc_balance()
+                        fresh_usdc, fresh_usdc_available = await self.order_mgr.get_usdc_balances()
                         (fresh_up, fresh_dn) = await self.order_mgr.get_all_token_balances(
                             self.market.up_token_id, self.market.dn_token_id)
                         if fresh_usdc is not None:
                             self._cached_usdc_balance = fresh_usdc
+                            self.inventory.usdc = fresh_usdc
+                        if fresh_usdc_available is not None:
+                            self._cached_usdc_available_balance = fresh_usdc_available
                         if fresh_up is not None:
                             self._cached_pm_up_shares = fresh_up
                         if fresh_dn is not None:
@@ -2584,6 +2605,36 @@ class MarketMaker:
             self.inventory.dn_cost.avg_entry_price,
             _pm_dn_price,
         )
+        is_live = not hasattr(self.order_mgr.client, "_orders")
+        inv_up_display = self._cached_pm_up_shares if is_live else self.inventory.up_shares
+        inv_dn_display = self._cached_pm_dn_shares if is_live else self.inventory.dn_shares
+        inv_usdc_total = self._cached_usdc_balance if is_live else self.inventory.usdc
+        inv_net_delta_display = inv_up_display - inv_dn_display
+        up_drift = abs(inv_up_display - self.inventory.up_shares)
+        dn_drift = abs(inv_dn_display - self.inventory.dn_shares)
+        up_avg_entry_display = (
+            round(self.inventory.up_cost.avg_entry_price, 4)
+            if inv_up_display > 0 and up_drift <= 0.25
+            else None
+        )
+        dn_avg_entry_display = (
+            round(self.inventory.dn_cost.avg_entry_price, 4)
+            if inv_dn_display > 0 and dn_drift <= 0.25
+            else None
+        )
+        token_balances = {}
+        if self.market:
+            token_balances[self.market.up_token_id] = max(0.0, inv_up_display)
+            token_balances[self.market.dn_token_id] = max(0.0, inv_dn_display)
+        reserved_est = self.order_mgr.estimate_reserved_collateral(token_balances)
+        if self._cached_usdc_available_balance is not None:
+            usdc_free_pm = max(0.0, float(self._cached_usdc_available_balance))
+            reserved_collateral_pm = max(0.0, inv_usdc_total - usdc_free_pm)
+            usdc_free_source = "pm_api_available"
+        else:
+            reserved_collateral_pm = max(0.0, reserved_est.get("total_reserved", 0.0))
+            usdc_free_pm = max(0.0, inv_usdc_total - reserved_collateral_pm)
+            usdc_free_source = "estimated_from_active_orders"
 
         return {
             # Market info
@@ -2622,17 +2673,27 @@ class MarketMaker:
 
             # Inventory
             "inventory": {
+                "up_shares": round(inv_up_display, 2),
+                "dn_shares": round(inv_dn_display, 2),
+                "net_delta": round(inv_net_delta_display, 2),
+                "usdc": round(inv_usdc_total, 2),
+                "up_avg_entry": up_avg_entry_display,
+                "dn_avg_entry": dn_avg_entry_display,
+            },
+            "inventory_internal": {
                 "up_shares": round(self.inventory.up_shares, 2),
                 "dn_shares": round(self.inventory.dn_shares, 2),
                 "net_delta": round(self.inventory.net_delta, 2),
                 "usdc": round(self.inventory.usdc, 2),
                 "up_avg_entry": round(self.inventory.up_cost.avg_entry_price, 4),
                 "dn_avg_entry": round(self.inventory.dn_cost.avg_entry_price, 4),
+                "drift_up_shares": round(up_drift, 3),
+                "drift_dn_shares": round(dn_drift, 3),
             },
 
             # Paired filling state
             "paired_filling": {
-                "imbalance_shares": round(abs(self.inventory.up_shares - self.inventory.dn_shares), 2),
+                "imbalance_shares": round(abs(inv_up_display - inv_dn_display), 2),
                 "imbalance_duration_sec": round(
                     max(0.0, time.time() - self._imbalance_start_ts), 2
                 ) if self._imbalance_start_ts > 0 else 0.0,
@@ -2659,6 +2720,7 @@ class MarketMaker:
             "starting_usdc_pm": round(self._starting_usdc_pm, 2),
             "starting_portfolio_pm": round(self._starting_portfolio_pm, 2),
             "portfolio_value": round(self._cached_usdc_balance + _position_value, 2),
+            "position_value_pm": round(_position_value, 4),
             "is_paused": self._paused,
             "pause_reason": self._pause_reason,
             "is_closing": self._is_closing,
@@ -2731,6 +2793,14 @@ class MarketMaker:
 
             # Real USDC balance on Polymarket
             "usdc_balance_pm": round(self._cached_usdc_balance, 2),
+            "usdc_free_pm": round(usdc_free_pm, 2),
+            "usdc_reserved_collateral_pm": round(reserved_collateral_pm, 2),
+            "usdc_reserved_collateral_est_pm": {
+                "buy_reserved": round(reserved_est.get("buy_reserved", 0.0), 2),
+                "short_reserved": round(reserved_est.get("short_reserved", 0.0), 2),
+                "total_reserved": round(reserved_est.get("total_reserved", 0.0), 2),
+            },
+            "usdc_free_source": usdc_free_source,
 
             # Active orders detail
             "active_orders_detail": self.order_mgr.get_active_orders_detail(

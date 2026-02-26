@@ -416,7 +416,9 @@ function updateUI(s) {
         setNumberAnimated('inv-up', s.inventory.up_shares || 0, '', 1);
         setNumberAnimated('inv-dn', s.inventory.dn_shares || 0, '', 1);
         setNumberAnimated('inv-delta', s.inventory.net_delta || 0, '', 1);
-        setNumberAnimated('inv-usdc', s.inventory.usdc || 0, '$', 2);
+        const totalUsdc = (s.usdc_balance_pm != null) ? s.usdc_balance_pm : (s.inventory.usdc || 0);
+        const freeUsdcDisplay = (s.usdc_free_pm != null) ? s.usdc_free_pm : totalUsdc;
+        setNumberAnimated('inv-usdc', freeUsdcDisplay, '$', 2);
         updateInventoryBar(s.inventory);
         // Avg entry prices
         setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '\u2014');
@@ -430,7 +432,8 @@ function updateUI(s) {
         setText('inv-dn-mark', dnP > 0 ? dnP.toFixed(4) : '\u2014');
         setNumberAnimated('inv-up-worth', upW, '$', 2);
         setNumberAnimated('inv-dn-worth', dnW, '$', 2);
-        setNumberAnimated('inv-total-value', upW + dnW + (s.inventory.usdc || 0), '$', 2);
+        const portfolioTotal = (s.portfolio_value != null) ? s.portfolio_value : (upW + dnW + totalUsdc);
+        setNumberAnimated('inv-total-value', portfolioTotal, '$', 2);
     }
 
     // Liquidation lock
@@ -448,9 +451,11 @@ function updateUI(s) {
 
     // ── PnL (simplified: 3 big numbers, animated) ────
     const sessionPnl = s.session_pnl != null ? s.session_pnl : (s.total_pnl || 0);
-    const positionsWorth = (s.inventory?.up_shares || 0) * (s.pm_prices?.up || 0)
-                         + (s.inventory?.dn_shares || 0) * (s.pm_prices?.dn || 0);
-    const freeUsdc = s.usdc_balance_pm || 0;
+    const positionsWorth = (s.position_value_pm != null)
+        ? s.position_value_pm
+        : ((s.inventory?.up_shares || 0) * (s.pm_prices?.up || 0)
+         + (s.inventory?.dn_shares || 0) * (s.pm_prices?.dn || 0));
+    const freeUsdc = (s.usdc_free_pm != null) ? s.usdc_free_pm : (s.usdc_balance_pm || 0);
     const stake = s.session_limit || 1;
     const pnlPct = (sessionPnl / stake * 100).toFixed(1);
 

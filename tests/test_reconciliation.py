@@ -83,13 +83,19 @@ def _make_mm(*, live: bool) -> MarketMaker:
 
 
 def _run_tick_with_reconcile_gate(mm: MarketMaker) -> None:
-    # _tick() increments first; setting to 4 ensures reconciliation check runs (%5 == 0).
-    mm._tick_count = 4
+    # _tick() increments first; setting to 14 ensures reconciliation check runs (%15 == 0).
+    mm._tick_count = 14
     asyncio.run(mm._tick())
 
 
 def _make_risk_setup() -> tuple[RiskManager, Inventory]:
-    risk_mgr = RiskManager(MMConfig(max_drawdown_usd=8.0))
+    risk_mgr = RiskManager(
+        MMConfig(
+            max_drawdown_usd=8.0,
+            max_inventory_shares=100.0,
+            max_net_delta_shares=100.0,
+        )
+    )
     inventory = Inventory(up_shares=14.96, dn_shares=0.0)
 
     risk_mgr.record_fill(
@@ -130,7 +136,7 @@ def test_debounce_prevents_oscillation():
             (1.5, 18.0),   # stable -> 3, reconcile
         ]
     )
-    mm.order_mgr.get_usdc_balance = AsyncMock(return_value=100.0)
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
 
     _run_tick_with_reconcile_gate(mm)
     assert mm._reconcile_prev_pm == (15.0, 18.0)
@@ -160,7 +166,7 @@ def test_forced_reconcile_arms_guard():
     mm.order_mgr._reconcile_requested = True
     mm.order_mgr.check_fills = AsyncMock(return_value=[])
     mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(15.0, 18.0))
-    mm.order_mgr.get_usdc_balance = AsyncMock(return_value=100.0)
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
 
     before = time.time()
     _run_tick_with_reconcile_gate(mm)
@@ -222,6 +228,34 @@ def test_reconcile_resets_on_window_transition():
 
     assert mm._reconcile_prev_pm is None
     assert mm._reconcile_stable_count == 0
+
+
+def test_snapshot_prefers_pm_balances_for_dashboard_inventory():
+    mm = _make_mm(live=True)
+    mm._cached_pm_up_shares = 0.0
+    mm._cached_pm_dn_shares = 0.0
+    mm._cached_usdc_balance = 42.0
+    mm._cached_usdc_available_balance = 40.0
+
+    # Simulate internal drift after missed fill reconciliation.
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 8.1
+    mm.inventory.usdc = 84.33
+    mm.inventory.dn_cost.total_shares = 8.1
+    mm.inventory.dn_cost.total_cost = 8.1 * 0.56
+
+    snap = mm.snapshot()
+
+    # Dashboard-facing inventory must reflect PM-cached balances.
+    assert snap["inventory"]["up_shares"] == pytest.approx(0.0)
+    assert snap["inventory"]["dn_shares"] == pytest.approx(0.0)
+    assert snap["inventory"]["usdc"] == pytest.approx(42.0)
+    assert snap["usdc_balance_pm"] == pytest.approx(42.0)
+    assert snap["usdc_free_pm"] == pytest.approx(40.0)
+
+    # Internal inventory remains available for diagnostics.
+    assert snap["inventory_internal"]["dn_shares"] == pytest.approx(8.1)
+    assert snap["inventory_internal"]["usdc"] == pytest.approx(84.33)
 
 
 def test_sell_clamps_shares_to_zero():
@@ -298,7 +332,7 @@ def test_drawdown_forces_taker_in_liquidation():
     # Mock order_mgr methods to prevent real API calls
     mm.order_mgr.check_fills = AsyncMock(return_value=[])
     mm.order_mgr.get_token_balance = AsyncMock(return_value=0.0)
-    mm.order_mgr.get_usdc_balance = AsyncMock(return_value=10.0)
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(10.0, 10.0))
 
     asyncio.run(mm._liquidate_inventory())
 

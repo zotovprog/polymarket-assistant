@@ -178,6 +178,23 @@ def test_budget_exhausted_no_quotes():
     assert result["dn"][1] is not None, "DN ask should still exist"
 
 
+def test_estimate_reserved_collateral_handles_inventory_backed_sells():
+    """Reserved collateral subtracts inventory-backed SELL exposure."""
+    client = _FakeClient()
+    om = OrderManager(client, MMConfig())
+
+    buy = Quote(side="BUY", token_id="tok-up", price=0.40, size=10.0)   # $4.00
+    sell_1 = Quote(side="SELL", token_id="tok-up", price=0.60, size=6.0)  # fully inventory-backed
+    sell_2 = Quote(side="SELL", token_id="tok-up", price=0.60, size=8.0)  # short 4.0 after inventory
+
+    om._active_orders = {"b1": buy, "s1": sell_1, "s2": sell_2}
+    reserved = om.estimate_reserved_collateral({"tok-up": 10.0})
+
+    assert reserved["buy_reserved"] == pytest.approx(4.0)
+    assert reserved["short_reserved"] == pytest.approx(1.6)  # 4 * (1 - 0.6)
+    assert reserved["total_reserved"] == pytest.approx(5.6)
+
+
 # ── Test 4: throttled warn ────────────────────────────────────
 
 

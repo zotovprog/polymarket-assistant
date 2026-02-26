@@ -123,6 +123,7 @@ class OrderManager:
         self.trade_ledger = TradeLedger()
         self._last_fill_check_ts: float = 0.0
         self._usdc_balance_cache: float | None = None
+        self._usdc_available_cache: float | None = None
         self._usdc_balance_cache_ts: float = 0.0
         self._usdc_cache_ttl: float = 5.0  # Cache USDC balance for 5 seconds
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
@@ -495,6 +496,99 @@ class OrderManager:
         else:
             return quote.size * (1.0 - quote.price)
 
+    def estimate_reserved_collateral(
+        self,
+        token_balances: Optional[dict[str, float]] = None,
+    ) -> dict[str, float]:
+        """Estimate USDC collateral currently reserved by active orders.
+
+        BUY orders always reserve `size * price`.
+        SELL orders only reserve short leg collateral:
+        `max(0, sell_size - available_token_balance) * (1 - price)`.
+        """
+        balances = {
+            token_id: max(0.0, float(balance))
+            for token_id, balance in (token_balances or {}).items()
+        }
+
+        buy_reserved = 0.0
+        short_reserved = 0.0
+
+        for quote in self._active_orders.values():
+            side = (quote.side or "").upper()
+            size = max(0.0, float(quote.size))
+            price = max(0.0, min(1.0, float(quote.price)))
+            if side == "BUY":
+                buy_reserved += size * price
+                continue
+            if side != "SELL":
+                continue
+
+            token_id = quote.token_id
+            available = balances.get(token_id, 0.0)
+            close_size = min(size, available)
+            balances[token_id] = max(0.0, available - close_size)
+            short_size = max(0.0, size - close_size)
+            short_reserved += short_size * (1.0 - price)
+
+        total_reserved = buy_reserved + short_reserved
+        return {
+            "buy_reserved": buy_reserved,
+            "short_reserved": short_reserved,
+            "total_reserved": total_reserved,
+        }
+
+    @staticmethod
+    def _decode_usdc_amount(raw: Any) -> Optional[float]:
+        """Decode PM balance value to USDC units.
+
+        PM usually returns base units (1e6). If a decimal string/float is returned,
+        keep it as-is.
+        """
+        if raw is None:
+            return None
+        try:
+            if isinstance(raw, str):
+                s = raw.strip()
+                if not s:
+                    return None
+                val = float(s)
+                return val if "." in s else (val / 1e6)
+            if isinstance(raw, int):
+                return float(raw) / 1e6
+            val = float(raw)
+            # If float is integer-like and large enough, treat as base units.
+            if val.is_integer() and abs(val) >= 1_000:
+                return val / 1e6
+            return val
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _extract_usdc_balances(cls, payload: Any) -> tuple[Optional[float], Optional[float]]:
+        """Extract total and available USDC from PM balance payload."""
+        if not isinstance(payload, dict):
+            return None, None
+
+        total = None
+        available = None
+
+        for key in ("balance", "total", "total_balance", "totalBalance"):
+            total = cls._decode_usdc_amount(payload.get(key))
+            if total is not None:
+                break
+
+        for key in ("available", "available_balance", "availableBalance", "free", "free_balance"):
+            available = cls._decode_usdc_amount(payload.get(key))
+            if available is not None:
+                break
+
+        if total is None and available is not None:
+            total = available
+        if available is None and total is not None:
+            available = total
+        return total, available
+
     async def ensure_sell_allowance(self, token_id: str) -> bool:
         """Ensure ERC1155 operator allowance is set for SELL orders on this token.
 
@@ -656,7 +750,7 @@ class OrderManager:
 
         # BUY balance pre-check (live only): avoid spamming PM API with 400 errors
         if quote.side == "BUY" and not is_mock:
-            usdc_bal = await self.get_usdc_balance()
+            usdc_bal = await self.get_usdc_available_balance()
             if usdc_bal is None:
                 log.warning("BUY pre-check skipped: failed to fetch USDC balance")
             else:
@@ -730,7 +824,7 @@ class OrderManager:
             short_collateral = short_size * (1.0 - quote.price)
 
             if short_collateral > 0.01:
-                usdc_bal = await self.get_usdc_balance()
+                usdc_bal = await self.get_usdc_available_balance()
                 if usdc_bal is None:
                     log.warning("SELL pre-check skipped: failed to fetch USDC balance")
                 elif usdc_bal < short_collateral:
@@ -1140,40 +1234,59 @@ class OrderManager:
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
             return None
 
-    async def get_usdc_balance(self) -> Optional[float]:
-        """Fetch real USDC (collateral) balance on Polymarket."""
+    async def get_usdc_balances(self) -> tuple[Optional[float], Optional[float]]:
+        """Fetch real USDC balances on Polymarket: (total, available)."""
         now = time.time()
         if (
             self._usdc_balance_cache is not None
+            and self._usdc_available_cache is not None
             and (now - self._usdc_balance_cache_ts) < self._usdc_cache_ttl
         ):
-            return self._usdc_balance_cache
+            return self._usdc_balance_cache, self._usdc_available_cache
 
         try:
             if hasattr(self.client, "_orders"):
                 balance = float(getattr(self.client, '_usdc_balance', 0.0))
                 self._usdc_balance_cache = balance
+                self._usdc_available_cache = balance
                 self._usdc_balance_cache_ts = now
-                return balance
+                return balance, balance
             if not _HAS_CLOB_TYPES:
                 self._usdc_balance_cache = 0.0
+                self._usdc_available_cache = 0.0
                 self._usdc_balance_cache_ts = now
-                return 0.0
+                return 0.0, 0.0
             result = await asyncio.to_thread(
                 self.client.get_balance_allowance,
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
             )
-            balance = float(result.get("balance", 0)) / 1e6
-            self._usdc_balance_cache = balance
+            total, available = self._extract_usdc_balances(result)
+            if total is None:
+                total = 0.0
+            if available is None:
+                available = total
+            self._usdc_balance_cache = total
+            self._usdc_available_cache = available
             self._usdc_balance_cache_ts = now
-            return balance
+            return total, available
         except Exception as e:
             log.warning(f"Failed to fetch USDC balance: {e}")
-            return None
+            return None, None
+
+    async def get_usdc_balance(self) -> Optional[float]:
+        """Fetch total USDC collateral balance on Polymarket."""
+        total, _available = await self.get_usdc_balances()
+        return total
+
+    async def get_usdc_available_balance(self) -> Optional[float]:
+        """Fetch available/free USDC balance on Polymarket."""
+        _total, available = await self.get_usdc_balances()
+        return available
 
     def invalidate_usdc_cache(self) -> None:
         """Force next USDC balance read to refresh from source."""
         self._usdc_balance_cache = None
+        self._usdc_available_cache = None
         self._usdc_balance_cache_ts = 0.0
 
     async def get_all_token_balances(
