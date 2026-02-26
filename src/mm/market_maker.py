@@ -17,6 +17,7 @@ Lifecycle:
 from __future__ import annotations
 import asyncio
 import logging
+import math
 import time
 from dataclasses import asdict
 from typing import Any, Optional
@@ -256,6 +257,17 @@ class MarketMaker:
             self._warn_cooldowns[key] = now
             log.warning(msg)
 
+    @staticmethod
+    def _safe_non_negative(value: Any) -> float:
+        """Best-effort float conversion with non-negative, finite clamp."""
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(val):
+            return 0.0
+        return max(0.0, val)
+
     def _arm_reconcile_guard(self, up_diff: float, dn_diff: float, source: str) -> None:
         """Briefly pause merge/liquidation after large inventory reconcile jumps."""
         max_diff = max(float(up_diff), float(dn_diff))
@@ -296,6 +308,114 @@ class MarketMaker:
             self._reconcile_guard_until = 0.0
             return False
         return True
+
+    def _session_budget_cap(self) -> float:
+        """Configured session USDC cap (0 means unlimited)."""
+        try:
+            return max(0.0, float(self.inventory.initial_usdc or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _effective_max_drawdown_usd(self) -> float:
+        """Drawdown cap bounded by session budget when configured."""
+        configured = max(0.0, float(getattr(self.config, "max_drawdown_usd", 0.0) or 0.0))
+        budget_cap = self._session_budget_cap()
+        if budget_cap > 0:
+            return min(configured, budget_cap)
+        return configured
+
+    def _session_reserved_collateral(self) -> tuple[float, str]:
+        """Reserved collateral estimate used for session exposure checks."""
+        total_usdc = self._safe_non_negative(self._cached_usdc_balance)
+        avail_usdc = self._cached_usdc_available_balance
+        if avail_usdc is not None:
+            avail_val = self._safe_non_negative(avail_usdc)
+            reserved = max(0.0, total_usdc - avail_val)
+            return reserved, "pm_available"
+
+        if not self.market:
+            return 0.0, "none"
+
+        token_balances = {
+            self.market.up_token_id: self._safe_non_negative(self._cached_pm_up_shares),
+            self.market.dn_token_id: self._safe_non_negative(self._cached_pm_dn_shares),
+        }
+        est = self.order_mgr.estimate_reserved_collateral(token_balances)
+        return self._safe_non_negative(est.get("total_reserved", 0.0)), "estimated"
+
+    def _enforce_session_exposure_cap(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+        *,
+        pm_up_price: float,
+        pm_dn_price: float,
+    ) -> None:
+        """Clamp BUY quotes so PM-fact exposure never exceeds session cap."""
+        budget_cap = self._session_budget_cap()
+        if budget_cap <= 0 or not self.market:
+            return
+
+        up_px = self._safe_non_negative(pm_up_price)
+        dn_px = self._safe_non_negative(pm_dn_price)
+        position_value = (
+            self._safe_non_negative(self._cached_pm_up_shares) * up_px
+            + self._safe_non_negative(self._cached_pm_dn_shares) * dn_px
+        )
+        reserved, reserved_source = self._session_reserved_collateral()
+        exposure_used = position_value + reserved
+        headroom = budget_cap - exposure_used
+
+        if headroom <= 0.01:
+            suppressed_any = False
+            for token_key in ("up", "dn"):
+                bid, ask = all_quotes[token_key]
+                if bid is not None:
+                    suppressed_any = True
+                    all_quotes[token_key] = (None, ask)
+            if suppressed_any:
+                self._throttled_warn(
+                    "session_cap_exhausted",
+                    "Session cap exhausted: used=$%.2f (pos=$%.2f reserved=$%.2f/%s) >= cap=$%.2f; suppressing BUYs"
+                    % (exposure_used, position_value, reserved, reserved_source, budget_cap),
+                    cooldown=8.0,
+                )
+            return
+
+        bid_refs: list[tuple[str, Quote]] = []
+        planned_buy_notional = 0.0
+        for token_key in ("up", "dn"):
+            bid, _ask = all_quotes[token_key]
+            if bid is None:
+                continue
+            if bid.price <= 0 or bid.size <= 0:
+                continue
+            bid_refs.append((token_key, bid))
+            planned_buy_notional += bid.size * bid.price
+
+        if not bid_refs or planned_buy_notional <= headroom + 0.01:
+            return
+
+        scale = max(0.0, min(1.0, headroom / planned_buy_notional))
+        adjusted = False
+        for token_key, bid in bid_refs:
+            _cur_bid, ask = all_quotes[token_key]
+            new_size = round(max(0.0, bid.size * scale), 2)
+            if new_size <= 0:
+                all_quotes[token_key] = (None, ask)
+                adjusted = True
+                continue
+            if new_size < bid.size:
+                adjusted = True
+            bid.size = new_size
+            all_quotes[token_key] = (bid, ask)
+
+        if adjusted:
+            self._throttled_warn(
+                "session_cap_clamp",
+                "Session cap clamp: cap=$%.2f used=$%.2f headroom=$%.2f planned_buy=$%.2f (reserved=%s)"
+                % (budget_cap, exposure_used, headroom, planned_buy_notional, reserved_source),
+                cooldown=8.0,
+            )
 
     async def _refresh_fee_rate_cache(self) -> None:
         """Best-effort refresh of dynamic fee params for current market tokens."""
@@ -653,6 +773,18 @@ class MarketMaker:
             if starting_usdc is None:
                 log.warning("Failed to fetch starting USDC balance, defaulting to 0.0")
                 starting_usdc = 0.0
+            requested_session_budget = self._session_budget_cap()
+            if requested_session_budget > 0:
+                session_budget = min(requested_session_budget, starting_usdc)
+                if session_budget + 0.01 < requested_session_budget:
+                    log.warning(
+                        "Session budget clipped to wallet balance: requested=$%.2f available=$%.2f -> using=$%.2f",
+                        requested_session_budget,
+                        starting_usdc,
+                        session_budget,
+                    )
+            else:
+                session_budget = starting_usdc
             self._starting_usdc_pm = starting_usdc
             self._cached_usdc_balance = starting_usdc
             self._cached_usdc_available_balance = (
@@ -664,7 +796,7 @@ class MarketMaker:
             self.inventory.up_shares = self._cached_pm_up_shares
             self.inventory.dn_shares = self._cached_pm_dn_shares
             self.inventory.usdc = starting_usdc
-            self.inventory.initial_usdc = starting_usdc
+            self.inventory.initial_usdc = session_budget
             self.inventory.up_cost.reset()
             self.inventory.dn_cost.reset()
             # Include pre-existing tokens in starting portfolio
@@ -707,6 +839,12 @@ class MarketMaker:
                 self._cached_pm_dn_shares, _fv_dn,
                 self._starting_portfolio_pm,
             )
+            if session_budget > 0:
+                log.info(
+                    "Session budget cap active: $%.2f (wallet total USDC: $%.2f)",
+                    session_budget,
+                    starting_usdc,
+                )
         except Exception:
             self._starting_usdc_pm = 0.0
             self._starting_portfolio_pm = 0.0
@@ -1250,12 +1388,16 @@ class MarketMaker:
         # Grace period: skip PnL-based risk checks for first 30s while balances settle
         _in_grace = time.time() < self._pnl_grace_until
         _risk_pnl = None if _in_grace else _session_pnl
+        effective_drawdown = self._effective_max_drawdown_usd()
         if _in_grace and self._tick_count % 10 == 0:
             log.info("PnL grace period active (%.0fs left), risk checks use fill-based PnL",
                      self._pnl_grace_until - time.time())
 
         should_pause, reason = self.risk_mgr.should_pause(
             self.inventory, vol, fv_up, fv_dn, session_pnl=_risk_pnl)
+        if _risk_pnl is not None and effective_drawdown > 0 and _risk_pnl < -effective_drawdown:
+            should_pause = True
+            reason = f"Max drawdown exceeded: PnL=${_risk_pnl:.2f}"
 
         # Exit triggers (TP, trailing stop, drawdown) ALWAYS take priority — even if already paused
         if should_pause and ("Take profit" in reason or "Trailing stop" in reason or "Max drawdown" in reason):
@@ -1342,7 +1484,7 @@ class MarketMaker:
         # Only reset if we're NOT in the middle of a drawdown confirmation cycle.
         # The exit trigger block sets should_pause=False while waiting for confirmation,
         # so we check _session_pnl directly instead of relying on should_pause.
-        if _session_pnl is not None and _session_pnl > -self.config.max_drawdown_usd:
+        if _session_pnl is not None and (_session_pnl > -effective_drawdown or effective_drawdown <= 0):
             if self._catastrophic_count > 0:
                 log.info("PnL recovered ($%.2f), resetting catastrophic counter", _session_pnl)
             self._catastrophic_count = 0
@@ -1659,6 +1801,12 @@ class MarketMaker:
             if ask is not None and ask.size > max_sh:
                 ask.size = round(max_sh, 2)
             all_quotes[token_key] = (bid, ask)
+
+        self._enforce_session_exposure_cap(
+            all_quotes,
+            pm_up_price=_pm_up,
+            pm_dn_price=_pm_dn,
+        )
 
         await self._apply_rebate_scoring_filters(all_quotes, is_live=is_live)
         _t_quotes = time.perf_counter()
@@ -2086,7 +2234,9 @@ class MarketMaker:
             _pm_dn = getattr(self.feed_state, "pm_dn_bid", None) or (self.feed_state.pm_dn if hasattr(self.feed_state, "pm_dn") else 0.5)
             _pos_val = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
             _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_portfolio_pm
-            if _liq_pnl < -2 * self.config.max_drawdown_usd:
+            effective_drawdown = self._effective_max_drawdown_usd()
+            catastrophic_limit = -effective_drawdown if effective_drawdown > 0 else float("-inf")
+            if _liq_pnl < catastrophic_limit:
                 self._catastrophic_count += 1
                 log.warning(
                     "CATASTROPHIC reading %d/%d: sPnL=$%.2f (USDC=$%.2f, pos=$%.2f, start=$%.2f)",
@@ -2113,7 +2263,7 @@ class MarketMaker:
                                       self._cached_pm_dn_shares * _pm_dn)
                         _fresh_pnl = (self._cached_usdc_balance + _fresh_pos) - self._starting_portfolio_pm
                         log.warning("CATASTROPHIC fresh recheck: sPnL=$%.2f (was $%.2f)", _fresh_pnl, _liq_pnl)
-                        if _fresh_pnl < -2 * self.config.max_drawdown_usd:
+                        if _fresh_pnl < catastrophic_limit:
                             await self._emergency_shutdown(
                                 f"CATASTROPHIC LOSS confirmed ({self._catastrophic_threshold} readings + fresh recheck): "
                                 f"sPnL=${_fresh_pnl:.2f}"
@@ -2132,7 +2282,7 @@ class MarketMaker:
                     return  # Wait for more readings before deciding
             else:
                 self._catastrophic_count = 0  # Reset counter on non-catastrophic reading
-            if _liq_pnl < -self.config.max_drawdown_usd and not use_taker:
+            if effective_drawdown > 0 and _liq_pnl < -effective_drawdown and not use_taker:
                 log.warning("Max drawdown exceeded during liquidation: sPnL=$%.2f, forcing taker mode", _liq_pnl)
                 use_taker = True
 
