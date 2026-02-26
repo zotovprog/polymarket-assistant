@@ -417,6 +417,41 @@ class MarketMaker:
             return min(configured, budget_cap)
         return configured
 
+    def _maybe_exit_inventory_close_mode_after_clear(self) -> None:
+        """Exit inventory-limit liquidation mode once PM balances are fully cleared."""
+        if not self.market or not self._is_closing:
+            return
+        if not (self._pause_reason or "").startswith("Inventory limit"):
+            return
+        if self._critical_drift_pause_active or self._quality_pause_active:
+            return
+
+        window_dur = max(1.0, float(self.market.window_end - self.market.window_start))
+        close_sec = min(float(self.config.close_window_sec), window_dur * 0.4)
+        time_left = float(self.market.time_remaining)
+        if time_left <= close_sec:
+            log.info(
+                "Inventory liquidation cleared near close window (%.0fs left <= %.0fs close window) — "
+                "staying in closing mode",
+                time_left,
+                close_sec,
+            )
+            return
+
+        self._is_closing = False
+        self._paused = False
+        self._pause_reason = ""
+        self._liq_lock = None
+        self._liq_chunk_index = 0
+        self._liq_last_chunk_time = 0.0
+        self._liq_last_attempt_time = 0.0
+        self._closing_start_time_left = 0.0
+        self._liquidation_order_ids.clear()
+        self._merge_failed_this_cycle = False
+        self._one_sided_counter = 0
+        self._requote_event.set()
+        log.info("Inventory liquidation complete — exiting closing mode and resuming MM")
+
     def _session_reserved_collateral(self) -> tuple[float, str]:
         """Reserved collateral estimate used for session exposure checks."""
         total_usdc = self._safe_non_negative(self._cached_usdc_balance)
@@ -3003,6 +3038,7 @@ class MarketMaker:
                         await self._cancel_order_guarded(oid)
                     self._liquidation_order_ids.clear()
                 log.info("Liquidation complete — PM inventory cleared")
+                self._maybe_exit_inventory_close_mode_after_clear()
                 return
 
         # Check if all remaining balances are "dust" — below PM minimum, can't sell

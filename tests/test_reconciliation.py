@@ -256,6 +256,50 @@ def test_critical_inventory_drift_triggers_when_internal_is_below_pm():
     assert mm.inventory.dn_shares == pytest.approx(0.0)
 
 
+def test_inventory_limit_closing_mode_clears_after_liquidation_if_not_near_close():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm._paused = True
+    mm._pause_reason = "Inventory limit (net delta): |13.4| > 12"
+    mm._quality_pause_active = False
+    mm._critical_drift_pause_active = False
+    mm._liq_chunk_index = 3
+    mm._liq_last_chunk_time = time.time()
+    mm._liq_last_attempt_time = time.time()
+    mm._closing_start_time_left = 500.0
+
+    mm._maybe_exit_inventory_close_mode_after_clear()
+
+    assert mm._is_closing is False
+    assert mm._paused is False
+    assert mm._pause_reason == ""
+    assert mm._liq_chunk_index == 0
+    assert mm._liq_last_chunk_time == pytest.approx(0.0)
+    assert mm._liq_last_attempt_time == pytest.approx(0.0)
+    assert mm._closing_start_time_left == pytest.approx(0.0)
+    assert mm._requote_event.is_set() is True
+
+
+def test_inventory_limit_closing_mode_stays_near_close_window():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm._paused = True
+    mm._pause_reason = "Inventory limit (net delta): |13.4| > 12"
+    mm._quality_pause_active = False
+    mm._critical_drift_pause_active = False
+    now = time.time()
+    mm.market.window_start = now - 840.0
+    mm.market.window_end = now + 60.0  # inside close window for 15m market
+
+    mm._maybe_exit_inventory_close_mode_after_clear()
+
+    assert mm._is_closing is True
+    assert mm._paused is True
+    assert "Inventory limit" in mm._pause_reason
+
+
 def test_toxic_divergence_no_trade_cancels_quotes_when_flat():
     mm = _make_mm(live=True)
     mm._running = True
