@@ -403,6 +403,63 @@ class MarketMaker:
         self._one_sided_counter = 0
         return True
 
+    async def _confirm_critical_drift_snapshot(
+        self,
+        *,
+        real_up: float,
+        real_dn: float,
+        source: str,
+    ) -> tuple[float, float, bool]:
+        """Re-check PM balances before hard critical-drift pause.
+
+        PM balance endpoint can briefly return transient zero/lagging values right
+        after fills. We only allow critical pause when immediate recheck confirms
+        the same snapshot.
+        """
+        threshold = self._critical_drift_threshold()
+        up_diff = abs(float(self.inventory.up_shares) - float(real_up))
+        dn_diff = abs(float(self.inventory.dn_shares) - float(real_dn))
+        if up_diff < threshold and dn_diff < threshold:
+            return real_up, real_dn, True
+        if not self.market:
+            return real_up, real_dn, True
+
+        try:
+            confirm_up, confirm_dn = await asyncio.wait_for(
+                self.order_mgr.get_all_token_balances(
+                    self.market.up_token_id,
+                    self.market.dn_token_id,
+                ),
+                timeout=5.0,
+            )
+        except Exception as e:
+            self._throttled_warn(
+                f"critical_drift_recheck_failed:{source}",
+                f"Critical drift recheck failed ({source}): {e}",
+                cooldown=3.0,
+            )
+            return real_up, real_dn, True
+
+        if confirm_up is None or confirm_dn is None:
+            return real_up, real_dn, True
+
+        confirm_up_f = float(confirm_up)
+        confirm_dn_f = float(confirm_dn)
+        # Snapshot changed too much on immediate recheck -> likely transient PM lag.
+        if abs(confirm_up_f - float(real_up)) > 0.5 or abs(confirm_dn_f - float(real_dn)) > 0.5:
+            self._throttled_warn(
+                f"critical_drift_recheck_unstable:{source}",
+                (
+                    "Critical drift recheck unstable (%s): first UP=%.2f DN=%.2f, "
+                    "recheck UP=%.2f DN=%.2f — skipping hard pause this tick"
+                )
+                % (source, float(real_up), float(real_dn), confirm_up_f, confirm_dn_f),
+                cooldown=2.0,
+            )
+            return confirm_up_f, confirm_dn_f, False
+
+        return confirm_up_f, confirm_dn_f, True
+
     def _session_budget_cap(self) -> float:
         """Configured session USDC cap (0 means unlimited)."""
         try:
@@ -1448,18 +1505,24 @@ class MarketMaker:
                 self._reconcile_stable_count = 0
                 self._reconcile_prev_pm = None
             else:
+                real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
+                    real_up=float(real_up),
+                    real_dn=float(real_dn),
+                    source="periodic_reconcile",
+                )
                 # Cache real PM token balances for accurate PnL calculation
                 self._cached_pm_up_shares = real_up
                 self._cached_pm_dn_shares = real_dn
-                if await self._handle_critical_inventory_drift(
-                    real_up=real_up,
-                    real_dn=real_dn,
-                    source="periodic_reconcile",
-                ):
-                    self._reconcile_stable_count = 0
-                    self._reconcile_prev_pm = None
-                    self.order_mgr.clear_reconcile_request()
-                    return
+                if drift_confirmed:
+                    if await self._handle_critical_inventory_drift(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
+                    ):
+                        self._reconcile_stable_count = 0
+                        self._reconcile_prev_pm = None
+                        self.order_mgr.clear_reconcile_request()
+                        return
                 self._update_critical_drift_recovery(
                     real_up=real_up,
                     real_dn=real_dn,
@@ -2458,12 +2521,20 @@ class MarketMaker:
                 if real_dn is not None:
                     self._cached_pm_dn_shares = real_dn
                 if real_up is not None and real_dn is not None:
-                    if await self._handle_critical_inventory_drift(
-                        real_up=real_up,
-                        real_dn=real_dn,
+                    real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
+                        real_up=float(real_up),
+                        real_dn=float(real_dn),
                         source="post_order_refresh",
-                    ):
-                        return
+                    )
+                    self._cached_pm_up_shares = real_up
+                    self._cached_pm_dn_shares = real_dn
+                    if drift_confirmed:
+                        if await self._handle_critical_inventory_drift(
+                            real_up=real_up,
+                            real_dn=real_dn,
+                            source="post_order_refresh",
+                        ):
+                            return
                     self._update_critical_drift_recovery(
                         real_up=real_up,
                         real_dn=real_dn,

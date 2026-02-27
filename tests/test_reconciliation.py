@@ -279,6 +279,32 @@ def test_critical_inventory_drift_triggers_when_internal_is_below_pm():
     assert mm.inventory.dn_shares == pytest.approx(0.0)
 
 
+def test_critical_inventory_drift_skips_unstable_pm_recheck():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0  # stop after reconcile path
+    mm.inventory.up_shares = 9.0
+    mm.inventory.dn_shares = 0.0
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    # First read is transient zero, immediate recheck returns current inventory.
+    mm.order_mgr.get_all_token_balances = AsyncMock(
+        side_effect=[(0.0, 0.0), (9.0, 0.0)]
+    )
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    _run_tick_with_reconcile_gate(mm)
+
+    mm.order_mgr.cancel_all.assert_not_awaited()
+    assert mm._paused is False
+    assert mm._pause_reason == ""
+    assert mm.inventory.up_shares == pytest.approx(9.0)
+    assert mm.inventory.dn_shares == pytest.approx(0.0)
+    assert mm._cached_pm_up_shares == pytest.approx(9.0)
+
+
 def test_inventory_limit_closing_mode_clears_after_liquidation_if_not_near_close():
     mm = _make_mm(live=True)
     mm._running = True
