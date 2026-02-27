@@ -1397,13 +1397,18 @@ class MMRuntime:
                         log.error(f"Auto-next-window failed: {e}")
                 break
 
-    async def stop(self) -> dict:
+    async def stop(self, *, liquidate: bool = True, emergency: bool = False) -> dict:
         """Stop market maker and feeds."""
         await self._cancel_strike_retry_task()
         self._strike_invalid = False
 
         if self.mm:
-            await self.mm.stop()
+            if emergency:
+                self.mm._emergency_flag = True
+                self.mm._emergency_stopped = True
+                self.mm._paused = True
+                self.mm._pause_reason = "Emergency stop"
+            await self.mm.stop(liquidate=liquidate)
 
         await self._stop_feed_tasks()
 
@@ -1419,7 +1424,7 @@ class MMRuntime:
             self._mongo = None
 
         self._running = False
-        log.info("MM stopped")
+        log.info("MM stopped (liquidate=%s emergency=%s)", liquidate, emergency)
         return self.snapshot()
 
     def snapshot(self) -> dict:
@@ -2069,18 +2074,14 @@ async def mm_config_get(request: Request):
 async def mm_emergency(request: Request):
     """Emergency stop — cancel all orders immediately."""
     _require_auth(request)
+    cancelled_estimate = 0
     if _runtime.mm:
-        _runtime.mm._emergency_flag = True  # Stop in-flight tick from placing orders
-        cancelled = await _runtime.mm.order_mgr.cancel_all()
-        await _runtime.mm.heartbeat.stop()
-        _runtime.mm._paused = True
-        _runtime.mm._pause_reason = "Emergency stop"
-        _runtime.mm._running = False  # Actually stop the tick loop
-        # Clear runtime state so start() doesn't return "Already running"
-        _runtime._running = False
-        return {"ok": True, "cancelled": cancelled}
-    _runtime._running = False
-    return {"ok": True, "cancelled": 0}
+        try:
+            cancelled_estimate = len(_runtime.mm.order_mgr.active_order_ids)
+        except Exception:
+            cancelled_estimate = 0
+    snap = await _runtime.stop(liquidate=False, emergency=True)
+    return {"ok": True, "cancelled": cancelled_estimate, "state": snap}
 
 
 @app.post("/api/mm/kill")

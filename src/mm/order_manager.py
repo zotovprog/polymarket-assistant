@@ -138,6 +138,11 @@ class OrderManager:
         self._on_heartbeat_id: Any = None  # Callable(str) — notify heartbeat of new ID
         self._on_ws_reconnect: Any = None  # Callable() — notify WS reconnect event
         self._post_orders_mode: str | None = None  # runtime-resolved py-clob-client signature mode
+        self._sell_reject_cooldown_until: dict[str, float] = {}
+        self._sell_reject_cooldown_sec: float = max(
+            2.0,
+            float(getattr(config, "sell_reject_cooldown_sec", 8.0) or 8.0),
+        )
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
@@ -428,6 +433,166 @@ class OrderManager:
                 return msg
 
         return "missing order id / unknown reject reason"
+
+    @staticmethod
+    def _is_balance_or_allowance_reject(reason: str) -> bool:
+        """Detect PM rejects that indicate balance/allowance mismatch."""
+        text = (reason or "").strip().lower()
+        if not text:
+            return False
+        markers = (
+            "not enough balance",
+            "insufficient balance",
+            "insufficient collateral",
+            "not enough collateral",
+            "allowance",
+        )
+        return any(marker in text for marker in markers)
+
+    def _sell_reject_cooldown_left(self, token_id: str) -> float:
+        """Seconds left for SELL cooldown after balance/allowance reject."""
+        until = float(self._sell_reject_cooldown_until.get(token_id, 0.0))
+        if until <= 0:
+            return 0.0
+        now = time.time()
+        if until <= now:
+            self._sell_reject_cooldown_until.pop(token_id, None)
+            return 0.0
+        return until - now
+
+    def _should_skip_sell_after_reject(self, quote: Quote, *, source: str) -> bool:
+        """Block repeated SELL attempts for same token right after reject."""
+        if quote.side != "SELL":
+            return False
+        cooldown_left = self._sell_reject_cooldown_left(quote.token_id)
+        if cooldown_left <= 0:
+            return False
+
+        self._throttled_warn(
+            f"sell_reject_cooldown:{source}:{quote.token_id}",
+            (
+                f"SELL skipped ({source}) {quote.token_id[:8]} "
+                f"{quote.size:.1f}@{quote.price:.2f}: cooldown {cooldown_left:.1f}s "
+                f"after balance/allowance reject"
+            ),
+            cooldown=2.0,
+        )
+        return True
+
+    def _mark_reconcile_on_balance_reject(
+        self,
+        quote: Quote,
+        *,
+        reason: str,
+        source: str,
+        raw: Any = None,
+    ) -> None:
+        """Raise reconcile request + local cooldown/cache reset after hard reject."""
+        if not self._is_balance_or_allowance_reject(reason):
+            return
+
+        self._reconcile_requested = True
+        self.invalidate_usdc_cache()
+        extra = ""
+        if quote.side == "SELL":
+            self._allowance_set.discard(quote.token_id)
+            self._allowance_cap_shares.pop(quote.token_id, None)
+            until = time.time() + self._sell_reject_cooldown_sec
+            prev = float(self._sell_reject_cooldown_until.get(quote.token_id, 0.0))
+            if until > prev:
+                self._sell_reject_cooldown_until[quote.token_id] = until
+            extra = f", sell_cooldown={self._sell_reject_cooldown_sec:.1f}s"
+
+        raw_suffix = ""
+        if raw is not None:
+            raw_suffix = f", raw={self._compact_raw(raw, max_len=240)}"
+        self._throttled_warn(
+            f"balance_reject_reconcile:{source}:{quote.side}:{quote.token_id}",
+            (
+                f"Balance/allowance reject ({source}): {quote.side} {quote.token_id[:8]} "
+                f"{quote.size:.1f}@{quote.price:.2f}, reason={reason} "
+                f"-> forcing reconcile{extra}{raw_suffix}"
+            ),
+            cooldown=2.0,
+        )
+
+    async def _retry_buy_after_balance_reject(
+        self,
+        quote: Quote,
+        *,
+        use_post_only: bool,
+    ) -> Optional[str]:
+        """Retry BUY after balance reject using fresh available balance and PM min size guard."""
+        if quote.side != "BUY":
+            return None
+        if quote.price <= 0:
+            return None
+
+        usdc_bal = await self.get_usdc_available_balance(force_refresh=True)
+        if usdc_bal is None:
+            self._throttled_warn(
+                "buy_balance_retry_no_usdc",
+                (
+                    f"BUY retry skipped: failed to refresh available USDC after reject "
+                    f"for {quote.token_id[:8]}"
+                ),
+                cooldown=3.0,
+            )
+            return None
+
+        active_buy_collateral = sum(
+            self.required_collateral(q)
+            for q in self._active_orders.values()
+            if q.side == "BUY"
+        )
+        available = max(0.0, usdc_bal - active_buy_collateral)
+        max_size = math.floor((available / quote.price) * 100.0) / 100.0
+        pm_min = 5.0
+
+        if max_size < pm_min:
+            self._throttled_warn(
+                "buy_balance_retry_below_min",
+                (
+                    f"BUY retry skipped: refreshed max_size={max_size:.2f} < PM min {pm_min:.1f} "
+                    f"(available=${available:.2f}, price={quote.price:.2f})"
+                ),
+                cooldown=3.0,
+            )
+            return None
+
+        new_size = min(max_size, float(quote.size))
+        if new_size >= quote.size - 0.01:
+            self._throttled_warn(
+                "buy_balance_retry_not_reducing",
+                (
+                    f"BUY retry skipped: no meaningful size reduction after reject "
+                    f"(size={quote.size:.2f}, max={max_size:.2f})"
+                ),
+                cooldown=3.0,
+            )
+            return None
+
+        old_size = quote.size
+        quote.size = round(new_size, 2)
+        self._throttled_warn(
+            "buy_balance_retry_clamp",
+            (
+                f"BUY balance retry clamp: {quote.token_id[:8]} "
+                f"{old_size:.1f}→{quote.size:.1f} (available=${available:.2f})"
+            ),
+            cooldown=2.0,
+        )
+
+        try:
+            return await self._place_order_inner(quote, use_post_only)
+        except Exception as e:
+            self._mark_reconcile_on_balance_reject(
+                quote,
+                reason=str(e),
+                source="single_place_retry",
+            )
+            log.error("BUY retry after balance reject failed: %s", e)
+            return None
 
     async def _retry_batch_reject_as_taker(
         self,
@@ -918,6 +1083,8 @@ class OrderManager:
         quote.placed_at = time.time()
         self._active_orders[order_id] = quote
         self._order_post_only[order_id] = post_only
+        if quote.side == "SELL":
+            self._sell_reject_cooldown_until.pop(quote.token_id, None)
         self._notify_heartbeat_id(resp)
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
@@ -935,6 +1102,8 @@ class OrderManager:
         """
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
+        if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="single_place"):
+            return None
 
         # Hard budget cap: reject BUY orders that exceed session budget
         collateral = self.required_collateral(quote)
@@ -1101,25 +1270,22 @@ class OrderManager:
             return await self._place_order_inner(quote, use_post_only)
         except Exception as e:
             error_msg = str(e)
+            if self._is_balance_or_allowance_reject(error_msg):
+                self._mark_reconcile_on_balance_reject(
+                    quote,
+                    reason=error_msg,
+                    source="single_place",
+                )
+                # For SELL-side rejects, stop immediately and let reconcile repair state.
+                if quote.side == "SELL":
+                    return None
             if "not enough balance" in error_msg.lower():
-                reduced = round(quote.size * 0.9, 2)
-                if reduced >= 1.0:
-                    self._throttled_warn(
-                        "insufficient_balance",
-                        f"Insufficient balance for {quote.side} "
-                        f"{quote.size:.1f}@{quote.price:.2f} — retrying with {reduced:.1f}",
+                if quote.side == "BUY":
+                    return await self._retry_buy_after_balance_reject(
+                        quote,
+                        use_post_only=use_post_only,
                     )
-                    quote.size = reduced
-                    try:
-                        return await self._place_order_inner(quote, use_post_only)
-                    except Exception as e2:
-                        log.error(f"Retry also failed: {e2}")
-                        return None
-                else:
-                    log.warning(
-                        f"Insufficient balance for {quote.side} "
-                        f"{quote.size:.1f}@{quote.price:.2f} — too small to retry"
-                    )
+                return None
             elif "crosses book" in error_msg.lower():
                 if fallback_taker:
                     log.info(
@@ -1177,6 +1343,9 @@ class OrderManager:
         planned_buy_collateral = 0.0
 
         for quote in quotes:
+            if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="batch_precheck"):
+                signed_orders.append(None)
+                continue
             # Hard budget cap for BUY orders.
             collateral = self.required_collateral(quote)
             if quote.side == "BUY" and self._session_budget > 0:
@@ -1264,6 +1433,12 @@ class OrderManager:
                     order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._mark_reconcile_on_balance_reject(
+                            quote,
+                            reason=reason,
+                            source="batch_place",
+                            raw=order_resp,
+                        )
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
@@ -1284,6 +1459,8 @@ class OrderManager:
                         quote.placed_at = time.time()
                         self._active_orders[order_id] = quote
                         self._order_post_only[order_id] = use_post_only
+                        if quote.side == "SELL":
+                            self._sell_reject_cooldown_until.pop(quote.token_id, None)
                         results[idx] = order_id
                         log.info(
                             "Batch placed %s %s %.1f@%.2f id=%s...",
@@ -1291,6 +1468,12 @@ class OrderManager:
                         )
                     else:
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._mark_reconcile_on_balance_reject(
+                            quote,
+                            reason=reason,
+                            source="batch_place",
+                            raw=order_resp,
+                        )
                         log.error(
                             "Batch reject %s %s %.1f@%.2f: reason=%s raw=%s",
                             quote.side,
@@ -1302,6 +1485,13 @@ class OrderManager:
                         )
             except Exception as e:
                 log.error("Batch post_orders failed: %s", e)
+                if self._is_balance_or_allowance_reject(str(e)):
+                    for idx in batch_indices:
+                        self._mark_reconcile_on_balance_reject(
+                            quotes[idx],
+                            reason=str(e),
+                            source="batch_post_orders_error",
+                        )
                 # Fallback to individual placement for failed batch.
                 for idx in batch_indices:
                     quote = quotes[idx]
@@ -1609,6 +1799,7 @@ class OrderManager:
         self._partial_fill_reported.clear()
         self._pending_cancels.clear()
         self._reconcile_requested = False
+        self._sell_reject_cooldown_until.clear()
         if clear_recent:
             self._recent_orders.clear()
         if clear_ws_queue:

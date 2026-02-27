@@ -1397,12 +1397,20 @@ class MarketMaker:
                             self.order_mgr.invalidate_usdc_cache()
 
         # Live mode: periodically reconcile internal shares with PM balances.
-        # Skip during closing to save HTTP calls (liquidation does its own balance checks).
-        # Uses debounce: only reconcile if PM values are stable for 3+ consecutive checks
-        # to avoid oscillation from PM balance API lagging behind fill detection.
+        # During closing we still run safety reconcile (faster cadence) so
+        # liquidation logic always sees wallet-truth inventory.
+        # Normal mode uses debounce (3+ stable checks) to avoid oscillation from
+        # PM balance API lagging behind fill detection.
         is_live = not hasattr(self.order_mgr.client, "_orders")
         reconcile_requested = self.order_mgr.reconcile_requested or merge_reconcile_requested
-        if is_live and not self._is_closing and (self._tick_count % 15 == 0 or reconcile_requested):
+        reconcile_interval_ticks = 15
+        if self._is_closing:
+            reconcile_interval_ticks = max(
+                1,
+                int(getattr(self.config, "closing_reconcile_interval_ticks", 2) or 2),
+            )
+        should_reconcile_now = reconcile_requested or (self._tick_count % reconcile_interval_ticks == 0)
+        if is_live and should_reconcile_now:
             try:
                 (real_up, real_dn), usdc_pair = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(
@@ -1489,11 +1497,13 @@ class MarketMaker:
                         else:
                             self._reconcile_stable_count = 1
 
-                        if self._reconcile_stable_count >= 3:
+                        stable_required = 1 if self._is_closing else 3
+                        if self._reconcile_stable_count >= stable_required:
                             log.warning(
-                                "Inventory reconcile (confirmed %d checks): "
+                                "Inventory reconcile (%d/%d stable checks): "
                                 "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
                                 self._reconcile_stable_count,
+                                stable_required,
                                 self.inventory.up_shares, self.inventory.dn_shares,
                                 real_up, real_dn,
                             )

@@ -7,6 +7,7 @@ import importlib
 import logging
 import os
 import sys
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -126,6 +127,48 @@ class _LiveBatchCaptureClient:
 
     def post_orders(self, signed_orders):
         return {"orders": [{"orderID": "oid-1"} for _ in signed_orders]}
+
+
+class _LiveBalanceRejectClient:
+    """Live-like client returning balance/allowance rejects."""
+
+    def create_order(self, order_args):
+        return {
+            "token_id": order_args.token_id,
+            "price": order_args.price,
+            "size": order_args.size,
+            "side": order_args.side,
+        }
+
+    def post_orders(self, signed_orders):
+        return {
+            "orders": [
+                {
+                    "status": "rejected",
+                    "errorMsg": "not enough balance / allowance",
+                }
+                for _ in signed_orders
+            ]
+        }
+
+
+class _LiveSingleSuccessClient:
+    """Live-like client for successful single-order placement."""
+
+    def __init__(self):
+        self.post_count = 0
+
+    def create_order(self, order_args):
+        return {
+            "token_id": order_args.token_id,
+            "price": order_args.price,
+            "size": order_args.size,
+            "side": order_args.side,
+        }
+
+    def post_order(self, *_args, **_kwargs):
+        self.post_count += 1
+        return {"orderID": f"oid-{self.post_count}"}
 
 
 class _DummyAssetType:
@@ -268,6 +311,41 @@ async def test_place_order_trims_close_only_sell_to_available_inventory():
     om._place_order_inner.assert_awaited_once()
 
 
+@pytest.mark.anyio
+async def test_place_order_buy_balance_retry_skips_when_below_pm_min():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.get_usdc_available_balance = AsyncMock(side_effect=[100.0, 2.4])
+    om._place_order_inner = AsyncMock(
+        side_effect=[RuntimeError("not enough balance"), "should-not-run"],
+    )
+
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0)
+    oid = await om.place_order(quote)
+
+    assert oid is None
+    assert om._place_order_inner.await_count == 1
+    assert om.reconcile_requested is True
+    assert quote.size == pytest.approx(10.0)
+
+
+@pytest.mark.anyio
+async def test_place_order_buy_balance_retry_recomputes_size_and_retries():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.get_usdc_available_balance = AsyncMock(side_effect=[100.0, 3.2])
+    om._place_order_inner = AsyncMock(
+        side_effect=[RuntimeError("not enough balance"), "oid-buy-retry"],
+    )
+
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0)
+    oid = await om.place_order(quote)
+
+    assert oid == "oid-buy-retry"
+    assert om._place_order_inner.await_count == 2
+    assert quote.size == pytest.approx(6.4)
+    assert quote.size >= 5.0
+    assert om.reconcile_requested is True
+
+
 def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
@@ -283,6 +361,55 @@ def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):
 
     assert result == [None]
     assert client.create_calls == 0
+
+
+def test_balance_allowance_batch_reject_requests_reconcile_and_sell_cooldown(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
+
+    token_id = "dn_tok_balance_reject"
+    om = order_manager_mod.OrderManager(_LiveBalanceRejectClient(), MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=10.0)
+    om._allowance_set.add(token_id)
+    om._allowance_cap_shares[token_id] = 25.0
+
+    q1 = Quote(side="SELL", token_id=token_id, price=0.80, size=6.0)
+    result = asyncio.run(om.place_orders_batch([q1], post_only=True))
+
+    assert result == [None]
+    assert om.reconcile_requested is True
+    assert token_id in om._sell_reject_cooldown_until
+    assert token_id not in om._allowance_set
+    assert token_id not in om._allowance_cap_shares
+
+    om._place_order_inner = AsyncMock(return_value="should-not-run")
+    q2 = Quote(side="SELL", token_id=token_id, price=0.81, size=6.0)
+    oid = asyncio.run(om.place_order(q2))
+    assert oid is None
+    om._place_order_inner.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_sell_cooldown_expires_and_single_place_resumes(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
+
+    token_id = "dn_tok_resume"
+    client = _LiveSingleSuccessClient()
+    om = order_manager_mod.OrderManager(client, MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=10.0)
+    om._sell_reject_cooldown_until[token_id] = time.time() - 1.0
+
+    q = Quote(side="SELL", token_id=token_id, price=0.80, size=6.0)
+    oid = await om.place_order(q)
+
+    assert oid is not None
+    assert oid.startswith("oid-")
+    assert token_id not in om._sell_reject_cooldown_until
 
 
 @pytest.mark.anyio
@@ -348,3 +475,29 @@ async def test_monitor_syncs_runtime_when_mm_stops_unexpectedly(monkeypatch):
     assert runtime._running is False
     runtime._cancel_strike_retry_task.assert_awaited_once()
     runtime._stop_feed_tasks.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_mm_emergency_uses_runtime_stop(monkeypatch):
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    called: dict[str, bool] = {}
+
+    async def _fake_stop(*, liquidate: bool = True, emergency: bool = False):
+        called["liquidate"] = liquidate
+        called["emergency"] = emergency
+        return {"is_running": False}
+
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "stop", _fake_stop)
+    web_server._runtime.mm = None
+
+    resp = await web_server.mm_emergency(request=object())
+
+    assert resp["ok"] is True
+    assert resp["cancelled"] == 0
+    assert called == {"liquidate": False, "emergency": True}

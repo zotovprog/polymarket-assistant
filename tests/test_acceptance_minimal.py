@@ -224,17 +224,18 @@ async def test_acceptance_smoke_single_trade_one_usdc_roundtrip_zero_pnl(monkeyp
 
 
 @pytest.mark.anyio
-async def test_acceptance_post_only_reject_retries_as_taker(monkeypatch):
+async def test_acceptance_post_only_reject_stays_maker_only(monkeypatch):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
     monkeypatch.setattr(order_manager_mod, "OrderArgs", _DummyOrderArgs, raising=False)
 
-    om = OrderManager(_LiveCrossBookRejectClient(), MMConfig())
+    client = _LiveCrossBookRejectClient()
+    om = OrderManager(client, MMConfig())
     q = Quote(side="BUY", token_id="up_token_123", price=0.51, size=5.0)
     result = await om.place_orders_batch([q], post_only=True)
 
-    assert result[0] is not None
-    assert result[0].startswith("taker-")
+    assert result[0] is None
+    assert client.single_post_calls == 0
 
 
 @pytest.mark.anyio

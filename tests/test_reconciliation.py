@@ -176,6 +176,29 @@ def test_forced_reconcile_arms_guard():
     assert mm.order_mgr.reconcile_requested is False
 
 
+def test_forced_reconcile_runs_during_closing_mode():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm.feed_state.mid = 0.0  # stop after reconcile/closing guard section
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+    mm.order_mgr._reconcile_requested = True
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(4.0, 6.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(20.0, 20.0))
+    mm._liquidate_inventory = AsyncMock()
+
+    asyncio.run(mm._tick())
+
+    mm.order_mgr.get_all_token_balances.assert_awaited()
+    assert mm.inventory.up_shares == pytest.approx(4.0)
+    assert mm.inventory.dn_shares == pytest.approx(6.0)
+    assert mm.order_mgr.reconcile_requested is False
+    # Forced reconcile in closing arms a brief guard before liquidation resumes.
+    mm._liquidate_inventory.assert_not_awaited()
+
+
 def test_reconcile_guard_pauses_liquidation_tick():
     mm = _make_mm(live=True)
     mm._running = True
