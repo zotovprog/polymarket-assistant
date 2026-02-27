@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import logging
 import os
@@ -475,6 +476,50 @@ async def test_monitor_syncs_runtime_when_mm_stops_unexpectedly(monkeypatch):
     assert runtime._running is False
     runtime._cancel_strike_retry_task.assert_awaited_once()
     runtime._stop_feed_tasks.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_stop_feed_tasks_sweeps_untracked_leaked_feed_task():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    async def ob_poller():
+        while True:
+            await asyncio.sleep(60)
+
+    leaked = asyncio.create_task(ob_poller())
+    try:
+        assert leaked.done() is False
+        assert runtime._feed_tasks == []
+
+        await runtime._stop_feed_tasks()
+
+        assert leaked.done() is True
+    finally:
+        leaked.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await leaked
+
+
+@pytest.mark.anyio
+async def test_cancel_monitor_task_handles_self_task():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+    runtime._monitor_task = asyncio.current_task()
+
+    await runtime._cancel_monitor_task()
+
+    assert runtime._monitor_task is None
 
 
 @pytest.mark.anyio

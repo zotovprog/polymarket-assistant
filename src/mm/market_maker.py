@@ -157,6 +157,7 @@ class MarketMaker:
             config.heartbeat_interval_sec,
             failure_threshold=max(1, int(getattr(config, "heartbeat_failures_before_shutdown", 3))),
             on_failure=self._schedule_heartbeat_failure,
+            should_send=lambda: bool(self.order_mgr.active_order_ids),
         )
         self.rebate = RebateTracker(clob_client)
         self.quality_analyzer = MarketQualityAnalyzer(config)
@@ -1611,7 +1612,23 @@ class MarketMaker:
             is_stale = staleness > BINANCE_FEED_STARTUP_GRACE_SEC
 
         if is_stale:
-            log.warning("Binance feed stale (%.1fs), cancelling orders and skipping tick", staleness)
+            ob_age = (now - last_ob_ok_ts) if last_ob_ok_ts > 0 else None
+            ws_age = (now - last_ws_ok_ts) if last_ws_ok_ts > 0 else None
+            ob_age_s = f"{ob_age:.1f}s" if ob_age is not None else "n/a"
+            ws_age_s = f"{ws_age:.1f}s" if ws_age is not None else "n/a"
+            self._throttled_warn(
+                "binance_feed_stale",
+                (
+                    f"Binance feed stale ({staleness:.1f}s): "
+                    f"ob_age={ob_age_s} ws_age={ws_age_s} "
+                    f"ob_connected={bool(getattr(st, 'binance_ob_connected', False))} "
+                    f"ws_connected={bool(getattr(st, 'binance_ws_connected', False))} "
+                    f"ob_msgs={int(getattr(st, 'binance_ob_msg_count', 0) or 0)} "
+                    f"ws_msgs={int(getattr(st, 'binance_ws_msg_count', 0) or 0)} "
+                    "— cancelling orders and skipping tick"
+                ),
+                cooldown=2.0,
+            )
             await self._cancel_all_guarded()
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return

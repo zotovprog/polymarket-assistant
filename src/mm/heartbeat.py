@@ -25,6 +25,7 @@ class HeartbeatManager:
         interval_sec: int = 55,
         failure_threshold: int = 3,
         on_failure: Callable[[], None] | None = None,
+        should_send: Callable[[], bool] | None = None,
     ):
         """
         Args:
@@ -32,11 +33,14 @@ class HeartbeatManager:
             interval_sec: Seconds between heartbeats (CLOB timeout is ~10s, send every 5s)
             failure_threshold: Consecutive failures before triggering on_failure
             on_failure: Optional callback fired after failure_threshold heartbeat failures
+            should_send: Optional callback. If provided and returns False,
+                heartbeat send is skipped for this cycle (treated as success).
         """
         self.client = clob_client
         self.interval = interval_sec
         self._failure_threshold = max(1, int(failure_threshold))
         self._on_failure = on_failure
+        self._should_send = should_send
         self._task: asyncio.Task | None = None
         self._running = False
         self._last_heartbeat: float = 0.0
@@ -44,6 +48,7 @@ class HeartbeatManager:
         self._error_count: int = 0
         self._consecutive_failures: int = 0
         self._id_refresh_count: int = 0  # ID adopted from server (not errors)
+        self._skip_count: int = 0
         self._heartbeat_id: str = str(uuid.uuid4())  # Stable ID for session
 
     @property
@@ -62,6 +67,7 @@ class HeartbeatManager:
             "heartbeat_count": self._heartbeat_count,
             "error_count": self._error_count,
             "id_refresh_count": self._id_refresh_count,
+            "skip_count": self._skip_count,
             "interval_sec": self.interval,
             "failure_threshold": self._failure_threshold,
             "heartbeat_id": self._heartbeat_id[:8] + "...",
@@ -116,6 +122,16 @@ class HeartbeatManager:
         Real ClobClient requires heartbeat_id parameter.
         MockClobClient accepts no args (handled gracefully).
         """
+        if self._should_send is not None:
+            try:
+                if not bool(self._should_send()):
+                    self._consecutive_failures = 0
+                    self._skip_count += 1
+                    return True
+            except Exception as e:
+                # Fail-open: still send heartbeat on callback issues.
+                log.debug("Heartbeat should_send callback failed: %s", e)
+
         try:
             is_mock = hasattr(self.client, '_orders')
             resp = None
@@ -232,4 +248,5 @@ class HeartbeatManager:
         self._heartbeat_count = 0
         self._error_count = 0
         self._id_refresh_count = 0
+        self._skip_count = 0
         self._last_heartbeat = 0.0

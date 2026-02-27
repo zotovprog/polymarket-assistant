@@ -627,6 +627,7 @@ class MMRuntime:
         self.mm: Optional[MarketMaker] = None
         self.mm_config: MMConfig = MMConfig()
         self._feed_tasks: list[asyncio.Task] = []
+        self._monitor_task: asyncio.Task | None = None
         self._running = False
         self._coin: str = ""
         self._timeframe: str = ""
@@ -876,15 +877,65 @@ class MMRuntime:
         finally:
             self._strike_retry_task = None
 
-    async def _stop_feed_tasks(self) -> None:
-        """Cancel feed tasks and let them clean up connection state."""
-        if not self._feed_tasks:
+    async def _cancel_monitor_task(self) -> None:
+        """Cancel runtime window-monitor task if active."""
+        task = self._monitor_task
+        if not task:
             return
+        current = asyncio.current_task()
+        if task is current:
+            self._monitor_task = None
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("Monitor task cleanup failed: %s", e)
+        finally:
+            self._monitor_task = None
+
+    def _ensure_monitor_task(self) -> None:
+        """Spawn single monitor task (idempotent)."""
+        if self._monitor_task and not self._monitor_task.done():
+            return
+        self._monitor_task = asyncio.create_task(self._monitor_window_expiry())
+
+    async def _stop_feed_tasks(self) -> None:
+        """Cancel feed tasks and sweep leaked feed coroutines from the loop."""
         tasks = list(self._feed_tasks)
         for task in tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._feed_tasks.clear()
+
+        # Safety sweep: in case tracked list got out of sync, cancel any leaked
+        # feed tasks left in the event loop.
+        leaked: list[asyncio.Task] = []
+        try:
+            loop = asyncio.get_running_loop()
+            current = asyncio.current_task(loop=loop)
+            for task in asyncio.all_tasks(loop):
+                if task is current or task.done():
+                    continue
+                label = _task_coro_label(task)
+                if any(name in label for name in ("ob_poller", "binance_feed", "pm_feed")):
+                    if task not in tasks:
+                        leaked.append(task)
+        except Exception:
+            leaked = []
+
+        if leaked:
+            log.warning(
+                "Feed task sweep: cancelling %d leaked feed task(s) not tracked by runtime",
+                len(leaked),
+            )
+            for task in leaked:
+                task.cancel()
+            await asyncio.gather(*leaked, return_exceptions=True)
+
         if self.feed_state:
             self.feed_state.binance_ws_connected = False
             self.feed_state.binance_ob_connected = False
@@ -1008,10 +1059,17 @@ class MMRuntime:
             raise HTTPException(status_code=400, detail="Already running")
 
         await self._cancel_strike_retry_task()
+        await self._cancel_monitor_task()
+        await self._stop_feed_tasks()
         self._strike_invalid = False
 
         if self._watching:
             await self.stop_watch()
+
+        # Previous session may have already stopped internally.
+        # Drop stale MM reference before creating a fresh instance.
+        if self.mm and not self.mm._running:
+            self.mm = None
 
         initial_usdc = float(initial_usdc)
         req_coin = str(coin)
@@ -1232,7 +1290,7 @@ class MMRuntime:
                 self._mongo = None
 
         # Monitor for window expiry and handle auto-next-window
-        asyncio.create_task(self._monitor_window_expiry())
+        self._ensure_monitor_task()
 
         log.info(f"MM started: {coin}/{timeframe} paper={paper_mode}")
         return self.snapshot()
@@ -1400,6 +1458,8 @@ class MMRuntime:
     async def stop(self, *, liquidate: bool = True, emergency: bool = False) -> dict:
         """Stop market maker and feeds."""
         await self._cancel_strike_retry_task()
+        self._running = False
+        await self._cancel_monitor_task()
         self._strike_invalid = False
 
         if self.mm:
@@ -1423,7 +1483,6 @@ class MMRuntime:
                 pass
             self._mongo = None
 
-        self._running = False
         log.info("MM stopped (liquidate=%s emergency=%s)", liquidate, emergency)
         return self.snapshot()
 
@@ -1512,6 +1571,8 @@ class MMRuntime:
         """Start feeds only (no trading) for live price monitoring."""
         if self._running:
             return {"detail": "Session running, feeds already active"}
+        await self._cancel_monitor_task()
+        await self._stop_feed_tasks()
         if self._watching:
             await self.stop_watch()
 
@@ -1548,6 +1609,7 @@ class MMRuntime:
     async def stop_watch(self):
         """Stop watch mode feeds."""
         await self._cancel_strike_retry_task()
+        await self._cancel_monitor_task()
         self._strike_invalid = False
         await self._stop_feed_tasks()
         self._watching = False
