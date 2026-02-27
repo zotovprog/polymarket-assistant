@@ -186,6 +186,8 @@ class ConfigUpdateRequest(BaseModel):
     max_loss_per_fill_usd: Optional[float] = Field(default=None)
     take_profit_usd: Optional[float] = Field(default=None)
     trailing_stop_pct: Optional[float] = Field(default=None)
+    toxic_divergence_threshold: Optional[float] = None
+    toxic_divergence_ticks: Optional[int] = None
     critical_reconcile_drift_shares: Optional[float] = None
     require_flat_start: Optional[bool] = None
     flat_start_max_shares: Optional[float] = None
@@ -245,6 +247,7 @@ class ConfigUpdateRequest(BaseModel):
         "max_loss_per_fill_usd",
         "take_profit_usd",
         "trailing_stop_pct",
+        "toxic_divergence_threshold",
         "critical_reconcile_drift_shares",
         "flat_start_max_shares",
         "close_window_sec",
@@ -282,6 +285,7 @@ class ConfigUpdateRequest(BaseModel):
         "heartbeat_interval_sec",
         "heartbeat_failures_before_shutdown",
         "max_one_sided_ticks",
+        "toxic_divergence_ticks",
         "liq_gradual_chunks",
         "price_jitter_ticks",
         "rebate_check_interval_ticks",
