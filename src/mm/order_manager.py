@@ -189,7 +189,7 @@ class OrderManager:
         if not isinstance(payload, dict):
             return None
         # Prefer explicit bps keys when available.
-        for key in ("fee_rate_bps", "feeRateBps"):
+        for key in ("fee_rate_bps", "feeRateBps", "base_fee_bps", "baseFeeBps"):
             raw_bps = payload.get(key)
             try:
                 if raw_bps is None:
@@ -200,18 +200,21 @@ class OrderManager:
             except (TypeError, ValueError):
                 continue
 
-        raw_rate = payload.get("feeRate")
-        try:
-            if raw_rate is None:
-                return None
-            fee_rate = float(raw_rate)
-            if fee_rate < 0:
-                return None
-            # API may return ratio (0.1) or bps (1000).
-            bps = int(round(fee_rate * 10000)) if fee_rate <= 1.0 else int(round(fee_rate))
-            return max(0, bps)
-        except (TypeError, ValueError):
-            return None
+        # Some CLOB deployments return ratio-like keys (feeRate/base_fee).
+        for key in ("feeRate", "base_fee", "baseFee"):
+            raw_rate = payload.get(key)
+            try:
+                if raw_rate is None:
+                    continue
+                fee_rate = float(raw_rate)
+                if fee_rate < 0:
+                    continue
+                # API may return ratio (0.1) or bps (1000).
+                bps = int(round(fee_rate * 10000)) if fee_rate <= 1.0 else int(round(fee_rate))
+                return max(0, bps)
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def _resolve_order_fee_rate_bps(self, token_id: str) -> Optional[int]:
         """Fetch fee rate for order signing on live fee-enabled markets.

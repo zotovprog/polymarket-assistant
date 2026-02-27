@@ -84,13 +84,17 @@ def get_cached_fee_params(token_id: str) -> tuple[int, int]:
         _fee_rate_cache.pop(token_id, None)
         return DEFAULT_BASE_FEE_BPS, CRYPTO_FEE_EXPONENT
 
-    fee_rate = payload.get("feeRate")
+    fee_rate = (
+        payload.get("feeRate")
+        if payload.get("feeRate") is not None
+        else payload.get("base_fee")
+    )
     exponent = payload.get("exponent", CRYPTO_FEE_EXPONENT)
 
     try:
         fee_rate_value = float(fee_rate)
-        if fee_rate_value <= 0:
-            raise ValueError("feeRate must be positive")
+        if fee_rate_value < 0:
+            raise ValueError("feeRate must be >= 0")
         base_fee_bps = (
             int(round(fee_rate_value * 10000)) if fee_rate_value <= 1.0 else int(round(fee_rate_value))
         )
