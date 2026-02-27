@@ -18,7 +18,7 @@ import websockets
 
 from .types import Quote, Fill
 from .mm_config import MMConfig
-from .pm_fees import taker_fee_usd, net_shares_after_buy_fee
+from .pm_fees import fetch_fee_rate, taker_fee_usd, net_shares_after_buy_fee
 from .runtime_metrics import runtime_metrics
 
 log = logging.getLogger("mm.orders")
@@ -143,6 +143,8 @@ class OrderManager:
             2.0,
             float(getattr(config, "sell_reject_cooldown_sec", 8.0) or 8.0),
         )
+        self._market_min_order_size: float = 5.0
+        self._order_args_supports_fee_rate: bool = self._detect_order_args_fee_rate_support()
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
@@ -151,6 +153,109 @@ class OrderManager:
     def set_ws_reconnect_callback(self, callback) -> None:
         """Set callback invoked when fill WS disconnects/reconnect loop kicks in."""
         self._on_ws_reconnect = callback
+
+    def set_market_context(self, *, min_order_size: float | None = None) -> None:
+        """Set market-dependent runtime parameters used by pre-trade checks."""
+        if min_order_size is None:
+            return
+        try:
+            self._market_min_order_size = max(0.01, float(min_order_size))
+        except (TypeError, ValueError):
+            self._market_min_order_size = 5.0
+
+    def _pm_min_order_size(self) -> float:
+        """Current PM minimum size from market context (safe default = 5)."""
+        return max(0.01, float(self._market_min_order_size or 5.0))
+
+    @staticmethod
+    def _detect_order_args_fee_rate_support() -> bool:
+        """Whether current OrderArgs supports explicit fee rate field."""
+        if not _HAS_CLOB_TYPES:
+            return False
+        try:
+            sig = inspect.signature(OrderArgs)
+            return "fee_rate_bps" in sig.parameters
+        except Exception:
+            return hasattr(OrderArgs, "fee_rate_bps")
+
+    @staticmethod
+    def _parse_fee_rate_bps(payload: Any) -> Optional[int]:
+        """Extract fee rate in bps from /fee-rate payload."""
+        if not isinstance(payload, dict):
+            return None
+        # Prefer explicit bps keys when available.
+        for key in ("fee_rate_bps", "feeRateBps"):
+            raw_bps = payload.get(key)
+            try:
+                if raw_bps is None:
+                    continue
+                bps = int(round(float(raw_bps)))
+                if bps >= 0:
+                    return bps
+            except (TypeError, ValueError):
+                continue
+
+        raw_rate = payload.get("feeRate")
+        try:
+            if raw_rate is None:
+                return None
+            fee_rate = float(raw_rate)
+            if fee_rate < 0:
+                return None
+            # API may return ratio (0.1) or bps (1000).
+            bps = int(round(fee_rate * 10000)) if fee_rate <= 1.0 else int(round(fee_rate))
+            return max(0, bps)
+        except (TypeError, ValueError):
+            return None
+
+    async def _resolve_order_fee_rate_bps(self, token_id: str) -> Optional[int]:
+        """Fetch fee rate for order signing on live fee-enabled markets.
+
+        Returns:
+            int bps when resolved (including 0 for fee-disabled markets),
+            None when fee rate is unavailable and order must not be sent.
+        """
+        if hasattr(self.client, "_orders"):
+            return 0
+
+        # Test stubs / non-official clients may not expose full API surface.
+        # Keep old behavior for these synthetic clients to avoid false failures in tests.
+        if not hasattr(self.client, "get_balance_allowance"):
+            return 0
+
+        if not self._order_args_supports_fee_rate:
+            self._throttled_warn(
+                "fee_rate_unsupported_order_args",
+                (
+                    "OrderArgs does not support fee_rate_bps on live client. "
+                    "Refusing to place orders to avoid fee-enabled market rejects."
+                ),
+                cooldown=15.0,
+            )
+            return None
+
+        payload = await fetch_fee_rate(token_id)
+        bps = self._parse_fee_rate_bps(payload)
+        if bps is None:
+            self._throttled_warn(
+                f"fee_rate_unavailable:{token_id}",
+                f"Fee-rate unavailable for token {token_id[:12]}... — skipping order",
+                cooldown=5.0,
+            )
+            return None
+        return bps
+
+    def _build_order_args(self, quote: Quote, *, fee_rate_bps: Optional[int]) -> Any:
+        """Construct OrderArgs with explicit fee rate when supported."""
+        kwargs: dict[str, Any] = {
+            "token_id": quote.token_id,
+            "price": quote.price,
+            "size": quote.size,
+            "side": quote.side,
+        }
+        if fee_rate_bps is not None and self._order_args_supports_fee_rate:
+            kwargs["fee_rate_bps"] = int(max(0, fee_rate_bps))
+        return OrderArgs(**kwargs)
 
     @staticmethod
     def _extract_heartbeat_id(resp: Any) -> str | None:
@@ -547,7 +652,7 @@ class OrderManager:
         )
         available = max(0.0, usdc_bal - active_buy_collateral)
         max_size = math.floor((available / quote.price) * 100.0) / 100.0
-        pm_min = 5.0
+        pm_min = self._pm_min_order_size()
 
         if max_size < pm_min:
             self._throttled_warn(
@@ -841,7 +946,7 @@ class OrderManager:
         if free_inventory >= quote.size:
             return True
 
-        pm_min = 5.0
+        pm_min = self._pm_min_order_size()
         if free_inventory >= pm_min:
             old = quote.size
             # Round down to avoid tiny float overshoot (e.g. 6.56 becoming 6.57).
@@ -1053,12 +1158,12 @@ class OrderManager:
                 raise ImportError("py_clob_client not installed for live trading")
 
             order_type = OrderType.GTD if self.config.use_gtd else OrderType.GTC
-            oa = OrderArgs(
-                token_id=quote.token_id,
-                price=quote.price,
-                size=quote.size,
-                side=quote.side,
-            )
+            fee_rate_bps = await self._resolve_order_fee_rate_bps(quote.token_id)
+            if fee_rate_bps is None:
+                raise RuntimeError(
+                    f"fee rate unavailable for token {quote.token_id[:12]}..."
+                )
+            oa = self._build_order_args(quote, fee_rate_bps=fee_rate_bps)
             if self.config.use_gtd:
                 oa.expiration = int(time.time()) + self.config.gtd_duration_sec
 
@@ -1169,7 +1274,7 @@ class OrderManager:
                 if collateral > available + 0.50:
                     if available > 1.0 and quote.price > 0:
                         max_size = available / quote.price
-                        pm_min = 5.0
+                        pm_min = self._pm_min_order_size()
                         if max_size >= pm_min:
                             self._throttled_warn(
                                 "buy_balance_cap",
@@ -1243,7 +1348,7 @@ class OrderManager:
                     if usdc_bal > 0.01 and quote.price < 1.0:
                         max_short_affordable = usdc_bal / (1.0 - quote.price)
                         max_total_size = free_inventory + max_short_affordable
-                        pm_min = 5.0
+                        pm_min = self._pm_min_order_size()
                         if max_total_size >= pm_min:
                             self._throttled_warn(
                                 "sell_balance_cap",
@@ -1341,6 +1446,7 @@ class OrderManager:
         signed_orders: list[Any | None] = []
         order_type = OrderType.GTD if self.config.use_gtd else OrderType.GTC
         planned_buy_collateral = 0.0
+        token_fee_rate_bps: dict[str, int] = {}
 
         for quote in quotes:
             if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="batch_precheck"):
@@ -1386,12 +1492,20 @@ class OrderManager:
                     signed_orders.append(None)
                     continue
 
-            oa = OrderArgs(
-                token_id=quote.token_id,
-                price=quote.price,
-                size=quote.size,
-                side=quote.side,
-            )
+            fee_rate_bps = token_fee_rate_bps.get(quote.token_id)
+            if fee_rate_bps is None:
+                resolved = await self._resolve_order_fee_rate_bps(quote.token_id)
+                if resolved is None:
+                    self._throttled_warn(
+                        f"batch_fee_rate_skip:{quote.token_id}",
+                        f"Batch order skipped: fee-rate unavailable for {quote.token_id[:12]}...",
+                        cooldown=3.0,
+                    )
+                    signed_orders.append(None)
+                    continue
+                fee_rate_bps = resolved
+                token_fee_rate_bps[quote.token_id] = fee_rate_bps
+            oa = self._build_order_args(quote, fee_rate_bps=fee_rate_bps)
             if self.config.use_gtd:
                 oa.expiration = int(time.time()) + self.config.gtd_duration_sec
 

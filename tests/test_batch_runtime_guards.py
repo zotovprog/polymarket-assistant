@@ -40,6 +40,23 @@ class _DummyOrderArgs:
         self.expiration = None
 
 
+class _OrderArgsWithFee:
+    def __init__(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        side: str,
+        fee_rate_bps: int = 0,
+    ):
+        self.token_id = token_id
+        self.price = price
+        self.size = size
+        self.side = side
+        self.fee_rate_bps = fee_rate_bps
+        self.expiration = None
+
+
 class _LiveRejectClient:
     """Minimal live-like client with batch rejects."""
 
@@ -170,6 +187,30 @@ class _LiveSingleSuccessClient:
     def post_order(self, *_args, **_kwargs):
         self.post_count += 1
         return {"orderID": f"oid-{self.post_count}"}
+
+
+class _LiveFeeCaptureClient:
+    """Live-like client capturing OrderArgs used for signing."""
+
+    def __init__(self):
+        self.last_order_args = None
+        self.post_count = 0
+
+    def create_order(self, order_args):
+        self.last_order_args = order_args
+        return {
+            "token_id": order_args.token_id,
+            "price": order_args.price,
+            "size": order_args.size,
+            "side": order_args.side,
+        }
+
+    def post_order(self, *_args, **_kwargs):
+        self.post_count += 1
+        return {"orderID": f"fee-oid-{self.post_count}"}
+
+    def get_balance_allowance(self, _params):
+        return {"balance": 100_000_000, "allowance": 100_000_000}
 
 
 class _DummyAssetType:
@@ -345,6 +386,59 @@ async def test_place_order_buy_balance_retry_recomputes_size_and_retries():
     assert quote.size == pytest.approx(6.4)
     assert quote.size >= 5.0
     assert om.reconcile_requested is True
+
+
+@pytest.mark.anyio
+async def test_place_order_includes_fee_rate_bps_when_supported(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _OrderArgsWithFee, raising=False)
+    monkeypatch.setattr(
+        order_manager_mod,
+        "fetch_fee_rate",
+        AsyncMock(return_value={"feeRate": 0.10}),
+    )
+
+    client = _LiveFeeCaptureClient()
+    om = order_manager_mod.OrderManager(client, MMConfig())
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0)
+
+    oid = await om._place_order_inner(quote, post_only=True)
+
+    assert oid is not None
+    assert client.last_order_args is not None
+    assert getattr(client.last_order_args, "fee_rate_bps", None) == 1000
+
+
+@pytest.mark.anyio
+async def test_place_order_blocks_when_fee_rate_unavailable_on_live(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
+    monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
+    monkeypatch.setattr(order_manager_mod, "OrderArgs", _OrderArgsWithFee, raising=False)
+    monkeypatch.setattr(order_manager_mod, "fetch_fee_rate", AsyncMock(return_value=None))
+
+    client = _LiveFeeCaptureClient()
+    om = order_manager_mod.OrderManager(client, MMConfig())
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0)
+
+    with pytest.raises(RuntimeError, match="fee rate unavailable"):
+        await om._place_order_inner(quote, post_only=True)
+
+
+@pytest.mark.anyio
+async def test_buy_balance_retry_uses_market_min_order_size():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.set_market_context(min_order_size=10.0)
+    om.get_usdc_available_balance = AsyncMock(side_effect=[100.0, 4.0])  # max_size=8 < min 10
+    om._place_order_inner = AsyncMock(
+        side_effect=[RuntimeError("not enough balance"), "should-not-run"],
+    )
+
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=20.0)
+    oid = await om.place_order(quote)
+
+    assert oid is None
+    assert om._place_order_inner.await_count == 1
 
 
 def test_place_orders_batch_blocks_naked_sell_in_close_only_mode(monkeypatch):

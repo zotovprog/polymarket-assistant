@@ -23,7 +23,11 @@ log = logging.getLogger("mm.quotes")
 def _round_price(price: float, tick_size: float = 0.01) -> float:
     """Round to Polymarket's tick increment, clamp to valid range."""
     rounded = round(round(price / tick_size) * tick_size, 10)
-    return max(tick_size, min(1.0 - tick_size, rounded))
+    min_price = max(tick_size, 0.01)
+    max_price = min(0.99, 1.0 - tick_size)
+    if max_price < min_price:
+        max_price = min_price
+    return max(min_price, min(max_price, rounded))
 
 
 def _bps_to_price(bps: float) -> float:

@@ -946,6 +946,7 @@ class MarketMaker:
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
         self.market = market
+        self.order_mgr.set_market_context(min_order_size=market.min_order_size)
         log.info(f"Market set: {market.coin} {market.timeframe} "
                  f"strike={market.strike:.2f} "
                  f"UP={market.up_token_id[:12]}... "
@@ -2147,7 +2148,11 @@ class MarketMaker:
 
         def _round_to_tick(price: float) -> float:
             rounded = round(round(price / tick_size) * tick_size, 10)
-            return max(tick_size, min(1.0 - tick_size, rounded))
+            min_price = max(tick_size, 0.01)
+            max_price = min(0.99, 1.0 - tick_size)
+            if max_price < min_price:
+                max_price = min_price
+            return max(min_price, min(max_price, rounded))
 
         def _apply_spread_multiplier(token_key: str, spread_mult: float) -> None:
             if spread_mult <= 0:
@@ -3049,7 +3054,13 @@ class MarketMaker:
                 sell_size = chunk_size
                 phase = f"LIMIT_CHUNK_{self._liq_chunk_index + 1}/{cfg.liq_gradual_chunks}"
 
-            sell_price = round(max(0.01, min(0.99, sell_price)), 2)
+            tick_size = max(0.001, float(self.market.tick_size if self.market else 0.01))
+            quantized = round(round(float(sell_price) / tick_size) * tick_size, 10)
+            min_price = max(0.01, tick_size)
+            max_price = min(0.99, 1.0 - tick_size)
+            if max_price < min_price:
+                max_price = min_price
+            sell_price = max(min_price, min(max_price, quantized))
 
             # Min sell: PM minimum order size (5 shares) or notional >= $0.50
             pm_min_size = self.market.min_order_size if self.market else 5.0

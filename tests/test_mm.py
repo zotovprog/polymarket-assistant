@@ -61,6 +61,22 @@ def test_quote_engine_price_bounds() -> None:
         assert 0.01 <= ask.price <= 0.99
 
 
+def test_quote_engine_price_bounds_with_subcent_tick() -> None:
+    engine = QuoteEngine(MMConfig(half_spread_bps=5, order_size_usd=10.0))
+    inventory = Inventory()
+
+    bid, ask = engine.generate_quotes(
+        fair_value=0.999,
+        token_id="up-token",
+        inventory=inventory,
+        tick_size=0.001,
+    )
+    assert bid.price <= 0.99
+    assert ask.price <= 0.99
+    assert bid.price >= 0.01
+    assert ask.price >= 0.01
+
+
 def test_fair_value_range() -> None:
     engine = FairValueEngine()
     klines = [{"c": 100000.0 + i * 5.0} for i in range(30)]
@@ -147,7 +163,7 @@ def test_mock_clob_client_lifecycle() -> None:
     assert cancelled_order["status"] == "CANCELLED"
 
 
-def test_mock_clob_client_fills() -> None:
+def test_mock_clob_client_fills(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that MockClobClient simulates fills with fill_prob=1.0."""
     import importlib
     import types
@@ -157,8 +173,10 @@ def test_mock_clob_client_fills() -> None:
 
     web_server = importlib.import_module("web_server")
     MockClobClient = web_server.MockClobClient
+    monkeypatch.setattr(web_server.random, "random", lambda: 0.0)
+    monkeypatch.setattr(web_server.random, "uniform", lambda _a, _b: 1.0)
 
-    # 100% fill probability for deterministic test
+    # Deterministic full-fill behavior for stable test outcome
     client = MockClobClient(fill_prob=1.0)
 
     signed = client.create_and_sign_order(
