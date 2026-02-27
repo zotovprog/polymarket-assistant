@@ -9,6 +9,7 @@ import pytest
 from backtest.data_loader import DataLoader
 from backtest.simulator import MMSimulator
 from mm.fair_value import FairValueEngine
+from mm.market_maker import MarketMaker
 from mm.mm_config import MMConfig
 from mm.quote_engine import QuoteEngine
 from mm.risk_manager import RiskManager
@@ -75,6 +76,12 @@ def test_quote_engine_price_bounds_with_subcent_tick() -> None:
     assert ask.price <= 0.99
     assert bid.price >= 0.01
     assert ask.price >= 0.01
+
+
+def test_extreme_fv_blocks_bid_on_both_tails() -> None:
+    assert MarketMaker._should_block_bid_for_extreme_fv(0.19, 0.20) is True
+    assert MarketMaker._should_block_bid_for_extreme_fv(0.81, 0.20) is True
+    assert MarketMaker._should_block_bid_for_extreme_fv(0.50, 0.20) is False
 
 
 def test_fair_value_range() -> None:

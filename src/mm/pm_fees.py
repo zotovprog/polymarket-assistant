@@ -17,7 +17,7 @@ import httpx
 CRYPTO_FEE_EXPONENT = 2
 DEFAULT_BASE_FEE_BPS = 1000  # default for crypto markets
 
-_FEE_RATE_CACHE_TTL_SECONDS = 300
+_FEE_RATE_CACHE_TTL_SECONDS = 20
 _fee_rate_cache: dict[str, tuple[float, dict]] = {}
 _log = logging.getLogger(__name__)
 
@@ -32,11 +32,17 @@ def fee_curve_weight(price: float, exponent: int = CRYPTO_FEE_EXPONENT) -> float
 async def fetch_fee_rate(
     token_id: str,
     clob_base_url: str = "https://clob.polymarket.com",
+    *,
+    force_refresh: bool = False,
 ) -> dict:
     """Fetch and cache fee-rate payload for token_id from CLOB endpoint."""
     now = time.time()
     cached = _fee_rate_cache.get(token_id)
-    if cached and now - cached[0] < _FEE_RATE_CACHE_TTL_SECONDS:
+    if (
+        not force_refresh
+        and cached
+        and now - cached[0] < _FEE_RATE_CACHE_TTL_SECONDS
+    ):
         return cached[1]
 
     url = f"{clob_base_url.rstrip('/')}/fee-rate"
@@ -57,6 +63,14 @@ async def fetch_fee_rate(
 
     _fee_rate_cache[token_id] = (now, payload)
     return payload
+
+
+def invalidate_fee_rate_cache(token_id: str | None = None) -> None:
+    """Invalidate cached fee-rate payloads."""
+    if token_id:
+        _fee_rate_cache.pop(token_id, None)
+        return
+    _fee_rate_cache.clear()
 
 
 def get_cached_fee_params(token_id: str) -> tuple[int, int]:

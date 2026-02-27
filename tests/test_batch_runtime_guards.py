@@ -640,3 +640,140 @@ async def test_mm_emergency_uses_runtime_stop(monkeypatch):
     assert resp["ok"] is True
     assert resp["cancelled"] == 0
     assert called == {"liquidate": False, "emergency": True}
+
+
+def test_runtime_enforce_maker_only_sets_alert():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+    runtime.mm_config.use_post_only = False
+
+    runtime._enforce_maker_only("test")
+
+    assert runtime.mm_config.use_post_only is True
+    alerts = runtime.list_alerts()
+    assert any(a.get("source") == "maker_only" for a in alerts)
+
+
+@pytest.mark.anyio
+async def test_mm_config_update_rejects_disabling_post_only(monkeypatch):
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+
+    req = web_server.ConfigUpdateRequest(use_post_only=False)
+    resp = await web_server.mm_config_update(req=req, request=object())
+
+    assert getattr(resp, "status_code", None) == 400
+    body = getattr(resp, "body", b"")
+    assert b"use_post_only=false" in body
+
+
+def test_fee_or_signature_reject_invalidates_fee_cache(monkeypatch):
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    calls: list[str] = []
+
+    def _capture(token_id=None):
+        calls.append(token_id)
+
+    monkeypatch.setattr(order_manager_mod, "invalidate_fee_rate_cache", _capture)
+
+    quote = Quote(side="BUY", token_id="tok_fee_123", price=0.5, size=10.0)
+    om._handle_fee_or_signature_reject(
+        quote,
+        reason="invalid feeRateBps signature",
+        source="unit",
+    )
+
+    assert calls == ["tok_fee_123"]
+
+
+@pytest.mark.anyio
+async def test_live_start_blocks_on_startup_cancel_all_failure():
+    import mm.market_maker as market_maker_mod
+    from mm.types import MarketInfo
+
+    class _FeedState:
+        pass
+
+    class _LiveClient:
+        pass
+
+    mm = market_maker_mod.MarketMaker(_FeedState(), _LiveClient(), MMConfig())
+    mm.set_market(
+        MarketInfo(
+            coin="BTC",
+            timeframe="5m",
+            up_token_id="up_token",
+            dn_token_id="dn_token",
+            strike=100000.0,
+            window_start=time.time(),
+            window_end=time.time() + 300.0,
+        )
+    )
+    mm._cancel_all_guarded = AsyncMock(side_effect=RuntimeError("cancel_all boom"))
+
+    with pytest.raises(market_maker_mod.StartBlockedError, match="startup cancel_all failed"):
+        await mm.start()
+
+
+def test_pm_apply_accepts_099_prices():
+    import feeds
+
+    state = feeds.State()
+    state.pm_up_id = "up_token"
+    feeds._pm_apply(
+        "up_token",
+        asks=[{"price": "0.99"}],
+        bids=[{"price": "0.99"}],
+        state=state,
+    )
+
+    assert state.pm_up == pytest.approx(0.99)
+    assert state.pm_up_bid == pytest.approx(0.99)
+    assert state.pm_last_update_ts > 0
+
+
+@pytest.mark.anyio
+async def test_check_fills_guarded_uses_order_ops_lock():
+    import mm.market_maker as market_maker_mod
+    from mm.types import MarketInfo
+
+    class _FeedState:
+        pass
+
+    class _PaperClient:
+        _orders = {}
+
+    mm = market_maker_mod.MarketMaker(_FeedState(), _PaperClient(), MMConfig())
+    mm.set_market(
+        MarketInfo(
+            coin="BTC",
+            timeframe="5m",
+            up_token_id="up_token",
+            dn_token_id="dn_token",
+            strike=100000.0,
+            window_start=time.time(),
+            window_end=time.time() + 300.0,
+        )
+    )
+
+    lock_observed = {"locked": False}
+
+    async def _fake_check_fills():
+        lock_observed["locked"] = mm._order_ops_lock.locked()
+        return []
+
+    mm.order_mgr.check_fills = _fake_check_fills
+    fills = await mm._check_fills_guarded()
+
+    assert fills == []
+    assert lock_observed["locked"] is True

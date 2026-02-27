@@ -675,6 +675,16 @@ class MMRuntime:
         except (TypeError, ValueError):
             return default
 
+    def _enforce_maker_only(self, source: str) -> None:
+        """Force maker-only quoting in runtime configuration."""
+        if bool(getattr(self.mm_config, "use_post_only", True)):
+            self.clear_alert("maker_only")
+            return
+        self.mm_config.use_post_only = True
+        msg = f"Maker-only enforced: ignored use_post_only=false ({source})"
+        log.warning(msg)
+        self.set_alert("maker_only", msg, level="warning")
+
     def set_alert(self, source: str, message: str, level: str = "warning") -> None:
         """Set/update a dashboard-visible runtime alert by source key."""
         self._alerts[source] = {
@@ -1105,6 +1115,7 @@ class MMRuntime:
                 thread_id=os.environ.get("TELEGRAM_THREAD_ID", ""),
             )
         self._initial_usdc = initial_usdc
+        self._enforce_maker_only("start")
 
         # Validate credentials before going live
         if not paper_mode:
@@ -1634,6 +1645,7 @@ class MMRuntime:
                     )
             log.info("Session limit updated to $%.2f", self._initial_usdc)
         self.mm_config.update(**kwargs)
+        self._enforce_maker_only("runtime_update")
         if self.mm:
             self.mm.config = self.mm_config
             self.mm.quote_engine.config = self.mm_config
@@ -1675,6 +1687,7 @@ class MMRuntime:
                 if saved_limit is not None:
                     self._initial_usdc = float(saved_limit)
                 self.mm_config.update(**doc)
+                self._enforce_maker_only("mongo_load")
                 self.mm_config.validate()
                 log.info("Config loaded from MongoDB: spread=%s, skew=%s, session_limit=$%.2f",
                          self.mm_config.half_spread_bps, self.mm_config.skew_bps_per_unit,
@@ -2118,6 +2131,11 @@ async def mm_config_update(req: ConfigUpdateRequest, request: Request):
     if req.session_limit is not None:
         if req.session_limit < 5:
             return JSONResponse({"error": "session_limit must be >= 5"}, status_code=400)
+    if req.use_post_only is False:
+        return JSONResponse(
+            {"error": "use_post_only=false is disabled (maker-only mode enforced)"},
+            status_code=400,
+        )
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     updates = _validate_config_updates_before_apply(updates)
     new_config = _runtime.update_config(**updates)

@@ -820,17 +820,17 @@ async def pm_feed(state: State):
 
 def _pm_apply(asset, asks, bids, state):
     if asks:
-        valid = [float(a["price"]) for a in asks if float(a["price"]) < 0.99]
+        valid = [float(a["price"]) for a in asks if float(a["price"]) <= 0.99]
         if valid:
             _pm_set(asset, min(valid), state)
             state.pm_all_filtered = False  # reset — valid prices exist
-        elif asks:  # all asks >= 0.99
+        elif asks:  # all asks > 0.99
             if not state.pm_all_filtered:
                 state.pm_all_filtered = True
                 state.pm_all_filtered_ts = time.time()
-                print(f"  [PM] all prices >= 0.99 for {(asset or '')[:12]}.. — market resolved?")
+                print(f"  [PM] all prices > 0.99 for {(asset or '')[:12]}.. — market resolved?")
     if bids:
-        valid_bids = [float(b["price"]) for b in bids if float(b["price"]) < 0.99]
+        valid_bids = [float(b["price"]) for b in bids if float(b["price"]) <= 0.99]
         if valid_bids:
             _pm_set_bid(asset, max(valid_bids), state)
 
@@ -840,11 +840,11 @@ _pm_filter_log_ts = 0.0
 
 def _pm_set(asset, price, state):
     global _pm_filter_log_ts
-    if price >= 0.99:
+    if price > 0.99:
         now = time.time()
         if now - _pm_filter_log_ts >= 60:
             asset_label = (asset or "")[:12]
-            print(f"  [PM] filtered price={price:.4f} for asset={asset_label}.. (>= 0.99)")
+            print(f"  [PM] filtered price={price:.4f} for asset={asset_label}.. (> 0.99)")
             _pm_filter_log_ts = now
         return
     if asset == state.pm_up_id:
@@ -856,7 +856,7 @@ def _pm_set(asset, price, state):
 
 
 def _pm_set_bid(asset, price, state):
-    if price >= 0.99:
+    if price > 0.99:
         return
     if asset == state.pm_up_id:
         state.pm_up_bid = price

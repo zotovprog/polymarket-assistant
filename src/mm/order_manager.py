@@ -18,7 +18,12 @@ import websockets
 
 from .types import Quote, Fill
 from .mm_config import MMConfig
-from .pm_fees import fetch_fee_rate, taker_fee_usd, net_shares_after_buy_fee
+from .pm_fees import (
+    fetch_fee_rate,
+    invalidate_fee_rate_cache,
+    net_shares_after_buy_fee,
+    taker_fee_usd,
+)
 from .runtime_metrics import runtime_metrics
 
 log = logging.getLogger("mm.orders")
@@ -553,6 +558,43 @@ class OrderManager:
             "allowance",
         )
         return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _is_fee_or_signature_reject(reason: str) -> bool:
+        """Detect rejects likely caused by stale fee rate / signing payload mismatch."""
+        text = (reason or "").strip().lower()
+        if not text:
+            return False
+        markers = (
+            "feerate",
+            "fee rate",
+            "fee_rate_bps",
+            "feeratebps",
+            "signature",
+            "invalid auth",
+            "invalid order",
+        )
+        return any(marker in text for marker in markers)
+
+    def _handle_fee_or_signature_reject(
+        self,
+        quote: Quote,
+        *,
+        reason: str,
+        source: str,
+    ) -> None:
+        """Invalidate token fee cache after probable fee/signature rejects."""
+        if not self._is_fee_or_signature_reject(reason):
+            return
+        invalidate_fee_rate_cache(quote.token_id)
+        self._throttled_warn(
+            f"fee_reject_refresh:{source}:{quote.token_id}",
+            (
+                f"Fee/signature reject ({source}) for {quote.token_id[:8]}: "
+                f"{reason}. Invalidated fee-rate cache."
+            ),
+            cooldown=2.0,
+        )
 
     def _sell_reject_cooldown_left(self, token_id: str) -> float:
         """Seconds left for SELL cooldown after balance/allowance reject."""
@@ -1375,6 +1417,11 @@ class OrderManager:
             return await self._place_order_inner(quote, use_post_only)
         except Exception as e:
             error_msg = str(e)
+            self._handle_fee_or_signature_reject(
+                quote,
+                reason=error_msg,
+                source="single_place",
+            )
             if self._is_balance_or_allowance_reject(error_msg):
                 self._mark_reconcile_on_balance_reject(
                     quote,
@@ -1547,6 +1594,11 @@ class OrderManager:
                     order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._handle_fee_or_signature_reject(
+                            quote,
+                            reason=reason,
+                            source="batch_place_payload",
+                        )
                         self._mark_reconcile_on_balance_reject(
                             quote,
                             reason=reason,
@@ -1582,6 +1634,11 @@ class OrderManager:
                         )
                     else:
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._handle_fee_or_signature_reject(
+                            quote,
+                            reason=reason,
+                            source="batch_place_reject",
+                        )
                         self._mark_reconcile_on_balance_reject(
                             quote,
                             reason=reason,
@@ -1606,6 +1663,12 @@ class OrderManager:
                             reason=str(e),
                             source="batch_post_orders_error",
                         )
+                for idx in batch_indices:
+                    self._handle_fee_or_signature_reject(
+                        quotes[idx],
+                        reason=str(e),
+                        source="batch_post_orders_error",
+                    )
                 # Fallback to individual placement for failed batch.
                 for idx in batch_indices:
                     quote = quotes[idx]

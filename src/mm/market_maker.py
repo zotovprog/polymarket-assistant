@@ -281,6 +281,19 @@ class MarketMaker:
             return 0.0
         return max(0.0, val)
 
+    def _is_live_mode(self) -> bool:
+        """Heuristic: mock paper client exposes in-memory `_orders`."""
+        return not hasattr(self.order_mgr.client, "_orders")
+
+    @staticmethod
+    def _should_block_bid_for_extreme_fv(fv: float, min_fv: float) -> bool:
+        """Whether new BUY quotes should be blocked in FV tail zones."""
+        if min_fv <= 0:
+            return False
+        upper = max(0.0, min(1.0, 1.0 - float(min_fv)))
+        value = float(fv)
+        return value < float(min_fv) or value > upper
+
     def _arm_reconcile_guard(self, up_diff: float, dn_diff: float, source: str) -> None:
         """Briefly pause merge/liquidation after large inventory reconcile jumps."""
         max_diff = max(float(up_diff), float(dn_diff))
@@ -837,6 +850,11 @@ class MarketMaker:
         async with self._order_ops_lock:
             return await self.order_mgr.cancel_order(order_id)
 
+    async def _check_fills_guarded(self) -> list[Fill]:
+        """Serialize fill processing with cancel/place flow."""
+        async with self._order_ops_lock:
+            return await self.order_mgr.check_fills()
+
     async def _place_order_guarded(
         self,
         quote: Quote,
@@ -981,6 +999,11 @@ class MarketMaker:
                 log.info("Startup: cancelled %d stale orders from previous session", cancelled)
                 await asyncio.sleep(1.0)  # Wait for PM to settle after cancels
         except Exception as e:
+            if self._is_live_mode():
+                self._running = False
+                raise StartBlockedError(
+                    f"Start blocked: startup cancel_all failed in live mode: {e}"
+                ) from e
             log.warning("Startup: cancel_all failed: %s", e)
 
         # Snapshot starting portfolio (USDC + token values) for real session PnL
@@ -1234,7 +1257,7 @@ class MarketMaker:
                 # Wait for fills
                 log.info(f"Stop liquidation attempt {attempt+1}/3, waiting for fills...")
                 await asyncio.sleep(3.0)
-                await self.order_mgr.check_fills()
+                await self._check_fills_guarded()
 
         # Final cancel of any remaining orders
         await self._cancel_all_guarded()
@@ -1409,7 +1432,7 @@ class MarketMaker:
             self._current_quotes = {"up": (None, None), "dn": (None, None)}
 
         # 2. Check for fills (always, including closing mode)
-        fills = await self.order_mgr.check_fills()
+        fills = await self._check_fills_guarded()
         if fills:
             # Fills change available collateral; force fresh read on next USDC check.
             self.order_mgr.invalidate_usdc_cache()
@@ -2214,11 +2237,22 @@ class MarketMaker:
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
         if min_fv > 0:
-            if fv_up < min_fv and all_quotes["up"][0] is not None:
-                log.info(f"Skipping UP bid: FV={fv_up:.3f} < min_fv={min_fv}")
+            upper_fv = max(0.0, min(1.0, 1.0 - min_fv))
+            if self._should_block_bid_for_extreme_fv(fv_up, min_fv) and all_quotes["up"][0] is not None:
+                log.info(
+                    "Skipping UP bid: FV=%.3f outside [%.3f, %.3f]",
+                    fv_up,
+                    min_fv,
+                    upper_fv,
+                )
                 all_quotes["up"] = (None, all_quotes["up"][1])
-            if fv_dn < min_fv and all_quotes["dn"][0] is not None:
-                log.info(f"Skipping DN bid: FV={fv_dn:.3f} < min_fv={min_fv}")
+            if self._should_block_bid_for_extreme_fv(fv_dn, min_fv) and all_quotes["dn"][0] is not None:
+                log.info(
+                    "Skipping DN bid: FV=%.3f outside [%.3f, %.3f]",
+                    fv_dn,
+                    min_fv,
+                    upper_fv,
+                )
                 all_quotes["dn"] = (None, all_quotes["dn"][1])
 
         self._taker_quotes = []
