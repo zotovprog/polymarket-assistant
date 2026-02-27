@@ -489,10 +489,8 @@ class MarketMaker:
         return configured
 
     def _maybe_exit_inventory_close_mode_after_clear(self) -> None:
-        """Exit inventory-limit liquidation mode once PM balances are fully cleared."""
+        """Exit closing/liquidation mode once PM balances are fully cleared."""
         if not self.market or not self._is_closing:
-            return
-        if not (self._pause_reason or "").startswith("Inventory limit"):
             return
         if self._critical_drift_pause_active or self._quality_pause_active:
             return
@@ -521,7 +519,7 @@ class MarketMaker:
         self._merge_failed_this_cycle = False
         self._one_sided_counter = 0
         self._requote_event.set()
-        log.info("Inventory liquidation complete — exiting closing mode and resuming MM")
+        log.info("Liquidation complete — exiting closing mode and resuming MM")
 
     def _session_reserved_collateral(self) -> tuple[float, str]:
         """Reserved collateral estimate used for session exposure checks."""
