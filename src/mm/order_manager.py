@@ -988,22 +988,29 @@ class OrderManager:
             if q.side == "SELL" and q.token_id == quote.token_id
         )
         free_inventory = max(0.0, float(token_bal) - active_sell_exposure)
-        if free_inventory >= quote.size:
-            return True
 
         pm_min = self._pm_min_order_size()
-        if free_inventory >= pm_min:
+        # Keep a tiny safety buffer for live SELLs to avoid exchange-side
+        # precision/race rejects when local balance reads equal requested size.
+        safety_buffer = 0.02
+        raw_free = math.floor(free_inventory * 100.0) / 100.0
+        if free_inventory >= (pm_min + safety_buffer):
+            effective_free = math.floor(max(0.0, free_inventory - safety_buffer) * 100.0) / 100.0
+        else:
+            effective_free = raw_free
+
+        if effective_free + 1e-9 >= quote.size:
+            return True
+
+        if effective_free >= pm_min:
             old = quote.size
-            # Round down to avoid tiny float overshoot (e.g. 6.56 becoming 6.57).
-            trimmed = math.floor(free_inventory * 100.0) / 100.0
-            if trimmed < pm_min:
-                trimmed = pm_min
-            quote.size = round(trimmed, 2)
+            quote.size = round(effective_free, 2)
             self._throttled_warn(
                 "sell_close_only_trimmed",
                 (
                     f"SELL trimmed (close-only) {quote.token_id[:8]} "
-                    f"{old:.1f}→{quote.size:.1f} shares (free={free_inventory:.1f})"
+                    f"{old:.1f}→{quote.size:.1f} shares "
+                    f"(free={free_inventory:.2f}, effective={effective_free:.2f})"
                 ),
                 cooldown=5.0,
             )
@@ -1013,7 +1020,7 @@ class OrderManager:
             "sell_close_only_blocked",
             (
                 f"SELL blocked (close-only) {quote.token_id[:8]} "
-                f"need={quote.size:.1f} free={free_inventory:.1f}"
+                f"need={quote.size:.1f} free={free_inventory:.2f} effective={effective_free:.2f}"
             ),
             cooldown=5.0,
         )

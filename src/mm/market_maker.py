@@ -2991,9 +2991,11 @@ class MarketMaker:
             fv = fv_up if is_up else fv_dn
             book = await self.order_mgr.get_book_summary(token_id)
             best_bid = book["best_bid"]
+            best_ask = book.get("best_ask")
             if best_bid is None or best_bid <= 0:
                 log.warning("no liquidity for %s", label)
                 continue
+            tick_size = max(0.001, float(self.market.tick_size if self.market else 0.01))
 
             # Determine price floor from lock or cost basis
             floor = 0.01
@@ -3050,7 +3052,13 @@ class MarketMaker:
                 # Price: max(floor, FV - discount), improve to best_bid if higher
                 sell_price = max(floor, fv - cfg.liq_max_discount_from_fv)
                 if best_bid and best_bid > sell_price:
-                    sell_price = best_bid  # improve, don't worsen
+                    resting_min = best_bid + tick_size
+                    if best_ask is not None and best_ask > 0:
+                        sell_price = max(resting_min, min(best_ask, sell_price))
+                        if sell_price < resting_min:
+                            sell_price = resting_min
+                    else:
+                        sell_price = max(resting_min, sell_price)
 
                 if sell_price < 0.03:
                     sell_price = fv * 0.8 if fv > 0.05 else 0.03
@@ -3072,7 +3080,6 @@ class MarketMaker:
                 sell_size = chunk_size
                 phase = f"LIMIT_CHUNK_{self._liq_chunk_index + 1}/{cfg.liq_gradual_chunks}"
 
-            tick_size = max(0.001, float(self.market.tick_size if self.market else 0.01))
             quantized = round(round(float(sell_price) / tick_size) * tick_size, 10)
             min_price = max(0.01, tick_size)
             max_price = min(0.99, 1.0 - tick_size)
