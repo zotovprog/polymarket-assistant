@@ -213,6 +213,10 @@ class ConfigUpdateRequest(BaseModel):
     toxic_divergence_ticks: Optional[int] = None
     critical_reconcile_drift_shares: Optional[float] = None
     fill_settlement_grace_sec: Optional[float] = None
+    pre_entry_stable_checks: Optional[int] = None
+    pre_entry_min_quality_score: Optional[float] = None
+    pre_entry_max_spread_bps: Optional[float] = None
+    pre_entry_max_divergence: Optional[float] = None
     post_fill_entry_guard_sec: Optional[float] = None
     post_fill_entry_score_drop: Optional[float] = None
     post_fill_entry_spread_widen_bps: Optional[float] = None
@@ -278,6 +282,9 @@ class ConfigUpdateRequest(BaseModel):
         "toxic_divergence_threshold",
         "critical_reconcile_drift_shares",
         "fill_settlement_grace_sec",
+        "pre_entry_min_quality_score",
+        "pre_entry_max_spread_bps",
+        "pre_entry_max_divergence",
         "post_fill_entry_guard_sec",
         "post_fill_entry_score_drop",
         "post_fill_entry_spread_widen_bps",
@@ -319,6 +326,7 @@ class ConfigUpdateRequest(BaseModel):
         "heartbeat_failures_before_shutdown",
         "max_one_sided_ticks",
         "toxic_divergence_ticks",
+        "pre_entry_stable_checks",
         "liq_gradual_chunks",
         "price_jitter_ticks",
         "rebate_check_interval_ticks",

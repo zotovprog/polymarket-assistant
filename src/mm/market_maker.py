@@ -210,9 +210,15 @@ class MarketMaker:
         self._catastrophic_count: int = 0  # Consecutive CATASTROPHIC readings
         self._catastrophic_threshold: int = 3  # Readings required before shutdown
         self._last_quality: MarketQuality | None = None
+        self._last_quality_ts: float = 0.0
         self._quality_error_count: int = 0
         self._quality_success_count: int = 0
         self._quality_pause_active: bool = False
+        self._pre_entry_guard_active: bool = False
+        self._pre_entry_guard_reason: str = ""
+        self._pre_entry_guard_trigger_count: int = 0
+        self._pre_entry_quality_passes: int = 0
+        self._pre_entry_inventory_was_material: bool = False
         self._post_fill_entry_guard_until: float = 0.0
         self._post_fill_entry_guard_anchor: MarketQuality | None = None
         self._post_fill_entry_guard_active: bool = False
@@ -409,6 +415,107 @@ class MarketMaker:
             float(self.inventory.up_shares) > threshold
             or float(self.inventory.dn_shares) > threshold
         )
+
+    def _pre_entry_required_checks(self) -> int:
+        return max(
+            1,
+            int(getattr(self.config, "pre_entry_stable_checks", 3) or 3),
+        )
+
+    def _set_pre_entry_guard(self, reason: str) -> None:
+        reason = reason.strip()
+        if (not self._pre_entry_guard_active) or reason != self._pre_entry_guard_reason:
+            self._pre_entry_guard_trigger_count += 1
+        self._pre_entry_guard_active = True
+        self._pre_entry_guard_reason = reason
+
+    def _clear_pre_entry_guard(self) -> None:
+        self._pre_entry_guard_active = False
+        self._pre_entry_guard_reason = ""
+
+    def _update_pre_entry_guard(
+        self,
+        *,
+        max_divergence: float,
+        quality_refreshed: bool,
+    ) -> None:
+        if not self._is_live_mode():
+            self._pre_entry_quality_passes = 0
+            self._pre_entry_inventory_was_material = False
+            self._clear_pre_entry_guard()
+            return
+
+        has_inventory = self._has_material_inventory()
+        if has_inventory:
+            self._pre_entry_inventory_was_material = True
+            self._pre_entry_quality_passes = 0
+            self._clear_pre_entry_guard()
+            return
+
+        if self._pre_entry_inventory_was_material:
+            self._pre_entry_inventory_was_material = False
+            self._pre_entry_quality_passes = 0
+            self._set_pre_entry_guard("inventory flat: waiting for stable quality")
+
+        current = self._last_quality
+        if current is None:
+            self._pre_entry_quality_passes = 0
+            self._set_pre_entry_guard("awaiting market quality sample")
+            return
+
+        reasons: list[str] = []
+        min_score = float(getattr(self.config, "pre_entry_min_quality_score", 0.75) or 0.75)
+        max_spread = float(getattr(self.config, "pre_entry_max_spread_bps", 500.0) or 500.0)
+        max_div = float(getattr(self.config, "pre_entry_max_divergence", 0.08) or 0.08)
+
+        if not bool(current.tradeable):
+            reasons.append(current.reason or "market not tradeable")
+        if float(current.overall_score) < min_score:
+            reasons.append(f"score {float(current.overall_score):.2f} < {min_score:.2f}")
+        if float(current.spread_bps) > max_spread:
+            reasons.append(f"spread {float(current.spread_bps):.0f}bps > {max_spread:.0f}bps")
+        if float(max_divergence) > max_div:
+            reasons.append(f"divergence {float(max_divergence):.3f} > {max_div:.3f}")
+
+        if reasons:
+            self._pre_entry_quality_passes = 0
+            self._set_pre_entry_guard("; ".join(dict.fromkeys(reasons)))
+            return
+
+        if quality_refreshed:
+            self._pre_entry_quality_passes = min(
+                self._pre_entry_required_checks(),
+                self._pre_entry_quality_passes + 1,
+            )
+
+        if self._pre_entry_quality_passes < self._pre_entry_required_checks():
+            self._set_pre_entry_guard(
+                f"stable quality warmup {self._pre_entry_quality_passes}/{self._pre_entry_required_checks()}"
+            )
+            return
+
+        self._clear_pre_entry_guard()
+
+    def _apply_pre_entry_buy_block(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+    ) -> None:
+        if not self._pre_entry_guard_active:
+            return
+
+        blocked_any = False
+        for token_key in ("up", "dn"):
+            bid, ask = all_quotes[token_key]
+            if bid is not None:
+                blocked_any = True
+                all_quotes[token_key] = (None, ask)
+
+        if blocked_any:
+            self._throttled_warn(
+                "pre_entry_guard_block",
+                f"Pre-entry guard: blocking new BUYs while flat ({self._pre_entry_guard_reason})",
+                cooldown=2.0,
+            )
 
     def _post_fill_entry_guard_window_active(self) -> bool:
         return time.time() < self._post_fill_entry_guard_until
@@ -1609,9 +1716,15 @@ class MarketMaker:
         self._liq_last_chunk_time = 0.0
         self._liq_last_attempt_time = 0.0
         self._one_sided_counter = 0
+        self._last_quality_ts = 0.0
         self._quality_error_count = 0
         self._quality_success_count = 0
         self._quality_pause_active = False
+        self._pre_entry_guard_active = False
+        self._pre_entry_guard_reason = ""
+        self._pre_entry_guard_trigger_count = 0
+        self._pre_entry_quality_passes = 0
+        self._pre_entry_inventory_was_material = False
         self._post_fill_entry_guard_until = 0.0
         self._post_fill_entry_guard_anchor = None
         self._post_fill_entry_guard_active = False
@@ -2566,6 +2679,7 @@ class MarketMaker:
                 or self._should_force_post_fill_quality_check()
             )
         )
+        quality_refreshed = False
         if should_check_quality:
             try:
                 up_book, dn_book = await asyncio.gather(
@@ -2574,6 +2688,8 @@ class MarketMaker:
                 )
                 self._last_quality = self.quality_analyzer.analyze(
                     up_book, dn_book, fv_up, fv_dn)
+                self._last_quality_ts = time.time()
+                quality_refreshed = True
                 self._update_post_fill_entry_guard()
                 self._quality_error_count = 0
                 if self._quality_pause_active:
@@ -2628,6 +2744,10 @@ class MarketMaker:
                     log.critical("Market quality degraded, pausing")
                 return
 
+        self._update_pre_entry_guard(
+            max_divergence=max_divergence,
+            quality_refreshed=quality_refreshed,
+        )
         if self._quality_pause_active:
             return
 
@@ -2778,6 +2898,7 @@ class MarketMaker:
             # In toxic regime, do not add new exposure; keep asks for inventory unwind.
             all_quotes["up"] = (None, all_quotes["up"][1])
             all_quotes["dn"] = (None, all_quotes["dn"][1])
+        self._apply_pre_entry_buy_block(all_quotes)
         self._apply_post_fill_entry_buy_block(all_quotes)
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
@@ -3868,6 +3989,12 @@ class MarketMaker:
         self._critical_drift_recovery_streak = 0
         self._settlement_lag = {}
         self._settlement_guard_tokens = set()
+        self._last_quality_ts = 0.0
+        self._pre_entry_guard_active = False
+        self._pre_entry_guard_reason = ""
+        self._pre_entry_guard_trigger_count = 0
+        self._pre_entry_quality_passes = 0
+        self._pre_entry_inventory_was_material = False
         self._post_fill_entry_guard_until = 0.0
         self._post_fill_entry_guard_anchor = None
         self._post_fill_entry_guard_active = False
@@ -4107,6 +4234,22 @@ class MarketMaker:
                 "tokens": settlement_guard_tokens,
                 "suppressed_total": self._settlement_lag_suppressed_total,
                 "escalated_total": self._settlement_lag_escalated_total,
+            },
+            "pre_entry_guard": {
+                "active": self._pre_entry_guard_active,
+                "reason": self._pre_entry_guard_reason,
+                "trigger_count": self._pre_entry_guard_trigger_count,
+                "stable_checks_passed": self._pre_entry_quality_passes,
+                "stable_checks_required": self._pre_entry_required_checks(),
+                "last_quality_score": round(self._last_quality.overall_score, 3)
+                if self._last_quality
+                else None,
+                "last_quality_spread_bps": round(self._last_quality.spread_bps, 1)
+                if self._last_quality
+                else None,
+                "last_quality_age_sec": round(max(0.0, time.time() - self._last_quality_ts), 2)
+                if self._last_quality_ts > 0
+                else None,
             },
             "post_fill_entry_guard": {
                 "active": self._post_fill_entry_guard_active,

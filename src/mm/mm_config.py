@@ -79,6 +79,10 @@ class MMConfig:
         "toxic_divergence_ticks": (1.0, 120.0),
         "critical_reconcile_drift_shares": (0.5, 50.0),
         "fill_settlement_grace_sec": (1.0, 15.0),
+        "pre_entry_stable_checks": (1.0, 20.0),
+        "pre_entry_min_quality_score": (0.0, 1.0),
+        "pre_entry_max_spread_bps": (25.0, 5000.0),
+        "pre_entry_max_divergence": (0.01, 0.50),
         "post_fill_entry_guard_sec": (5.0, 120.0),
         "post_fill_entry_score_drop": (0.05, 1.0),
         "post_fill_entry_spread_widen_bps": (50.0, 5000.0),
@@ -145,6 +149,10 @@ class MMConfig:
     toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
     critical_reconcile_drift_shares: float = 1.5  # Immediate pause if |internal-real| exceeds this many shares
     fill_settlement_grace_sec: float = 6.0    # Grace window for PM balance lag right after live fills
+    pre_entry_stable_checks: int = 3          # Require this many consecutive strong quality checks before first BUY
+    pre_entry_min_quality_score: float = 0.75  # Stricter score floor before opening a fresh position
+    pre_entry_max_spread_bps: float = 500.0   # Stricter spread ceiling before first BUY
+    pre_entry_max_divergence: float = 0.08    # Max FV/PM divergence before first BUY
     post_fill_entry_guard_sec: float = 45.0   # After a BUY fill, watch quality closely for this long
     post_fill_entry_score_drop: float = 0.20  # Block new BUYs if overall quality drops this much vs fill-time anchor
     post_fill_entry_spread_widen_bps: float = 250.0  # Block new BUYs if spread widens this much vs fill-time anchor

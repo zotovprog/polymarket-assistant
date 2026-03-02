@@ -694,6 +694,153 @@ def test_post_fill_quality_guard_resets_when_inventory_flat():
     assert mm._post_fill_entry_guard_anchor is None
 
 
+def test_pre_entry_guard_blocks_first_buy_until_stable_quality():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.pre_entry_stable_checks = 3
+    mm.config.pre_entry_min_quality_score = 0.75
+    mm.config.pre_entry_max_spread_bps = 500.0
+    mm.config.pre_entry_max_divergence = 0.08
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=9000.0,
+        ask_depth_usd=8500.0,
+        spread_bps=220.0,
+        liquidity_score=1.0,
+        spread_score=0.97,
+        overall_score=0.92,
+        tradeable=True,
+        reason="OK",
+    )
+
+    mm._update_pre_entry_guard(max_divergence=0.03, quality_refreshed=True)
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.42, size=5.0),
+            None,
+        ),
+        "dn": (
+            Quote(side="BUY", token_id=mm.market.dn_token_id, price=0.40, size=5.0),
+            Quote(side="SELL", token_id=mm.market.dn_token_id, price=0.50, size=5.0),
+        ),
+    }
+    mm._apply_pre_entry_buy_block(quotes)
+
+    assert mm._pre_entry_guard_active is True
+    assert mm._pre_entry_quality_passes == 1
+    assert mm._pre_entry_guard_reason == "stable quality warmup 1/3"
+    assert quotes["up"][0] is None
+    assert quotes["dn"][0] is None
+    assert quotes["dn"][1] is not None
+
+
+def test_pre_entry_guard_clears_after_required_quality_streak():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.pre_entry_stable_checks = 2
+    mm.config.pre_entry_min_quality_score = 0.70
+    mm.config.pre_entry_max_spread_bps = 550.0
+    mm.config.pre_entry_max_divergence = 0.08
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=9500.0,
+        ask_depth_usd=9100.0,
+        spread_bps=240.0,
+        liquidity_score=1.0,
+        spread_score=0.95,
+        overall_score=0.90,
+        tradeable=True,
+        reason="OK",
+    )
+
+    mm._update_pre_entry_guard(max_divergence=0.02, quality_refreshed=True)
+    assert mm._pre_entry_guard_active is True
+    assert mm._pre_entry_quality_passes == 1
+
+    mm._update_pre_entry_guard(max_divergence=0.02, quality_refreshed=True)
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.42, size=5.0),
+            None,
+        ),
+        "dn": (
+            Quote(side="BUY", token_id=mm.market.dn_token_id, price=0.40, size=5.0),
+            None,
+        ),
+    }
+    mm._apply_pre_entry_buy_block(quotes)
+
+    assert mm._pre_entry_guard_active is False
+    assert mm._pre_entry_guard_reason == ""
+    assert mm._pre_entry_quality_passes == 2
+    assert quotes["up"][0] is not None
+    assert quotes["dn"][0] is not None
+
+
+def test_pre_entry_guard_resets_on_bad_quality_or_divergence():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.pre_entry_stable_checks = 2
+    mm.config.pre_entry_min_quality_score = 0.75
+    mm.config.pre_entry_max_spread_bps = 500.0
+    mm.config.pre_entry_max_divergence = 0.08
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=9000.0,
+        ask_depth_usd=8600.0,
+        spread_bps=220.0,
+        liquidity_score=1.0,
+        spread_score=0.96,
+        overall_score=0.91,
+        tradeable=True,
+        reason="OK",
+    )
+    mm._update_pre_entry_guard(max_divergence=0.02, quality_refreshed=True)
+    assert mm._pre_entry_quality_passes == 1
+
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=9200.0,
+        ask_depth_usd=8800.0,
+        spread_bps=230.0,
+        liquidity_score=1.0,
+        spread_score=0.95,
+        overall_score=0.90,
+        tradeable=True,
+        reason="OK",
+    )
+    mm._update_pre_entry_guard(max_divergence=0.12, quality_refreshed=True)
+
+    assert mm._pre_entry_guard_active is True
+    assert mm._pre_entry_quality_passes == 0
+    assert "divergence 0.120 > 0.080" in mm._pre_entry_guard_reason
+
+
+def test_pre_entry_guard_rearms_after_inventory_returns_flat():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.pre_entry_stable_checks = 2
+    mm.inventory.dn_shares = 5.0
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=9000.0,
+        ask_depth_usd=9000.0,
+        spread_bps=200.0,
+        liquidity_score=1.0,
+        spread_score=1.0,
+        overall_score=0.95,
+        tradeable=True,
+        reason="OK",
+    )
+
+    mm._update_pre_entry_guard(max_divergence=0.02, quality_refreshed=True)
+    assert mm._pre_entry_guard_active is False
+
+    mm.inventory.dn_shares = 0.0
+    mm._update_pre_entry_guard(max_divergence=0.02, quality_refreshed=False)
+
+    assert mm._pre_entry_guard_active is True
+    assert mm._pre_entry_quality_passes == 0
+    assert mm._pre_entry_guard_reason == "stable quality warmup 0/2"
+
+
 def test_session_pnl_prevents_false_drawdown():
     risk_mgr, inventory = _make_risk_setup()
 
