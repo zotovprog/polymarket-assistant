@@ -224,6 +224,27 @@ async def test_acceptance_smoke_single_trade_one_usdc_roundtrip_zero_pnl(monkeyp
 
 
 @pytest.mark.anyio
+async def test_acceptance_paper_active_orders_are_polled_without_stale_delay(monkeypatch):
+    web_server = _web_server_module()
+    monkeypatch.setattr(web_server.random, "random", lambda: 0.0)
+    monkeypatch.setattr(web_server.random, "uniform", lambda _a, _b: 1.0)
+
+    client = _make_mock_client(fill_prob=1.0, usdc_balance=20.0)
+    market = _market()
+    client.set_fair_values(0.5, 0.5, market, pm_prices={"up": 0.5, "dn": 0.5})
+
+    om = OrderManager(client, MMConfig())
+    quote = Quote(side="BUY", token_id=market.up_token_id, price=0.50, size=5.0)
+    order_id = await om.place_order(quote)
+
+    fills = await om.check_fills()
+
+    assert len(fills) == 1
+    assert fills[0].order_id == order_id
+    assert order_id not in om._active_orders
+
+
+@pytest.mark.anyio
 async def test_acceptance_post_only_reject_stays_maker_only(monkeypatch):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)

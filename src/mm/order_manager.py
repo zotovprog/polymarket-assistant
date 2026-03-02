@@ -2192,6 +2192,7 @@ class OrderManager:
         HTTP polling only runs every 30s for orders with no WS activity.
         """
         now = time.time()
+        is_mock_client = hasattr(self.client, "_orders")
         self._prune_recent_orders(now)
         fills = []
         to_remove = []
@@ -2337,7 +2338,12 @@ class OrderManager:
         removed_set = set(to_remove)
         poll_map: dict[str, Quote] = {}
 
-        if (now - self._last_fill_check_ts) >= stale_cutoff and self._active_orders:
+        if is_mock_client and self._active_orders:
+            for oid, quote in self._active_orders.items():
+                if oid in ws_processed_oids or oid in removed_set:
+                    continue
+                poll_map[oid] = quote
+        elif (now - self._last_fill_check_ts) >= stale_cutoff and self._active_orders:
             self._last_fill_check_ts = now
             for oid, quote in self._active_orders.items():
                 if (
@@ -2361,7 +2367,10 @@ class OrderManager:
 
         if poll_map:
             poll_items = list(poll_map.items())
-            log.info("HTTP fallback: polling %d tracked orders", len(poll_items))
+            if is_mock_client:
+                log.info("Paper fill poll: checking %d tracked orders", len(poll_items))
+            else:
+                log.info("HTTP fallback: polling %d tracked orders", len(poll_items))
             fetch_results = await asyncio.gather(
                 *(
                     asyncio.wait_for(

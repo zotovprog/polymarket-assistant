@@ -435,6 +435,7 @@ class MockClobClient:
             "collateral": collateral,
             "fill_credit_applied": False,
             "created_tick": self._tick_count,
+            "created_ts": time.time(),
         }
         return {"orderID": oid}
 
@@ -466,7 +467,10 @@ class MockClobClient:
         SELL closer to (or below) FV → more likely to fill.
         Age bonus capped at 2x base probability.
         """
-        age = self._tick_count - order.get("created_tick", 0)
+        age_ticks = max(0.0, float(self._tick_count - order.get("created_tick", 0)))
+        created_ts = float(order.get("created_ts", 0.0) or 0.0)
+        age_seconds = max(0.0, time.time() - created_ts) if created_ts > 0 else 0.0
+        age = max(age_ticks, age_seconds / 3.0)
         price = order["price"]
         side = order["side"]
         token_id = order.get("token_id", "")
