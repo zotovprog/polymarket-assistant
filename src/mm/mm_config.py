@@ -79,6 +79,9 @@ class MMConfig:
         "toxic_divergence_ticks": (1.0, 120.0),
         "critical_reconcile_drift_shares": (0.5, 50.0),
         "fill_settlement_grace_sec": (1.0, 15.0),
+        "post_fill_entry_guard_sec": (5.0, 120.0),
+        "post_fill_entry_score_drop": (0.05, 1.0),
+        "post_fill_entry_spread_widen_bps": (50.0, 5000.0),
         "one_sided_protect_ticks": (1.0, 600.0),
         "flat_start_max_shares": (0.0, 1000.0),
     }
@@ -142,6 +145,9 @@ class MMConfig:
     toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
     critical_reconcile_drift_shares: float = 1.5  # Immediate pause if |internal-real| exceeds this many shares
     fill_settlement_grace_sec: float = 6.0    # Grace window for PM balance lag right after live fills
+    post_fill_entry_guard_sec: float = 45.0   # After a BUY fill, watch quality closely for this long
+    post_fill_entry_score_drop: float = 0.20  # Block new BUYs if overall quality drops this much vs fill-time anchor
+    post_fill_entry_spread_widen_bps: float = 250.0  # Block new BUYs if spread widens this much vs fill-time anchor
     one_sided_protect_ticks: int = 30          # Start anti-expansion protection before hard-close trigger
     require_flat_start: bool = True            # Block start when wallet already carries non-dust token inventory
     flat_start_max_shares: float = 0.25        # Per-side dust threshold allowed at startup

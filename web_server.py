@@ -213,6 +213,9 @@ class ConfigUpdateRequest(BaseModel):
     toxic_divergence_ticks: Optional[int] = None
     critical_reconcile_drift_shares: Optional[float] = None
     fill_settlement_grace_sec: Optional[float] = None
+    post_fill_entry_guard_sec: Optional[float] = None
+    post_fill_entry_score_drop: Optional[float] = None
+    post_fill_entry_spread_widen_bps: Optional[float] = None
     require_flat_start: Optional[bool] = None
     flat_start_max_shares: Optional[float] = None
     max_one_sided_ticks: Optional[int] = None
@@ -275,6 +278,9 @@ class ConfigUpdateRequest(BaseModel):
         "toxic_divergence_threshold",
         "critical_reconcile_drift_shares",
         "fill_settlement_grace_sec",
+        "post_fill_entry_guard_sec",
+        "post_fill_entry_score_drop",
+        "post_fill_entry_spread_widen_bps",
         "flat_start_max_shares",
         "min_fv_to_quote",
         "close_window_sec",

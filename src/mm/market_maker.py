@@ -213,6 +213,11 @@ class MarketMaker:
         self._quality_error_count: int = 0
         self._quality_success_count: int = 0
         self._quality_pause_active: bool = False
+        self._post_fill_entry_guard_until: float = 0.0
+        self._post_fill_entry_guard_anchor: MarketQuality | None = None
+        self._post_fill_entry_guard_active: bool = False
+        self._post_fill_entry_guard_reason: str = ""
+        self._post_fill_entry_guard_trigger_count: int = 0
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
@@ -393,6 +398,152 @@ class MarketMaker:
             self.market.up_token_id: float(self.inventory.up_shares),
             self.market.dn_token_id: float(self.inventory.dn_shares),
         }
+
+    def _clone_quality(self, quality: MarketQuality | None) -> MarketQuality | None:
+        if quality is None:
+            return None
+        return MarketQuality(**asdict(quality))
+
+    def _has_material_inventory(self, *, threshold: float = 0.5) -> bool:
+        return (
+            float(self.inventory.up_shares) > threshold
+            or float(self.inventory.dn_shares) > threshold
+        )
+
+    def _post_fill_entry_guard_window_active(self) -> bool:
+        return time.time() < self._post_fill_entry_guard_until
+
+    def _should_force_post_fill_quality_check(self) -> bool:
+        return (
+            self._post_fill_entry_guard_window_active()
+            and abs(float(self.inventory.up_shares) - float(self.inventory.dn_shares)) > 2.0
+        )
+
+    def _clear_post_fill_entry_guard(self, *, reset_anchor: bool) -> None:
+        self._post_fill_entry_guard_active = False
+        self._post_fill_entry_guard_reason = ""
+        if reset_anchor:
+            self._post_fill_entry_guard_until = 0.0
+            self._post_fill_entry_guard_anchor = None
+
+    def _arm_post_fill_entry_guard(self, fill: Fill) -> None:
+        if not self._is_live_mode() or fill.side != "BUY":
+            return
+
+        guard_sec = max(
+            5.0,
+            float(getattr(self.config, "post_fill_entry_guard_sec", 45.0) or 45.0),
+        )
+        self._post_fill_entry_guard_until = time.time() + guard_sec
+        self._post_fill_entry_guard_anchor = self._clone_quality(self._last_quality)
+        self._post_fill_entry_guard_active = False
+        self._post_fill_entry_guard_reason = ""
+
+        token_key = self._token_key_for_id(fill.token_id) or fill.token_id
+        anchor = self._post_fill_entry_guard_anchor
+        log.info(
+            "Post-fill entry guard armed: token=%s size=%.2f window=%.1fs anchor_score=%s anchor_spread=%s",
+            token_key.upper(),
+            float(fill.size),
+            guard_sec,
+            f"{anchor.overall_score:.3f}" if anchor is not None else "n/a",
+            f"{anchor.spread_bps:.0f}bps" if anchor is not None else "n/a",
+        )
+
+    def _update_post_fill_entry_guard(self) -> None:
+        if not self._has_material_inventory():
+            self._clear_post_fill_entry_guard(reset_anchor=True)
+            return
+
+        if not self._post_fill_entry_guard_window_active():
+            self._clear_post_fill_entry_guard(reset_anchor=True)
+            return
+
+        if self._last_quality is None:
+            return
+
+        if self._post_fill_entry_guard_anchor is None:
+            self._post_fill_entry_guard_anchor = self._clone_quality(self._last_quality)
+            return
+
+        anchor = self._post_fill_entry_guard_anchor
+        current = self._last_quality
+        score_drop = float(anchor.overall_score) - float(current.overall_score)
+        spread_widen = float(current.spread_bps) - float(anchor.spread_bps)
+
+        degraded = False
+        reason = ""
+        if not bool(current.tradeable):
+            degraded = True
+            reason = current.reason or "market no longer tradeable"
+        elif score_drop >= float(getattr(self.config, "post_fill_entry_score_drop", 0.20) or 0.20):
+            degraded = True
+            reason = (
+                f"quality score drop {score_drop:.2f} >= "
+                f"{float(getattr(self.config, 'post_fill_entry_score_drop', 0.20) or 0.20):.2f}"
+            )
+        elif spread_widen >= float(
+            getattr(self.config, "post_fill_entry_spread_widen_bps", 250.0) or 250.0
+        ):
+            degraded = True
+            reason = (
+                f"spread widened {spread_widen:.0f}bps >= "
+                f"{float(getattr(self.config, 'post_fill_entry_spread_widen_bps', 250.0) or 250.0):.0f}bps"
+            )
+
+        if degraded:
+            if (not self._post_fill_entry_guard_active) or reason != self._post_fill_entry_guard_reason:
+                self._post_fill_entry_guard_active = True
+                self._post_fill_entry_guard_reason = reason
+                self._post_fill_entry_guard_trigger_count += 1
+                self._throttled_warn(
+                    "post_fill_entry_guard_activated",
+                    (
+                        "Post-fill entry guard activated: %s "
+                        "(anchor score=%.3f spread=%.0fbps -> current score=%.3f spread=%.0fbps)"
+                    )
+                    % (
+                        reason,
+                        anchor.overall_score,
+                        anchor.spread_bps,
+                        current.overall_score,
+                        current.spread_bps,
+                    ),
+                    cooldown=2.0,
+                )
+            return
+
+        if self._post_fill_entry_guard_active:
+            log.info("Post-fill entry guard cleared: market quality recovered before guard expiry")
+        self._post_fill_entry_guard_active = False
+        self._post_fill_entry_guard_reason = ""
+
+    def _apply_post_fill_entry_buy_block(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+    ) -> None:
+        if not self._post_fill_entry_guard_active:
+            return
+
+        blocked_any = False
+        for token_key in ("up", "dn"):
+            bid, ask = all_quotes[token_key]
+            if bid is not None:
+                blocked_any = True
+                all_quotes[token_key] = (None, ask)
+
+        if blocked_any:
+            self._throttled_warn(
+                "post_fill_entry_guard_block",
+                (
+                    "Post-fill entry guard: blocking new BUYs for %.1fs (%s)"
+                    % (
+                        max(0.0, self._post_fill_entry_guard_until - time.time()),
+                        self._post_fill_entry_guard_reason or "quality degraded after fill",
+                    )
+                ),
+                cooldown=2.0,
+            )
 
     def _drop_settlement_lag(self, token_id: str) -> None:
         self._settlement_lag.pop(token_id, None)
@@ -1461,6 +1612,11 @@ class MarketMaker:
         self._quality_error_count = 0
         self._quality_success_count = 0
         self._quality_pause_active = False
+        self._post_fill_entry_guard_until = 0.0
+        self._post_fill_entry_guard_anchor = None
+        self._post_fill_entry_guard_active = False
+        self._post_fill_entry_guard_reason = ""
+        self._post_fill_entry_guard_trigger_count = 0
         self._imbalance_start_ts = 0.0
         self._imbalance_adjustments = {
             "leading_spread_mult": 1.0,
@@ -1736,6 +1892,7 @@ class MarketMaker:
             self.inventory.update_from_fill(fill, token_type)
             self.risk_mgr.record_fill(fill)
             self._record_live_fill_settlement(fill)
+            self._arm_post_fill_entry_guard(fill)
             self.pnl_decomp.record_fill(
                 fill.side, fill.token_id, fill.price, fill.size, fill.fee, fill.is_maker
             )
@@ -2402,7 +2559,14 @@ class MarketMaker:
 
         # ── Market quality check (every N ticks, live only) ─────────
         is_live = not hasattr(self.order_mgr.client, "_orders")
-        if is_live and self._tick_count % self.config.quality_check_interval == 0:
+        should_check_quality = (
+            is_live
+            and (
+                self._tick_count % self.config.quality_check_interval == 0
+                or self._should_force_post_fill_quality_check()
+            )
+        )
+        if should_check_quality:
             try:
                 up_book, dn_book = await asyncio.gather(
                     self.order_mgr.get_full_book(self.market.up_token_id),
@@ -2410,6 +2574,7 @@ class MarketMaker:
                 )
                 self._last_quality = self.quality_analyzer.analyze(
                     up_book, dn_book, fv_up, fv_dn)
+                self._update_post_fill_entry_guard()
                 self._quality_error_count = 0
                 if self._quality_pause_active:
                     self._quality_success_count += 1
@@ -2613,6 +2778,7 @@ class MarketMaker:
             # In toxic regime, do not add new exposure; keep asks for inventory unwind.
             all_quotes["up"] = (None, all_quotes["up"][1])
             all_quotes["dn"] = (None, all_quotes["dn"][1])
+        self._apply_post_fill_entry_buy_block(all_quotes)
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
@@ -3702,6 +3868,11 @@ class MarketMaker:
         self._critical_drift_recovery_streak = 0
         self._settlement_lag = {}
         self._settlement_guard_tokens = set()
+        self._post_fill_entry_guard_until = 0.0
+        self._post_fill_entry_guard_anchor = None
+        self._post_fill_entry_guard_active = False
+        self._post_fill_entry_guard_reason = ""
+        self._post_fill_entry_guard_trigger_count = 0
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0
@@ -3936,6 +4107,21 @@ class MarketMaker:
                 "tokens": settlement_guard_tokens,
                 "suppressed_total": self._settlement_lag_suppressed_total,
                 "escalated_total": self._settlement_lag_escalated_total,
+            },
+            "post_fill_entry_guard": {
+                "active": self._post_fill_entry_guard_active,
+                "seconds_left": round(
+                    max(0.0, self._post_fill_entry_guard_until - time.time()),
+                    2,
+                ) if self._post_fill_entry_guard_window_active() else 0.0,
+                "reason": self._post_fill_entry_guard_reason,
+                "trigger_count": self._post_fill_entry_guard_trigger_count,
+                "anchor_score": round(self._post_fill_entry_guard_anchor.overall_score, 3)
+                if self._post_fill_entry_guard_anchor
+                else None,
+                "anchor_spread_bps": round(self._post_fill_entry_guard_anchor.spread_bps, 1)
+                if self._post_fill_entry_guard_anchor
+                else None,
             },
 
             # PnL & Risk (override fill-based with PM-balance-based)

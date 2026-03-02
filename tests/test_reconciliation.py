@@ -17,6 +17,7 @@ if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
 from mm.market_maker import MarketMaker, SettlementLagState
+from mm.market_quality import MarketQuality
 from mm.mm_config import MMConfig
 from mm.risk_manager import RiskManager
 from mm.types import Fill, Inventory, MarketInfo, Quote
@@ -573,6 +574,124 @@ def test_toxic_divergence_no_trade_cancels_quotes_when_flat():
     mm.order_mgr.cancel_all.assert_awaited_once()
     assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
     assert mm._toxic_divergence_count >= 1
+
+
+def test_post_fill_quality_guard_blocks_new_buys_after_degradation():
+    mm = _make_mm(live=True)
+    mm._running = True
+
+    fill = Fill(
+        ts=time.time(),
+        side="BUY",
+        token_id=mm.market.dn_token_id,
+        price=0.46,
+        size=5.0,
+        fee=0.0,
+        is_maker=True,
+    )
+    mm.inventory.update_from_fill(fill, "dn")
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=8000.0,
+        ask_depth_usd=8000.0,
+        spread_bps=180.0,
+        liquidity_score=1.0,
+        spread_score=1.0,
+        overall_score=1.0,
+        tradeable=True,
+        reason="OK",
+    )
+    mm._arm_post_fill_entry_guard(fill)
+
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=40.0,
+        ask_depth_usd=30.0,
+        spread_bps=1600.0,
+        liquidity_score=0.2,
+        spread_score=0.0,
+        overall_score=0.12,
+        tradeable=False,
+        reason="spread 1600bps > 800bps",
+    )
+    mm._update_post_fill_entry_guard()
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.42, size=5.0),
+            None,
+        ),
+        "dn": (
+            Quote(side="BUY", token_id=mm.market.dn_token_id, price=0.40, size=5.0),
+            Quote(side="SELL", token_id=mm.market.dn_token_id, price=0.50, size=5.0),
+        ),
+    }
+    mm._apply_post_fill_entry_buy_block(quotes)
+
+    assert mm._post_fill_entry_guard_active is True
+    assert "spread 1600bps" in mm._post_fill_entry_guard_reason
+    assert quotes["up"][0] is None
+    assert quotes["dn"][0] is None
+    assert quotes["dn"][1] is not None
+
+
+def test_post_fill_quality_guard_clears_after_recovery():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.inventory.up_shares = 5.0
+    mm._post_fill_entry_guard_until = time.time() + 30.0
+    mm._post_fill_entry_guard_anchor = MarketQuality(
+        bid_depth_usd=8000.0,
+        ask_depth_usd=8000.0,
+        spread_bps=180.0,
+        liquidity_score=1.0,
+        spread_score=1.0,
+        overall_score=0.95,
+        tradeable=True,
+        reason="OK",
+    )
+    mm._post_fill_entry_guard_active = True
+    mm._post_fill_entry_guard_reason = "spread widened 900bps >= 250bps"
+    mm._last_quality = MarketQuality(
+        bid_depth_usd=7800.0,
+        ask_depth_usd=7900.0,
+        spread_bps=220.0,
+        liquidity_score=1.0,
+        spread_score=0.98,
+        overall_score=0.90,
+        tradeable=True,
+        reason="OK",
+    )
+
+    mm._update_post_fill_entry_guard()
+
+    assert mm._post_fill_entry_guard_active is False
+    assert mm._post_fill_entry_guard_reason == ""
+    assert mm._post_fill_entry_guard_window_active() is True
+
+
+def test_post_fill_quality_guard_resets_when_inventory_flat():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._post_fill_entry_guard_until = time.time() + 30.0
+    mm._post_fill_entry_guard_anchor = MarketQuality(
+        bid_depth_usd=8000.0,
+        ask_depth_usd=8000.0,
+        spread_bps=180.0,
+        liquidity_score=1.0,
+        spread_score=1.0,
+        overall_score=0.95,
+        tradeable=True,
+        reason="OK",
+    )
+    mm._post_fill_entry_guard_active = True
+    mm._post_fill_entry_guard_reason = "quality score drop 0.30 >= 0.20"
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+
+    mm._update_post_fill_entry_guard()
+
+    assert mm._post_fill_entry_guard_active is False
+    assert mm._post_fill_entry_guard_window_active() is False
+    assert mm._post_fill_entry_guard_anchor is None
 
 
 def test_session_pnl_prevents_false_drawdown():
