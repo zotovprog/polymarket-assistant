@@ -192,6 +192,7 @@ class ConfigUpdateRequest(BaseModel):
     require_flat_start: Optional[bool] = None
     flat_start_max_shares: Optional[float] = None
     max_one_sided_ticks: Optional[int] = None
+    min_fv_to_quote: Optional[float] = None
     close_window_sec: Optional[float] = None
     auto_next_window: Optional[bool] = None
     resolution_wait_sec: Optional[float] = None
@@ -250,6 +251,7 @@ class ConfigUpdateRequest(BaseModel):
         "toxic_divergence_threshold",
         "critical_reconcile_drift_shares",
         "flat_start_max_shares",
+        "min_fv_to_quote",
         "close_window_sec",
         "resolution_wait_sec",
         "liq_chunk_interval_sec",
