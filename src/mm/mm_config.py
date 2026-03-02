@@ -78,6 +78,7 @@ class MMConfig:
         "toxic_divergence_threshold": (0.02, 0.40),
         "toxic_divergence_ticks": (1.0, 120.0),
         "critical_reconcile_drift_shares": (0.5, 50.0),
+        "fill_settlement_grace_sec": (1.0, 15.0),
         "one_sided_protect_ticks": (1.0, 600.0),
         "flat_start_max_shares": (0.0, 1000.0),
     }
@@ -140,6 +141,7 @@ class MMConfig:
     toxic_divergence_threshold: float = 0.10  # No-trade threshold for persistent FV/PM divergence
     toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
     critical_reconcile_drift_shares: float = 1.5  # Immediate pause if |internal-real| exceeds this many shares
+    fill_settlement_grace_sec: float = 6.0    # Grace window for PM balance lag right after live fills
     one_sided_protect_ticks: int = 30          # Start anti-expansion protection before hard-close trigger
     require_flat_start: bool = True            # Block start when wallet already carries non-dust token inventory
     flat_start_max_shares: float = 0.25        # Per-side dust threshold allowed at startup

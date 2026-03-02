@@ -83,6 +83,21 @@ class _AlwaysCrossingClient(_FakeClient):
         raise Exception("Order would cross book (crosses book)")
 
 
+class _BalanceAllowanceClient:
+    """Live-like client exposing free CONDITIONAL balances only."""
+
+    def __init__(self, balances: dict[str, float]):
+        self._balances = {token_id: float(value) for token_id, value in balances.items()}
+
+    def get_balance_allowance(self, params):
+        token_id = getattr(params, "token_id", None)
+        balance = self._balances.get(token_id, 0.0)
+        return {
+            "balance": int(round(balance * 1e6)),
+            "allowance": int(round(balance * 1e6)),
+        }
+
+
 # ── Test 1: strike=0 rejected ────────────────────────────────
 
 
@@ -193,6 +208,63 @@ def test_estimate_reserved_collateral_handles_inventory_backed_sells():
     assert reserved["buy_reserved"] == pytest.approx(4.0)
     assert reserved["short_reserved"] == pytest.approx(1.6)  # 4 * (1 - 0.6)
     assert reserved["total_reserved"] == pytest.approx(5.6)
+
+
+@pytest.mark.asyncio
+async def test_get_all_token_balances_adds_back_reserved_sell_inventory():
+    """Reconcile balance should include shares reserved by active close-only SELLs."""
+    client = _BalanceAllowanceClient({"tok-up": 0.0, "tok-dn": 0.90})
+    om = OrderManager(client, MMConfig())
+
+    sell = Quote(side="SELL", token_id="tok-dn", price=0.99, size=6.0, order_id="sell-1")
+    om._active_orders = {"sell-1": sell}
+
+    up, dn = await om.get_all_token_balances(
+        "tok-up",
+        "tok-dn",
+        reference_balances={"tok-up": 0.0, "tok-dn": 6.89},
+    )
+
+    assert up == pytest.approx(0.0)
+    assert dn == pytest.approx(6.90)
+
+
+@pytest.mark.asyncio
+async def test_get_all_token_balances_uses_remaining_sell_size_after_partial_fill():
+    """Reserved SELL add-back should use remaining open size, not original order size."""
+    client = _BalanceAllowanceClient({"tok-up": 0.0, "tok-dn": 0.90})
+    om = OrderManager(client, MMConfig())
+
+    sell = Quote(side="SELL", token_id="tok-dn", price=0.99, size=6.0, order_id="sell-1")
+    om._active_orders = {"sell-1": sell}
+    om._partial_fill_reported["sell-1"] = 2.50
+
+    _up, dn = await om.get_all_token_balances(
+        "tok-up",
+        "tok-dn",
+        reference_balances={"tok-up": 0.0, "tok-dn": 4.40},
+    )
+
+    assert dn == pytest.approx(4.40)
+
+
+@pytest.mark.asyncio
+async def test_get_all_token_balances_prefers_raw_total_when_closer_to_reference():
+    """If PM already reports total inventory, reconcile must not add reserve twice."""
+    client = _BalanceAllowanceClient({"tok-up": 5.0, "tok-dn": 0.0})
+    om = OrderManager(client, MMConfig())
+
+    sell = Quote(side="SELL", token_id="tok-up", price=0.64, size=5.0, order_id="sell-1")
+    om._active_orders = {"sell-1": sell}
+
+    up, dn = await om.get_all_token_balances(
+        "tok-up",
+        "tok-dn",
+        reference_balances={"tok-up": 5.0, "tok-dn": 0.0},
+    )
+
+    assert up == pytest.approx(5.0)
+    assert dn == pytest.approx(0.0)
 
 
 # ── Test 4: throttled warn ────────────────────────────────────

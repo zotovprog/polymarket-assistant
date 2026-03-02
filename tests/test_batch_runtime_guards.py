@@ -349,7 +349,7 @@ async def test_place_order_trims_close_only_sell_to_available_inventory():
     oid = await om.place_order(quote)
 
     assert oid == "oid-trim"
-    assert quote.size == pytest.approx(6.56)
+    assert quote.size == pytest.approx(6.54)
     om._place_order_inner.assert_awaited_once()
 
 
@@ -793,6 +793,40 @@ async def test_runtime_start_rejects_window_too_close_to_close(monkeypatch):
     assert "too close to close" in str(exc.value.detail)
     assert runtime.mm is None
     assert runtime._running is False
+
+
+def test_runtime_snapshot_exposes_runtime_watchdog():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+    runtime._runtime_watchdog["active"] = True
+    runtime._runtime_watchdog["last_cpu_pct"] = 97.5
+    runtime._runtime_watchdog["last_main_stack"] = ["market_maker.py:1500 in _tick"]
+
+    snap = runtime.snapshot()
+
+    assert "runtime_watchdog" in snap
+    assert snap["runtime_watchdog"]["active"] is True
+    assert snap["runtime_watchdog"]["last_cpu_pct"] == pytest.approx(97.5)
+
+
+def test_telegram_polling_enabled_env(monkeypatch):
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+
+    monkeypatch.setenv("TELEGRAM_POLLING_ENABLED", "0")
+    assert web_server._telegram_polling_enabled() is False
+
+    monkeypatch.setenv("TELEGRAM_POLLING_ENABLED", "1")
+    assert web_server._telegram_polling_enabled() is True
 
 
 @pytest.mark.anyio

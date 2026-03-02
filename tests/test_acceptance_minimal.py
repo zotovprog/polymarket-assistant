@@ -28,10 +28,10 @@ if BASE not in sys.path:
 
 import mm.market_maker as market_maker_mod
 import mm.order_manager as order_manager_mod
-from mm.market_maker import MarketMaker
+from mm.market_maker import MarketMaker, SettlementLagState
 from mm.mm_config import MMConfig
 from mm.order_manager import OrderManager
-from mm.types import Inventory, MarketInfo, Quote
+from mm.types import Fill, Inventory, MarketInfo, Quote
 
 
 def _web_server_module():
@@ -168,6 +168,11 @@ def _make_mm(client, *, window_end_offset_sec: float = 900.0) -> MarketMaker:
     mm = MarketMaker(_FeedState(), client, MMConfig())
     mm.set_market(_market(window_end_offset_sec=window_end_offset_sec))
     return mm
+
+
+async def _clear_cancel_all(mm: MarketMaker, *_args, **_kwargs):
+    mm.order_mgr.clear_local_order_tracking()
+    return 1
 
 
 @pytest.mark.anyio
@@ -451,3 +456,219 @@ async def test_acceptance_api_orderbook_error_safe_cancels_open_orders():
     mm.order_mgr.cancel_all.assert_awaited_once()
     assert mm.order_mgr.active_order_ids == []
     assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
+
+
+@pytest.mark.anyio
+async def test_live_fill_balance_lag_does_not_trigger_critical_pause():
+    mm = _make_mm(_LiveNoopClient())
+    mm._running = True
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    fill = Fill(
+        ts=time.time(),
+        side="BUY",
+        token_id=mm.market.up_token_id,
+        price=0.50,
+        size=5.0,
+        fee=0.0,
+    )
+    mm.inventory.update_from_fill(fill, "up")
+    mm.risk_mgr.record_fill(fill)
+    mm._record_live_fill_settlement(fill)
+
+    live_bid = Quote(
+        side="BUY",
+        token_id=mm.market.up_token_id,
+        price=0.49,
+        size=5.0,
+        order_id="oid-1",
+    )
+    mm.order_mgr._active_orders = {"oid-1": live_bid}
+    mm._current_quotes = {"up": (live_bid, None), "dn": (None, None)}
+
+    async def _cancel_and_clear(*_args, **_kwargs):
+        return await _clear_cancel_all(mm)
+
+    mm.order_mgr.cancel_all = AsyncMock(side_effect=_cancel_and_clear)
+
+    protected, has_unexplained = mm._classify_drift_snapshot(
+        real_up=0.0,
+        real_dn=0.0,
+        source="post_order_refresh",
+    )
+    assert protected == {mm.market.up_token_id}
+    assert has_unexplained is False
+
+    await mm._activate_settlement_guard(
+        protected_tokens=protected,
+        real_up=0.0,
+        real_dn=0.0,
+        source="post_order_refresh",
+    )
+    mm._update_settlement_lag_progress(
+        real_up=0.0,
+        real_dn=0.0,
+        source="post_order_refresh",
+    )
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._paused is False
+    assert mm._critical_drift_pause_active is False
+    assert mm._active_settlement_guard_tokens() == {mm.market.up_token_id}
+
+    snap = mm.snapshot()
+    assert snap["settlement_guard"]["active"] is True
+    assert snap["settlement_guard"]["tokens"][0]["token"] == "UP"
+
+
+@pytest.mark.anyio
+async def test_settlement_guard_blocks_quotes_for_affected_token():
+    mm = _make_mm(_LiveNoopClient())
+    mm._running = True
+    mm._cached_usdc_balance = 100.0
+    mm._cached_usdc_available_balance = 100.0
+    mm.inventory.usdc = 100.0
+    mm.inventory.initial_usdc = 100.0
+    mm.inventory.up_shares = 5.0
+    mm._settlement_lag[mm.market.up_token_id] = SettlementLagState(
+        token_id=mm.market.up_token_id,
+        pending_delta_shares=5.0,
+        grace_until=time.time() + 6.0,
+        last_fill_ts=time.time(),
+        last_fill_side="BUY",
+        last_fill_size=5.0,
+        last_internal_shares=5.0,
+        last_pm_shares=0.0,
+        source="test",
+    )
+    mm._settlement_guard_tokens.add(mm.market.up_token_id)
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_book_summary = AsyncMock(
+        side_effect=[
+            {"best_bid": 0.49, "best_ask": 0.51},
+            {"best_bid": 0.49, "best_ask": 0.51},
+        ]
+    )
+    mm.order_mgr.cancel_orders_batch = AsyncMock(return_value=0)
+    mm.order_mgr.place_orders_batch = AsyncMock(
+        side_effect=lambda quotes, **_kwargs: [f"oid-{idx}" for idx, _ in enumerate(quotes, start=1)]
+    )
+
+    await mm._tick()
+
+    placed_quotes = mm.order_mgr.place_orders_batch.await_args.args[0]
+    assert placed_quotes
+    assert all(q.token_id != mm.market.up_token_id for q in placed_quotes)
+
+
+def test_settlement_guard_clears_when_pm_balance_catches_up():
+    mm = _make_mm(_LiveNoopClient())
+    mm.inventory.up_shares = 5.0
+    mm._settlement_lag[mm.market.up_token_id] = SettlementLagState(
+        token_id=mm.market.up_token_id,
+        pending_delta_shares=5.0,
+        grace_until=time.time() + 6.0,
+        last_fill_ts=time.time(),
+        last_fill_side="BUY",
+        last_fill_size=5.0,
+        last_internal_shares=5.0,
+        last_pm_shares=0.0,
+        source="test",
+    )
+    mm._settlement_guard_tokens.add(mm.market.up_token_id)
+
+    mm._update_settlement_lag_progress(real_up=5.0, real_dn=0.0, source="periodic_reconcile")
+
+    assert mm._active_settlement_guard_tokens() == set()
+    assert mm._settlement_lag == {}
+
+
+@pytest.mark.anyio
+async def test_persistent_drift_after_grace_escalates_to_critical_pause():
+    mm = _make_mm(_LiveNoopClient())
+    mm._running = True
+    mm.config.critical_reconcile_drift_shares = 1.0
+    mm.inventory.up_shares = 5.0
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+    mm._settlement_lag[mm.market.up_token_id] = SettlementLagState(
+        token_id=mm.market.up_token_id,
+        pending_delta_shares=5.0,
+        grace_until=time.time() - 0.1,
+        last_fill_ts=time.time() - 6.5,
+        last_fill_side="BUY",
+        last_fill_size=5.0,
+        last_internal_shares=5.0,
+        last_pm_shares=0.0,
+        source="test",
+    )
+    mm._settlement_guard_tokens.add(mm.market.up_token_id)
+
+    protected, has_unexplained = mm._classify_drift_snapshot(
+        real_up=0.0,
+        real_dn=0.0,
+        source="periodic_reconcile",
+    )
+    assert protected == set()
+    assert has_unexplained is True
+
+    handled = await mm._handle_critical_inventory_drift(
+        real_up=0.0,
+        real_dn=0.0,
+        source="periodic_reconcile",
+    )
+
+    assert handled is True
+    assert mm._paused is True
+    assert mm._settlement_lag_escalated_total == 1
+
+
+def test_partial_fill_with_lag_does_not_false_pause():
+    mm = _make_mm(_LiveNoopClient())
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    fill = Fill(
+        ts=time.time(),
+        side="BUY",
+        token_id=mm.market.up_token_id,
+        price=0.50,
+        size=2.5,
+        fee=0.0,
+    )
+    mm.inventory.update_from_fill(fill, "up")
+    mm._record_live_fill_settlement(fill)
+
+    protected, has_unexplained = mm._classify_drift_snapshot(
+        real_up=0.5,
+        real_dn=0.0,
+        source="post_order_refresh",
+    )
+
+    assert protected == {mm.market.up_token_id}
+    assert has_unexplained is False
+
+
+def test_sell_fill_lag_uses_signed_delta_and_does_not_false_pause():
+    mm = _make_mm(_LiveNoopClient())
+    mm.config.critical_reconcile_drift_shares = 1.0
+    mm.inventory.up_shares = 6.0
+    mm._cached_pm_up_shares = 6.0
+
+    fill = Fill(
+        ts=time.time(),
+        side="SELL",
+        token_id=mm.market.up_token_id,
+        price=0.55,
+        size=3.0,
+        fee=0.0,
+    )
+    mm.inventory.update_from_fill(fill, "up")
+    mm._record_live_fill_settlement(fill)
+
+    protected, has_unexplained = mm._classify_drift_snapshot(
+        real_up=6.0,
+        real_dn=0.0,
+        source="post_order_refresh",
+    )
+
+    assert protected == {mm.market.up_token_id}
+    assert has_unexplained is False

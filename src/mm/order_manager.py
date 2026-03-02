@@ -1843,7 +1843,13 @@ class OrderManager:
             return empty
 
     async def get_token_balance(self, token_id: str) -> Optional[float]:
-        """Fetch real PM token balance in shares for a conditional token."""
+        """Fetch free/tradable PM token balance in shares for a conditional token.
+
+        For live CONDITIONAL balances, PM may report only currently available
+        inventory, excluding shares reserved by open SELL orders. This method is
+        therefore suitable for pre-trade close-only checks, but not for
+        reconcile/startup wallet-truth inventory snapshots.
+        """
         try:
             if hasattr(self.client, "_orders"):
                 return float(self._mock_token_balances.get(token_id, 0.0))
@@ -1862,6 +1868,69 @@ class OrderManager:
         except Exception as e:
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
             return None
+
+    def _remaining_active_sell_size(self, order_id: str, quote: Quote) -> float:
+        """Remaining live SELL size after partial fills for a tracked order."""
+        if (quote.side or "").upper() != "SELL":
+            return 0.0
+        matched = max(0.0, float(self._partial_fill_reported.get(order_id, 0.0)))
+        total = max(0.0, float(quote.size))
+        return max(0.0, total - matched)
+
+    def _reserved_sell_inventory(self, token_id: str) -> float:
+        """Shares reserved by our active close-only SELL orders for this token.
+
+        When short selling is disabled, PM's CONDITIONAL balance endpoint may
+        return free inventory with open SELL sizes deducted. Reconcile/startup
+        need wallet-total inventory, so we add back our still-open SELL size.
+        """
+        if bool(getattr(self.config, "allow_short_sells", False)):
+            return 0.0
+
+        reserved = 0.0
+        for order_id, quote in self._active_orders.items():
+            if quote.token_id != token_id:
+                continue
+            reserved += self._remaining_active_sell_size(order_id, quote)
+        return reserved
+
+    async def get_reconcile_token_balance(
+        self,
+        token_id: str,
+        *,
+        reference_shares: float | None = None,
+    ) -> Optional[float]:
+        """Fetch wallet-total token inventory for reconcile/startup/PnL paths.
+
+        PM's CONDITIONAL endpoint is inconsistent in live mode: sometimes it
+        reports free balance (open SELL inventory already deducted), sometimes
+        total wallet inventory. Reconcile therefore evaluates both candidates:
+        the raw endpoint response, and raw + still-open tracked SELL reserve.
+
+        When a reference inventory is available from the MM state, prefer the
+        candidate closer to that expected total. This prevents both under-counts
+        and double-counts during live reconcile.
+        """
+        free_balance = await self.get_token_balance(token_id)
+        if free_balance is None:
+            return None
+
+        raw_balance = max(0.0, float(free_balance))
+        reserved_balance = self._reserved_sell_inventory(token_id)
+        adjusted_balance = raw_balance + reserved_balance
+        if reference_shares is None:
+            return adjusted_balance
+
+        try:
+            reference = max(0.0, float(reference_shares))
+        except (TypeError, ValueError):
+            return adjusted_balance
+
+        raw_diff = abs(raw_balance - reference)
+        adjusted_diff = abs(adjusted_balance - reference)
+        if raw_diff <= adjusted_diff:
+            return raw_balance
+        return adjusted_balance
 
     async def get_usdc_balances(
         self,
@@ -1925,11 +1994,19 @@ class OrderManager:
         self._usdc_balance_cache_ts = 0.0
 
     async def get_all_token_balances(
-        self, up_token_id: str, dn_token_id: str
+        self,
+        up_token_id: str,
+        dn_token_id: str,
+        *,
+        reference_balances: dict[str, float] | None = None,
     ) -> tuple[Optional[float], Optional[float]]:
         """Fetch both UP and DN token balances.
 
-        Live mode: fetches PM balances via API.
+        Live mode: fetches wallet-total inventory for reconcile/startup paths.
+        PM CONDITIONAL balances can exclude shares reserved by our open SELL
+        orders, or sometimes already include them. `reference_balances` lets us
+        choose the candidate that best matches the MM's expected wallet-total
+        inventory for each token.
         Mock mode: returns balances tracked from observed mock fills.
         """
         if hasattr(self.client, "_orders"):
@@ -1937,9 +2014,15 @@ class OrderManager:
             dn = float(self._mock_token_balances.get(dn_token_id, 0.0))
             return up, dn
 
+        up_reference = None
+        dn_reference = None
+        if reference_balances:
+            up_reference = reference_balances.get(up_token_id)
+            dn_reference = reference_balances.get(dn_token_id)
+
         up, dn = await asyncio.gather(
-            self.get_token_balance(up_token_id),
-            self.get_token_balance(dn_token_id),
+            self.get_reconcile_token_balance(up_token_id, reference_shares=up_reference),
+            self.get_reconcile_token_balance(dn_token_id, reference_shares=dn_reference),
         )
         return up, dn
 

@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 import time
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
 import pytest
 
-from mm.market_maker import MarketMaker
+BASE = os.path.dirname(os.path.dirname(__file__))
+SRC = os.path.join(BASE, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
+from mm.market_maker import MarketMaker, SettlementLagState
 from mm.mm_config import MMConfig
 from mm.risk_manager import RiskManager
 from mm.types import Fill, Inventory, MarketInfo, Quote
@@ -58,6 +65,27 @@ class MockLiveClobClient(MockClobClient):
     def __init__(self):
         super().__init__()
         del self._orders
+
+
+class FreeBalanceLiveClobClient(MockLiveClobClient):
+    """Live-like client returning free CONDITIONAL balances only."""
+
+    def __init__(self, balances: dict[str, float]):
+        super().__init__()
+        self._balances = {token_id: float(value) for token_id, value in balances.items()}
+
+    def get_balance_allowance(self, params):
+        token_id = getattr(params, "token_id", None)
+        if token_id is None:
+            return {
+                "balance": int(round(100.0 * 1e6)),
+                "available": int(round(100.0 * 1e6)),
+            }
+        balance = self._balances.get(token_id, 0.0)
+        return {
+            "balance": int(round(balance * 1e6)),
+            "allowance": int(round(balance * 1e6)),
+        }
 
 
 def _make_market() -> MarketInfo:
@@ -233,6 +261,176 @@ def test_reconcile_guard_freezes_quotes_and_cancels_active_orders():
 
     mm.order_mgr.cancel_all.assert_awaited_once()
     assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
+
+
+def test_periodic_reconcile_respects_settlement_guard_before_hard_stop():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    fill = Fill(
+        ts=time.time(),
+        side="BUY",
+        token_id=mm.market.up_token_id,
+        price=0.50,
+        size=5.0,
+        fee=0.0,
+    )
+    mm.inventory.update_from_fill(fill, "up")
+    mm._record_live_fill_settlement(fill)
+
+    live_bid = Quote(side="BUY", token_id=mm.market.up_token_id, price=0.50, size=5.0, order_id="oid-1")
+    mm.order_mgr._active_orders = {"oid-1": live_bid}
+    mm._current_quotes = {"up": (live_bid, None), "dn": (None, None)}
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+
+    async def _cancel_and_clear(*_args, **_kwargs):
+        mm.order_mgr.clear_local_order_tracking()
+        return 1
+
+    mm.order_mgr.cancel_all = AsyncMock(side_effect=_cancel_and_clear)
+
+    _run_tick_with_reconcile_gate(mm)
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._paused is False
+    assert mm._pause_reason == ""
+    assert mm._critical_drift_pause_active is False
+    assert mm._active_settlement_guard_tokens() == {mm.market.up_token_id}
+    assert mm._current_quotes == {"up": (None, None), "dn": (None, None)}
+    assert mm.inventory.up_shares == pytest.approx(5.0)
+
+
+def test_periodic_reconcile_uses_wallet_total_not_free_balance_for_active_sell():
+    feed_state = MockFeedState(mid=0.0)
+    client = FreeBalanceLiveClobClient({"up_token_123": 0.0, "dn_token_456": 0.90})
+    mm = MarketMaker(feed_state, client, MMConfig())
+    mm.set_market(_make_market())
+    mm._running = True
+    mm.config.critical_reconcile_drift_shares = 1.0
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 6.89
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+
+    active_sell = Quote(
+        side="SELL",
+        token_id=mm.market.dn_token_id,
+        price=0.99,
+        size=6.0,
+        order_id="sell-1",
+    )
+    mm.order_mgr._active_orders = {"sell-1": active_sell}
+
+    _run_tick_with_reconcile_gate(mm)
+
+    assert mm._cached_pm_dn_shares == pytest.approx(6.90)
+    assert mm._paused is False
+    assert mm._critical_drift_pause_active is False
+
+
+def test_periodic_reconcile_does_not_double_count_when_pm_already_reports_total():
+    feed_state = MockFeedState(mid=0.0)
+    client = FreeBalanceLiveClobClient({"up_token_123": 5.0, "dn_token_456": 0.0})
+    mm = MarketMaker(feed_state, client, MMConfig())
+    mm.set_market(_make_market())
+    mm._running = True
+    mm.config.critical_reconcile_drift_shares = 1.0
+    mm.inventory.up_shares = 5.0
+    mm.inventory.dn_shares = 0.0
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+
+    active_sell = Quote(
+        side="SELL",
+        token_id=mm.market.up_token_id,
+        price=0.64,
+        size=5.0,
+        order_id="sell-up-1",
+    )
+    mm.order_mgr._active_orders = {"sell-up-1": active_sell}
+
+    _run_tick_with_reconcile_gate(mm)
+
+    assert mm._cached_pm_up_shares == pytest.approx(5.0)
+    assert mm.inventory.up_shares == pytest.approx(5.0)
+    assert mm._paused is False
+    assert mm._critical_drift_pause_active is False
+
+
+def test_unexplained_drift_bypasses_settlement_guard_and_triggers_pause():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.feed_state.mid = 0.0
+    mm.inventory.up_shares = 5.0
+    mm.config.critical_reconcile_drift_shares = 1.0
+
+    mm._settlement_lag[mm.market.up_token_id] = SettlementLagState(
+        token_id=mm.market.up_token_id,
+        pending_delta_shares=5.0,
+        grace_until=time.time() - 0.1,
+        last_fill_ts=time.time() - 6.5,
+        last_fill_side="BUY",
+        last_fill_size=5.0,
+        last_internal_shares=5.0,
+        last_pm_shares=0.0,
+        source="test",
+    )
+    mm._settlement_guard_tokens.add(mm.market.up_token_id)
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    _run_tick_with_reconcile_gate(mm)
+
+    mm.order_mgr.cancel_all.assert_awaited_once()
+    assert mm._paused is True
+    assert "Critical inventory drift" in mm._pause_reason
+    assert mm._settlement_lag_escalated_total == 1
+    assert mm._active_settlement_guard_tokens() == set()
+
+
+def test_merge_is_suppressed_while_settlement_guard_active():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._cached_usdc_balance = 100.0
+    mm._cached_usdc_available_balance = 100.0
+    mm.inventory.usdc = 100.0
+    mm.inventory.initial_usdc = 100.0
+    mm.inventory.up_shares = 5.0
+    mm._settlement_lag[mm.market.up_token_id] = SettlementLagState(
+        token_id=mm.market.up_token_id,
+        pending_delta_shares=5.0,
+        grace_until=time.time() + 6.0,
+        last_fill_ts=time.time(),
+        last_fill_side="BUY",
+        last_fill_size=5.0,
+        last_internal_shares=5.0,
+        last_pm_shares=0.0,
+        source="test",
+    )
+    mm._settlement_guard_tokens.add(mm.market.up_token_id)
+    mm._merge_check_counter = mm._merge_check_interval - 1
+    mm._try_merge_pairs = AsyncMock(return_value=0.0)
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_book_summary = AsyncMock(
+        side_effect=[
+            {"best_bid": 0.49, "best_ask": 0.51},
+            {"best_bid": 0.49, "best_ask": 0.51},
+        ]
+    )
+    mm.order_mgr.cancel_orders_batch = AsyncMock(return_value=0)
+    mm.order_mgr.place_orders_batch = AsyncMock(
+        side_effect=lambda quotes, **_kwargs: [f"oid-{idx}" for idx, _ in enumerate(quotes, start=1)]
+    )
+
+    asyncio.run(mm._tick())
+
+    mm._try_merge_pairs.assert_not_awaited()
 
 
 def test_critical_inventory_drift_triggers_pause_and_cancel():
@@ -506,7 +704,7 @@ def test_drawdown_forces_taker_in_liquidation():
     """Catastrophic loss during liquidation should stop the bot."""
     mm = _make_mm(live=True)
     mm._is_closing = True
-    mm._starting_usdc_pm = 50.0  # started with $50
+    mm._starting_portfolio_pm = 50.0  # started with $50 total portfolio
     mm._cached_usdc_balance = 10.0  # now only $10
     mm.inventory.up_shares = 0.0
     mm.inventory.dn_shares = 0.0
@@ -516,17 +714,18 @@ def test_drawdown_forces_taker_in_liquidation():
     # Session PnL = (10 + 0) - 50 = -$40, max_drawdown_usd default = 100
     # With max_drawdown=8: -40 < -16 (2*8) -> catastrophic -> abandon
     mm.config.max_drawdown_usd = 8.0
+    mm._catastrophic_count = mm._catastrophic_threshold - 1
 
     # Mock order_mgr methods to prevent real API calls
     mm.order_mgr.check_fills = AsyncMock(return_value=[])
     mm.order_mgr.get_token_balance = AsyncMock(return_value=0.0)
     mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(10.0, 10.0))
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm._emergency_shutdown = AsyncMock(return_value=None)  # type: ignore[assignment]
 
     asyncio.run(mm._liquidate_inventory())
 
-    # Bot should remain in closing mode until window transition/end.
-    assert mm._is_closing is True
-    assert mm._running is False
+    mm._emergency_shutdown.assert_awaited_once()
 
 
 def test_event_requote_suppressed_while_closing():
@@ -575,7 +774,7 @@ def test_liquidation_attempt_throttle_prevents_hot_retry():
     mm.config.liq_chunk_interval_sec = 5.0
     mm.config.liq_taker_threshold_sec = 10.0
 
-    mm.order_mgr.get_token_balance = AsyncMock(return_value=0.0)
+    mm.order_mgr.get_token_balance = AsyncMock(return_value=0.25)
     mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
     mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": None, "best_ask": None})
     mm.order_mgr.ensure_sell_allowance = AsyncMock(return_value=True)

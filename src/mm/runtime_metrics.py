@@ -44,7 +44,13 @@ class RuntimeMetrics:
         if duration_ms is not None:
             self.observe_ms(name, duration_ms)
 
-    def snapshot(self, *, reset: bool = False, top_n: int = 50) -> dict[str, Any]:
+    def snapshot(
+        self,
+        *,
+        reset: bool = False,
+        top_n: int = 50,
+        advance: bool = True,
+    ) -> dict[str, Any]:
         now = time.time()
         with self._lock:
             window_sec = max(1e-6, now - self._last_reset_ts)
@@ -91,8 +97,9 @@ class RuntimeMetrics:
                 "now_ts": now,
             }
 
-            self._last_cpu_sample_ts = now
-            self._last_cpu_sample_proc_sec = cpu_now_sec
+            if advance:
+                self._last_cpu_sample_ts = now
+                self._last_cpu_sample_proc_sec = cpu_now_sec
 
             if reset:
                 self._counts_interval.clear()

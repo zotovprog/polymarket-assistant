@@ -1,3 +1,11 @@
+import os
+import sys
+
+BASE = os.path.dirname(os.path.dirname(__file__))
+SRC = os.path.join(BASE, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+
 from mm.runtime_metrics import RuntimeMetrics
 
 
@@ -23,3 +31,15 @@ def test_runtime_metrics_reset_clears_interval_only():
 
     second = metrics.snapshot()
     assert all(item["interval_count"] == 0 for item in second["counts"]) or not second["counts"]
+
+
+def test_runtime_metrics_snapshot_advance_false_preserves_cpu_sample():
+    metrics = RuntimeMetrics()
+    metrics.incr("web.monitor.loop", n=1)
+
+    first = metrics.snapshot(advance=False)
+    second = metrics.snapshot(advance=False)
+
+    assert first["process_cpu_pct"] >= 0.0
+    assert second["process_cpu_pct"] >= 0.0
+    assert any(item["name"] == "web.monitor.loop" for item in second["counts"])

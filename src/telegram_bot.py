@@ -14,12 +14,15 @@ import time
 from typing import Any, Callable
 
 from mm.runtime_metrics import runtime_metrics
+from telegram_notifier import TelegramAPIError
 
 log = logging.getLogger("tg.bot")
 
 
 class TelegramBotManager:
     """Interactive Telegram bot with single-message UI."""
+
+    _MIN_POLL_INTERVAL_SEC = 0.25
 
     def __init__(
         self,
@@ -37,6 +40,7 @@ class TelegramBotManager:
         self._offset: int | None = None
         self._disabled_reason: str = ""
         self._disabled_at: float = 0.0
+        self._min_poll_interval_sec = self._MIN_POLL_INTERVAL_SEC
         # Track the live message per chat for edit-in-place
         self._live_msg: dict[int, int] = {}  # chat_id -> message_id
         # Current view per chat: "status" | "settings"
@@ -77,9 +81,28 @@ class TelegramBotManager:
 
     # ── Poll loop ───────────────────────────────────────────────
 
+    @staticmethod
+    def _is_conflict_error(error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        error_code = getattr(error, "error_code", None)
+        if status_code == 409 or error_code == 409:
+            return True
+        err_str = str(error)
+        return "409" in err_str or "Conflict" in err_str
+
+    async def _yield_after_poll(self, poll_started: float) -> None:
+        elapsed = time.monotonic() - poll_started
+        runtime_metrics.observe_ms("tg.poll.cycle_ms", elapsed * 1000.0)
+        remaining = self._min_poll_interval_sec - elapsed
+        if remaining > 0:
+            runtime_metrics.incr("tg.poll.min_yield")
+            await asyncio.sleep(remaining)
+
     async def _poll_loop(self) -> None:
         while self._running:
             runtime_metrics.incr("tg.poll.loop")
+            poll_started = time.monotonic()
+            applied_backoff = False
             try:
                 updates = await self._tg.get_updates(
                     offset=self._offset, timeout=30,
@@ -98,8 +121,7 @@ class TelegramBotManager:
                 break
             except Exception as e:
                 runtime_metrics.incr("tg.poll.error")
-                err_str = str(e)
-                if "409" in err_str or "Conflict" in err_str:
+                if self._is_conflict_error(e):
                     runtime_metrics.incr("tg.poll.conflict_409")
                     self._disabled_reason = (
                         "Telegram polling disabled: 409 Conflict "
@@ -118,7 +140,11 @@ class TelegramBotManager:
                     break
                 else:
                     log.warning("Poll error: %s", e)
+                    applied_backoff = True
                     await asyncio.sleep(5.0)
+            finally:
+                if self._running and not applied_backoff:
+                    await self._yield_after_poll(poll_started)
 
     async def _handle(self, upd: dict) -> None:
         if "callback_query" in upd:

@@ -13,6 +13,21 @@ import httpx
 log = logging.getLogger("tg.notify")
 
 
+class TelegramAPIError(RuntimeError):
+    """Structured Telegram API error with optional HTTP/API codes."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error_code = error_code
+
+
 class TelegramNotifier:
     """Fire-and-forget Telegram notifications for market-making notifications.
     Uses httpx (already a project dependency) for HTTP calls.
@@ -300,10 +315,25 @@ class TelegramNotifier:
             json=params,
             timeout=timeout + 10,
         )
-        data = resp.json()
+        data: dict[str, Any] = {}
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if not resp.is_success:
+            description = data.get("description") or resp.text[:300]
+            error_code = data.get("error_code")
+            raise TelegramAPIError(
+                f"Telegram getUpdates HTTP {resp.status_code}: {description}",
+                status_code=resp.status_code,
+                error_code=error_code if isinstance(error_code, int) else None,
+            )
         if not data.get("ok"):
-            raise RuntimeError(
-                f"Telegram getUpdates failed: {data.get('error_code')} {data.get('description', '')}"
+            error_code = data.get("error_code")
+            raise TelegramAPIError(
+                f"Telegram getUpdates failed: {error_code} {data.get('description', '')}",
+                status_code=resp.status_code,
+                error_code=error_code if isinstance(error_code, int) else None,
             )
         return data.get("result", [])
 

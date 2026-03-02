@@ -19,7 +19,7 @@ import asyncio
 import logging
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from .types import Quote, Fill, Inventory, MMState, MarketInfo
@@ -130,6 +130,19 @@ class SREMetrics:
         self._last_reset = time.time()
 
 
+@dataclass
+class SettlementLagState:
+    token_id: str
+    pending_delta_shares: float
+    grace_until: float
+    last_fill_ts: float
+    last_fill_side: str
+    last_fill_size: float
+    last_internal_shares: float
+    last_pm_shares: float
+    source: str
+
+
 class MarketMaker:
     """Main Market Making engine."""
 
@@ -224,6 +237,10 @@ class MarketMaker:
         self._critical_drift_pause_active: bool = False
         self._critical_drift_recovery_streak: int = 0
         self._critical_drift_recovery_required: int = 2
+        self._settlement_lag: dict[str, SettlementLagState] = {}
+        self._settlement_guard_tokens: set[str] = set()
+        self._settlement_lag_suppressed_total: int = 0
+        self._settlement_lag_escalated_total: int = 0
         self._warn_cooldowns: dict[str, float] = {}
         self._private_key: str = ""
         self.sre_metrics = SREMetrics()
@@ -341,6 +358,279 @@ class MarketMaker:
             float(getattr(self.config, "critical_reconcile_drift_shares", 1.5) or 1.5),
         )
 
+    def _settlement_clear_threshold(self) -> float:
+        return max(0.25, 0.25 * self._critical_drift_threshold())
+
+    def _token_key_for_id(self, token_id: str) -> str | None:
+        if not self.market:
+            return None
+        if token_id == self.market.up_token_id:
+            return "up"
+        if token_id == self.market.dn_token_id:
+            return "dn"
+        return None
+
+    def _internal_shares_for_token(self, token_id: str) -> float:
+        token_key = self._token_key_for_id(token_id)
+        if token_key == "up":
+            return float(self.inventory.up_shares)
+        if token_key == "dn":
+            return float(self.inventory.dn_shares)
+        return 0.0
+
+    def _pm_shares_for_token(self, token_id: str, *, real_up: float, real_dn: float) -> float:
+        token_key = self._token_key_for_id(token_id)
+        if token_key == "up":
+            return float(real_up)
+        if token_key == "dn":
+            return float(real_dn)
+        return 0.0
+
+    def _balance_reference_snapshot(self) -> dict[str, float]:
+        if not self.market:
+            return {}
+        return {
+            self.market.up_token_id: float(self.inventory.up_shares),
+            self.market.dn_token_id: float(self.inventory.dn_shares),
+        }
+
+    def _drop_settlement_lag(self, token_id: str) -> None:
+        self._settlement_lag.pop(token_id, None)
+        self._settlement_guard_tokens.discard(token_id)
+
+    def _record_live_fill_settlement(self, fill: Fill) -> None:
+        if not self._is_live_mode() or not self.market:
+            return
+        token_key = self._token_key_for_id(fill.token_id)
+        if token_key is None:
+            return
+
+        fill_size = max(0.0, float(fill.size))
+        if fill_size <= 0:
+            return
+
+        delta = fill_size if fill.side == "BUY" else -fill_size
+        now = time.time()
+        grace_sec = max(1.0, float(getattr(self.config, "fill_settlement_grace_sec", 6.0) or 6.0))
+        current = self._settlement_lag.get(fill.token_id)
+        if current is not None and current.grace_until > now:
+            pending_delta = current.pending_delta_shares + delta
+        else:
+            pending_delta = delta
+
+        if abs(pending_delta) <= 1e-9:
+            self._drop_settlement_lag(fill.token_id)
+            return
+
+        self._settlement_lag[fill.token_id] = SettlementLagState(
+            token_id=fill.token_id,
+            pending_delta_shares=pending_delta,
+            grace_until=now + grace_sec,
+            last_fill_ts=float(fill.ts or now),
+            last_fill_side=str(fill.side),
+            last_fill_size=fill_size,
+            last_internal_shares=self._internal_shares_for_token(fill.token_id),
+            last_pm_shares=(
+                float(self._cached_pm_up_shares)
+                if token_key == "up"
+                else float(self._cached_pm_dn_shares)
+            ),
+            source="fill",
+        )
+
+    def _settlement_lag_explains_diff(
+        self,
+        *,
+        token_id: str,
+        internal_shares: float,
+        pm_shares: float,
+        threshold: float,
+    ) -> bool:
+        state = self._settlement_lag.get(token_id)
+        if state is None:
+            return False
+        if time.time() > state.grace_until:
+            return False
+
+        diff = float(internal_shares) - float(pm_shares)
+        pending = float(state.pending_delta_shares)
+        if abs(diff) < float(threshold) or abs(pending) <= 1e-9 or abs(diff) <= 1e-9:
+            return False
+        if (diff > 0) != (pending > 0):
+            return False
+
+        tolerance = max(0.25, 0.25 * float(threshold))
+        return abs(diff) <= abs(pending) + tolerance
+
+    def _classify_drift_snapshot(
+        self,
+        *,
+        real_up: float,
+        real_dn: float,
+        source: str,
+    ) -> tuple[set[str], bool]:
+        if not self.market:
+            return set(), False
+
+        threshold = self._critical_drift_threshold()
+        protected_tokens: set[str] = set()
+        has_unexplained_critical_drift = False
+        now = time.time()
+        token_snapshots = (
+            (self.market.up_token_id, float(self.inventory.up_shares), float(real_up)),
+            (self.market.dn_token_id, float(self.inventory.dn_shares), float(real_dn)),
+        )
+        for token_id, internal_shares, pm_shares in token_snapshots:
+            diff = internal_shares - pm_shares
+            if abs(diff) < threshold:
+                continue
+            if self._settlement_lag_explains_diff(
+                token_id=token_id,
+                internal_shares=internal_shares,
+                pm_shares=pm_shares,
+                threshold=threshold,
+            ):
+                protected_tokens.add(token_id)
+                continue
+
+            state = self._settlement_lag.get(token_id)
+            if state is not None:
+                self._settlement_lag_escalated_total += 1
+                reason = "expired" if now > state.grace_until else "mismatch"
+                log.warning(
+                    "Settlement lag guard escalated (%s): token=%s reason=%s diff=%.2f pending=%.2f",
+                    source,
+                    (self._token_key_for_id(token_id) or token_id).upper(),
+                    reason,
+                    diff,
+                    state.pending_delta_shares,
+                )
+                self._drop_settlement_lag(token_id)
+
+            has_unexplained_critical_drift = True
+
+        return protected_tokens, has_unexplained_critical_drift
+
+    async def _activate_settlement_guard(
+        self,
+        *,
+        protected_tokens: set[str],
+        real_up: float,
+        real_dn: float,
+        source: str,
+    ) -> None:
+        if not protected_tokens:
+            return
+
+        now = time.time()
+        grace_sec = max(1.0, float(getattr(self.config, "fill_settlement_grace_sec", 6.0) or 6.0))
+        newly_engaged: set[str] = set()
+        for token_id in protected_tokens:
+            token_key = self._token_key_for_id(token_id)
+            if token_key is None:
+                continue
+            internal_shares = self._internal_shares_for_token(token_id)
+            pm_shares = self._pm_shares_for_token(token_id, real_up=real_up, real_dn=real_dn)
+            diff = internal_shares - pm_shares
+            state = self._settlement_lag.get(token_id)
+            if state is None:
+                state = SettlementLagState(
+                    token_id=token_id,
+                    pending_delta_shares=diff,
+                    grace_until=now + grace_sec,
+                    last_fill_ts=now,
+                    last_fill_side="UNKNOWN",
+                    last_fill_size=abs(diff),
+                    last_internal_shares=internal_shares,
+                    last_pm_shares=pm_shares,
+                    source=source,
+                )
+                self._settlement_lag[token_id] = state
+            else:
+                state.last_internal_shares = internal_shares
+                state.last_pm_shares = pm_shares
+                state.source = source
+
+            if token_id not in self._settlement_guard_tokens:
+                newly_engaged.add(token_id)
+            self._settlement_guard_tokens.add(token_id)
+            self._throttled_warn(
+                f"settlement_guard_armed:{source}:{token_id}",
+                (
+                    "Settlement lag guard armed (%s): token=%s internal=%.2f pm=%.2f "
+                    "diff=%.2f grace_left=%.1fs"
+                )
+                % (
+                    source,
+                    token_key.upper(),
+                    internal_shares,
+                    pm_shares,
+                    diff,
+                    max(0.0, state.grace_until - now),
+                ),
+                cooldown=1.0,
+            )
+            self._current_quotes[token_key] = (None, None)
+
+        if newly_engaged:
+            self._settlement_lag_suppressed_total += len(newly_engaged)
+            if self.order_mgr.active_order_ids:
+                await self._cancel_all_guarded()
+
+    def _update_settlement_lag_progress(self, *, real_up: float, real_dn: float, source: str) -> None:
+        if not self._settlement_lag:
+            return
+
+        now = time.time()
+        clear_threshold = self._settlement_clear_threshold()
+        for token_id, state in list(self._settlement_lag.items()):
+            token_key = self._token_key_for_id(token_id)
+            if token_key is None:
+                self._drop_settlement_lag(token_id)
+                continue
+
+            internal_shares = self._internal_shares_for_token(token_id)
+            pm_shares = self._pm_shares_for_token(token_id, real_up=real_up, real_dn=real_dn)
+            diff = internal_shares - pm_shares
+            if abs(diff) <= clear_threshold:
+                if token_id in self._settlement_guard_tokens:
+                    log.info(
+                        "Settlement lag guard cleared (%s): token=%s diff=%.3f",
+                        source,
+                        token_key.upper(),
+                        diff,
+                    )
+                self._drop_settlement_lag(token_id)
+                continue
+
+            if now > state.grace_until:
+                self._drop_settlement_lag(token_id)
+                continue
+
+            if abs(state.pending_delta_shares) > 1e-9 and abs(diff) > 1e-9:
+                if (diff > 0) != (state.pending_delta_shares > 0):
+                    self._drop_settlement_lag(token_id)
+                    continue
+
+            state.last_internal_shares = internal_shares
+            state.last_pm_shares = pm_shares
+            state.pending_delta_shares = diff
+            state.source = source
+
+    def _active_settlement_guard_tokens(self) -> set[str]:
+        if not self._settlement_guard_tokens:
+            return set()
+
+        now = time.time()
+        active: set[str] = set()
+        for token_id in list(self._settlement_guard_tokens):
+            state = self._settlement_lag.get(token_id)
+            if state is None or now > state.grace_until or abs(state.pending_delta_shares) <= 1e-9:
+                self._settlement_guard_tokens.discard(token_id)
+                continue
+            active.add(token_id)
+        return active
+
     def _update_critical_drift_recovery(self, *, real_up: float, real_dn: float, source: str) -> None:
         """Keep MM paused until drift stays reconciled across multiple checks."""
         if not self._critical_drift_pause_active:
@@ -442,6 +732,7 @@ class MarketMaker:
                 self.order_mgr.get_all_token_balances(
                     self.market.up_token_id,
                     self.market.dn_token_id,
+                    reference_balances=self._balance_reference_snapshot(),
                 ),
                 timeout=5.0,
             )
@@ -1008,7 +1299,9 @@ class MarketMaker:
         try:
             (real_up, real_dn), usdc_pair = await asyncio.gather(
                 self.order_mgr.get_all_token_balances(
-                    self.market.up_token_id, self.market.dn_token_id,
+                    self.market.up_token_id,
+                    self.market.dn_token_id,
+                    reference_balances=self._balance_reference_snapshot(),
                 ),
                 self.order_mgr.get_usdc_balances(),
             )
@@ -1145,6 +1438,10 @@ class MarketMaker:
         self._pause_reason = ""
         self._critical_drift_pause_active = False
         self._critical_drift_recovery_streak = 0
+        self._settlement_lag = {}
+        self._settlement_guard_tokens = set()
+        self._settlement_lag_suppressed_total = 0
+        self._settlement_lag_escalated_total = 0
         self._heartbeat_failure_task = None
         self._tick_count = 0
         self._merge_check_counter = 0
@@ -1438,6 +1735,7 @@ class MarketMaker:
             token_type = "up" if fill.token_id == self.market.up_token_id else "dn"
             self.inventory.update_from_fill(fill, token_type)
             self.risk_mgr.record_fill(fill)
+            self._record_live_fill_settlement(fill)
             self.pnl_decomp.record_fill(
                 fill.side, fill.token_id, fill.price, fill.size, fill.fee, fill.is_maker
             )
@@ -1459,7 +1757,28 @@ class MarketMaker:
         merge_reconcile_requested = False
         # Merge-first: check for merge opportunity periodically (skip during closing).
         if not self._is_closing:
-            if self._reconcile_guard_active():
+            guarded_tokens = self._active_settlement_guard_tokens()
+            if guarded_tokens:
+                guard_left = max(
+                    0.0,
+                    max(
+                        (self._settlement_lag[token_id].grace_until - time.time())
+                        for token_id in guarded_tokens
+                        if token_id in self._settlement_lag
+                    ),
+                )
+                guard_names = ",".join(
+                    sorted(
+                        (self._token_key_for_id(token_id) or token_id).upper()
+                        for token_id in guarded_tokens
+                    )
+                )
+                self._throttled_warn(
+                    "merge_settlement_guard",
+                    f"Merge check paused for {guard_left:.1f}s during settlement lag ({guard_names})",
+                    cooldown=2.0,
+                )
+            elif self._reconcile_guard_active():
                 guard_left = max(0.0, self._reconcile_guard_until - time.time())
                 self._throttled_warn(
                     "merge_reconcile_guard",
@@ -1496,6 +1815,7 @@ class MarketMaker:
                     self.order_mgr.get_all_token_balances(
                         self.market.up_token_id,
                         self.market.dn_token_id,
+                        reference_balances=self._balance_reference_snapshot(),
                     ),
                     self.order_mgr.get_usdc_balances(),
                 )
@@ -1527,86 +1847,126 @@ class MarketMaker:
                 self._reconcile_stable_count = 0
                 self._reconcile_prev_pm = None
             else:
-                real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
-                    real_up=float(real_up),
-                    real_dn=float(real_dn),
-                    source="periodic_reconcile",
-                )
-                # Cache real PM token balances for accurate PnL calculation
-                self._cached_pm_up_shares = real_up
-                self._cached_pm_dn_shares = real_dn
-                if drift_confirmed:
-                    if await self._handle_critical_inventory_drift(
-                        real_up=real_up,
-                        real_dn=real_dn,
-                        source="periodic_reconcile",
-                    ):
-                        self._reconcile_stable_count = 0
-                        self._reconcile_prev_pm = None
-                        self.order_mgr.clear_reconcile_request()
-                        return
-                self._update_critical_drift_recovery(
+                real_up = float(real_up)
+                real_dn = float(real_dn)
+                protected_tokens, has_unexplained_critical_drift = self._classify_drift_snapshot(
                     real_up=real_up,
                     real_dn=real_dn,
                     source="periodic_reconcile",
                 )
-                if self._critical_drift_pause_active:
-                    self.order_mgr.clear_reconcile_request()
-                    self._current_quotes = {"up": (None, None), "dn": (None, None)}
-                    return
-                if reconcile_requested:
-                    forced_up_diff = abs(real_up - self.inventory.up_shares)
-                    forced_dn_diff = abs(real_dn - self.inventory.dn_shares)
-                    log.warning(
-                        "Forced reconcile after anomalous fill: internal UP=%.2f DN=%.2f "
-                        "→ PM UP=%.2f DN=%.2f",
-                        self.inventory.up_shares, self.inventory.dn_shares,
-                        real_up, real_dn,
+                # Cache real PM token balances for accurate PnL calculation.
+                self._cached_pm_up_shares = real_up
+                self._cached_pm_dn_shares = real_dn
+
+                if protected_tokens and not has_unexplained_critical_drift:
+                    await self._activate_settlement_guard(
+                        protected_tokens=protected_tokens,
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
                     )
-                    self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
-                    self._arm_reconcile_guard(forced_up_diff, forced_dn_diff, "forced")
+                    self._update_settlement_lag_progress(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
+                    )
+                    self._update_critical_drift_recovery(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
+                    )
                     self._reconcile_stable_count = 0
                     self._reconcile_prev_pm = None
-                    self.order_mgr.clear_reconcile_request()
+                    if self._critical_drift_pause_active:
+                        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                        return
                 else:
-                    up_diff = abs(real_up - self.inventory.up_shares)
-                    dn_diff = abs(real_dn - self.inventory.dn_shares)
-                    if up_diff > 1.0 or dn_diff > 1.0:
-                        prev = self._reconcile_prev_pm
-                        pm_stable = (prev is not None
-                                     and abs(real_up - prev[0]) < 0.5
-                                     and abs(real_dn - prev[1]) < 0.5)
-                        self._reconcile_prev_pm = (real_up, real_dn)
+                    if has_unexplained_critical_drift:
+                        real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
+                            real_up=real_up,
+                            real_dn=real_dn,
+                            source="periodic_reconcile",
+                        )
+                        self._cached_pm_up_shares = real_up
+                        self._cached_pm_dn_shares = real_dn
+                        if drift_confirmed:
+                            if await self._handle_critical_inventory_drift(
+                                real_up=real_up,
+                                real_dn=real_dn,
+                                source="periodic_reconcile",
+                            ):
+                                self._reconcile_stable_count = 0
+                                self._reconcile_prev_pm = None
+                                self.order_mgr.clear_reconcile_request()
+                                return
 
-                        if pm_stable:
-                            self._reconcile_stable_count += 1
-                        else:
-                            self._reconcile_stable_count = 1
-
-                        stable_required = 1 if self._is_closing else 3
-                        if self._reconcile_stable_count >= stable_required:
-                            log.warning(
-                                "Inventory reconcile (%d/%d stable checks): "
-                                "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
-                                self._reconcile_stable_count,
-                                stable_required,
-                                self.inventory.up_shares, self.inventory.dn_shares,
-                                real_up, real_dn,
-                            )
-                            self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
-                            self._arm_reconcile_guard(up_diff, dn_diff, "debounced")
-                            self._reconcile_stable_count = 0
-                            self._reconcile_prev_pm = None
-                        else:
-                            log.info(
-                                "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
-                                self._reconcile_stable_count,
-                                self.inventory.up_shares, self.inventory.dn_shares,
-                                real_up, real_dn,
-                            )
-                    else:
+                    self._update_settlement_lag_progress(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
+                    )
+                    self._update_critical_drift_recovery(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="periodic_reconcile",
+                    )
+                    if self._critical_drift_pause_active:
+                        self.order_mgr.clear_reconcile_request()
+                        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                        return
+                    if reconcile_requested:
+                        forced_up_diff = abs(real_up - self.inventory.up_shares)
+                        forced_dn_diff = abs(real_dn - self.inventory.dn_shares)
+                        log.warning(
+                            "Forced reconcile after anomalous fill: internal UP=%.2f DN=%.2f "
+                            "→ PM UP=%.2f DN=%.2f",
+                            self.inventory.up_shares, self.inventory.dn_shares,
+                            real_up, real_dn,
+                        )
+                        self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                        self._arm_reconcile_guard(forced_up_diff, forced_dn_diff, "forced")
                         self._reconcile_stable_count = 0
                         self._reconcile_prev_pm = None
+                        self.order_mgr.clear_reconcile_request()
+                    else:
+                        up_diff = abs(real_up - self.inventory.up_shares)
+                        dn_diff = abs(real_dn - self.inventory.dn_shares)
+                        if up_diff > 1.0 or dn_diff > 1.0:
+                            prev = self._reconcile_prev_pm
+                            pm_stable = (prev is not None
+                                         and abs(real_up - prev[0]) < 0.5
+                                         and abs(real_dn - prev[1]) < 0.5)
+                            self._reconcile_prev_pm = (real_up, real_dn)
+
+                            if pm_stable:
+                                self._reconcile_stable_count += 1
+                            else:
+                                self._reconcile_stable_count = 1
+
+                            stable_required = 1 if self._is_closing else 3
+                            if self._reconcile_stable_count >= stable_required:
+                                log.warning(
+                                    "Inventory reconcile (%d/%d stable checks): "
+                                    "internal UP=%.2f DN=%.2f → PM UP=%.2f DN=%.2f",
+                                    self._reconcile_stable_count,
+                                    stable_required,
+                                    self.inventory.up_shares, self.inventory.dn_shares,
+                                    real_up, real_dn,
+                                )
+                                self.inventory.reconcile(real_up, real_dn, self._cached_usdc_balance)
+                                self._arm_reconcile_guard(up_diff, dn_diff, "debounced")
+                                self._reconcile_stable_count = 0
+                                self._reconcile_prev_pm = None
+                            else:
+                                log.info(
+                                    "Inventory drift (%d/3): internal UP=%.2f DN=%.2f, PM UP=%.2f DN=%.2f",
+                                    self._reconcile_stable_count,
+                                    self.inventory.up_shares, self.inventory.dn_shares,
+                                    real_up, real_dn,
+                                )
+                        else:
+                            self._reconcile_stable_count = 0
+                            self._reconcile_prev_pm = None
         elif not is_live:
             # Paper mode: sync from mock client balance + internal inventory
             self._cached_usdc_balance = self.order_mgr.client.get_balance()
@@ -1633,6 +1993,28 @@ class MarketMaker:
                 self._throttled_warn(
                     "liquidation_reconcile_guard",
                     f"Liquidation paused for {guard_left:.1f}s after reconcile drift",
+                    cooldown=2.0,
+                )
+                return
+            guarded_tokens = self._active_settlement_guard_tokens()
+            if guarded_tokens and time_left > max(5.0, float(self.config.liq_taker_threshold_sec)):
+                guard_names = ",".join(
+                    sorted(
+                        (self._token_key_for_id(token_id) or token_id).upper()
+                        for token_id in guarded_tokens
+                    )
+                )
+                guard_left = max(
+                    0.0,
+                    max(
+                        (self._settlement_lag[token_id].grace_until - time.time())
+                        for token_id in guarded_tokens
+                        if token_id in self._settlement_lag
+                    ),
+                )
+                self._throttled_warn(
+                    "liquidation_settlement_guard",
+                    f"Liquidation paused for {guard_left:.1f}s during settlement lag ({guard_names})",
                     cooldown=2.0,
                 )
                 return
@@ -2339,6 +2721,20 @@ class MarketMaker:
         )
 
         await self._apply_rebate_scoring_filters(all_quotes, is_live=is_live)
+        guarded_tokens = self._active_settlement_guard_tokens()
+        if guarded_tokens:
+            for token_key, token_id in (
+                ("up", self.market.up_token_id),
+                ("dn", self.market.dn_token_id),
+            ):
+                if token_id in guarded_tokens:
+                    if all_quotes[token_key] != (None, None):
+                        self._throttled_warn(
+                            f"quote_settlement_guard:{token_id}",
+                            f"Settlement lag guard: suppressing {token_key.upper()} quotes until PM balances catch up",
+                            cooldown=2.0,
+                        )
+                    all_quotes[token_key] = (None, None)
         _t_quotes = time.perf_counter()
 
         # Abort if emergency shutdown was triggered during this tick
@@ -2543,7 +2939,9 @@ class MarketMaker:
             try:
                 (real_up, real_dn), usdc_pair = await asyncio.gather(
                     self.order_mgr.get_all_token_balances(
-                        self.market.up_token_id, self.market.dn_token_id,
+                        self.market.up_token_id,
+                        self.market.dn_token_id,
+                        reference_balances=self._balance_reference_snapshot(),
                     ),
                     self.order_mgr.get_usdc_balances(),
                 )
@@ -2558,20 +2956,41 @@ class MarketMaker:
                 if real_dn is not None:
                     self._cached_pm_dn_shares = real_dn
                 if real_up is not None and real_dn is not None:
-                    real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
-                        real_up=float(real_up),
-                        real_dn=float(real_dn),
+                    real_up = float(real_up)
+                    real_dn = float(real_dn)
+                    protected_tokens, has_unexplained_critical_drift = self._classify_drift_snapshot(
+                        real_up=real_up,
+                        real_dn=real_dn,
                         source="post_order_refresh",
                     )
-                    self._cached_pm_up_shares = real_up
-                    self._cached_pm_dn_shares = real_dn
-                    if drift_confirmed:
-                        if await self._handle_critical_inventory_drift(
+                    if protected_tokens and not has_unexplained_critical_drift:
+                        await self._activate_settlement_guard(
+                            protected_tokens=protected_tokens,
                             real_up=real_up,
                             real_dn=real_dn,
                             source="post_order_refresh",
-                        ):
-                            return
+                        )
+                    else:
+                        if has_unexplained_critical_drift:
+                            real_up, real_dn, drift_confirmed = await self._confirm_critical_drift_snapshot(
+                                real_up=real_up,
+                                real_dn=real_dn,
+                                source="post_order_refresh",
+                            )
+                            self._cached_pm_up_shares = real_up
+                            self._cached_pm_dn_shares = real_dn
+                            if drift_confirmed:
+                                if await self._handle_critical_inventory_drift(
+                                    real_up=real_up,
+                                    real_dn=real_dn,
+                                    source="post_order_refresh",
+                                ):
+                                    return
+                    self._update_settlement_lag_progress(
+                        real_up=real_up,
+                        real_dn=real_dn,
+                        source="post_order_refresh",
+                    )
                     self._update_critical_drift_recovery(
                         real_up=real_up,
                         real_dn=real_dn,
@@ -2844,7 +3263,10 @@ class MarketMaker:
                     try:
                         fresh_usdc, fresh_usdc_available = await self.order_mgr.get_usdc_balances()
                         (fresh_up, fresh_dn) = await self.order_mgr.get_all_token_balances(
-                            self.market.up_token_id, self.market.dn_token_id)
+                            self.market.up_token_id,
+                            self.market.dn_token_id,
+                            reference_balances=self._balance_reference_snapshot(),
+                        )
                         if fresh_usdc is not None:
                             self._cached_usdc_balance = fresh_usdc
                             self.inventory.usdc = fresh_usdc
@@ -3133,6 +3555,7 @@ class MarketMaker:
             real_up_chk, real_dn_chk = await self.order_mgr.get_all_token_balances(
                 self.market.up_token_id,
                 self.market.dn_token_id,
+                reference_balances=self._balance_reference_snapshot(),
             )
             if real_up_chk is None or real_dn_chk is None:
                 log.warning("Liquidation completion check deferred: failed to fetch PM balances")
@@ -3277,6 +3700,8 @@ class MarketMaker:
         self._reconcile_guard_until = 0.0
         self._critical_drift_pause_active = False
         self._critical_drift_recovery_streak = 0
+        self._settlement_lag = {}
+        self._settlement_guard_tokens = set()
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0
@@ -3412,6 +3837,26 @@ class MarketMaker:
             reserved_collateral_pm = max(0.0, reserved_est.get("total_reserved", 0.0))
             usdc_free_pm = max(0.0, inv_usdc_total - reserved_collateral_pm)
             usdc_free_source = "estimated_from_active_orders"
+        active_settlement_tokens = self._active_settlement_guard_tokens()
+        settlement_guard_tokens = []
+        for token_id in sorted(active_settlement_tokens):
+            state = self._settlement_lag.get(token_id)
+            if state is None:
+                continue
+            token_key = self._token_key_for_id(token_id)
+            settlement_guard_tokens.append(
+                {
+                    "token": (token_key or token_id).upper(),
+                    "token_id": token_id,
+                    "pending_delta_shares": round(state.pending_delta_shares, 4),
+                    "seconds_left": round(max(0.0, state.grace_until - time.time()), 2),
+                    "last_fill_side": state.last_fill_side,
+                    "last_fill_size": round(state.last_fill_size, 4),
+                    "internal_shares": round(state.last_internal_shares, 4),
+                    "pm_shares": round(state.last_pm_shares, 4),
+                    "source": state.source,
+                }
+            )
 
         return {
             # Market info
@@ -3485,6 +3930,12 @@ class MarketMaker:
                 "dn_floor": round(self._liq_lock.min_sell_price_dn, 2) if self._liq_lock else 0,
                 "chunk_index": self._liq_chunk_index,
                 "total_chunks": self.config.liq_gradual_chunks,
+            },
+            "settlement_guard": {
+                "active": bool(settlement_guard_tokens),
+                "tokens": settlement_guard_tokens,
+                "suppressed_total": self._settlement_lag_suppressed_total,
+                "escalated_total": self._settlement_lag_escalated_total,
             },
 
             # PnL & Risk (override fill-based with PM-balance-based)

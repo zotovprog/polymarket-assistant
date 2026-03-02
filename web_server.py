@@ -17,6 +17,7 @@ import time
 import logging
 import math
 import threading
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -75,6 +76,23 @@ _log_handler = RingBufferLogHandler()
 _log_handler.setLevel(logging.INFO)
 logging.getLogger().addHandler(_log_handler)
 
+RUNTIME_WATCHDOG_INTERVAL_SEC = max(
+    0.5,
+    float(os.environ.get("RUNTIME_WATCHDOG_INTERVAL_SEC", "2.0")),
+)
+RUNTIME_WATCHDOG_CPU_ALERT_PCT = max(
+    50.0,
+    float(os.environ.get("RUNTIME_WATCHDOG_CPU_ALERT_PCT", "85.0")),
+)
+RUNTIME_WATCHDOG_LAG_ALERT_MS = max(
+    50.0,
+    float(os.environ.get("RUNTIME_WATCHDOG_LAG_ALERT_MS", "250.0")),
+)
+RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC = max(
+    2.0,
+    float(os.environ.get("RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC", "10.0")),
+)
+
 
 # ── Auth ────────────────────────────────────────────────────────
 AUTH_COOKIE = "pm_web_auth"
@@ -114,6 +132,11 @@ log.info(f"PM_API_PASSPHRASE={'set' if PM_API_PASSPHRASE else 'MISSING'} (len={l
 # ── Telegram ────────────────────────────────────────────────────
 _telegram = TelegramNotifier()
 log.info(f"Telegram: {'enabled' if _telegram.enabled else 'disabled'}")
+
+
+def _telegram_polling_enabled() -> bool:
+    raw = os.environ.get("TELEGRAM_POLLING_ENABLED", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 # ── FastAPI app ─────────────────────────────────────────────────
 app = FastAPI(title="Polymarket MM", docs_url=None, redoc_url=None)
@@ -189,6 +212,7 @@ class ConfigUpdateRequest(BaseModel):
     toxic_divergence_threshold: Optional[float] = None
     toxic_divergence_ticks: Optional[int] = None
     critical_reconcile_drift_shares: Optional[float] = None
+    fill_settlement_grace_sec: Optional[float] = None
     require_flat_start: Optional[bool] = None
     flat_start_max_shares: Optional[float] = None
     max_one_sided_ticks: Optional[int] = None
@@ -250,6 +274,7 @@ class ConfigUpdateRequest(BaseModel):
         "trailing_stop_pct",
         "toxic_divergence_threshold",
         "critical_reconcile_drift_shares",
+        "fill_settlement_grace_sec",
         "flat_start_max_shares",
         "min_fv_to_quote",
         "close_window_sec",
@@ -658,6 +683,16 @@ class MMRuntime:
         self._last_good_min_order_size: float = 5.0
         self._last_market_selection: dict[str, Any] | None = None
         self._alerts: dict[str, dict[str, Any]] = {}
+        self._runtime_watchdog: dict[str, Any] = {
+            "active": False,
+            "last_check_ts": 0.0,
+            "last_loop_lag_ms": 0.0,
+            "last_cpu_pct": 0.0,
+            "last_log_ts": 0.0,
+            "last_top_counts": [],
+            "last_top_tasks": [],
+            "last_main_stack": [],
+        }
 
     @property
     def is_running(self) -> bool:
@@ -1343,6 +1378,7 @@ class MMRuntime:
     async def _monitor_window_expiry(self) -> None:
         """Watch for window expiry; auto-restart next window if configured."""
         while self._running:
+            runtime_metrics.incr("web.monitor.loop")
             await asyncio.sleep(2.0)
             mm = self.mm
             if not mm:
@@ -1533,6 +1569,7 @@ class MMRuntime:
 
     def snapshot(self) -> dict:
         """Get current state for API."""
+        runtime_metrics.incr("web.runtime.snapshot")
         if self.mm:
             snap = self.mm.snapshot()
             snap["paper_mode"] = self._paper_mode
@@ -1547,6 +1584,7 @@ class MMRuntime:
             snap["app_version"] = APP_VERSION
             snap["app_git_hash"] = APP_GIT_HASH
             snap["alerts"] = self.list_alerts()
+            snap["runtime_watchdog"] = dict(self._runtime_watchdog)
             if "_tg_bot" in globals():
                 snap["telegram_bot"] = _tg_bot.status
             if self._last_market_selection:
@@ -1569,6 +1607,7 @@ class MMRuntime:
         result["app_version"] = APP_VERSION
         result["app_git_hash"] = APP_GIT_HASH
         result["alerts"] = self.list_alerts()
+        result["runtime_watchdog"] = dict(self._runtime_watchdog)
         if "_tg_bot" in globals():
             result["telegram_bot"] = _tg_bot.status
         if self._last_market_selection:
@@ -2067,6 +2106,7 @@ _ws_manager = ConnectionManager()
 async def _ws_broadcast_loop():
     """Broadcast state snapshots to all WS clients every ~1s."""
     while True:
+        runtime_metrics.incr("web.ws_broadcast.loop")
         try:
             if _ws_manager.client_count > 0:
                 snap = _runtime.snapshot()
@@ -2286,6 +2326,152 @@ def _task_coro_label(task: asyncio.Task) -> str:
         return "unknown"
 
 
+def _collect_asyncio_task_counts(top_n: int = 10) -> tuple[int, list[dict[str, Any]]]:
+    """Best-effort pending-task breakdown for diagnostics."""
+    task_counts: collections.Counter[str] = collections.Counter()
+    loop = asyncio.get_running_loop()
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    for task in pending:
+        task_counts[_task_coro_label(task)] += 1
+    top_tasks = [
+        {"coro": name, "count": int(cnt)}
+        for name, cnt in task_counts.most_common(top_n)
+    ]
+    return len(pending), top_tasks
+
+
+def _sample_main_thread_stack(limit: int = 12) -> list[str]:
+    """Sample main-thread stack frames for CPU starvation debugging."""
+    main_tid = threading.main_thread().ident
+    if main_tid is None:
+        return []
+    frame = sys._current_frames().get(main_tid)
+    if frame is None:
+        return []
+    extracted = traceback.extract_stack(frame)
+    sampled = extracted[-max(1, int(limit)):]
+    return [
+        f"{Path(item.filename).name}:{item.lineno} in {item.name}"
+        for item in sampled
+    ]
+
+
+_runtime_watchdog_task: asyncio.Task | None = None
+_runtime_stack_watchdog_thread: threading.Thread | None = None
+_runtime_stack_watchdog_stop = threading.Event()
+
+
+async def _runtime_watchdog_loop() -> None:
+    """Event-loop watchdog: lag + top counters/tasks when runtime gets unhealthy."""
+    interval = RUNTIME_WATCHDOG_INTERVAL_SEC
+    last_tick = time.perf_counter()
+    while True:
+        await asyncio.sleep(interval)
+        now_perf = time.perf_counter()
+        actual_interval = max(0.0, now_perf - last_tick)
+        last_tick = now_perf
+        lag_ms = max(0.0, (actual_interval - interval) * 1000.0)
+        runtime_metrics.observe_ms("web.watchdog.loop_lag_ms", lag_ms)
+        metrics = runtime_metrics.snapshot(reset=True, top_n=10, advance=True)
+        process_cpu_pct = float(metrics.get("process_cpu_pct", 0.0) or 0.0)
+        pending_tasks = 0
+        top_tasks: list[dict[str, Any]] = []
+        try:
+            pending_tasks, top_tasks = _collect_asyncio_task_counts(top_n=10)
+        except Exception as e:
+            top_tasks = [{"coro": "task_snapshot_error", "count": 1, "error": str(e)}]
+
+        top_counts = metrics.get("counts", [])[:5]
+        watchdog = _runtime._runtime_watchdog
+        watchdog["active"] = True
+        watchdog["last_check_ts"] = time.time()
+        watchdog["last_loop_lag_ms"] = round(lag_ms, 2)
+        watchdog["last_cpu_pct"] = round(process_cpu_pct, 2)
+        watchdog["last_top_counts"] = top_counts
+        watchdog["last_top_tasks"] = top_tasks[:5]
+        watchdog["pending_tasks"] = pending_tasks
+
+        unhealthy = (
+            process_cpu_pct >= RUNTIME_WATCHDOG_CPU_ALERT_PCT
+            or lag_ms >= RUNTIME_WATCHDOG_LAG_ALERT_MS
+        )
+        if unhealthy:
+            now_ts = time.time()
+            if (now_ts - float(watchdog.get("last_log_ts", 0.0) or 0.0)) >= RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC:
+                watchdog["last_log_ts"] = now_ts
+                msg = (
+                    f"Runtime watchdog: cpu={process_cpu_pct:.1f}% "
+                    f"loop_lag={lag_ms:.1f}ms pending_tasks={pending_tasks} "
+                    f"top_counts={top_counts} top_tasks={top_tasks[:3]}"
+                )
+                log.warning(msg)
+                _runtime.set_alert("runtime_watchdog", msg, level="warning")
+        else:
+            _runtime.clear_alert("runtime_watchdog")
+
+
+def _runtime_stack_watchdog_main() -> None:
+    """Thread-based CPU sampler that can still inspect main-thread stack when loop is wedged."""
+    interval = RUNTIME_WATCHDOG_INTERVAL_SEC
+    prev_wall = time.time()
+    prev_proc = time.process_time()
+    last_log_ts = 0.0
+    while not _runtime_stack_watchdog_stop.wait(interval):
+        now_wall = time.time()
+        now_proc = time.process_time()
+        wall_delta = max(1e-6, now_wall - prev_wall)
+        proc_delta = max(0.0, now_proc - prev_proc)
+        prev_wall = now_wall
+        prev_proc = now_proc
+        cpu_pct = round((proc_delta / wall_delta) * 100.0, 2)
+        watchdog = _runtime._runtime_watchdog
+        watchdog["last_cpu_pct"] = max(float(watchdog.get("last_cpu_pct", 0.0) or 0.0), cpu_pct)
+        if cpu_pct < RUNTIME_WATCHDOG_CPU_ALERT_PCT:
+            continue
+        if (now_wall - last_log_ts) < RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC:
+            continue
+        last_log_ts = now_wall
+        main_stack = _sample_main_thread_stack(limit=14)
+        watchdog["last_main_stack"] = main_stack
+        watchdog["last_log_ts"] = now_wall
+        msg = (
+            f"Runtime CPU watchdog: cpu={cpu_pct:.1f}% main_thread_stack={main_stack}"
+        )
+        log.warning(msg)
+        _runtime.set_alert("runtime_cpu_watchdog", msg, level="warning")
+
+
+def _ensure_runtime_watchdogs() -> None:
+    """Start async + thread watchdogs once."""
+    global _runtime_watchdog_task, _runtime_stack_watchdog_thread
+    if _runtime_watchdog_task is None or _runtime_watchdog_task.done():
+        _runtime_watchdog_task = asyncio.create_task(_runtime_watchdog_loop())
+    if _runtime_stack_watchdog_thread is None or not _runtime_stack_watchdog_thread.is_alive():
+        _runtime_stack_watchdog_stop.clear()
+        _runtime_stack_watchdog_thread = threading.Thread(
+            target=_runtime_stack_watchdog_main,
+            name="runtime-stack-watchdog",
+            daemon=True,
+        )
+        _runtime_stack_watchdog_thread.start()
+
+
+async def _stop_runtime_watchdogs() -> None:
+    """Stop background watchdogs on shutdown."""
+    global _runtime_watchdog_task
+    _runtime_stack_watchdog_stop.set()
+    task = _runtime_watchdog_task
+    _runtime_watchdog_task = None
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("Runtime watchdog shutdown error: %s", e)
+
+
 @app.get("/api/debug/runtime-metrics")
 async def debug_runtime_metrics(
     request: Request,
@@ -2295,25 +2481,20 @@ async def debug_runtime_metrics(
     """Runtime counters/rates + asyncio task breakdown for CPU hot-path debugging."""
     _require_auth(request)
     top_n = max(1, min(int(top_n), 500))
-    metrics = runtime_metrics.snapshot(reset=reset, top_n=top_n)
-
-    task_counts: collections.Counter[str] = collections.Counter()
+    metrics = runtime_metrics.snapshot(reset=reset, top_n=top_n, advance=False)
     try:
-        loop = asyncio.get_running_loop()
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
-        for task in pending:
-            task_counts[_task_coro_label(task)] += 1
-        top_tasks = [
-            {"coro": name, "count": int(cnt)}
-            for name, cnt in task_counts.most_common(top_n)
-        ]
+        pending_count, top_tasks = _collect_asyncio_task_counts(top_n=top_n)
         metrics["asyncio"] = {
-            "pending_tasks": len(pending),
+            "pending_tasks": pending_count,
             "top_tasks": top_tasks,
             "threads": threading.active_count(),
         }
     except Exception as e:
         metrics["asyncio"] = {"error": str(e)}
+    metrics["watchdog"] = dict(_runtime._runtime_watchdog)
+    metrics["python"] = {
+        "main_thread_stack": _sample_main_thread_stack(limit=14),
+    }
     return metrics
 
 
@@ -2387,17 +2568,24 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
+    _ensure_runtime_watchdogs()
     await _runtime.load_config()
     _runtime.clear_alert("telegram_conflict")
-    if _telegram.enabled:
+    _runtime.clear_alert("telegram_polling")
+    if _telegram.enabled and _telegram_polling_enabled():
         await _tg_bot.start()
         log.info("Telegram bot polling started")
+    elif _telegram.enabled:
+        msg = "Telegram bot polling disabled by TELEGRAM_POLLING_ENABLED=0"
+        _runtime.set_alert("telegram_polling", msg, level="warning")
+        log.warning(msg)
     # Start WebSocket broadcast loop
     asyncio.create_task(_ws_broadcast_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown():
+    await _stop_runtime_watchdogs()
     await _tg_bot.stop()
     if _runtime.is_running:
         try:
