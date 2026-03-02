@@ -2753,9 +2753,9 @@ class MarketMaker:
             - Price = max(floor, FV - discount), improved to best_bid if higher
             - Post-only (maker)
         Phase 2 (Taker): time_left <= taker_threshold
-            - Sell everything at best_bid, but only if best_bid >= floor
-        Phase 3 (Abandon): best_bid < floor
-            - Don't sell — let token expire (may resolve to $1)
+            - Sell everything at best_bid (fail-closed), including below floor
+        Phase 3 (Abandon): disabled
+            - We do not intentionally hold risk in liquidation mode.
         """
         if not self.market:
             return
@@ -3031,34 +3031,20 @@ class MarketMaker:
 
             if use_taker:
                 # ── Phase 2: Taker ──
-                if best_bid < floor and cfg.liq_abandon_below_floor:
-                    if time_left > 5:
-                        # Still time — wait for price recovery
-                        log.warning(
-                            f"{label}: best_bid={best_bid:.2f} < floor={floor:.2f}, "
-                            f"waiting ({time_left:.0f}s left, {real_balance:.1f} shares)")
-                        continue
-                    else:
-                        # < 5 seconds — force sell but enforce absolute minimum
-                        absolute_min = max(0.03, floor * 0.8)
-                        if best_bid < absolute_min:
-                            log.critical(
-                                f"{label} HOLD: best_bid={best_bid:.2f} < absolute_min={absolute_min:.2f}, "
-                                f"holding to resolution ({time_left:.0f}s left, {real_balance:.1f} shares)")
-                            continue
-                        log.warning(
-                            f"{label} FORCE SELL: best_bid={best_bid:.2f} >= absolute_min={absolute_min:.2f}, "
-                            f"({time_left:.0f}s left, {real_balance:.1f} shares)")
-                        sell_price = best_bid
-                        post_only = False
-                        phase = "FORCE_TAKER"
-                        sell_size = round(real_balance, 2)
+                if best_bid < floor:
+                    # Fail-closed liquidation: never hold inventory by floor logic.
+                    # In closing mode we prioritize risk reduction over entry-floor protection.
+                    log.warning(
+                        f"{label}: best_bid={best_bid:.2f} < floor={floor:.2f} — "
+                        f"forced taker exit ({time_left:.0f}s left, {real_balance:.1f} shares)"
+                    )
+                    phase = "FORCE_TAKER_BELOW_FLOOR"
                 else:
-                    sell_price = best_bid
-                    post_only = False
                     phase = "TAKER"
-                    # Sell everything remaining (no buffer in taker mode)
-                    sell_size = round(real_balance, 2)
+                sell_price = best_bid
+                post_only = False
+                # Sell everything remaining (no buffer in taker mode)
+                sell_size = round(real_balance, 2)
             else:
                 # ── Phase 1: Gradual Limit ──
                 # Price: max(floor, FV - discount), improve to best_bid if higher

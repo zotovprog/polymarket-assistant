@@ -254,6 +254,39 @@ async def test_liquidation_catastrophic_uses_single_drawdown_threshold():
 
 
 @pytest.mark.anyio
+async def test_liquidation_forces_taker_below_floor_even_when_abandon_enabled():
+    mm = _make_mm()
+    now = time.time()
+    mm.market.window_start = now - 100.0
+    mm.market.window_end = now + 2.0  # force taker phase
+    mm._closing_start_time_left = 30.0
+
+    mm.config.liq_taker_threshold_sec = 10.0
+    mm.config.liq_abandon_below_floor = True
+
+    mm.inventory.up_shares = 10.0
+    mm.inventory.dn_shares = 0.0
+    mm.inventory.usdc = 5.0
+    mm.inventory.up_cost.record_buy(0.70, 10.0, 0.0)  # create floor > best_bid
+
+    # _liquidate_inventory reads balances:
+    # 1) preflight up, 2) preflight dn, 3) loop up, 4) loop dn
+    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[10.0, 0.0, 10.0, 0.0])
+    mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": 0.20, "best_ask": 0.21})
+    mm._compute_fv = lambda: (0.30, 0.70)
+    mm._place_order_guarded = AsyncMock(return_value="oid-up")
+
+    await mm._liquidate_inventory()
+
+    mm._place_order_guarded.assert_awaited_once()
+    placed_quote = mm._place_order_guarded.await_args.args[0]
+    assert placed_quote.side == "SELL"
+    assert placed_quote.price == pytest.approx(0.20)
+    assert placed_quote.size == pytest.approx(10.0)
+    assert mm._place_order_guarded.await_args.kwargs["post_only"] is False
+
+
+@pytest.mark.anyio
 async def test_inventory_limit_triggers_hard_close_and_cancel():
     mm = _make_mm()
     mm.config.max_inventory_shares = 5.0
