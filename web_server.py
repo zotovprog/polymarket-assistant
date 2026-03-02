@@ -708,6 +708,24 @@ class MMRuntime:
         alerts.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
         return alerts
 
+    def _startup_window_block_reason(self, market: MarketInfo | None) -> str:
+        """Return non-empty reason when MM should not start on this window."""
+        if not market:
+            return ""
+
+        time_left = max(0.0, float(market.time_remaining))
+        if time_left <= 0.0:
+            return "Selected market window already expired"
+
+        window_dur = max(1.0, float(market.window_end - market.window_start))
+        close_sec = min(float(self.mm_config.close_window_sec), window_dur * 0.4)
+        if time_left <= close_sec:
+            return (
+                f"Selected market window too close to close "
+                f"({time_left:.1f}s left <= close_window_sec {close_sec:.1f}s)"
+            )
+        return ""
+
     async def _fetch_public_book_metrics(self, token_id: str) -> dict[str, float]:
         """Fetch best bid/ask and coarse depth from public PM orderbook."""
         import requests as _req
@@ -1238,6 +1256,12 @@ class MMRuntime:
         # Enrich MarketInfo with tick_size, market_type, resolution_source from PM API
         if market and market.up_token_id and not market.up_token_id.startswith("placeholder"):
             await self._enrich_market_info(market, coin, timeframe)
+
+        startup_block_reason = self._startup_window_block_reason(market)
+        if startup_block_reason:
+            log.warning("%s — refusing start for %s/%s", startup_block_reason, coin, timeframe)
+            await self._stop_feed_tasks()
+            raise HTTPException(status_code=409, detail=startup_block_reason)
 
         # Create and start market maker
         self.mm = MarketMaker(self.feed_state, clob, self.mm_config)

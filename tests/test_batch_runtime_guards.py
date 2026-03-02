@@ -743,6 +743,59 @@ def test_pm_apply_accepts_099_prices():
 
 
 @pytest.mark.anyio
+async def test_runtime_start_rejects_window_too_close_to_close(monkeypatch):
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    class _State:
+        def __init__(self):
+            self.mid = 100000.0
+            self.pm_up_id = None
+            self.pm_dn_id = None
+
+    async def _noop_feed(*_args, **_kwargs):
+        return None
+
+    now = time.time()
+    near_close_market = web_server.MarketInfo(
+        coin="BTC",
+        timeframe="15m",
+        up_token_id="up_token",
+        dn_token_id="dn_token",
+        condition_id="cond_token",
+        strike=100000.0,
+        window_start=now - 870.0,
+        window_end=now + 30.0,
+        min_order_size=5.0,
+        tick_size=0.01,
+    )
+
+    monkeypatch.setattr(runtime, "_auto_select_market", AsyncMock(return_value=("BTC", "15m")))
+    monkeypatch.setattr(web_server.feeds, "State", _State)
+    monkeypatch.setattr(web_server.feeds, "ob_poller", _noop_feed)
+    monkeypatch.setattr(web_server.feeds, "binance_feed", _noop_feed)
+    monkeypatch.setattr(web_server.feeds, "pm_feed", _noop_feed)
+    monkeypatch.setattr(web_server.feeds, "fetch_pm_tokens", lambda *_args, **_kwargs: ("up_token", "dn_token", "cond_token"))
+    monkeypatch.setattr(runtime, "_build_market_info_from_tokens", lambda *_args, **_kwargs: near_close_market)
+    monkeypatch.setattr(runtime, "_enrich_market_info", AsyncMock(return_value=None))
+    monkeypatch.setattr(web_server, "_create_clob_client", lambda **_kwargs: object())
+    monkeypatch.setattr(web_server._telegram, "switch_credentials", lambda **_kwargs: None)
+
+    with pytest.raises(web_server.HTTPException) as exc:
+        await runtime.start("BTC", "15m", paper_mode=True, initial_usdc=5.0, dev=False)
+
+    assert exc.value.status_code == 409
+    assert "too close to close" in str(exc.value.detail)
+    assert runtime.mm is None
+    assert runtime._running is False
+
+
+@pytest.mark.anyio
 async def test_check_fills_guarded_uses_order_ops_lock():
     import mm.market_maker as market_maker_mod
     from mm.types import MarketInfo
