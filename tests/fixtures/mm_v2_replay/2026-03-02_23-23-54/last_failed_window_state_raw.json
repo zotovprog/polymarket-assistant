@@ -1,0 +1,30 @@
+{
+  "session_pnl": -3.7251,
+  "inventory": {
+    "up_shares": 11.38,
+    "dn_shares": 0.0
+  },
+  "active_orders": 0,
+  "pair_inventory": {
+    "paired_qty": 0.0,
+    "excess_up_qty": 11.38,
+    "excess_dn_qty": 0.0,
+    "paired_value_usd": 0.0,
+    "excess_up_value_usd": 5.69,
+    "excess_dn_value_usd": 0.0
+  },
+  "analytics": {
+    "session_pnl": -3.7251,
+    "spread_capture_usd": -0.84
+  },
+  "markout_tca": {
+    "avg_markout_5s": -0.061,
+    "adverse_pct_5s": 50.0
+  },
+  "liquidation": {
+    "residual_inventory_failure": true
+  },
+  "order_tracking": {
+    "last_fallback_poll_count": 0
+  }
+}
