@@ -918,6 +918,51 @@ def test_close_only_blocks_all_new_buys():
     assert quotes["dn"][1] is None
 
 
+def test_net_delta_buy_cap_trims_bid_to_remaining_headroom():
+    mm = _make_mm(live=True)
+    mm.config.max_net_delta_shares = 12.0
+    mm.config.min_order_size_usd = 2.0
+    mm._cached_pm_up_shares = 8.36
+    mm._cached_pm_dn_shares = 4.01
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.08, size=16.18),
+            None,
+        ),
+        "dn": (
+            Quote(side="BUY", token_id=mm.market.dn_token_id, price=0.70, size=4.01),
+            None,
+        ),
+    }
+
+    mm._enforce_net_delta_buy_cap(quotes, is_live=True)
+
+    assert quotes["up"][0] is not None
+    assert quotes["up"][0].size == pytest.approx(7.65)
+    assert quotes["dn"][0] is not None
+    assert quotes["dn"][0].size == pytest.approx(4.01)
+
+
+def test_net_delta_buy_cap_blocks_bid_when_headroom_below_pm_min():
+    mm = _make_mm(live=True)
+    mm.config.max_net_delta_shares = 12.0
+    mm._cached_pm_up_shares = 10.0
+    mm._cached_pm_dn_shares = 0.0
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.20, size=5.0),
+            None,
+        ),
+        "dn": (None, None),
+    }
+
+    mm._enforce_net_delta_buy_cap(quotes, is_live=True)
+
+    assert quotes["up"][0] is None
+
+
 @pytest.mark.anyio
 async def test_placement_failure_lockout_enters_close_only_when_nonflat():
     mm = _make_mm(live=True)
@@ -979,6 +1024,30 @@ async def test_residual_inventory_failure_flagged_after_close():
     await mm._liquidate_inventory()
 
     assert mm._residual_inventory_failure is True
+
+
+@pytest.mark.anyio
+async def test_stop_flags_residual_inventory_when_not_flat_after_cleanup():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm.inventory.up_shares = 8.69
+    mm.inventory.dn_shares = 0.01
+    mm._cached_pm_up_shares = 8.69
+    mm._cached_pm_dn_shares = 0.01
+    mm._cancel_all_guarded = AsyncMock(return_value=0)
+    mm._liquidate_inventory = AsyncMock(return_value=None)
+    mm._check_fills_guarded = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(8.69, 0.01))
+    mm.order_mgr.stop_fill_ws = AsyncMock(return_value=None)
+    mm.heartbeat.stop = AsyncMock(return_value=None)
+
+    await mm.stop()
+
+    assert mm._residual_inventory_failure is True
+    assert "Residual inventory after stop" in mm._pause_reason
+    mm.order_mgr.stop_fill_ws.assert_awaited_once()
+    mm.heartbeat.stop.assert_awaited_once()
 
 
 def test_negative_edge_signal_trips_on_bad_markout_and_negative_spread_capture():

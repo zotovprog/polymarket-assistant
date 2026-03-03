@@ -1679,6 +1679,157 @@ class MarketMaker:
                 cooldown=8.0,
             )
 
+    def _active_same_side_buy_size(self, token_key: str, token_id: str) -> float:
+        """Outstanding BUY size on the same token that could still increase net delta.
+
+        Excludes the currently tracked resting bid for the same side to avoid double-counting
+        quote replacement when we evaluate fresh `all_quotes`.
+        """
+        active_orders = self.order_mgr.active_orders
+        outstanding = sum(
+            max(0.0, float(q.size))
+            for q in active_orders.values()
+            if q.side == "BUY" and q.token_id == token_id
+        )
+        cur_bid, _ = self._current_quotes.get(token_key, (None, None))
+        if cur_bid and cur_bid.order_id:
+            live_quote = active_orders.get(cur_bid.order_id)
+            if live_quote and live_quote.side == "BUY" and live_quote.token_id == token_id:
+                outstanding = max(0.0, outstanding - max(0.0, float(live_quote.size)))
+        return outstanding
+
+    def _enforce_net_delta_buy_cap(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+        *,
+        is_live: bool,
+    ) -> None:
+        """Clamp BUY quotes so a new fill cannot exceed remaining net-delta headroom.
+
+        This is intentionally one-sided and conservative:
+        - `UP BUY` is limited by positive headroom only.
+        - `DN BUY` is limited by negative headroom only.
+        - outstanding same-side BUY orders are counted as already consuming headroom.
+        """
+        if not self.market:
+            return
+        max_net = max(0.0, float(getattr(self.config, "max_net_delta_shares", 0.0) or 0.0))
+        if max_net <= 0:
+            return
+
+        if is_live:
+            current_up = max(float(self._cached_pm_up_shares), float(self.inventory.up_shares))
+            current_dn = max(float(self._cached_pm_dn_shares), float(self.inventory.dn_shares))
+        else:
+            current_up = float(self.inventory.up_shares)
+            current_dn = float(self.inventory.dn_shares)
+        current_net = current_up - current_dn
+        pm_min_size = float(self.market.min_order_size if self.market else 5.0)
+        for token_key, token_id in (
+            ("up", self.market.up_token_id),
+            ("dn", self.market.dn_token_id),
+        ):
+            bid, ask = all_quotes[token_key]
+            if bid is None or bid.side != "BUY" or bid.size <= 0:
+                continue
+
+            outstanding_same_side = self._active_same_side_buy_size(token_key, token_id)
+            if token_key == "up":
+                headroom = max_net - current_net - outstanding_same_side
+            else:
+                headroom = max_net + current_net - outstanding_same_side
+            headroom = round(max(0.0, headroom), 2)
+
+            if headroom <= 0:
+                all_quotes[token_key] = (None, ask)
+                self._throttled_warn(
+                    f"net_delta_cap_block:{token_key}",
+                    (
+                        f"Net-delta cap: blocking {token_key.upper()} BUY "
+                        f"(net={current_net:.2f}, outstanding_same_side={outstanding_same_side:.2f}, "
+                        f"max={max_net:.2f})"
+                    ),
+                    cooldown=3.0,
+                )
+                continue
+
+            if bid.size <= headroom + 0.01:
+                continue
+
+            new_size = round(min(float(bid.size), headroom), 2)
+            if new_size < pm_min_size:
+                all_quotes[token_key] = (None, ask)
+                self._throttled_warn(
+                    f"net_delta_cap_suppress:{token_key}",
+                    (
+                        f"Net-delta cap: suppressing {token_key.upper()} BUY "
+                        f"(headroom={headroom:.2f} < quote size={bid.size:.2f}, "
+                        f"pm_min={pm_min_size:.2f})"
+                    ),
+                    cooldown=3.0,
+                )
+                continue
+
+            bid.size = new_size
+            all_quotes[token_key] = (bid, ask)
+            self._throttled_warn(
+                f"net_delta_cap_trim:{token_key}",
+                (
+                    f"Net-delta cap trim: {token_key.upper()} BUY {bid.size:.2f} shares "
+                    f"(headroom={headroom:.2f}, net={current_net:.2f}, "
+                    f"outstanding_same_side={outstanding_same_side:.2f}, max={max_net:.2f})"
+                ),
+                cooldown=3.0,
+            )
+
+    async def _finalize_stop_inventory_state(self, *, completion_threshold: float = 0.5) -> None:
+        """Mark shutdown as failed if material inventory remains after stop cleanup."""
+        if not self.market:
+            return
+
+        real_up: float | None = None
+        real_dn: float | None = None
+        try:
+            real_up, real_dn = await self.order_mgr.get_all_token_balances(
+                self.market.up_token_id,
+                self.market.dn_token_id,
+                reference_balances=self._balance_reference_snapshot(),
+            )
+        except Exception as exc:
+            log.error("Stop final inventory check failed: %s", exc)
+
+        if real_up is not None:
+            self._cached_pm_up_shares = max(0.0, float(real_up))
+        if real_dn is not None:
+            self._cached_pm_dn_shares = max(0.0, float(real_dn))
+
+        pm_up = self._cached_pm_up_shares
+        pm_dn = self._cached_pm_dn_shares
+        internal_up = float(self.inventory.up_shares)
+        internal_dn = float(self.inventory.dn_shares)
+        material_remaining = (
+            pm_up > completion_threshold
+            or pm_dn > completion_threshold
+            or internal_up > completion_threshold
+            or internal_dn > completion_threshold
+        )
+
+        if material_remaining:
+            self._residual_inventory_failure = True
+            self._is_closing = True
+            self._paused = True
+            if not self._pause_reason:
+                self._pause_reason = "Residual inventory after stop"
+            log.error(
+                "Stop completed with residual inventory: PM UP=%.2f DN=%.2f, internal UP=%.2f DN=%.2f",
+                pm_up,
+                pm_dn,
+                internal_up,
+                internal_dn,
+            )
+        else:
+            self._residual_inventory_failure = False
+
     async def _refresh_fee_rate_cache(self) -> None:
         """Best-effort refresh of dynamic fee params for current market tokens."""
         if not self.market or hasattr(self.order_mgr.client, "_orders"):
@@ -2345,6 +2496,9 @@ class MarketMaker:
 
         # Final cancel of any remaining orders
         await self._cancel_all_guarded()
+        self._liquidation_order_ids.clear()
+        await self._check_fills_guarded()
+        await self._finalize_stop_inventory_state()
 
         # Stop fill WebSocket
         await self.order_mgr.stop_fill_ws()
@@ -3600,6 +3754,7 @@ class MarketMaker:
             pm_up_price=_pm_up,
             pm_dn_price=_pm_dn,
         )
+        self._enforce_net_delta_buy_cap(all_quotes, is_live=is_live)
 
         await self._apply_rebate_scoring_filters(all_quotes, is_live=is_live)
         guarded_tokens = self._active_settlement_guard_tokens()
@@ -4584,6 +4739,17 @@ class MarketMaker:
                 )
                 # Stay in _is_closing=True so bot doesn't resume quoting,
                 # but stop spamming sell attempts — just wait for window end
+            else:
+                self._residual_inventory_failure = True
+                log.error(
+                    "Liquidation stalled with material inventory and no live orders: "
+                    "UP=%.2f DN=%.2f (pm_min=%.2f, time_left=%.0fs, mode=%s)",
+                    up_rem,
+                    dn_rem,
+                    pm_min,
+                    time_left,
+                    self._liquidation_mode,
+                )
 
     async def redeem_after_resolution(self, max_wait_sec: float | None = None) -> dict:
         """Best-effort winner token redemption after market resolution."""
