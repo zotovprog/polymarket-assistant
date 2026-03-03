@@ -2900,6 +2900,165 @@ _runtime = MMRuntime()
 _runtime_v2 = MMRuntimeV2()
 
 
+def _dashboard_engine(preferred: str | None = None) -> str:
+    preferred_norm = str(preferred or "").strip().lower()
+    if _runtime_v2._running or _runtime_v2.mm_v2:
+        return "v2"
+    if _runtime._running or _runtime.mm or _runtime._watching:
+        return "legacy"
+    if preferred_norm in {"legacy", "v2"}:
+        return preferred_norm
+    return "v2"
+
+
+def _v2_active_orders_detail() -> list[dict[str, Any]]:
+    mm = _runtime_v2.mm_v2
+    if not mm or not getattr(mm, "market", None):
+        return []
+    try:
+        return mm.gateway.order_mgr.get_active_orders_detail(
+            liquidation_ids=set(),
+            up_token_id=mm.market.up_token_id,
+            dn_token_id=mm.market.dn_token_id,
+        )
+    except Exception:
+        return []
+
+
+def _compute_spread_bps(bid: float | None, ask: float | None) -> float:
+    bid_v = float(bid or 0.0)
+    ask_v = float(ask or 0.0)
+    mid = (bid_v + ask_v) / 2.0
+    if bid_v <= 0 or ask_v <= 0 or ask_v <= bid_v or mid <= 0:
+        return 0.0
+    return ((ask_v - bid_v) / mid) * 10000.0
+
+
+def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
+    market = raw.get("market") or {}
+    valuation = raw.get("valuation") or {}
+    inventory = raw.get("inventory") or {}
+    execution = raw.get("execution") or {}
+    risk = raw.get("risk") or {}
+    health = raw.get("health") or {}
+    analytics = raw.get("analytics") or {}
+    quotes = raw.get("quotes") or {}
+    mm = _runtime_v2.mm_v2
+    market_info = getattr(mm, "market", None) if mm else None
+    heartbeat = getattr(getattr(mm, "heartbeat", None), "stats", {}) or {}
+    fills_page = _runtime_v2.fills_page(limit=20, offset=0)
+    recent_fills = list(fills_page.get("fills") or [])
+    started_at = float(getattr(mm, "_started_at", 0.0) or 0.0) if mm else 0.0
+    now_ts = time.time()
+    up_bid = market.get("up_best_bid")
+    up_ask = market.get("up_best_ask")
+    dn_bid = market.get("dn_best_bid")
+    dn_ask = market.get("dn_best_ask")
+    spread_values = [
+        _compute_spread_bps(up_bid, up_ask),
+        _compute_spread_bps(dn_bid, dn_ask),
+    ]
+    spread_values = [v for v in spread_values if v > 0]
+    spread_bps = max(spread_values) if spread_values else 0.0
+    bid_depth_usd = float(market.get("up_bid_depth_usd") or 0.0) + float(market.get("dn_bid_depth_usd") or 0.0)
+    ask_depth_usd = float(market.get("up_ask_depth_usd") or 0.0) + float(market.get("dn_ask_depth_usd") or 0.0)
+    depth_total = bid_depth_usd + ask_depth_usd
+    market_quality = {
+        "overall_score": float(market.get("market_quality_score") or 0.0),
+        "tradeable": bool(market.get("market_tradeable", False)),
+        "liquidity_score": max(0.0, min(1.0, depth_total / 200.0)),
+        "spread_bps": round(spread_bps, 1),
+        "bid_depth_usd": round(bid_depth_usd, 2),
+        "ask_depth_usd": round(ask_depth_usd, 2),
+    }
+    up_mid = market.get("pm_mid_up")
+    dn_mid = market.get("pm_mid_dn")
+    free_usdc = float(inventory.get("free_usdc") or 0.0)
+    reserved_usdc = float(inventory.get("reserved_usdc") or 0.0)
+    position_value = float(inventory.get("total_inventory_value_usd") or 0.0)
+    portfolio_value = free_usdc + reserved_usdc + position_value
+    up_shares = float(inventory.get("up_shares") or 0.0)
+    dn_shares = float(inventory.get("dn_shares") or 0.0)
+    feed_mid = float(getattr(_runtime_v2.feed_state, "mid", 0.0) or 0.0) if _runtime_v2.feed_state else 0.0
+    lifecycle = str(raw.get("lifecycle") or "bootstrapping")
+    is_running = bool(raw.get("is_running", False))
+    return {
+        "dashboard_engine": "v2",
+        "app_version": raw.get("app_version", APP_VERSION),
+        "app_git_hash": raw.get("app_git_hash", APP_GIT_HASH),
+        "is_running": is_running,
+        "is_paused": lifecycle == "halted" or str(risk.get("hard_mode") or "") == "halted",
+        "pause_reason": str(risk.get("reason") or "") if lifecycle == "halted" else "",
+        "is_closing": lifecycle in {"unwind", "emergency_unwind", "expired"},
+        "paper_mode": bool(_runtime_v2._paper_mode),
+        "started_at": started_at,
+        "uptime_sec": round(max(0.0, now_ts - started_at), 2) if started_at else 0.0,
+        "session_limit": float((raw.get("config") or {}).get("session_budget_usd") or _runtime_v2._initial_usdc or 0.0),
+        "usdc_balance_pm": round(free_usdc + reserved_usdc, 4),
+        "usdc_free_pm": round(free_usdc, 4),
+        "portfolio_value": round(portfolio_value, 4),
+        "position_value_pm": round(position_value, 4),
+        "session_pnl": float(analytics.get("session_pnl") or 0.0),
+        "realized_pnl": float(analytics.get("spread_capture_usd") or 0.0),
+        "unrealized_pnl": round(float(analytics.get("session_pnl") or 0.0) - float(analytics.get("spread_capture_usd") or 0.0), 4),
+        "peak_pnl": float(analytics.get("session_pnl") or 0.0),
+        "total_fees": 0.0,
+        "total_volume": round(sum(float(f.get("price") or 0.0) * float(f.get("size") or 0.0) for f in recent_fills), 4),
+        "fill_count": int(analytics.get("fill_count") or fills_page.get("total") or 0),
+        "quote_count": 0,
+        "requote_count": 0,
+        "avg_spread_bps": round(spread_bps, 1),
+        "fair_value": {
+            "up": float(valuation.get("fv_up") or 0.0),
+            "dn": float(valuation.get("fv_dn") or 0.0),
+            "volatility": 0.0,
+            "binance_mid": feed_mid,
+        },
+        "quotes": {
+            "up_bid": quotes.get("up_bid"),
+            "up_ask": quotes.get("up_ask"),
+            "dn_bid": quotes.get("dn_bid"),
+            "dn_ask": quotes.get("dn_ask"),
+        },
+        "pm_prices": {
+            "up": float(up_mid or 0.0),
+            "dn": float(dn_mid or 0.0),
+        },
+        "inventory": {
+            "up_shares": up_shares,
+            "dn_shares": dn_shares,
+            "net_delta": round(up_shares - dn_shares, 4),
+            "usdc": round(free_usdc, 4),
+            "up_avg_entry": None,
+            "dn_avg_entry": None,
+        },
+        "recent_fills": recent_fills,
+        "active_orders_detail": _v2_active_orders_detail(),
+        "market_quality": market_quality,
+        "latency": None,
+        "market": {
+            "coin": _runtime_v2._coin or "BTC",
+            "timeframe": _runtime_v2._timeframe or "15m",
+            "strike": float(getattr(market_info, "strike", 0.0) or 0.0) if market_info else 0.0,
+            "time_remaining": float(market.get("time_left_sec") or 0.0),
+        },
+        "alerts": raw.get("alerts") or [],
+        "heartbeat": heartbeat,
+        "config": raw.get("config") or {},
+        "feeds": {},
+        "next_window_in": 0.0,
+    }
+
+
+def _dashboard_snapshot(preferred: str | None = None) -> dict[str, Any]:
+    engine = _dashboard_engine(preferred)
+    if engine == "v2":
+        return _dashboard_snapshot_from_v2(_runtime_v2.snapshot())
+    snap = dict(_runtime.snapshot())
+    snap["dashboard_engine"] = "legacy"
+    return snap
+
+
 # ── WebSocket Connection Manager ───────────────────────────────
 class ConnectionManager:
     """Manages active WebSocket connections with thread-safe broadcast."""
@@ -2951,7 +3110,7 @@ async def _ws_broadcast_loop():
         runtime_metrics.incr("web.ws_broadcast.loop")
         try:
             if _ws_manager.client_count > 0:
-                snap = _runtime.snapshot()
+                snap = _dashboard_snapshot()
                 await _ws_manager.broadcast(snap)
         except Exception as e:
             log.warning("WS broadcast error: %s", e)
@@ -3040,7 +3199,8 @@ async def mm_stop(request: Request):
 @app.get("/api/mm/state")
 async def mm_state(request: Request):
     _require_auth(request)
-    return _runtime.snapshot()
+    preferred = request.query_params.get("engine")
+    return _dashboard_snapshot(preferred)
 
 
 @app.post("/api/mm/config")
@@ -3123,6 +3283,9 @@ async def mm_validate_credentials(request: Request):
 @app.get("/api/mm/fills")
 async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
     _require_auth(request)
+    preferred = request.query_params.get("engine")
+    if _dashboard_engine(preferred) == "v2":
+        return _runtime_v2.fills_page(limit=limit, offset=offset)
     if _runtime.mm:
         fills = _runtime.mm.risk_mgr.fills
         total = len(fills)

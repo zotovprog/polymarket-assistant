@@ -24,6 +24,7 @@ let lastStartedAt = 0;
 
 // Last known state for order distance calc
 let lastState = {};
+let selectedEngine = 'v2';
 
 // Animation: previous values cache
 const _prevValues = {};
@@ -34,6 +35,20 @@ let _wsConnected = false;
 let _wsReconnectDelay = 1000;
 let _wsReconnectTimer = null;
 let _wsAuthKey = '';  // saved from login for WS auth
+
+function getSelectedEngine() {
+    const el = document.getElementById('engine-select');
+    if (el && el.value) selectedEngine = el.value;
+    return selectedEngine;
+}
+
+function getEffectiveEngine() {
+    return (lastState && lastState.dashboard_engine) || getSelectedEngine();
+}
+
+function dashboardStateUrl() {
+    return `${API_BASE}/api/mm/state?engine=${encodeURIComponent(getSelectedEngine())}`;
+}
 
 // ── Collapsible Sections ─────────────────────────────
 function toggleSection(el) {
@@ -82,13 +97,15 @@ function showDashboard() {
     document.getElementById('dashboard').classList.remove('hidden');
     initCharts();
     connectWebSocket();
+    pollState();
     // Auto-start watch mode for live feed data when no session is running
     autoWatch();
 }
 
 async function autoWatch() {
+    if (getSelectedEngine() !== 'legacy') return;
     try {
-        const r = await fetch(`${API_BASE}/api/mm/state`);
+        const r = await fetch(dashboardStateUrl());
         if (!r.ok) return;
         const s = await r.json();
         if (s.is_running) return; // Session active, no need for watch
@@ -262,7 +279,7 @@ function initCharts() {
 // ── Polling (fallback only) ──────────────────────────
 async function pollState() {
     try {
-        const r = await fetch(`${API_BASE}/api/mm/state`);
+        const r = await fetch(dashboardStateUrl());
         if (r.status === 401) {
             document.getElementById('dashboard').classList.add('hidden');
             document.getElementById('auth-screen').classList.remove('hidden');
@@ -324,6 +341,11 @@ function setTextAnimated(id, val) {
 function updateUI(s) {
     isRunning = s.is_running || false;
     isWatching = !isRunning && s.feeds && Object.keys(s.feeds).length > 0;
+    const engine = s.dashboard_engine || getSelectedEngine();
+    const engineSelect = document.getElementById('engine-select');
+    if (engineSelect && isRunning && engineSelect.value !== engine) engineSelect.value = engine;
+    const engineBadge = document.getElementById('engine-badge');
+    if (engineBadge) engineBadge.textContent = (isRunning ? engine : getSelectedEngine()).toUpperCase();
 
     // Sync paper mode toggle with backend only while running
     const paperToggle = document.getElementById('paper-mode');
@@ -679,7 +701,7 @@ function setQuoteAnimated(prefix, data) {
 
 function setConfigIfNotFocused(id, val) {
     const el = document.getElementById(id);
-    if (el && document.activeElement !== el) {
+    if (el && document.activeElement !== el && val !== undefined && val !== null) {
         el.value = val;
     }
 }
@@ -977,14 +999,17 @@ function updateCharts(s) {
 
 // ── Actions ──────────────────────────────────────────
 async function toggleMM() {
+    const engine = isRunning ? getEffectiveEngine() : getSelectedEngine();
     if (isRunning) {
-        await fetch(`${API_BASE}/api/mm/stop`, { method: 'POST' });
+        const stopUrl = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/stop`;
+        await fetch(stopUrl, { method: 'POST' });
     } else {
         const coin = document.getElementById('coin-select').value;
         const tf = document.getElementById('tf-select').value;
         const paper = document.getElementById('paper-mode').checked;
         const stake = parseFloat(document.getElementById('stake-usdc').value) || 10;
-        const r = await fetch(`${API_BASE}/api/mm/start`, {
+        const startUrl = engine === 'v2' ? `${API_BASE}/api/mmv2/start` : `${API_BASE}/api/mm/start`;
+        const r = await fetch(startUrl, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ coin, timeframe: tf, paper_mode: paper, initial_usdc: stake }),
@@ -999,18 +1024,22 @@ async function toggleMM() {
 }
 
 async function emergency() {
+    const engine = getEffectiveEngine();
     if (confirm('Emergency stop \u2014 cancel all orders?')) {
-        await fetch(`${API_BASE}/api/mm/emergency`, { method: 'POST' });
+        const url = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/emergency`;
+        await fetch(url, { method: 'POST' });
         setTimeout(pollState, 500);
     }
 }
 
 async function killAll() {
     if (!confirm('KILL ALL: Stop trading, sell all positions, disable auto-restart. Continue?')) return;
+    const engine = getEffectiveEngine();
     try {
-        const r = await fetch(`${API_BASE}/api/mm/kill`, { method: 'POST' });
+        const url = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/kill`;
+        const r = await fetch(url, { method: 'POST' });
         if (r.ok) {
-            showToast('Kill All executed \u2014 all positions liquidated', 'warning');
+            showToast(engine === 'v2' ? 'MM V2 stopped' : 'Kill All executed \u2014 all positions liquidated', 'warning');
         } else {
             showToast('Kill All failed', 'error');
         }
@@ -1021,6 +1050,22 @@ async function killAll() {
 }
 
 async function saveConfig() {
+    const engine = getSelectedEngine();
+    if (engine === 'v2') {
+        const budget = parseFloat(document.getElementById('stake-usdc').value) || 10;
+        const r = await fetch(`${API_BASE}/api/mmv2/config`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ session_budget_usd: budget }),
+        });
+        if (r.ok) {
+            showToast('V2 budget updated');
+        } else {
+            showToast('V2 config update failed', 'error');
+        }
+        setTimeout(pollState, 300);
+        return;
+    }
     const cfg = {
         half_spread_bps: parseFloat(document.getElementById('cfg-spread').value),
         min_spread_bps: parseFloat(document.getElementById('cfg-min-spread').value),
@@ -1058,6 +1103,10 @@ async function saveConfig() {
 }
 
 async function toggleEnabled() {
+    if (getSelectedEngine() === 'v2') {
+        showToast('V2 does not use legacy enabled toggle', 'warning');
+        return;
+    }
     const btn = document.getElementById('cfg-enabled-btn');
     const nowEnabled = btn.classList.contains('active');
     const r = await fetch(`${API_BASE}/api/mm/config`, {
@@ -1158,6 +1207,15 @@ async function validateCredentials() {
 // ── Enter key login ──────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
     checkAuth();
+    const engineSelect = document.getElementById('engine-select');
+    if (engineSelect) {
+        engineSelect.value = selectedEngine;
+        engineSelect.addEventListener('change', () => {
+            selectedEngine = engineSelect.value || 'v2';
+            pollState();
+            autoWatch();
+        });
+    }
     const paperToggle = document.getElementById('paper-mode');
     if (paperToggle) {
         paperToggle.addEventListener('change', function() {

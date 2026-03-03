@@ -33,6 +33,7 @@
             <div class="status-bar">
                 <span id="status-indicator" class="status-dot offline"></span>
                 <span id="status-text">Offline</span>
+                <span id="engine-badge" class="cred-badge">V2</span>
                 <span id="uptime" class="stat-small"></span>
                 <span class="feed-dots" id="header-feeds"></span>
                 <span class="ws-status" id="ws-status"><span class="ws-dot" id="ws-dot"></span><span id="ws-label">WS</span></span>
@@ -56,6 +57,10 @@
         <!-- 2. Settings Panel (full width, most prominent) -->
         <div class="settings-panel">
             <div class="settings-row-1">
+                <select id="engine-select" title="Trading engine">
+                    <option value="v2">V2</option>
+                    <option value="legacy">Legacy</option>
+                </select>
                 <select id="coin-select">
                     <option value="BTC">BTC</option>
                     <option value="ETH">ETH</option>

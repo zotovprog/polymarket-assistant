@@ -4,6 +4,7 @@ import importlib
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -279,3 +280,116 @@ async def test_mmv2_verification_route_delegates_to_runtime(monkeypatch):
     resp = await web_server.mmv2_verification_run(req=req, request=object())
     assert resp["ok"] is True
     assert resp["verification"]["kind"] == "pytest_v2"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._runtime, "_watching", False)
+    monkeypatch.setattr(web_server._runtime, "mm", None)
+    monkeypatch.setattr(web_server._runtime_v2, "_running", True)
+    monkeypatch.setattr(web_server._runtime_v2, "_coin", "BTC")
+    monkeypatch.setattr(web_server._runtime_v2, "_timeframe", "15m")
+    monkeypatch.setattr(web_server._runtime_v2, "_paper_mode", True)
+    monkeypatch.setattr(web_server._runtime_v2, "_initial_usdc", 50.0)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "fills_page",
+        lambda limit=20, offset=0: {
+            "fills": [
+                {
+                    "ts": time.time(),
+                    "side": "BUY",
+                    "token_type": "up",
+                    "price": 0.54,
+                    "size": 5.0,
+                    "fee": 0.0,
+                    "is_maker": True,
+                }
+            ],
+            "total": 1,
+        },
+    )
+    fake_market = SimpleNamespace(
+        strike=100000.0,
+        up_token_id="up-token",
+        dn_token_id="dn-token",
+    )
+    fake_mm = SimpleNamespace(
+        _started_at=time.time() - 10.0,
+        market=fake_market,
+        heartbeat=SimpleNamespace(stats={"running": True, "heartbeat_count": 3}),
+        gateway=SimpleNamespace(
+            order_mgr=SimpleNamespace(
+                get_active_orders_detail=lambda **_kwargs: [
+                    {
+                        "order_id": "abc",
+                        "side": "BUY",
+                        "price": 0.52,
+                        "size": 5.0,
+                        "notional": 2.6,
+                        "token": "UP",
+                        "age_sec": 1.0,
+                        "type": "quote",
+                    }
+                ]
+            )
+        ),
+    )
+    monkeypatch.setattr(web_server._runtime_v2, "mm_v2", fake_mm)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "app_version": "test",
+            "app_git_hash": "deadbeef",
+            "is_running": True,
+            "lifecycle": "quoting",
+            "market": {
+                "pm_mid_up": 0.53,
+                "pm_mid_dn": 0.47,
+                "up_best_bid": 0.52,
+                "up_best_ask": 0.54,
+                "dn_best_bid": 0.46,
+                "dn_best_ask": 0.48,
+                "up_bid_depth_usd": 100.0,
+                "up_ask_depth_usd": 100.0,
+                "dn_bid_depth_usd": 110.0,
+                "dn_ask_depth_usd": 90.0,
+                "market_quality_score": 0.82,
+                "market_tradeable": True,
+                "time_left_sec": 321.0,
+            },
+            "valuation": {"fv_up": 0.54, "fv_dn": 0.46},
+            "inventory": {
+                "up_shares": 5.0,
+                "dn_shares": 1.0,
+                "free_usdc": 40.0,
+                "reserved_usdc": 5.0,
+                "total_inventory_value_usd": 3.12,
+            },
+            "quotes": {
+                "up_bid": {"price": 0.52, "size": 5.0},
+                "up_ask": {"price": 0.56, "size": 5.0},
+                "dn_bid": {"price": 0.44, "size": 5.0},
+                "dn_ask": {"price": 0.48, "size": 5.0},
+            },
+            "risk": {"hard_mode": "none", "reason": ""},
+            "health": {"last_fallback_poll_count": 4},
+            "analytics": {"session_pnl": 1.23, "fill_count": 1, "spread_capture_usd": 0.0},
+            "alerts": [],
+            "config": {"session_budget_usd": 50.0},
+        },
+    )
+    web_server._runtime_v2.feed_state = SimpleNamespace(mid=99999.0)
+    req = SimpleNamespace(query_params={})
+    resp = await web_server.mm_state(request=req)
+    assert resp["dashboard_engine"] == "v2"
+    assert resp["market"]["coin"] == "BTC"
+    assert resp["market"]["timeframe"] == "15m"
+    assert resp["session_limit"] == pytest.approx(50.0)
+    assert resp["inventory"]["net_delta"] == pytest.approx(4.0)
+    assert resp["active_orders_detail"][0]["token"] == "UP"
+    assert resp["fill_count"] == 1
