@@ -4,7 +4,15 @@ from dataclasses import dataclass
 import math
 from typing import Literal
 
-from .config import HARMFUL_PRICE_TICKS_MAX, HARMFUL_SIZE_MULT_MIN, HELPFUL_PRICE_TICKS_MAX, HELPFUL_SIZE_MULT_MAX, MMConfigV2
+from .config import (
+    HARMFUL_PRICE_TICKS_MAX,
+    HARMFUL_SIZE_MULT_MIN,
+    HELPFUL_MIN_PROMOTION_MULT,
+    HELPFUL_PRICE_TICKS_MAX,
+    HELPFUL_SIZE_MULT_MAX,
+    MMConfigV2,
+    PAIR_SHARE_CLIP_PRICE_FLOOR,
+)
 from .types import PairInventoryState, PairMarketSnapshot, QuoteIntent, QuotePlan, RiskRegime
 
 
@@ -145,6 +153,49 @@ class QuotePolicyV2:
             price = max(price, float(best_bid) + tick_size)
         return price
 
+    @staticmethod
+    def _pair_reference_price(snapshot: PairMarketSnapshot) -> float:
+        return max(
+            PAIR_SHARE_CLIP_PRICE_FLOOR,
+            float(snapshot.fv_up or 0.0),
+            float(snapshot.fv_dn or 0.0),
+        )
+
+    @staticmethod
+    def _count_effects(built: dict[str, QuoteIntent | None]) -> tuple[int, int, int]:
+        helpful = 0
+        harmful = 0
+        neutral = 0
+        for intent in built.values():
+            if not intent:
+                continue
+            if intent.inventory_effect == "helpful":
+                helpful += 1
+            elif intent.inventory_effect == "harmful":
+                harmful += 1
+            else:
+                neutral += 1
+        return helpful, harmful, neutral
+
+    @staticmethod
+    def _quote_balance_state(
+        *,
+        built: dict[str, QuoteIntent | None],
+        helpful_count: int,
+        harmful_count: int,
+        harmful_blocked: bool,
+    ) -> str:
+        active_count = sum(1 for intent in built.values() if intent)
+        if harmful_blocked:
+            return "harmful_only_blocked"
+        if active_count == 4:
+            return "balanced"
+        if helpful_count > 0 and harmful_count == 0:
+            return "helpful_only"
+        if active_count > 0:
+            return "reduced"
+        return "none"
+
     def _make_intent(
         self,
         *,
@@ -152,6 +203,7 @@ class QuotePolicyV2:
         side: Literal["BUY", "SELL"],
         price: float,
         clip_usd: float,
+        share_cap: float,
         ctx: QuoteContext,
         role: str,
         post_only: bool,
@@ -159,26 +211,36 @@ class QuotePolicyV2:
         size_mult: float,
         price_adjust_ticks: int,
         size_override: float | None = None,
-    ) -> QuoteIntent | None:
+    ) -> tuple[QuoteIntent | None, str | None]:
         if size_override is not None:
-            size = size_override
+            size = float(size_override)
         elif side == "BUY":
-            size = self._buy_size_from_clip(clip_usd, price)
+            economic_size = self._buy_size_from_clip(clip_usd, price)
+            size = min(economic_size, share_cap)
         else:
-            size = self._sell_size_from_clip(clip_usd, price)
+            economic_size = self._sell_size_from_clip(clip_usd, price)
+            size = min(economic_size, share_cap)
         size = round(max(0.0, float(size)), 2)
+        if 0.0 < size < ctx.min_order_size and inventory_effect == "helpful":
+            promoted = round(float(ctx.min_order_size), 2)
+            if promoted <= round(max(0.0, share_cap * HELPFUL_MIN_PROMOTION_MULT), 2):
+                size = promoted
         if size < ctx.min_order_size:
-            return None
-        return QuoteIntent(
-            token=token,
-            side=side,
-            price=_round_price(price, ctx.tick_size),
-            size=size,
-            quote_role=role,  # type: ignore[arg-type]
-            post_only=post_only,
-            inventory_effect=inventory_effect,
-            size_mult=size_mult,
-            price_adjust_ticks=price_adjust_ticks,
+            return None, "below_min_order_size"
+        return (
+            QuoteIntent(
+                token=token,
+                side=side,
+                price=_round_price(price, ctx.tick_size),
+                size=size,
+                quote_role=role,  # type: ignore[arg-type]
+                post_only=post_only,
+                inventory_effect=inventory_effect,
+                size_mult=size_mult,
+                price_adjust_ticks=price_adjust_ticks,
+                suppressed_reason=None,
+            ),
+            None,
         )
 
     def generate(
@@ -197,6 +259,8 @@ class QuotePolicyV2:
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
         mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
         pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
+        pair_reference_price = self._pair_reference_price(snapshot)
+        base_share_clip = max(0.0, per_quote_budget / pair_reference_price)
 
         up_bid_price = pair_mid - spread
         up_ask_price = pair_mid + spread
@@ -211,6 +275,7 @@ class QuotePolicyV2:
             "dn_ask": ("SELL", snapshot.dn_token_id, dn_ask_price, snapshot.dn_best_bid, snapshot.dn_best_ask, "base_ask"),
         }
         built: dict[str, QuoteIntent | None] = {}
+        suppressed_reasons: dict[str, str] = {}
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
             effect = self._classify_inventory_effect(
@@ -228,6 +293,7 @@ class QuotePolicyV2:
                 dn_token_id=snapshot.dn_token_id,
             ):
                 built[slot] = None
+                suppressed_reasons[slot] = "pair-expanding intent disabled in unwind"
                 continue
             ticks = self._price_adjust_ticks(effect, pressure)
             adjusted_price = base_price
@@ -244,11 +310,12 @@ class QuotePolicyV2:
             )
             size_mult = self._size_multiplier(effect, pressure)
             role_name = role if risk.soft_mode != "unwind" else "unwind"
-            built[slot] = self._make_intent(
+            intent, suppressed = self._make_intent(
                 token=token,
                 side=side,
                 price=adjusted_price,
                 clip_usd=per_quote_budget * size_mult,
+                share_cap=max(0.0, base_share_clip * size_mult),
                 ctx=ctx,
                 role=role_name,
                 post_only=True,
@@ -256,6 +323,9 @@ class QuotePolicyV2:
                 size_mult=size_mult,
                 price_adjust_ticks=ticks,
             )
+            built[slot] = intent
+            if suppressed:
+                suppressed_reasons[slot] = suppressed
 
         pair_ceiling = 1.0 - ctx.tick_size
         if built["up_bid"] and built["dn_ask"] and built["up_bid"].price + built["dn_ask"].price > pair_ceiling:
@@ -269,11 +339,12 @@ class QuotePolicyV2:
             regime = "emergency_unwind"
             if inventory.up_shares > 0:
                 built["up_bid"] = None
-                built["up_ask"] = self._make_intent(
+                built["up_ask"], _ = self._make_intent(
                     token=snapshot.up_token_id,
                     side="SELL",
                     price=float(snapshot.up_best_bid or max(0.01, up_ask_price)),
                     clip_usd=per_quote_budget,
+                    share_cap=max(0.0, inventory.up_shares),
                     ctx=ctx,
                     role="emergency_unwind",
                     post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
@@ -287,11 +358,12 @@ class QuotePolicyV2:
                 built["up_ask"] = None
             if inventory.dn_shares > 0:
                 built["dn_bid"] = None
-                built["dn_ask"] = self._make_intent(
+                built["dn_ask"], _ = self._make_intent(
                     token=snapshot.dn_token_id,
                     side="SELL",
                     price=float(snapshot.dn_best_bid or max(0.01, dn_ask_price)),
                     clip_usd=per_quote_budget,
+                    share_cap=max(0.0, inventory.dn_shares),
                     ctx=ctx,
                     role="emergency_unwind",
                     post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
@@ -304,6 +376,30 @@ class QuotePolicyV2:
                 built["dn_bid"] = None
                 built["dn_ask"] = None
 
+        helpful_count, harmful_count, neutral_count = self._count_effects(built)
+        harmful_blocked = False
+        if (
+            risk.hard_mode == "none"
+            and risk.inventory_side != "flat"
+            and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            and helpful_count == 0
+            and harmful_count > 0
+        ):
+            for slot, intent in list(built.items()):
+                if intent and intent.inventory_effect == "harmful":
+                    built[slot] = None
+                    suppressed_reasons[slot] = "harmful blocked without helpful viability"
+            harmful_blocked = True
+            helpful_count, harmful_count, neutral_count = self._count_effects(built)
+            reason = "helpful intents not viable; harmful blocked"
+
+        quote_balance_state = self._quote_balance_state(
+            built=built,
+            helpful_count=helpful_count,
+            harmful_count=harmful_count,
+            harmful_blocked=harmful_blocked,
+        )
+
         return QuotePlan(
             up_bid=built["up_bid"],
             up_ask=built["up_ask"],
@@ -311,4 +407,6 @@ class QuotePolicyV2:
             dn_ask=built["dn_ask"],
             regime=regime,
             reason=reason,
+            quote_balance_state=quote_balance_state,  # type: ignore[arg-type]
+            suppressed_reasons=suppressed_reasons,
         )

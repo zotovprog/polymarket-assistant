@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+
+BASE = os.path.dirname(os.path.dirname(__file__))
+SRC = os.path.join(BASE, "src")
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
+if BASE not in sys.path:
+    sys.path.insert(0, BASE)
+
+from mm_v2.config import MMConfigV2
+from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
+from mm_v2.risk_kernel import HardSafetyKernel
+from mm_v2.state_machine import StateMachineV2
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
+
+
+def _snapshot(**overrides) -> PairMarketSnapshot:
+    payload = dict(
+        ts=time.time(),
+        market_id="btc-15m",
+        up_token_id="up-token",
+        dn_token_id="dn-token",
+        time_left_sec=900.0,
+        fv_up=0.54,
+        fv_dn=0.46,
+        fv_confidence=0.9,
+        pm_mid_up=0.53,
+        pm_mid_dn=0.47,
+        up_best_bid=0.52,
+        up_best_ask=0.54,
+        dn_best_bid=0.46,
+        dn_best_ask=0.48,
+        up_bid_depth_usd=200.0,
+        up_ask_depth_usd=200.0,
+        dn_bid_depth_usd=200.0,
+        dn_ask_depth_usd=200.0,
+        market_quality_score=0.9,
+        market_tradeable=True,
+        divergence_up=0.01,
+        divergence_dn=0.01,
+    )
+    payload.update(overrides)
+    return PairMarketSnapshot(**payload)
+
+
+def _inventory(**overrides) -> PairInventoryState:
+    payload = dict(
+        up_shares=0.0,
+        dn_shares=0.0,
+        free_usdc=50.0,
+        reserved_usdc=0.0,
+        pending_buy_up=0.0,
+        pending_buy_dn=0.0,
+        pending_sell_up=0.0,
+        pending_sell_dn=0.0,
+        paired_qty=0.0,
+        excess_up_qty=0.0,
+        excess_dn_qty=0.0,
+        paired_value_usd=0.0,
+        excess_up_value_usd=0.0,
+        excess_dn_value_usd=0.0,
+        total_inventory_value_usd=0.0,
+        excess_value_usd=0.0,
+        signed_excess_value_usd=0.0,
+        inventory_pressure_abs=0.0,
+        inventory_pressure_signed=0.0,
+    )
+    payload.update(overrides)
+    return PairInventoryState(**payload)
+
+
+def _risk_and_plan(cfg: MMConfigV2, snapshot: PairMarketSnapshot, inventory: PairInventoryState):
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    viability = QuoteViabilitySummary(
+        any_quote=any([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+        four_quotes=all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+        helpful_count=sum(1 for q in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask) if q and q.inventory_effect == "helpful"),
+        harmful_count=sum(1 for q in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask) if q and q.inventory_effect == "harmful"),
+        helpful_only=False,
+        harmful_only=False,
+        four_quote_presence_ratio=1.0 if all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]) else 0.25,
+    )
+    viability.helpful_only = viability.helpful_count > 0 and viability.harmful_count == 0
+    viability.harmful_only = viability.harmful_count > 0 and viability.helpful_count == 0
+    return risk, plan, viability
+
+
+def test_dn_excess_near_endpoint_below_hard_cap_keeps_safe_plan():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.99,
+        fv_dn=0.01,
+        pm_mid_up=0.99,
+        pm_mid_dn=0.01,
+        up_best_bid=0.98,
+        up_best_ask=0.99,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(
+        dn_shares=40.0,
+        excess_dn_qty=40.0,
+        excess_dn_value_usd=8.0,
+        excess_value_usd=8.0,
+        signed_excess_value_usd=-8.0,
+        total_inventory_value_usd=8.0,
+    )
+    risk, plan, _ = _risk_and_plan(cfg, snapshot, inventory)
+    assert risk.hard_mode == "none"
+    assert risk.soft_mode in {"inventory_skewed", "defensive"}
+    assert plan.quote_balance_state in {"balanced", "helpful_only", "reduced", "harmful_only_blocked"}
+    assert not (plan.quote_balance_state == "harmful_only_blocked" and plan.up_bid is None and plan.dn_ask is None)
+
+
+def test_helpful_quotes_can_be_restored_by_promotion():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=6.0,
+        excess_value_usd=6.0,
+        signed_excess_value_usd=-6.0,
+        total_inventory_value_usd=6.0,
+    )
+    _, plan, viability = _risk_and_plan(cfg, snapshot, inventory)
+    assert viability.helpful_count >= 1
+    assert not viability.harmful_only
+
+
+def test_no_progress_for_30s_with_helpful_quotes_stays_defensive():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk, plan, viability = _risk_and_plan(cfg, snapshot, inventory)
+    sm = StateMachineV2(cfg)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = 3.0
+    result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    assert result.lifecycle == "defensive"
+    assert result.no_progress is True
+
+
+def test_no_progress_for_30s_and_no_helpful_quotes_enters_unwind():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk, _, _ = _risk_and_plan(cfg, snapshot, inventory)
+    sm = StateMachineV2(cfg)
+    bad_viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=0,
+        harmful_count=2,
+        helpful_only=False,
+        harmful_only=True,
+        four_quote_presence_ratio=0.10,
+    )
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=bad_viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=bad_viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=bad_viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = 3.0
+    for _ in range(3):
+        result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=bad_viability)
+    assert result.lifecycle == "unwind"
+
+
+def test_hard_cap_exceeded_disables_pair_expanding_intents_without_halt():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5)
+    risk, plan, _ = _risk_and_plan(cfg, snapshot, inventory)
+    assert risk.target_soft_mode == "unwind"
+    assert risk.hard_mode == "none"
+    assert plan.dn_bid is None
+    assert plan.up_ask is None

@@ -73,6 +73,7 @@ class QuoteIntent:
     inventory_effect: Literal["helpful", "neutral", "harmful"] = "neutral"
     size_mult: float = 1.0
     price_adjust_ticks: int = 0
+    suppressed_reason: str | None = None
 
 
 @dataclass
@@ -83,6 +84,14 @@ class QuotePlan:
     dn_ask: QuoteIntent | None
     regime: str
     reason: str
+    quote_balance_state: Literal[
+        "balanced",
+        "helpful_only",
+        "harmful_only_blocked",
+        "reduced",
+        "none",
+    ] = "none"
+    suppressed_reasons: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,6 +102,7 @@ class RiskRegime:
     inventory_pressure: float
     edge_score: float
     drawdown_pct_budget: float
+    target_soft_mode: Literal["normal", "inventory_skewed", "defensive", "unwind"] = "normal"
     inventory_side: Literal["flat", "up", "dn"] = "flat"
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
@@ -128,7 +138,38 @@ class AnalyticsState:
     four_quote_presence_ratio: float = 0.0
     helpful_quote_count: int = 0
     harmful_quote_count: int = 0
+    quote_balance_state: str = "none"
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class QuoteViabilitySummary:
+    any_quote: bool = False
+    four_quotes: bool = False
+    helpful_count: int = 0
+    harmful_count: int = 0
+    helpful_only: bool = False
+    harmful_only: bool = False
+    four_quote_presence_ratio: float = 0.0
+
+
+@dataclass
+class SoftTransitionResult:
+    lifecycle: Literal[
+        "bootstrapping",
+        "quoting",
+        "inventory_skewed",
+        "defensive",
+        "unwind",
+        "emergency_unwind",
+        "expired",
+        "halted",
+    ]
+    effective_soft_mode: Literal["normal", "inventory_skewed", "defensive", "unwind"]
+    target_soft_mode: Literal["normal", "inventory_skewed", "defensive", "unwind"]
+    progress_ratio: float = 0.0
+    no_progress: bool = False
+    reason: str = ""
 
 
 @dataclass

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import time
 from typing import Any
 
@@ -18,7 +19,17 @@ from .reconcile import ReconcileV2
 from .risk_kernel import HardSafetyKernel
 from .state_api import serialize_engine_state
 from .state_machine import StateMachineV2
-from .types import AnalyticsState, EngineState, ExecutionState, HealthState, PairInventoryState, PairMarketSnapshot, QuotePlan, RiskRegime
+from .types import (
+    AnalyticsState,
+    EngineState,
+    ExecutionState,
+    HealthState,
+    PairInventoryState,
+    PairMarketSnapshot,
+    QuotePlan,
+    QuoteViabilitySummary,
+    RiskRegime,
+)
 
 
 class MarketMakerV2:
@@ -75,6 +86,7 @@ class MarketMakerV2:
         self._last_risk = RiskRegime(
             soft_mode="normal",
             hard_mode="none",
+            target_soft_mode="normal",
             reason="boot",
             inventory_pressure=0.0,
             edge_score=0.0,
@@ -93,6 +105,34 @@ class MarketMakerV2:
             failure_threshold=3,
             on_failure=self._on_heartbeat_failure,
             should_send=lambda: bool(self.gateway.active_order_ids()),
+        )
+
+    def _provisional_quote_viability(self, plan: QuotePlan) -> QuoteViabilitySummary:
+        helpful = 0
+        harmful = 0
+        active = 0
+        for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask):
+            if not intent:
+                continue
+            active += 1
+            if intent.inventory_effect == "helpful":
+                helpful += 1
+            elif intent.inventory_effect == "harmful":
+                harmful += 1
+        _, rolling_four_quote_presence = self._quote_presence_ratio(
+            extra_present=(
+                any([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+                all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+            )
+        )
+        return QuoteViabilitySummary(
+            any_quote=active > 0,
+            four_quotes=active == 4,
+            helpful_count=helpful,
+            harmful_count=harmful,
+            helpful_only=helpful > 0 and harmful == 0,
+            harmful_only=harmful > 0 and helpful == 0,
+            four_quote_presence_ratio=rolling_four_quote_presence,
         )
 
     def set_market(self, market: MarketInfo) -> None:
@@ -228,12 +268,15 @@ class MarketMakerV2:
                 return max(0.0, ts - start_ts)
         return 0.0
 
-    def _quote_presence_ratio(self) -> tuple[float, float]:
-        if not self._quote_presence_history:
+    def _quote_presence_ratio(self, extra_present: tuple[bool, bool] | None = None) -> tuple[float, float]:
+        history = list(self._quote_presence_history)
+        if extra_present is not None:
+            history.append((time.time(), extra_present))
+        if not history:
             return 0.0, 0.0
-        total = len(self._quote_presence_history)
-        any_quote = sum(1 for _, present in self._quote_presence_history if present[0])
-        four_quote = sum(1 for _, present in self._quote_presence_history if present[1])
+        total = len(history)
+        any_quote = sum(1 for _, present in history if present[0])
+        four_quote = sum(1 for _, present in history if present[1])
         return any_quote / total, four_quote / total
 
     async def _tick(self) -> None:
@@ -283,15 +326,29 @@ class MarketMakerV2:
         )
         inventory.inventory_pressure_abs = risk.inventory_pressure_abs
         inventory.inventory_pressure_signed = risk.inventory_pressure_signed
-        lifecycle = self.state_machine.transition(
-            snapshot=snapshot,
-            inventory=inventory,
-            risk=risk,
-        )
         ctx = QuoteContext(
             tick_size=float(self.market.tick_size),
             min_order_size=float(self.market.min_order_size),
         )
+        provisional_plan = QuotePolicyV2(self.config).generate(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            ctx=ctx,
+        )
+        transition = self.state_machine.transition(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            viability=self._provisional_quote_viability(provisional_plan),
+        )
+        effective_risk = replace(
+            risk,
+            soft_mode=transition.effective_soft_mode,
+            target_soft_mode=transition.target_soft_mode,
+            reason=transition.reason or risk.reason,
+        )
+        lifecycle = transition.lifecycle
         if lifecycle in {"halted", "expired"}:
             await self.gateway.cancel_all()
             plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
@@ -299,7 +356,7 @@ class MarketMakerV2:
             plan = QuotePolicyV2(self.config).generate(
                 snapshot=snapshot,
                 inventory=inventory,
-                risk=risk,
+                risk=effective_risk,
                 ctx=ctx,
             )
             await self.execution_policy.sync(plan)
@@ -344,6 +401,7 @@ class MarketMakerV2:
             four_quote_presence_ratio=four_quote_presence_ratio,
             helpful_quote_count=helpful_quote_count,
             harmful_quote_count=harmful_quote_count,
+            quote_balance_state=plan.quote_balance_state,
             recent_fills=[
                 {
                     "ts": f.ts,
@@ -368,7 +426,7 @@ class MarketMakerV2:
 
         self._last_snapshot = snapshot
         self._last_inventory = inventory
-        self._last_risk = risk
+        self._last_risk = effective_risk
         self._last_plan = plan
         self._last_analytics = analytics
         self._last_health = health

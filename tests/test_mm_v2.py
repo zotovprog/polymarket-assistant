@@ -23,7 +23,7 @@ from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
 
 
 def _market() -> MarketInfo:
@@ -243,31 +243,36 @@ def test_hard_excess_transitions_state_machine_to_unwind():
         analytics=AnalyticsState(),
         health=HealthState(),
     )
-    lifecycle = sm.transition(
+    transition = sm.transition(
         snapshot=_snapshot(),
         inventory=inventory,
         risk=risk,
+        viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1),
     )
-    assert lifecycle == "quoting"
-    lifecycle = sm.transition(
+    assert transition.lifecycle == "quoting"
+    transition = sm.transition(
         snapshot=_snapshot(),
         inventory=inventory,
         risk=risk,
+        viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1),
     )
-    assert lifecycle == "inventory_skewed"
-    lifecycle = sm.transition(
+    assert transition.lifecycle == "inventory_skewed"
+    transition = sm.transition(
         snapshot=_snapshot(),
         inventory=inventory,
         risk=risk,
+        viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1),
     )
-    assert lifecycle == "defensive"
-    lifecycle = sm.transition(
+    assert transition.lifecycle == "defensive"
+    transition = sm.transition(
         snapshot=_snapshot(),
         inventory=inventory,
         risk=risk,
+        viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=0, harmful_count=2),
     )
-    assert risk.soft_mode == "unwind"
-    assert lifecycle == "unwind"
+    assert risk.target_soft_mode == "unwind"
+    assert transition.lifecycle == "unwind"
+    assert transition.effective_soft_mode == "unwind"
 
 
 @pytest.mark.asyncio
@@ -281,6 +286,7 @@ async def test_dashboard_state_surfaces_inventory_pressure_fields(monkeypatch):
             "lifecycle": "inventory_skewed",
             "risk": {
                 "soft_mode": "inventory_skewed",
+                "target_soft_mode": "defensive",
                 "inventory_side": "dn",
                 "inventory_pressure_abs": 0.42,
                 "inventory_pressure_signed": -0.42,
@@ -292,6 +298,7 @@ async def test_dashboard_state_surfaces_inventory_pressure_fields(monkeypatch):
                 "four_quote_presence_ratio": 0.75,
                 "helpful_quote_count": 2,
                 "harmful_quote_count": 2,
+                "quote_balance_state": "balanced",
             },
         },
     )
@@ -300,6 +307,7 @@ async def test_dashboard_state_surfaces_inventory_pressure_fields(monkeypatch):
     assert resp["risk"]["inventory_pressure_abs"] == pytest.approx(0.42)
     assert resp["analytics"]["excess_value_usd"] == pytest.approx(6.3)
     assert resp["analytics"]["inventory_half_life_sec"] == pytest.approx(28.0)
+    assert resp["risk"]["target_soft_mode"] == "defensive"
 
 
 @pytest.mark.asyncio
@@ -317,9 +325,11 @@ async def test_mmv2_state_exposes_quote_inventory_effect(monkeypatch):
                     "side": "BUY",
                     "price": 0.52,
                     "size": 5.0,
+                    "active": True,
                     "inventory_effect": "helpful",
                     "size_mult": 1.4,
                     "price_adjust_ticks": 2,
+                    "suppressed_reason": None,
                 }
             },
             "risk": {"soft_mode": "inventory_skewed"},
@@ -329,6 +339,65 @@ async def test_mmv2_state_exposes_quote_inventory_effect(monkeypatch):
     assert resp["quotes"]["up_bid"]["inventory_effect"] == "helpful"
     assert resp["quotes"]["up_bid"]["size_mult"] == pytest.approx(1.4)
     assert resp["quotes"]["up_bid"]["price_adjust_ticks"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mmv2_state_exposes_target_and_effective_soft_modes(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "risk": {
+                "soft_mode": "defensive",
+                "target_soft_mode": "inventory_skewed",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["risk"]["soft_mode"] == "defensive"
+    assert resp["risk"]["target_soft_mode"] == "inventory_skewed"
+
+
+@pytest.mark.asyncio
+async def test_mmv2_state_exposes_quote_balance_state(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "analytics": {"quote_balance_state": "harmful_only_blocked"},
+            "quote_balance_state": "harmful_only_blocked",
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["quote_balance_state"] == "harmful_only_blocked"
+    assert resp["quote_balance_state"] == "harmful_only_blocked"
+
+
+@pytest.mark.asyncio
+async def test_mmv2_state_exposes_quote_suppressed_reason(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "quotes": {
+                "dn_bid": {
+                    "active": False,
+                    "suppressed_reason": "harmful blocked without helpful viability",
+                }
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["quotes"]["dn_bid"]["suppressed_reason"] == "harmful blocked without helpful viability"
 
 
 @pytest.mark.asyncio

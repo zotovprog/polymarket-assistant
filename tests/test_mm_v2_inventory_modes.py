@@ -14,7 +14,8 @@ if BASE not in sys.path:
 
 from mm_v2.config import MMConfigV2
 from mm_v2.risk_kernel import HardSafetyKernel
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot
+from mm_v2.state_machine import StateMachineV2
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -157,3 +158,128 @@ def test_hard_drawdown_enters_emergency_unwind_not_soft_defensive():
     )
     assert risk.hard_mode == "emergency_unwind"
     assert risk.soft_mode in {"defensive", "inventory_skewed"}
+
+
+def test_below_hard_cap_no_progress_does_not_force_unwind_while_helpful_quotes_exist():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=True,
+        helpful_count=2,
+        harmful_count=2,
+        helpful_only=False,
+        harmful_only=False,
+        four_quote_presence_ratio=0.80,
+    )
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = 3.0
+    result = sm.transition(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        risk=risk,
+        viability=viability,
+    )
+    assert result.lifecycle == "defensive"
+    assert result.no_progress is True
+
+
+def test_defensive_enters_unwind_after_no_progress_and_missing_helpful_quotes():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    bad_viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=0,
+        harmful_count=2,
+        helpful_only=False,
+        harmful_only=True,
+        four_quote_presence_ratio=0.10,
+    )
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=bad_viability)
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=bad_viability)
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk, viability=bad_viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = 3.0
+    for _ in range(3):
+        result = sm.transition(
+            snapshot=_snapshot(),
+            inventory=inventory,
+            risk=risk,
+            viability=bad_viability,
+        )
+    assert result.lifecycle == "unwind"
+    assert result.effective_soft_mode == "unwind"
+
+
+def test_target_soft_mode_can_be_defensive_while_effective_soft_mode_stays_inventory_skewed_during_hysteresis():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    inv_skewed = _inventory(excess_dn_value_usd=2.0, excess_value_usd=2.0, signed_excess_value_usd=-2.0)
+    risk_skewed = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inv_skewed,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    sm.transition(snapshot=_snapshot(), inventory=inv_skewed, risk=risk_skewed)
+    result = sm.transition(snapshot=_snapshot(), inventory=inv_skewed, risk=risk_skewed)
+    assert result.lifecycle == "inventory_skewed"
+
+    inv_def = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0)
+    risk_def = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inv_def,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    result = sm.transition(snapshot=_snapshot(), inventory=inv_def, risk=risk_def)
+    assert result.target_soft_mode == "defensive"
+    assert result.effective_soft_mode == "inventory_skewed"
+
+
+def test_effective_soft_mode_matches_lifecycle_mapping():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    inventory = _inventory(excess_dn_value_usd=2.0, excess_value_usd=2.0, signed_excess_value_usd=-2.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk)
+    result = sm.transition(snapshot=_snapshot(), inventory=inventory, risk=risk)
+    assert result.lifecycle == "inventory_skewed"
+    assert result.effective_soft_mode == "inventory_skewed"

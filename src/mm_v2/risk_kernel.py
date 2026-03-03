@@ -139,6 +139,7 @@ class HardSafetyKernel:
         return RiskRegime(
             soft_mode=soft.target_soft_mode,  # type: ignore[arg-type]
             hard_mode=hard_mode,  # type: ignore[arg-type]
+            target_soft_mode=soft.target_soft_mode,  # type: ignore[arg-type]
             reason=hard_reason or soft.soft_reason,
             inventory_pressure=soft.pressure_signed,
             edge_score=edge_score,

@@ -4,6 +4,8 @@ import os
 import sys
 import time
 
+import pytest
+
 
 BASE = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(BASE, "src")
@@ -169,3 +171,164 @@ def test_pair_complementarity_survives_inventory_skew_adjustment():
     assert plan.dn_bid is not None and plan.up_ask is not None
     assert plan.up_bid.price + plan.dn_ask.price <= 0.99
     assert plan.dn_bid.price + plan.up_ask.price <= 0.99
+
+
+def test_endpoint_prices_cap_harmful_share_size_below_explosive_levels():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.99,
+        fv_dn=0.01,
+        pm_mid_up=0.99,
+        pm_mid_dn=0.01,
+        up_best_bid=0.98,
+        up_best_ask=0.99,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(excess_dn_value_usd=6.0, excess_value_usd=6.0, signed_excess_value_usd=-6.0, free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    if plan.up_ask is not None:
+        assert plan.up_ask.size <= 12.0
+    if plan.dn_bid is not None:
+        assert plan.dn_bid.size <= 12.0
+
+
+def test_helpful_intent_is_promoted_to_min_order_size_when_safe():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5, free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_bid is not None
+    assert plan.up_bid.inventory_effect == "helpful"
+    assert plan.up_bid.size >= 5.0
+
+
+def test_harmful_intents_are_blocked_when_no_helpful_intents_survive(monkeypatch):
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    policy = QuotePolicyV2(cfg)
+    snapshot = _snapshot(
+        fv_up=0.99,
+        fv_dn=0.01,
+        pm_mid_up=0.99,
+        pm_mid_dn=0.01,
+        up_best_bid=0.98,
+        up_best_ask=0.99,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0, free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+
+    original_make_intent = policy._make_intent
+
+    def _fake_make_intent(**kwargs):
+        if kwargs["inventory_effect"] == "helpful":
+            return None, "below_min_order_size"
+        return original_make_intent(**kwargs)
+
+    monkeypatch.setattr(policy, "_make_intent", _fake_make_intent)
+    plan = policy.generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.quote_balance_state == "harmful_only_blocked"
+    assert plan.up_ask is None or plan.dn_bid is None
+    assert plan.suppressed_reasons["up_ask"] == "harmful blocked without helpful viability"
+
+
+def test_effective_soft_mode_drives_quote_generation_not_target_mode():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    inventory = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    risk.soft_mode = "unwind"
+    risk.target_soft_mode = "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.regime == "unwind"
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+
+
+def test_quote_state_includes_suppressed_reason_for_blocked_harmful_intents(monkeypatch):
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    policy = QuotePolicyV2(cfg)
+    snapshot = _snapshot(
+        fv_up=0.99,
+        fv_dn=0.01,
+        pm_mid_up=0.99,
+        pm_mid_dn=0.01,
+        up_best_bid=0.98,
+        up_best_ask=0.99,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0, free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+
+    original_make_intent = policy._make_intent
+
+    def _fake_make_intent(**kwargs):
+        if kwargs["inventory_effect"] == "helpful":
+            return None, "below_min_order_size"
+        return original_make_intent(**kwargs)
+
+    monkeypatch.setattr(policy, "_make_intent", _fake_make_intent)
+    plan = policy.generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.suppressed_reasons["dn_bid"] == "harmful blocked without helpful viability"

@@ -2859,6 +2859,10 @@ class MMRuntimeV2(MMRuntime):
                 "pytest",
                 "-q",
                 "tests/test_mm_v2.py",
+                "tests/test_mm_v2_inventory_modes.py",
+                "tests/test_mm_v2_quote_skew.py",
+                "tests/test_mm_v2_paper_multiwindow.py",
+                "tests/test_mm_v2_runtime_skew_flow.py",
             ]
         if kind == "replay_v2":
             return [
@@ -2943,6 +2947,12 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
     health = raw.get("health") or {}
     analytics = raw.get("analytics") or {}
     quotes = raw.get("quotes") or {}
+    quotes = {
+        key: value
+        if isinstance(value, dict) and value.get("active", True) and "price" in value and "size" in value
+        else None
+        for key, value in quotes.items()
+    }
     mm = _runtime_v2.mm_v2
     market_info = getattr(mm, "market", None) if mm else None
     heartbeat = getattr(getattr(mm, "heartbeat", None), "stats", {}) or {}

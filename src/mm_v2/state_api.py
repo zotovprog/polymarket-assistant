@@ -7,6 +7,20 @@ from .config import MMConfigV2
 from .types import EngineState, PairMarketSnapshot
 
 
+def _serialize_quote(raw: Any, *, suppressed_reason: str | None = None) -> dict[str, Any] | None:
+    if raw is None:
+        if not suppressed_reason:
+            return None
+        return {
+            "active": False,
+            "suppressed_reason": suppressed_reason,
+        }
+    payload = asdict(raw)
+    payload["active"] = True
+    payload["suppressed_reason"] = suppressed_reason
+    return payload
+
+
 def serialize_engine_state(
     state: EngineState,
     *,
@@ -29,10 +43,10 @@ def serialize_engine_state(
         "inventory_pressure_signed": round(state.inventory.inventory_pressure_signed, 6),
     }
     quotes = {
-        "up_bid": asdict(state.current_quotes.up_bid) if state.current_quotes.up_bid else None,
-        "up_ask": asdict(state.current_quotes.up_ask) if state.current_quotes.up_ask else None,
-        "dn_bid": asdict(state.current_quotes.dn_bid) if state.current_quotes.dn_bid else None,
-        "dn_ask": asdict(state.current_quotes.dn_ask) if state.current_quotes.dn_ask else None,
+        "up_bid": _serialize_quote(state.current_quotes.up_bid, suppressed_reason=state.current_quotes.suppressed_reasons.get("up_bid")),
+        "up_ask": _serialize_quote(state.current_quotes.up_ask, suppressed_reason=state.current_quotes.suppressed_reasons.get("up_ask")),
+        "dn_bid": _serialize_quote(state.current_quotes.dn_bid, suppressed_reason=state.current_quotes.suppressed_reasons.get("dn_bid")),
+        "dn_ask": _serialize_quote(state.current_quotes.dn_ask, suppressed_reason=state.current_quotes.suppressed_reasons.get("dn_ask")),
     }
     return {
         "app_version": app_version,
@@ -55,6 +69,7 @@ def serialize_engine_state(
         "risk": asdict(state.risk),
         "health": asdict(state.health),
         "analytics": asdict(state.analytics),
+        "quote_balance_state": state.current_quotes.quote_balance_state,
         "alerts": list(state.alerts),
         "config": config.to_dict(),
     }

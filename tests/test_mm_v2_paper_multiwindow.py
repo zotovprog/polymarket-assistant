@@ -16,7 +16,7 @@ from mm_v2.config import MMConfigV2
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -105,6 +105,7 @@ def test_one_sided_dn_fill_below_hard_cap_keeps_four_quotes():
     assert risk.soft_mode == "inventory_skewed"
     assert risk.hard_mode == "none"
     assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
+    assert plan.quote_balance_state == "balanced"
     assert plan.dn_bid.inventory_effect == "harmful"
     assert plan.dn_ask.inventory_effect == "helpful"
 
@@ -123,6 +124,7 @@ def test_repeated_dn_accumulation_enters_defensive_but_keeps_quotes():
     risk, plan = _evaluate(cfg, snapshot, inventory)
     assert risk.soft_mode == "defensive"
     assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
+    assert plan.quote_balance_state == "balanced"
     assert plan.up_bid.size_mult > plan.dn_bid.size_mult
 
 
@@ -139,16 +141,16 @@ def test_excess_beyond_hard_cap_moves_into_unwind_without_halt():
         total_inventory_value_usd=4.5,
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
-    lifecycle = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    assert lifecycle == "quoting"
-    lifecycle = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    assert lifecycle == "inventory_skewed"
-    lifecycle = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    assert lifecycle == "defensive"
-    lifecycle = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
+    transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
+    assert transition.lifecycle == "quoting"
+    transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
+    assert transition.lifecycle == "inventory_skewed"
+    transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
+    assert transition.lifecycle == "defensive"
+    transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=0, harmful_count=2, harmful_only=True, four_quote_presence_ratio=0.10))
     assert risk.hard_mode == "none"
-    assert risk.soft_mode == "unwind"
-    assert lifecycle == "unwind"
+    assert risk.target_soft_mode == "unwind"
+    assert transition.lifecycle == "unwind"
     assert plan.dn_bid is None
     assert plan.up_bid is not None
 
@@ -166,10 +168,23 @@ def test_no_progress_in_unwind_keeps_engine_in_unwind():
         total_inventory_value_usd=4.5,
     )
     risk, _ = _evaluate(cfg, snapshot, inventory)
-    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    sm._excess_baseline_ts = time.time() - 25.0
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
+    sm._excess_baseline_ts = time.time() - 31.0
     sm._excess_baseline_value_usd = 4.5
-    lifecycle = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk)
-    assert lifecycle == "unwind"
+    for _ in range(3):
+        result = sm.transition(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            viability=QuoteViabilitySummary(
+                any_quote=True,
+                four_quotes=False,
+                helpful_count=0,
+                harmful_count=2,
+                harmful_only=True,
+                four_quote_presence_ratio=0.10,
+            ),
+        )
+    assert result.lifecycle == "unwind"
     assert sm.lifecycle == "unwind"
