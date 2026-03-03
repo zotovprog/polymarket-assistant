@@ -855,6 +855,45 @@ def test_runtime_snapshot_exposes_runtime_watchdog():
     assert "runtime_watchdog" in snap
     assert snap["runtime_watchdog"]["active"] is True
     assert snap["runtime_watchdog"]["last_cpu_pct"] == pytest.approx(97.5)
+    assert "verification" in snap
+    assert snap["verification"]["running"] is False
+
+
+@pytest.mark.anyio
+async def test_runtime_server_self_check_passes_when_idle():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    result = await runtime._run_server_self_check()
+
+    assert result["ok"] is True
+    names = {check["name"] for check in result["checks"]}
+    assert "state_contract:order_tracking" in names
+    assert "state_contract:cycle_guard" in names
+    assert "state_contract:negative_edge_guard" in names
+    assert "state_contract:liquidation" in names
+    assert "state_contract:api_errors" in names
+
+
+@pytest.mark.anyio
+async def test_runtime_verification_rejects_unknown_kind():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    with pytest.raises(web_server.HTTPException) as exc:
+        await runtime.start_verification("unsupported-kind")
+
+    assert exc.value.status_code == 400
 
 
 def test_fallback_poll_hot_alert_after_repeated_cap_hits():

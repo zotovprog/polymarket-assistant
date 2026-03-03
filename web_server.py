@@ -16,6 +16,7 @@ import sys
 import time
 import logging
 import math
+import copy
 import threading
 import traceback
 from pathlib import Path
@@ -364,6 +365,10 @@ class ConfigUpdateRequest(BaseModel):
         if not math.isfinite(n) or not n.is_integer():
             raise ValueError("must be a valid integer")
         return int(n)
+
+
+class VerificationRunRequest(BaseModel):
+    kind: str = "server_self_check"
 
 
 def _validate_config_updates_before_apply(updates: dict[str, Any]) -> dict[str, Any]:
@@ -720,6 +725,21 @@ class MMRuntime:
             "fallback_cap_hits": 0,
             "fallback_near_hits": 0,
         }
+        self._verification_task: asyncio.Task | None = None
+        self._verification_status: dict[str, Any] = {
+            "running": False,
+            "kind": "",
+            "started_at": 0.0,
+            "finished_at": 0.0,
+            "ok": None,
+            "summary": "",
+            "checks": [],
+            "command": [],
+            "exit_code": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "error": "",
+        }
         self._runtime_watchdog: dict[str, Any] = {
             "active": False,
             "last_check_ts": 0.0,
@@ -783,6 +803,218 @@ class MMRuntime:
         alerts = list(self._alerts.values())
         alerts.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
         return alerts
+
+    def get_verification_status(self) -> dict[str, Any]:
+        return copy.deepcopy(self._verification_status)
+
+    async def _run_server_self_check(self) -> dict[str, Any]:
+        snap = self.snapshot()
+        required_blocks = [
+            "order_tracking",
+            "cycle_guard",
+            "negative_edge_guard",
+            "liquidation",
+            "api_errors",
+        ]
+        checks: list[dict[str, Any]] = []
+        for key in required_blocks:
+            checks.append(
+                {
+                    "name": f"state_contract:{key}",
+                    "ok": key in snap,
+                    "detail": "present" if key in snap else "missing",
+                }
+            )
+        maker_only = bool((snap.get("config") or {}).get("use_post_only", True))
+        checks.append(
+            {
+                "name": "config:maker_only",
+                "ok": maker_only,
+                "detail": "use_post_only=true" if maker_only else "use_post_only=false",
+            }
+        )
+        watchdog_present = "runtime_watchdog" in snap
+        checks.append(
+            {
+                "name": "state_contract:runtime_watchdog",
+                "ok": watchdog_present,
+                "detail": "present" if watchdog_present else "missing",
+            }
+        )
+        app_meta_ok = bool(snap.get("app_version")) and bool(snap.get("app_git_hash"))
+        checks.append(
+            {
+                "name": "state_contract:app_meta",
+                "ok": app_meta_ok,
+                "detail": "present" if app_meta_ok else "missing",
+            }
+        )
+        alert_sources = {str(a.get("source", "")) for a in snap.get("alerts", [])}
+        blocking_alerts = {
+            "critical_drift_pause",
+            "residual_inventory_failure",
+            "runtime_watchdog",
+            "runtime_cpu_watchdog",
+        }
+        bad_alerts = sorted(source for source in alert_sources if source in blocking_alerts)
+        checks.append(
+            {
+                "name": "alerts:blocking",
+                "ok": not bad_alerts,
+                "detail": ", ".join(bad_alerts) if bad_alerts else "none",
+            }
+        )
+        fallback_cap = int(
+            (snap.get("config") or {}).get("fallback_poll_cap", 0)
+            or 0
+        )
+        fallback_count = int((snap.get("order_tracking") or {}).get("last_fallback_poll_count", 0) or 0)
+        fallback_ok = fallback_cap <= 0 or fallback_count <= fallback_cap
+        checks.append(
+            {
+                "name": "fallback_poll:within_cap",
+                "ok": fallback_ok,
+                "detail": f"{fallback_count}/{fallback_cap}" if fallback_cap > 0 else str(fallback_count),
+            }
+        )
+        passed = sum(1 for check in checks if check["ok"])
+        return {
+            "ok": passed == len(checks),
+            "summary": f"{passed}/{len(checks)} checks passed",
+            "checks": checks,
+            "command": [],
+            "exit_code": 0 if passed == len(checks) else 1,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "error": "",
+        }
+
+    def _verification_command(self, kind: str) -> list[str] | None:
+        if kind == "pytest_safety":
+            return [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_acceptance_minimal.py",
+                "tests/test_reconciliation.py",
+                "tests/test_batch_runtime_guards.py",
+                "tests/test_session_cap_guards.py",
+                "tests/test_bug_fixes.py",
+                "tests/test_telegram_conflict.py",
+                "tests/test_runtime_metrics.py",
+            ]
+        if kind == "backtest_smoke":
+            return [
+                sys.executable,
+                "backtest/run_backtest.py",
+            ]
+        return None
+
+    @staticmethod
+    def _tail_text(value: bytes, limit: int = 16000) -> str:
+        text = value.decode("utf-8", errors="replace")
+        if len(text) <= limit:
+            return text
+        return text[-limit:]
+
+    async def _run_command_verification(self, kind: str, command: list[str]) -> dict[str, Any]:
+        env = os.environ.copy()
+        py_path = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{SRC_DIR}:{py_path}" if py_path else str(SRC_DIR)
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(BASE_DIR),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "summary": f"{kind} {'passed' if ok else 'failed'} (exit_code={proc.returncode})",
+            "checks": [],
+            "command": command,
+            "exit_code": proc.returncode,
+            "stdout_tail": self._tail_text(stdout),
+            "stderr_tail": self._tail_text(stderr),
+            "error": "",
+        }
+
+    async def _verification_runner(self, kind: str) -> None:
+        self._verification_status = {
+            "running": True,
+            "kind": kind,
+            "started_at": time.time(),
+            "finished_at": 0.0,
+            "ok": None,
+            "summary": "",
+            "checks": [],
+            "command": [],
+            "exit_code": None,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "error": "",
+        }
+        try:
+            if kind == "server_self_check":
+                result = await self._run_server_self_check()
+            else:
+                command = self._verification_command(kind)
+                if not command:
+                    raise ValueError(f"unsupported verification kind: {kind}")
+                result = await self._run_command_verification(kind, command)
+            self._verification_status.update(result)
+        except asyncio.CancelledError:
+            self._verification_status.update(
+                {
+                    "running": False,
+                    "finished_at": time.time(),
+                    "ok": False,
+                    "summary": "verification cancelled",
+                    "error": "cancelled",
+                }
+            )
+            raise
+        except Exception as e:
+            self._verification_status.update(
+                {
+                    "running": False,
+                    "finished_at": time.time(),
+                    "ok": False,
+                    "summary": f"{kind} failed",
+                    "error": str(e),
+                }
+            )
+        else:
+            self._verification_status["running"] = False
+            self._verification_status["finished_at"] = time.time()
+        finally:
+            self._verification_task = None
+
+    async def start_verification(self, kind: str) -> dict[str, Any]:
+        allowed = {"server_self_check", "pytest_safety", "backtest_smoke"}
+        kind = str(kind or "server_self_check").strip() or "server_self_check"
+        if kind not in allowed:
+            raise HTTPException(status_code=400, detail=f"unsupported verification kind: {kind}")
+        if self._verification_task and not self._verification_task.done():
+            raise HTTPException(status_code=409, detail="verification already running")
+        self._verification_task = asyncio.create_task(self._verification_runner(kind))
+        return self.get_verification_status()
+
+    async def cancel_verification(self) -> dict[str, Any]:
+        task = self._verification_task
+        if not task or task.done():
+            return self.get_verification_status()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.warning("Verification cancel failed: %s", e)
+        return self.get_verification_status()
 
     def _clear_mm_alerts(self) -> None:
         for source in (
@@ -1753,6 +1985,7 @@ class MMRuntime:
             snap["app_version"] = APP_VERSION
             snap["app_git_hash"] = APP_GIT_HASH
             snap["alerts"] = self.list_alerts()
+            snap["verification"] = self.get_verification_status()
             snap["runtime_watchdog"] = dict(self._runtime_watchdog)
             if "_tg_bot" in globals():
                 snap["telegram_bot"] = _tg_bot.status
@@ -1822,6 +2055,7 @@ class MMRuntime:
         result["app_version"] = APP_VERSION
         result["app_git_hash"] = APP_GIT_HASH
         result["alerts"] = self.list_alerts()
+        result["verification"] = self.get_verification_status()
         result["runtime_watchdog"] = dict(self._runtime_watchdog)
         if "_tg_bot" in globals():
             result["telegram_bot"] = _tg_bot.status
@@ -2526,6 +2760,26 @@ async def get_logs(request: Request, limit: int = 200, level: str = ""):
         entries = [e for e in entries if e["level"] == level_upper]
     entries = entries[-limit:]
     return {"logs": entries, "total": len(_log_handler.buffer)}
+
+
+@app.post("/api/verification/run")
+async def verification_run(req: VerificationRunRequest, request: Request):
+    _require_auth(request)
+    status = await _runtime.start_verification(req.kind)
+    return {"ok": True, "verification": status}
+
+
+@app.get("/api/verification/state")
+async def verification_state(request: Request):
+    _require_auth(request)
+    return {"verification": _runtime.get_verification_status()}
+
+
+@app.post("/api/verification/cancel")
+async def verification_cancel(request: Request):
+    _require_auth(request)
+    status = await _runtime.cancel_verification()
+    return {"ok": True, "verification": status}
 
 
 def _task_coro_label(task: asyncio.Task) -> str:
