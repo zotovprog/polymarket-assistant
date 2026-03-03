@@ -20,6 +20,7 @@ CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short", "--ignore=tests/tes
 # ── Production target ─────────────────────────────────────
 FROM base AS production
 ARG GIT_HASH=unknown
+RUN pip install --no-cache-dir pytest pytest-asyncio
 RUN echo "${GIT_HASH}" > /app/.git_hash
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
