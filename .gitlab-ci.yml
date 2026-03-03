@@ -47,7 +47,7 @@ BacktestSmoke:
     - rabbit2
   script:
     - rm -rf "$CI_PY_DEPS"
-    - : > backtest_smoke.txt
+    - rm -f backtest_smoke.txt && touch backtest_smoke.txt
     - |
       if python3 -m pip --version >/dev/null 2>&1; then
         PIP_CMD="python3 -m pip"
