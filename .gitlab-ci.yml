@@ -1,6 +1,7 @@
 variables:
   IMAGE_NAME: $CI_REGISTRY_IMAGE/polymarketbot
   GIT_STRATEGY: clone
+  CI_PY_DEPS: .ci_deps
 
 stages:
   - test
@@ -14,12 +15,20 @@ Tests:
     - shell
     - rabbit2
   script:
-    - rm -rf .ci_venv
-    - python3 -m venv .ci_venv
-    - ./.ci_venv/bin/pip install --upgrade pip
-    - ./.ci_venv/bin/pip install -r requirements.txt
+    - rm -rf "$CI_PY_DEPS"
+    - |
+      if python3 -m pip --version >/dev/null 2>&1; then
+        PIP_CMD="python3 -m pip"
+      elif command -v pip3 >/dev/null 2>&1; then
+        PIP_CMD="pip3"
+      else
+        echo "python3 -m pip or pip3 is required on the runner"
+        exit 1
+      fi
+      $PIP_CMD install --target "$CI_PY_DEPS" -r requirements.txt
     - >
-      ./.ci_venv/bin/python -m pytest -q
+      PYTHONPATH="$CI_PY_DEPS:src"
+      python3 -m pytest -q
       tests/test_acceptance_minimal.py
       tests/test_reconciliation.py
       tests/test_batch_runtime_guards.py
@@ -28,7 +37,7 @@ Tests:
       tests/test_telegram_conflict.py
       tests/test_runtime_metrics.py
   after_script:
-    - rm -rf .ci_venv
+    - rm -rf "$CI_PY_DEPS"
 
 
 BacktestSmoke:
@@ -37,17 +46,25 @@ BacktestSmoke:
     - shell
     - rabbit2
   script:
-    - rm -rf .ci_venv
-    - python3 -m venv .ci_venv
-    - ./.ci_venv/bin/pip install --upgrade pip
-    - ./.ci_venv/bin/pip install -r requirements.txt
-    - PYTHONPATH=src ./.ci_venv/bin/python backtest/run_backtest.py | tee backtest_smoke.txt
+    - rm -rf "$CI_PY_DEPS"
+    - : > backtest_smoke.txt
+    - |
+      if python3 -m pip --version >/dev/null 2>&1; then
+        PIP_CMD="python3 -m pip"
+      elif command -v pip3 >/dev/null 2>&1; then
+        PIP_CMD="pip3"
+      else
+        echo "python3 -m pip or pip3 is required on the runner" | tee -a backtest_smoke.txt
+        exit 1
+      fi
+      $PIP_CMD install --target "$CI_PY_DEPS" -r requirements.txt
+    - PYTHONPATH="$CI_PY_DEPS:src" python3 backtest/run_backtest.py | tee -a backtest_smoke.txt
   artifacts:
     when: always
     paths:
       - backtest_smoke.txt
   after_script:
-    - rm -rf .ci_venv
+    - rm -rf "$CI_PY_DEPS"
 
 
 Build:
