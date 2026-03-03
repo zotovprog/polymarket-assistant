@@ -251,6 +251,16 @@ class _LateFillClient:
         return {"status": "MATCHED", "size_matched": "10", "price": "0.50"}
 
 
+class _CancelAllFailClient:
+    def cancel_all(self):
+        raise RuntimeError("cancel_all boom")
+
+
+class _FallbackPollErrorClient:
+    def get_order(self, _oid):
+        raise RuntimeError("fallback poll boom")
+
+
 def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True)
     monkeypatch.setattr(order_manager_mod, "OrderType", _DummyOrderType, raising=False)
@@ -267,6 +277,10 @@ def test_place_orders_batch_logs_raw_reject(monkeypatch, caplog):
     assert "Batch reject BUY" in messages
     assert "price outside bounds" in messages
     assert "raw=" in messages
+    stats = om.get_api_error_stats()
+    assert stats["total_by_op"]["place_batch_item"] == 1
+    assert stats["recent"][-1]["token_id"] == "up_tok_123"
+    assert stats["recent"][-1]["message"] == "price outside bounds"
 
 
 def test_place_orders_batch_crosses_book_stays_maker_only(monkeypatch):
@@ -299,6 +313,35 @@ def test_place_orders_batch_crosses_book_retry_blocked_by_price_guard(monkeypatc
 
     assert result == [None]
     assert client.single_post_calls == 0
+
+
+@pytest.mark.anyio
+async def test_cancel_all_failure_recorded_in_api_error_stats():
+    om = order_manager_mod.OrderManager(_CancelAllFailClient(), MMConfig())
+
+    with pytest.raises(RuntimeError, match="cancel_all boom"):
+        await om.cancel_all(force_exchange=True)
+
+    stats = om.get_api_error_stats()
+    assert stats["total_by_op"]["cancel_all"] == 1
+    assert stats["recent"][-1]["message"] == "cancel_all boom"
+
+
+@pytest.mark.anyio
+async def test_fill_poll_failure_is_visible_in_state_api_errors():
+    om = order_manager_mod.OrderManager(_FallbackPollErrorClient(), MMConfig())
+    oid = "oid-fallback-error"
+    quote = Quote(side="BUY", token_id="up_tok_123", price=0.50, size=10.0, order_id=oid)
+    quote.placed_at = time.time() - 31.0
+    om._active_orders[oid] = quote
+    om._order_post_only[oid] = True
+
+    fills = await om.check_fills()
+
+    assert fills == []
+    stats = om.get_api_error_stats()
+    assert stats["total_by_op"]["fallback_poll"] == 1
+    assert stats["recent"][-1]["order_id"] == oid[:12]
 
 
 @pytest.mark.anyio
@@ -812,6 +855,80 @@ def test_runtime_snapshot_exposes_runtime_watchdog():
     assert "runtime_watchdog" in snap
     assert snap["runtime_watchdog"]["active"] is True
     assert snap["runtime_watchdog"]["last_cpu_pct"] == pytest.approx(97.5)
+
+
+def test_fallback_poll_hot_alert_after_repeated_cap_hits():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    class _MM:
+        def snapshot(self):
+            return {
+                "config": {"fallback_poll_cap": 12},
+                "order_tracking": {"last_fallback_poll_count": 12},
+                "cycle_guard": {"mode": "off", "reason": "", "active": False},
+                "negative_edge_guard": {"active": False, "reason": ""},
+                "liquidation": {"mode": "inactive", "reason": "", "residual_inventory_failure": False},
+                "pause_reason": "",
+            }
+
+    runtime.mm = _MM()
+    runtime._running = True
+
+    runtime.snapshot()
+    snap = runtime.snapshot()
+
+    assert any(a["source"] == "fallback_poll_hot" for a in snap["alerts"])
+
+
+def test_runtime_snapshot_emits_guard_alerts():
+    if "aiohttp" not in sys.modules:
+        import types
+
+        sys.modules["aiohttp"] = types.ModuleType("aiohttp")
+
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntime()
+
+    class _MM:
+        def snapshot(self):
+            return {
+                "config": {"fallback_poll_cap": 12},
+                "order_tracking": {"last_fallback_poll_count": 11},
+                "cycle_guard": {
+                    "mode": "close_only",
+                    "reason": "negative edge confirmed",
+                    "active": True,
+                },
+                "negative_edge_guard": {
+                    "active": True,
+                    "reason": "negative edge confirmed",
+                },
+                "liquidation": {
+                    "mode": "aggressive",
+                    "reason": "Max drawdown exceeded: PnL=$-4.50",
+                    "residual_inventory_failure": True,
+                },
+                "pause_reason": "Critical inventory drift: waiting for full reconcile",
+            }
+
+    runtime.mm = _MM()
+    runtime._running = True
+
+    snap = runtime.snapshot()
+    alert_sources = {a["source"] for a in snap["alerts"]}
+
+    assert "negative_edge_guard_activated" in alert_sources
+    assert "cycle_guard_close_only" in alert_sources
+    assert "drawdown_exit" in alert_sources
+    assert "residual_inventory_failure" in alert_sources
+    assert "critical_drift_pause" in alert_sources
+    assert "aggressive_liquidation_activated" in alert_sources
 
 
 def test_telegram_polling_enabled_env(monkeypatch):

@@ -3,8 +3,51 @@ variables:
   GIT_STRATEGY: clone
 
 stages:
+  - test
   - build
   - deploy
+
+
+Tests:
+  stage: test
+  tags:
+    - shell
+    - rabbit2
+  script:
+    - rm -rf .ci_venv
+    - python3 -m venv .ci_venv
+    - ./.ci_venv/bin/pip install --upgrade pip
+    - ./.ci_venv/bin/pip install -r requirements.txt
+    - >
+      ./.ci_venv/bin/python -m pytest -q
+      tests/test_acceptance_minimal.py
+      tests/test_reconciliation.py
+      tests/test_batch_runtime_guards.py
+      tests/test_session_cap_guards.py
+      tests/test_bug_fixes.py
+      tests/test_telegram_conflict.py
+      tests/test_runtime_metrics.py
+  after_script:
+    - rm -rf .ci_venv
+
+
+BacktestSmoke:
+  stage: test
+  tags:
+    - shell
+    - rabbit2
+  script:
+    - rm -rf .ci_venv
+    - python3 -m venv .ci_venv
+    - ./.ci_venv/bin/pip install --upgrade pip
+    - ./.ci_venv/bin/pip install -r requirements.txt
+    - PYTHONPATH=src ./.ci_venv/bin/python backtest/run_backtest.py | tee backtest_smoke.txt
+  artifacts:
+    when: always
+    paths:
+      - backtest_smoke.txt
+  after_script:
+    - rm -rf .ci_venv
 
 
 Build:

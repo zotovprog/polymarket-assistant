@@ -126,6 +126,24 @@ class _LiveCrossBookRejectClient:
         return _Book(bid=0.50, ask=0.51)
 
 
+class _RecentPollClient:
+    def __init__(self, status: str = "LIVE", *, with_orders: bool = True):
+        if with_orders:
+            self._orders = {}
+        self.polled_ids: list[str] = []
+        self._status = status
+
+    def get_order(self, oid):
+        self.polled_ids.append(oid)
+        return {"status": self._status, "size_matched": "0"}
+
+    def cancel_all(self):
+        return {"success": True}
+
+    def get_balance(self):
+        return 20.0
+
+
 @dataclass
 class _FeedState:
     mid: float = 100000.0
@@ -262,6 +280,91 @@ async def test_acceptance_post_only_reject_stays_maker_only(monkeypatch):
 
     assert result[0] is None
     assert client.single_post_calls == 0
+
+
+@pytest.mark.anyio
+async def test_recent_orders_pruned_by_ttl_and_cap():
+    om = OrderManager(
+        _RecentPollClient(),
+        MMConfig(recent_order_retention_sec=20.0, recent_order_max_per_token=2, fallback_poll_cap=4),
+    )
+    om.set_market_context(token_ids={"up_token_123", "dn_token_456"})
+
+    for idx in range(4):
+        om._track_recent_order(
+            f"up-{idx}",
+            Quote(side="BUY", token_id="up_token_123", price=0.5, size=5.0),
+        )
+    for idx in range(3):
+        om._track_recent_order(
+            f"dn-{idx}",
+            Quote(side="BUY", token_id="dn_token_456", price=0.5, size=5.0),
+        )
+
+    assert sum(1 for state in om._recent_orders.values() if state.token_id == "up_token_123") == 2
+    assert sum(1 for state in om._recent_orders.values() if state.token_id == "dn_token_456") == 2
+
+    stale_oid = next(iter(om._recent_orders))
+    om._recent_orders[stale_oid].removed_ts = time.time() - 25.0
+    om._prune_recent_orders()
+    assert stale_oid not in om._recent_orders
+
+
+@pytest.mark.anyio
+async def test_recent_orders_only_current_tokens_polled():
+    client = _RecentPollClient()
+    om = OrderManager(client, MMConfig(fallback_poll_cap=4))
+
+    om.set_market_context(token_ids={"old_up"})
+    om._track_recent_order(
+        "old-1",
+        Quote(side="BUY", token_id="old_up", price=0.5, size=5.0),
+    )
+
+    om.set_market_context(token_ids={"new_up"})
+    om._track_recent_order(
+        "new-1",
+        Quote(side="BUY", token_id="new_up", price=0.5, size=5.0),
+    )
+
+    await om.check_fills()
+
+    assert client.polled_ids == ["new-1"]
+    assert "old-1" not in om._recent_orders
+
+
+@pytest.mark.anyio
+async def test_fallback_poll_cap_applied():
+    client = _RecentPollClient()
+    om = OrderManager(client, MMConfig(fallback_poll_cap=4, recent_order_max_per_token=10))
+    om.set_market_context(token_ids={"up_token_123"})
+
+    for idx in range(8):
+        om._track_recent_order(
+            f"oid-{idx}",
+            Quote(side="BUY", token_id="up_token_123", price=0.5, size=5.0),
+        )
+
+    await om.check_fills()
+
+    assert len(client.polled_ids) == 4
+    assert om._last_fallback_poll_count == 4
+
+
+@pytest.mark.anyio
+async def test_terminal_orders_removed_from_tracking():
+    client = _RecentPollClient(status="MATCHED", with_orders=False)
+    om = OrderManager(client, MMConfig())
+    quote = Quote(side="BUY", token_id="up_token_123", price=0.5, size=5.0, placed_at=time.time() - 31.0)
+    om._active_orders["live-1"] = quote
+    om._order_post_only["live-1"] = True
+    om.set_market_context(token_ids={"up_token_123"})
+
+    fills = await om.check_fills()
+
+    assert fills == []
+    assert "live-1" not in om._active_orders
+    assert "live-1" not in om._recent_orders
 
 
 @pytest.mark.anyio

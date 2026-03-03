@@ -213,6 +213,9 @@ class ConfigUpdateRequest(BaseModel):
     toxic_divergence_ticks: Optional[int] = None
     critical_reconcile_drift_shares: Optional[float] = None
     fill_settlement_grace_sec: Optional[float] = None
+    recent_order_retention_sec: Optional[float] = None
+    recent_order_max_per_token: Optional[int] = None
+    fallback_poll_cap: Optional[int] = None
     pre_entry_stable_checks: Optional[int] = None
     pre_entry_min_quality_score: Optional[float] = None
     pre_entry_max_spread_bps: Optional[float] = None
@@ -220,6 +223,18 @@ class ConfigUpdateRequest(BaseModel):
     post_fill_entry_guard_sec: Optional[float] = None
     post_fill_entry_score_drop: Optional[float] = None
     post_fill_entry_spread_widen_bps: Optional[float] = None
+    cycle_lockout_bad_cycles: Optional[int] = None
+    cycle_lockout_loss_usd: Optional[float] = None
+    cycle_lockout_sec: Optional[float] = None
+    placement_failure_lockout_count: Optional[int] = None
+    placement_failure_lockout_sec: Optional[float] = None
+    close_only_toxic_checks: Optional[int] = None
+    close_only_toxic_spread_bps: Optional[float] = None
+    negative_edge_min_fills: Optional[int] = None
+    negative_edge_markout_5s_threshold: Optional[float] = None
+    negative_edge_adverse_pct_threshold: Optional[float] = None
+    negative_edge_min_spread_capture_events: Optional[int] = None
+    negative_edge_spread_capture_threshold_usd: Optional[float] = None
     require_flat_start: Optional[bool] = None
     flat_start_max_shares: Optional[float] = None
     max_one_sided_ticks: Optional[int] = None
@@ -233,6 +248,10 @@ class ConfigUpdateRequest(BaseModel):
     liq_chunk_interval_s: Optional[float] = Field(default=None)
     liq_taker_threshold_sec: Optional[float] = None
     liq_max_discount_from_fv: Optional[float] = Field(default=None)
+    aggressive_liq_after_sec: Optional[float] = None
+    aggressive_liq_chunk_interval_sec: Optional[float] = None
+    aggressive_liq_taker_threshold_sec: Optional[float] = None
+    aggressive_liq_max_discount_from_fv: Optional[float] = None
     liq_abandon_below_floor: Optional[bool] = None
     merge_sell_epsilon: Optional[float] = None
     merge_sell_min_depth_pairs: Optional[float] = None
@@ -697,6 +716,10 @@ class MMRuntime:
         self._last_good_min_order_size: float = 5.0
         self._last_market_selection: dict[str, Any] | None = None
         self._alerts: dict[str, dict[str, Any]] = {}
+        self._mm_alert_state: dict[str, Any] = {
+            "fallback_cap_hits": 0,
+            "fallback_near_hits": 0,
+        }
         self._runtime_watchdog: dict[str, Any] = {
             "active": False,
             "last_check_ts": 0.0,
@@ -760,6 +783,136 @@ class MMRuntime:
         alerts = list(self._alerts.values())
         alerts.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
         return alerts
+
+    def _clear_mm_alerts(self) -> None:
+        for source in (
+            "negative_edge_guard_activated",
+            "cycle_guard_no_trade",
+            "cycle_guard_close_only",
+            "drawdown_exit",
+            "fallback_poll_hot",
+            "residual_inventory_failure",
+            "critical_drift_pause",
+            "aggressive_liquidation_activated",
+        ):
+            self.clear_alert(source)
+        self._mm_alert_state["fallback_cap_hits"] = 0
+        self._mm_alert_state["fallback_near_hits"] = 0
+
+    def _sync_mm_alerts_from_snapshot(self, snap: dict[str, Any]) -> None:
+        order_tracking = snap.get("order_tracking") or {}
+        cycle_guard = snap.get("cycle_guard") or {}
+        negative_edge_guard = snap.get("negative_edge_guard") or {}
+        liquidation = snap.get("liquidation") or {}
+        pause_reason = str(snap.get("pause_reason") or "")
+        config = snap.get("config") or {}
+
+        fallback_cap = int(
+            order_tracking.get("fallback_poll_cap")
+            or config.get("fallback_poll_cap")
+            or getattr(self.mm_config, "fallback_poll_cap", 0)
+            or 0
+        )
+        fallback_count = int(order_tracking.get("last_fallback_poll_count", 0) or 0)
+        if fallback_cap > 0:
+            if fallback_count >= fallback_cap:
+                self._mm_alert_state["fallback_cap_hits"] += 1
+            else:
+                self._mm_alert_state["fallback_cap_hits"] = 0
+            near_threshold = max(1, fallback_cap - 1)
+            if fallback_count >= near_threshold:
+                self._mm_alert_state["fallback_near_hits"] += 1
+            else:
+                self._mm_alert_state["fallback_near_hits"] = 0
+            if (
+                self._mm_alert_state["fallback_cap_hits"] >= 2
+                or self._mm_alert_state["fallback_near_hits"] >= 3
+            ):
+                self.set_alert(
+                    "fallback_poll_hot",
+                    f"Fallback polling hot: {fallback_count} tracked orders (cap={fallback_cap})",
+                    level="warning",
+                )
+            else:
+                self.clear_alert("fallback_poll_hot")
+        else:
+            self.clear_alert("fallback_poll_hot")
+            self._mm_alert_state["fallback_cap_hits"] = 0
+            self._mm_alert_state["fallback_near_hits"] = 0
+
+        if bool(negative_edge_guard.get("active")):
+            self.set_alert(
+                "negative_edge_guard_activated",
+                str(negative_edge_guard.get("reason") or "Negative edge guard activated"),
+                level="warning",
+            )
+        else:
+            self.clear_alert("negative_edge_guard_activated")
+
+        cycle_mode = str(cycle_guard.get("mode") or "off")
+        cycle_reason = str(cycle_guard.get("reason") or "")
+        if cycle_mode == "no_trade":
+            self.set_alert(
+                "cycle_guard_no_trade",
+                cycle_reason or "Cycle guard no-trade lockout active",
+                level="warning",
+            )
+        else:
+            self.clear_alert("cycle_guard_no_trade")
+        if cycle_mode == "close_only":
+            self.set_alert(
+                "cycle_guard_close_only",
+                cycle_reason or "Cycle guard close-only active",
+                level="warning",
+            )
+        else:
+            self.clear_alert("cycle_guard_close_only")
+
+        lower_reasons = " | ".join(
+            reason.lower()
+            for reason in (
+                cycle_reason,
+                str(liquidation.get("reason") or ""),
+                pause_reason,
+            )
+            if reason
+        )
+        if "max drawdown" in lower_reasons:
+            self.set_alert(
+                "drawdown_exit",
+                str(liquidation.get("reason") or cycle_reason or pause_reason or "Max drawdown exit active"),
+                level="error",
+            )
+        else:
+            self.clear_alert("drawdown_exit")
+
+        if bool(liquidation.get("residual_inventory_failure")):
+            self.set_alert(
+                "residual_inventory_failure",
+                "Residual inventory remained after closing window",
+                level="error",
+            )
+        else:
+            self.clear_alert("residual_inventory_failure")
+
+        if "critical inventory drift" in pause_reason.lower():
+            self.set_alert(
+                "critical_drift_pause",
+                pause_reason,
+                level="error",
+            )
+        else:
+            self.clear_alert("critical_drift_pause")
+
+        liq_mode = str(liquidation.get("mode") or "inactive")
+        if liq_mode in {"aggressive", "taker"}:
+            self.set_alert(
+                "aggressive_liquidation_activated",
+                str(liquidation.get("reason") or f"{liq_mode} liquidation active"),
+                level="warning",
+            )
+        else:
+            self.clear_alert("aggressive_liquidation_activated")
 
     def _startup_window_block_reason(self, market: MarketInfo | None) -> str:
         """Return non-empty reason when MM should not start on this window."""
@@ -1157,6 +1310,7 @@ class MMRuntime:
         # Drop stale MM reference before creating a fresh instance.
         if self.mm and not self.mm._running:
             self.mm = None
+        self._clear_mm_alerts()
 
         initial_usdc = float(initial_usdc)
         req_coin = str(coin)
@@ -1586,11 +1740,12 @@ class MMRuntime:
         runtime_metrics.incr("web.runtime.snapshot")
         if self.mm:
             snap = self.mm.snapshot()
+            self._sync_mm_alerts_from_snapshot(snap)
             snap["paper_mode"] = self._paper_mode
             snap["dev_mode"] = self._dev_mode
             snap["session_limit"] = self._initial_usdc
             snap["next_window_in"] = max(0, self._next_window_at - time.time()) if self._next_window_at else 0
-            if self._paper_mode:
+            if self._paper_mode and hasattr(self.mm, "order_mgr"):
                 client = self.mm.order_mgr.client
                 if hasattr(client, "balance"):
                     snap["mock_usdc_balance"] = float(client.balance)
@@ -1605,6 +1760,7 @@ class MMRuntime:
                 snap["market_selector"] = self._last_market_selection
             return snap
 
+        self._clear_mm_alerts()
         result = {
             "is_running": False,
             "paper_mode": self._paper_mode,
@@ -1616,6 +1772,51 @@ class MMRuntime:
             "inventory": {"up_shares": 0, "dn_shares": 0, "net_delta": 0, "usdc": 0},
             "recent_fills": [],
             "config": self.mm_config.to_dict(),
+            "order_tracking": {
+                "active_count": 0,
+                "recent_count": 0,
+                "current_generation": 0,
+                "last_fallback_poll_count": 0,
+                "max_recent_per_token": int(getattr(self.mm_config, "recent_order_max_per_token", 0) or 0),
+                "current_tokens": [],
+            },
+            "cycle_guard": {
+                "active": False,
+                "mode": "off",
+                "reason": "",
+                "seconds_left": 0.0,
+                "bad_cycle_count": 0,
+                "consecutive_place_failures": 0,
+                "current_cycle_active": False,
+                "current_cycle_fill_count": 0,
+                "last_cycle_pnl": 0.0,
+            },
+            "negative_edge_guard": {
+                "active": False,
+                "mode": "off",
+                "reason": "",
+                "seconds_left": 0.0,
+                "trigger_count": 0,
+                "last_total_fills": 0,
+                "last_avg_markout_5s": 0.0,
+                "last_adverse_pct_5s": 0.0,
+                "last_spread_capture_usd": 0.0,
+                "last_spread_capture_count": 0,
+                "last_triggered_at": 0.0,
+            },
+            "liquidation": {
+                "mode": "inactive",
+                "reason": "",
+                "seconds_in_mode": 0.0,
+                "chunk_interval_sec_current": float(getattr(self.mm_config, "liq_chunk_interval_sec", 0.0) or 0.0),
+                "taker_threshold_sec_current": float(getattr(self.mm_config, "liq_taker_threshold_sec", 0.0) or 0.0),
+                "residual_inventory_failure": False,
+            },
+            "api_errors": {
+                "total_by_op": {},
+                "recent": [],
+                "last_error_ts": 0.0,
+            },
         }
         result["feeds"] = self._build_feeds_dict()
         result["app_version"] = APP_VERSION

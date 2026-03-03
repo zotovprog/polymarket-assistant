@@ -79,6 +79,9 @@ class MMConfig:
         "toxic_divergence_ticks": (1.0, 120.0),
         "critical_reconcile_drift_shares": (0.5, 50.0),
         "fill_settlement_grace_sec": (1.0, 15.0),
+        "recent_order_retention_sec": (5.0, 60.0),
+        "recent_order_max_per_token": (2.0, 20.0),
+        "fallback_poll_cap": (4.0, 30.0),
         "pre_entry_stable_checks": (1.0, 20.0),
         "pre_entry_min_quality_score": (0.0, 1.0),
         "pre_entry_max_spread_bps": (25.0, 5000.0),
@@ -86,8 +89,24 @@ class MMConfig:
         "post_fill_entry_guard_sec": (5.0, 120.0),
         "post_fill_entry_score_drop": (0.05, 1.0),
         "post_fill_entry_spread_widen_bps": (50.0, 5000.0),
+        "cycle_lockout_bad_cycles": (1.0, 5.0),
+        "cycle_lockout_loss_usd": (0.25, 5.0),
+        "cycle_lockout_sec": (10.0, 300.0),
+        "placement_failure_lockout_count": (1.0, 10.0),
+        "placement_failure_lockout_sec": (10.0, 300.0),
+        "close_only_toxic_checks": (1.0, 10.0),
+        "close_only_toxic_spread_bps": (500.0, 5000.0),
+        "negative_edge_min_fills": (4.0, 100.0),
+        "negative_edge_markout_5s_threshold": (-0.05, 0.0),
+        "negative_edge_adverse_pct_threshold": (10.0, 100.0),
+        "negative_edge_min_spread_capture_events": (1.0, 50.0),
+        "negative_edge_spread_capture_threshold_usd": (-100.0, 0.0),
         "one_sided_protect_ticks": (1.0, 600.0),
         "flat_start_max_shares": (0.0, 1000.0),
+        "aggressive_liq_after_sec": (1.0, 120.0),
+        "aggressive_liq_chunk_interval_sec": (0.5, 5.0),
+        "aggressive_liq_taker_threshold_sec": (10.0, 90.0),
+        "aggressive_liq_max_discount_from_fv": (0.03, 0.15),
     }
 
     # ── Spread ───────────────────────────────────────────────────
@@ -149,6 +168,9 @@ class MMConfig:
     toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
     critical_reconcile_drift_shares: float = 1.5  # Immediate pause if |internal-real| exceeds this many shares
     fill_settlement_grace_sec: float = 6.0    # Grace window for PM balance lag right after live fills
+    recent_order_retention_sec: float = 20.0  # Retain recently removed orders briefly for late-fill accounting
+    recent_order_max_per_token: int = 8       # Cap recent tracked orders per token to avoid fallback polling bloat
+    fallback_poll_cap: int = 12               # Max tracked orders to poll in HTTP fallback per pass
     pre_entry_stable_checks: int = 3          # Require this many consecutive strong quality checks before first BUY
     pre_entry_min_quality_score: float = 0.75  # Stricter score floor before opening a fresh position
     pre_entry_max_spread_bps: float = 500.0   # Stricter spread ceiling before first BUY
@@ -156,6 +178,18 @@ class MMConfig:
     post_fill_entry_guard_sec: float = 45.0   # After a BUY fill, watch quality closely for this long
     post_fill_entry_score_drop: float = 0.20  # Block new BUYs if overall quality drops this much vs fill-time anchor
     post_fill_entry_spread_widen_bps: float = 250.0  # Block new BUYs if spread widens this much vs fill-time anchor
+    cycle_lockout_bad_cycles: int = 2         # Lock out new entries after this many bad cycles in one window
+    cycle_lockout_loss_usd: float = 1.0       # Loss threshold that classifies a cycle as bad
+    cycle_lockout_sec: float = 45.0           # Temporary lockout after repeated placement failures
+    placement_failure_lockout_count: int = 3  # Consecutive failed placement ticks before lockout
+    placement_failure_lockout_sec: float = 45.0  # Cooldown after placement-failure lockout
+    close_only_toxic_checks: int = 3          # Consecutive toxic quality checks before forcing close-only
+    close_only_toxic_spread_bps: float = 1200.0  # Spread threshold for toxic held-position close-only
+    negative_edge_min_fills: int = 10         # Require at least this many completed fills before session-level edge verdict
+    negative_edge_markout_5s_threshold: float = -0.005  # Avg 5s markout below this is considered adverse
+    negative_edge_adverse_pct_threshold: float = 65.0   # Or too many adverse 5s markouts
+    negative_edge_min_spread_capture_events: int = 3    # Need at least this many realized spread events before lockout
+    negative_edge_spread_capture_threshold_usd: float = -0.5  # Negative spread capture required to confirm bad edge
     one_sided_protect_ticks: int = 30          # Start anti-expansion protection before hard-close trigger
     require_flat_start: bool = True            # Block start when wallet already carries non-dust token inventory
     flat_start_max_shares: float = 0.25        # Per-side dust threshold allowed at startup
@@ -168,6 +202,10 @@ class MMConfig:
     liq_chunk_interval_sec: float = 5.0        # Interval between chunks
     liq_taker_threshold_sec: float = 10.0      # Use taker only in final 10s of the window
     liq_max_discount_from_fv: float = 0.03     # Max discount from FV for limit orders
+    aggressive_liq_after_sec: float = 20.0     # Promote close-only to aggressive liquidation after this long
+    aggressive_liq_chunk_interval_sec: float = 2.0  # Faster reprice cadence in aggressive liquidation
+    aggressive_liq_taker_threshold_sec: float = 30.0  # Use taker earlier in aggressive liquidation
+    aggressive_liq_max_discount_from_fv: float = 0.06  # Larger FV discount in aggressive liquidation
     liq_abandon_below_floor: bool = True       # Don't sell below floor, let expire
     merge_sell_epsilon: float = 0.01           # Require this premium over $1 before preferring sell-over-merge
     merge_sell_min_depth_pairs: float = 5.0    # Minimum top-book pair depth to choose sell-over-merge

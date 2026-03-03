@@ -143,6 +143,37 @@ class SettlementLagState:
     source: str
 
 
+@dataclass
+class CycleGuardState:
+    mode: str
+    active: bool
+    reason: str
+    lockout_until: float
+    bad_cycle_count: int
+    consecutive_place_failures: int
+    current_cycle_active: bool
+    current_cycle_started_at: float
+    current_cycle_start_portfolio_pm: float
+    current_cycle_fill_count: int
+    current_cycle_forced_close: bool
+    last_cycle_pnl: float
+
+
+@dataclass
+class NegativeEdgeGuardState:
+    active: bool
+    mode: str
+    reason: str
+    lockout_until: float
+    trigger_count: int
+    last_total_fills: int
+    last_avg_markout_5s: float
+    last_adverse_pct_5s: float
+    last_spread_capture_usd: float
+    last_spread_capture_count: int
+    last_triggered_at: float
+
+
 class MarketMaker:
     """Main Market Making engine."""
 
@@ -209,6 +240,7 @@ class MarketMaker:
         self._pnl_grace_until: float = 0.0  # Skip PnL risk checks until this timestamp
         self._catastrophic_count: int = 0  # Consecutive CATASTROPHIC readings
         self._catastrophic_threshold: int = 3  # Readings required before shutdown
+        self._drawdown_liquidation_breach_count: int = 0
         self._last_quality: MarketQuality | None = None
         self._last_quality_ts: float = 0.0
         self._quality_error_count: int = 0
@@ -224,6 +256,40 @@ class MarketMaker:
         self._post_fill_entry_guard_active: bool = False
         self._post_fill_entry_guard_reason: str = ""
         self._post_fill_entry_guard_trigger_count: int = 0
+        self._cycle_guard = CycleGuardState(
+            mode="off",
+            active=False,
+            reason="",
+            lockout_until=0.0,
+            bad_cycle_count=0,
+            consecutive_place_failures=0,
+            current_cycle_active=False,
+            current_cycle_started_at=0.0,
+            current_cycle_start_portfolio_pm=0.0,
+            current_cycle_fill_count=0,
+            current_cycle_forced_close=False,
+            last_cycle_pnl=0.0,
+        )
+        self._negative_edge_guard = NegativeEdgeGuardState(
+            active=False,
+            mode="off",
+            reason="",
+            lockout_until=0.0,
+            trigger_count=0,
+            last_total_fills=0,
+            last_avg_markout_5s=0.0,
+            last_adverse_pct_5s=0.0,
+            last_spread_capture_usd=0.0,
+            last_spread_capture_count=0,
+            last_triggered_at=0.0,
+        )
+        self._close_only_reason: str = ""
+        self._close_only_started_at: float = 0.0
+        self._close_only_toxic_count: int = 0
+        self._liquidation_mode: str = "inactive"
+        self._liquidation_reason: str = ""
+        self._liquidation_mode_started_at: float = 0.0
+        self._residual_inventory_failure: bool = False
         self._liq_lock: LiquidationLock | None = None
         self._liq_chunk_index: int = 0
         self._liq_last_chunk_time: float = 0.0
@@ -415,6 +481,442 @@ class MarketMaker:
             float(self.inventory.up_shares) > threshold
             or float(self.inventory.dn_shares) > threshold
         )
+
+    def _has_material_position(self, *, threshold: float = 0.5) -> bool:
+        if self._is_live_mode():
+            return (
+                float(self._cached_pm_up_shares) > threshold
+                or float(self._cached_pm_dn_shares) > threshold
+                or self._has_material_inventory(threshold=threshold)
+            )
+        return self._has_material_inventory(threshold=threshold)
+
+    def _cycle_flat(self, *, threshold: float = 0.5) -> bool:
+        return (
+            float(self.inventory.up_shares) <= threshold
+            and float(self.inventory.dn_shares) <= threshold
+            and float(self._cached_pm_up_shares) <= threshold
+            and float(self._cached_pm_dn_shares) <= threshold
+            and not self._liquidation_order_ids
+        )
+
+    def _cycle_guard_seconds_left(self) -> float:
+        if not self._cycle_guard.active:
+            return 0.0
+        return max(0.0, float(self._cycle_guard.lockout_until) - time.time())
+
+    def _negative_edge_seconds_left(self) -> float:
+        if not self._negative_edge_guard.active:
+            return 0.0
+        return max(0.0, float(self._negative_edge_guard.lockout_until) - time.time())
+
+    def _reset_negative_edge_guard(self) -> None:
+        self._negative_edge_guard = NegativeEdgeGuardState(
+            active=False,
+            mode="off",
+            reason="",
+            lockout_until=0.0,
+            trigger_count=0,
+            last_total_fills=0,
+            last_avg_markout_5s=0.0,
+            last_adverse_pct_5s=0.0,
+            last_spread_capture_usd=0.0,
+            last_spread_capture_count=0,
+            last_triggered_at=0.0,
+        )
+
+    def _reset_cycle_window_state(self) -> None:
+        self._cycle_guard = CycleGuardState(
+            mode="off",
+            active=False,
+            reason="",
+            lockout_until=0.0,
+            bad_cycle_count=0,
+            consecutive_place_failures=0,
+            current_cycle_active=False,
+            current_cycle_started_at=0.0,
+            current_cycle_start_portfolio_pm=0.0,
+            current_cycle_fill_count=0,
+            current_cycle_forced_close=False,
+            last_cycle_pnl=0.0,
+        )
+        self._reset_negative_edge_guard()
+        self._close_only_reason = ""
+        self._close_only_started_at = 0.0
+        self._close_only_toxic_count = 0
+        self._liquidation_mode = "inactive"
+        self._liquidation_reason = ""
+        self._liquidation_mode_started_at = 0.0
+        self._residual_inventory_failure = False
+        self._drawdown_liquidation_breach_count = 0
+
+    def _set_liquidation_mode(self, mode: str, reason: str = "") -> None:
+        if self._liquidation_mode != mode:
+            self._liquidation_mode = mode
+            self._liquidation_mode_started_at = time.time()
+        self._liquidation_reason = reason
+
+    async def _trigger_drawdown_exit(
+        self,
+        reason: str,
+        *,
+        time_left: float,
+        already_closing: bool,
+    ) -> None:
+        """Immediately transition into drawdown liquidation path."""
+        log.warning("Exit trigger: %s", reason)
+        self._paused = False
+        self._pause_reason = ""
+        if not self._liq_lock:
+            try:
+                fv_up, fv_dn = self._compute_fv()
+            except Exception:
+                fv_up = float(getattr(self.feed_state, "pm_up", None) or 0.5)
+                fv_dn = float(getattr(self.feed_state, "pm_dn", None) or 0.5)
+            best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
+            self._liq_lock = self.risk_mgr.lock_pnl(
+                self.inventory,
+                fv_up,
+                fv_dn,
+                margin=self.config.liq_price_floor_margin,
+                best_bid_up=best_bid_up,
+                best_bid_dn=best_bid_dn,
+            )
+            log.info(
+                "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
+                "UP_floor=%.2f DN_floor=%.2f",
+                self._liq_lock.trigger_pnl,
+                self._liq_lock.up_avg_entry,
+                self._liq_lock.dn_avg_entry,
+                self._liq_lock.min_sell_price_up,
+                self._liq_lock.min_sell_price_dn,
+            )
+        self._liq_chunk_index = 0
+        self._liq_last_chunk_time = 0.0
+        self._liq_last_attempt_time = 0.0
+        self._is_closing = True
+        self._cycle_guard.current_cycle_forced_close = True
+        if self._cycle_guard.mode != "no_trade":
+            self._set_cycle_guard_mode("close_only", reason)
+        self._close_only_reason = reason
+        if self._close_only_started_at <= 0:
+            self._close_only_started_at = time.time()
+        self._closing_start_time_left = self.market.time_remaining if self.market else 0.0
+        self._merge_failed_this_cycle = False
+        self._drawdown_liquidation_breach_count = 1
+        drawdown_mode = "close_only"
+        if already_closing:
+            aggressive_taker_threshold = max(
+                10.0,
+                float(getattr(self.config, "aggressive_liq_taker_threshold_sec", 30.0) or 30.0),
+            )
+            drawdown_mode = "taker" if time_left <= aggressive_taker_threshold else "aggressive"
+        self._set_liquidation_mode(drawdown_mode, reason)
+        await self._cancel_all_guarded()
+        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+
+    def _set_cycle_guard_mode(self, mode: str, reason: str, *, duration_sec: float = 0.0) -> None:
+        self._cycle_guard.mode = mode
+        self._cycle_guard.active = mode != "off"
+        self._cycle_guard.reason = reason
+        self._cycle_guard.lockout_until = (
+            time.time() + max(0.0, duration_sec)
+            if duration_sec > 0
+            else 0.0
+        )
+
+    def _clear_cycle_guard_if_expired(self) -> None:
+        if not self._cycle_guard.active:
+            self._cycle_guard.mode = "off"
+            self._cycle_guard.reason = ""
+            self._cycle_guard.lockout_until = 0.0
+            return
+        if self._cycle_guard.mode == "close_only":
+            return
+        if self._cycle_guard.lockout_until > 0 and time.time() >= self._cycle_guard.lockout_until:
+            self._cycle_guard.active = False
+            self._cycle_guard.mode = "off"
+            self._cycle_guard.reason = ""
+            self._cycle_guard.lockout_until = 0.0
+
+    def _record_cycle_fill_activity(self, fills: list[Fill]) -> None:
+        if fills and self._cycle_guard.current_cycle_active:
+            self._cycle_guard.current_cycle_fill_count += len(fills)
+
+    def _negative_edge_signal(
+        self,
+        *,
+        stats: dict[str, Any] | None = None,
+        spread_capture_total: float | None = None,
+        spread_capture_count: int | None = None,
+    ) -> tuple[bool, str, dict[str, float]]:
+        current_stats = stats or self.markout_tracker.stats
+        total_fills = int(current_stats.get("total_fills", 0) or 0)
+        avg_markout_5s = float(current_stats.get("avg_markout_5s", 0.0) or 0.0)
+        adverse_pct_5s = float(current_stats.get("adverse_pct_5s", 0.0) or 0.0)
+        spread_capture_total_val = (
+            float(self.pnl_decomp.spread_capture.total_usd)
+            if spread_capture_total is None
+            else float(spread_capture_total)
+        )
+        spread_capture_count_val = (
+            int(self.pnl_decomp.spread_capture.count)
+            if spread_capture_count is None
+            else int(spread_capture_count)
+        )
+
+        metrics = {
+            "total_fills": float(total_fills),
+            "avg_markout_5s": avg_markout_5s,
+            "adverse_pct_5s": adverse_pct_5s,
+            "spread_capture_usd": spread_capture_total_val,
+            "spread_capture_count": float(spread_capture_count_val),
+        }
+
+        min_fills = max(1, int(getattr(self.config, "negative_edge_min_fills", 10)))
+        min_spread_events = max(
+            1,
+            int(getattr(self.config, "negative_edge_min_spread_capture_events", 3)),
+        )
+        markout_threshold = float(getattr(self.config, "negative_edge_markout_5s_threshold", -0.005))
+        adverse_threshold = float(getattr(self.config, "negative_edge_adverse_pct_threshold", 65.0))
+        spread_capture_threshold = float(
+            getattr(self.config, "negative_edge_spread_capture_threshold_usd", -0.5)
+        )
+
+        reasons: list[str] = []
+        markout_bad = False
+        if total_fills >= min_fills:
+            if avg_markout_5s <= markout_threshold:
+                markout_bad = True
+                reasons.append(
+                    f"avg_markout_5s {avg_markout_5s:.4f} <= {markout_threshold:.4f}"
+                )
+            if adverse_pct_5s >= adverse_threshold:
+                markout_bad = True
+                reasons.append(
+                    f"adverse_pct_5s {adverse_pct_5s:.1f}% >= {adverse_threshold:.1f}%"
+                )
+
+        spread_bad = (
+            spread_capture_count_val >= min_spread_events
+            and spread_capture_total_val <= spread_capture_threshold
+        )
+        if spread_bad:
+            reasons.append(
+                f"spread_capture {spread_capture_total_val:.2f} <= {spread_capture_threshold:.2f}"
+            )
+
+        triggered = total_fills >= min_fills and markout_bad and spread_bad
+        reason = (
+            "negative edge confirmed: " + "; ".join(reasons)
+            if triggered
+            else ""
+        )
+        return triggered, reason, metrics
+
+    def _update_negative_edge_metrics(self, metrics: dict[str, float]) -> None:
+        self._negative_edge_guard.last_total_fills = int(metrics.get("total_fills", 0.0) or 0.0)
+        self._negative_edge_guard.last_avg_markout_5s = float(
+            metrics.get("avg_markout_5s", 0.0) or 0.0
+        )
+        self._negative_edge_guard.last_adverse_pct_5s = float(
+            metrics.get("adverse_pct_5s", 0.0) or 0.0
+        )
+        self._negative_edge_guard.last_spread_capture_usd = float(
+            metrics.get("spread_capture_usd", 0.0) or 0.0
+        )
+        self._negative_edge_guard.last_spread_capture_count = int(
+            metrics.get("spread_capture_count", 0.0) or 0.0
+        )
+
+    async def _maybe_activate_negative_edge_guard(
+        self,
+        *,
+        time_left: float,
+        stats: dict[str, Any] | None = None,
+        spread_capture_total: float | None = None,
+        spread_capture_count: int | None = None,
+    ) -> bool:
+        triggered, reason, metrics = self._negative_edge_signal(
+            stats=stats,
+            spread_capture_total=spread_capture_total,
+            spread_capture_count=spread_capture_count,
+        )
+        self._update_negative_edge_metrics(metrics)
+        if not triggered:
+            return False
+
+        self._negative_edge_guard.reason = reason
+        self._negative_edge_guard.lockout_until = time.time() + max(0.0, float(time_left))
+
+        if self._negative_edge_guard.active:
+            if self._negative_edge_guard.mode == "close_only" and not self._has_material_position():
+                self._negative_edge_guard.mode = "no_trade"
+                self._set_cycle_guard_mode(
+                    "no_trade",
+                    reason,
+                    duration_sec=self._negative_edge_seconds_left(),
+                )
+            return True
+
+        self._negative_edge_guard.active = True
+        self._negative_edge_guard.trigger_count += 1
+        self._negative_edge_guard.last_triggered_at = time.time()
+
+        if self._has_material_position():
+            self._negative_edge_guard.mode = "close_only"
+            self._throttled_warn(
+                "negative_edge_close_only",
+                f"Negative-edge guard: close-only ({reason})",
+                cooldown=5.0,
+            )
+            await self._enter_close_only(reason, aggressive=True)
+        else:
+            self._negative_edge_guard.mode = "no_trade"
+            self._set_cycle_guard_mode(
+                "no_trade",
+                reason,
+                duration_sec=max(0.0, float(time_left)),
+            )
+            if self.order_mgr.active_order_ids:
+                await self._cancel_all_guarded()
+            self._paused = False
+            self._pause_reason = ""
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            self._throttled_warn(
+                "negative_edge_no_trade",
+                f"Negative-edge guard: no-trade for current window ({reason})",
+                cooldown=5.0,
+            )
+        return True
+
+    def _update_cycle_guard(self, *, current_portfolio_pm: float, time_left: float) -> None:
+        self._clear_cycle_guard_if_expired()
+        is_flat = self._cycle_flat()
+
+        if not self._cycle_guard.current_cycle_active and not is_flat:
+            self._cycle_guard.current_cycle_active = True
+            self._cycle_guard.current_cycle_started_at = time.time()
+            self._cycle_guard.current_cycle_start_portfolio_pm = float(current_portfolio_pm)
+            self._cycle_guard.current_cycle_fill_count = 0
+            self._cycle_guard.current_cycle_forced_close = False
+            self._close_only_toxic_count = 0
+
+        if self._cycle_guard.current_cycle_active and is_flat:
+            cycle_pnl = float(current_portfolio_pm) - float(self._cycle_guard.current_cycle_start_portfolio_pm)
+            duration = max(0.0, time.time() - float(self._cycle_guard.current_cycle_started_at or time.time()))
+            loss_threshold = max(
+                0.25,
+                float(getattr(self.config, "cycle_lockout_loss_usd", 1.0) or 1.0),
+            )
+            bad_cycle = (
+                cycle_pnl <= -loss_threshold
+                or (self._cycle_guard.current_cycle_forced_close and cycle_pnl < 0.0)
+                or (duration <= 90.0 and cycle_pnl < 0.0 and self._cycle_guard.current_cycle_fill_count > 0)
+            )
+            self._cycle_guard.last_cycle_pnl = cycle_pnl
+            if bad_cycle:
+                self._cycle_guard.bad_cycle_count += 1
+            self._cycle_guard.current_cycle_active = False
+            self._cycle_guard.current_cycle_started_at = 0.0
+            self._cycle_guard.current_cycle_start_portfolio_pm = 0.0
+            self._cycle_guard.current_cycle_fill_count = 0
+            self._cycle_guard.current_cycle_forced_close = False
+            self._close_only_reason = ""
+            self._close_only_started_at = 0.0
+            self._close_only_toxic_count = 0
+            self._set_liquidation_mode("inactive", "")
+            if self._negative_edge_guard.active:
+                self._negative_edge_guard.mode = "no_trade"
+                self._set_cycle_guard_mode(
+                    "no_trade",
+                    self._negative_edge_guard.reason,
+                    duration_sec=max(self._negative_edge_seconds_left(), max(0.0, float(time_left))),
+                )
+            elif self._cycle_guard.bad_cycle_count >= max(
+                1,
+                int(getattr(self.config, "cycle_lockout_bad_cycles", 2) or 2),
+            ):
+                self._set_cycle_guard_mode(
+                    "no_trade",
+                    "bad cycle lockout for current window",
+                    duration_sec=max(0.0, float(time_left)),
+                )
+            elif self._cycle_guard.mode == "close_only":
+                self._set_cycle_guard_mode("off", "")
+
+    def _record_place_failures(self, *, place_failed: int, place_total: int) -> None:
+        if place_total <= 0:
+            return
+        if place_failed > 0:
+            self._cycle_guard.consecutive_place_failures += 1
+        else:
+            self._cycle_guard.consecutive_place_failures = 0
+
+    def _placement_failure_threshold(self) -> int:
+        return max(
+            1,
+            int(getattr(self.config, "placement_failure_lockout_count", 3) or 3),
+        )
+
+    def _aggressive_liq_active(self) -> bool:
+        return self._liquidation_mode == "aggressive"
+
+    async def _enter_close_only(self, reason: str, *, aggressive: bool = False) -> None:
+        reason = reason.strip() or "close-only"
+        if not self._cycle_guard.active or self._cycle_guard.mode != "close_only" or self._close_only_reason != reason:
+            self._throttled_warn(
+                f"close_only:{reason}",
+                f"Close-only mode: {reason}",
+                cooldown=2.0,
+            )
+        self._cycle_guard.current_cycle_forced_close = True
+        self._set_cycle_guard_mode("close_only", reason)
+        self._close_only_reason = reason
+        if self._close_only_started_at <= 0:
+            self._close_only_started_at = time.time()
+        self._paused = False
+        self._pause_reason = ""
+        self._current_quotes = {"up": (None, None), "dn": (None, None)}
+        await self._cancel_all_guarded()
+        if aggressive:
+            self._is_closing = True
+            self._closing_start_time_left = self.market.time_remaining if self.market else 0.0
+            self._merge_failed_this_cycle = False
+            self._liq_chunk_index = 0
+            self._liq_last_chunk_time = 0.0
+            self._liq_last_attempt_time = 0.0
+            self._set_liquidation_mode("aggressive", reason)
+        else:
+            self._set_liquidation_mode("close_only", reason)
+
+    def _cycle_guard_blocks_new_buys(self) -> bool:
+        return self._cycle_guard.active and self._cycle_guard.mode in {"no_trade", "close_only"}
+
+    def _cycle_guard_blocks_all_quotes(self) -> bool:
+        return self._cycle_guard.active and self._cycle_guard.mode == "no_trade"
+
+    def _apply_cycle_guard_quote_block(
+        self,
+        all_quotes: dict[str, tuple[Quote | None, Quote | None]],
+        *,
+        is_live: bool,
+    ) -> None:
+        if not self._cycle_guard_blocks_new_buys():
+            return
+        up_bid, up_ask = all_quotes["up"]
+        dn_bid, dn_ask = all_quotes["dn"]
+        up_inventory = self._cached_pm_up_shares if is_live else self.inventory.up_shares
+        dn_inventory = self._cached_pm_dn_shares if is_live else self.inventory.dn_shares
+        all_quotes["up"] = (None, up_ask if up_inventory > 0.5 else None)
+        all_quotes["dn"] = (None, dn_ask if dn_inventory > 0.5 else None)
+        if self._cycle_guard.mode == "close_only":
+            self._throttled_warn(
+                "close_only_quotes",
+                f"Close-only: suppressing new BUYs ({self._cycle_guard.reason or self._close_only_reason})",
+                cooldown=2.0,
+            )
 
     def _pre_entry_required_checks(self) -> int:
         return max(
@@ -1067,6 +1569,20 @@ class MarketMaker:
         self._liquidation_order_ids.clear()
         self._merge_failed_this_cycle = False
         self._one_sided_counter = 0
+        self._set_liquidation_mode("inactive", "")
+        if self._negative_edge_guard.active:
+            self._negative_edge_guard.mode = "no_trade"
+            self._set_cycle_guard_mode(
+                "no_trade",
+                self._negative_edge_guard.reason,
+                duration_sec=self._negative_edge_seconds_left(),
+            )
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            log.info(
+                "Liquidation complete — staying no-trade for current window (%s)",
+                self._negative_edge_guard.reason,
+            )
+            return
         self._requote_event.set()
         log.info("Liquidation complete — exiting closing mode and resuming MM")
 
@@ -1511,7 +2027,10 @@ class MarketMaker:
     def set_market(self, market: MarketInfo) -> None:
         """Set the current market (token IDs, strike, window)."""
         self.market = market
-        self.order_mgr.set_market_context(min_order_size=market.min_order_size)
+        self.order_mgr.set_market_context(
+            min_order_size=market.min_order_size,
+            token_ids={market.up_token_id, market.dn_token_id},
+        )
         log.info(f"Market set: {market.coin} {market.timeframe} "
                  f"strike={market.strike:.2f} "
                  f"UP={market.up_token_id[:12]}... "
@@ -1730,6 +2249,7 @@ class MarketMaker:
         self._post_fill_entry_guard_active = False
         self._post_fill_entry_guard_reason = ""
         self._post_fill_entry_guard_trigger_count = 0
+        self._reset_cycle_window_state()
         self._imbalance_start_ts = 0.0
         self._imbalance_adjustments = {
             "leading_spread_mult": 1.0,
@@ -1866,14 +2386,22 @@ class MarketMaker:
                 # Closing mode does not need event-driven requote bursts.
                 # Keep a bounded cadence so API handlers remain responsive.
                 if self._is_closing:
-                    if self.market and self.market.time_remaining <= float(
-                        getattr(self.config, "liq_taker_threshold_sec", 10.0)
-                    ):
+                    taker_threshold = (
+                        float(getattr(self.config, "aggressive_liq_taker_threshold_sec", 30.0))
+                        if self._aggressive_liq_active()
+                        else float(getattr(self.config, "liq_taker_threshold_sec", 10.0))
+                    )
+                    chunk_interval = (
+                        float(getattr(self.config, "aggressive_liq_chunk_interval_sec", 2.0))
+                        if self._aggressive_liq_active()
+                        else float(getattr(self.config, "liq_chunk_interval_sec", 5.0))
+                    )
+                    if self.market and self.market.time_remaining <= taker_threshold:
                         close_sleep = 0.5
                     else:
                         close_sleep = max(
-                            1.0,
-                            min(float(getattr(self.config, "liq_chunk_interval_sec", 5.0)), 3.0),
+                            0.5 if self._aggressive_liq_active() else 1.0,
+                            min(float(chunk_interval), 3.0),
                         )
                     elapsed = time.monotonic() - loop_started_at
                     if elapsed < close_sleep:
@@ -1939,6 +2467,7 @@ class MarketMaker:
             # Window expired — liquidate and stop
             if not self._is_closing:
                 self._is_closing = True
+                self._set_liquidation_mode("close_only", "window expired")
                 self._closing_start_time_left = max(time_left, 1.0)
                 self._merge_failed_this_cycle = False
                 fv_up, fv_dn = self._compute_fv()
@@ -1977,6 +2506,7 @@ class MarketMaker:
 
         if time_left <= close_sec and not self._is_closing:
             self._is_closing = True
+            self._set_liquidation_mode("close_only", "close window reached")
             self._closing_start_time_left = time_left
             self._merge_failed_this_cycle = False
             fv_up_close, fv_dn_close = self._compute_fv()
@@ -2022,13 +2552,20 @@ class MarketMaker:
         await self._maybe_backfill_trades(triggered_by_fills=bool(fills))
         await self.markout_tracker.check_markouts()
         self._update_toxicity_mode()
+        await self._maybe_activate_negative_edge_guard(time_left=time_left)
         _t_fills = time.perf_counter()
 
         merge_reconcile_requested = False
         # Merge-first: check for merge opportunity periodically (skip during closing).
         if not self._is_closing:
             guarded_tokens = self._active_settlement_guard_tokens()
-            if guarded_tokens:
+            if self._cycle_guard.mode == "close_only":
+                self._throttled_warn(
+                    "merge_close_only_guard",
+                    f"Merge check paused during close-only ({self._cycle_guard.reason or self._close_only_reason})",
+                    cooldown=2.0,
+                )
+            elif guarded_tokens:
                 guard_left = max(
                     0.0,
                     max(
@@ -2304,6 +2841,32 @@ class MarketMaker:
                 self._current_quotes = {"up": (None, None), "dn": (None, None)}
             return
 
+        if self._cycle_guard.mode == "close_only" and self._has_material_position():
+            one_sided_now = (
+                (self._cached_pm_up_shares > 0.5 and self._cached_pm_dn_shares <= 0.5)
+                or (self._cached_pm_dn_shares > 0.5 and self._cached_pm_up_shares <= 0.5)
+            )
+            if one_sided_now and time_left <= 90.0 and not self._aggressive_liq_active():
+                await self._enter_close_only(
+                    self._close_only_reason or self._cycle_guard.reason or "one-sided near close",
+                    aggressive=True,
+                )
+                return
+            aggressive_after_sec = max(
+                1.0,
+                float(getattr(self.config, "aggressive_liq_after_sec", 20.0) or 20.0),
+            )
+            if (
+                self._close_only_started_at > 0
+                and (time.time() - self._close_only_started_at) >= aggressive_after_sec
+                and not self._aggressive_liq_active()
+            ):
+                await self._enter_close_only(
+                    self._close_only_reason or self._cycle_guard.reason or "close-only escalation",
+                    aggressive=True,
+                )
+                return
+
         st = self.feed_state
 
         if is_live:
@@ -2505,6 +3068,14 @@ class MarketMaker:
         _pos_value = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
         _current_portfolio = self._cached_usdc_balance + _pos_value
         _session_pnl = (_current_portfolio - self._starting_portfolio_pm) if self._starting_portfolio_pm > 0 else None
+        self._update_cycle_guard(current_portfolio_pm=_current_portfolio, time_left=time_left)
+        self._record_cycle_fill_activity(fills)
+
+        if self._cycle_guard.active and self._cycle_guard.mode == "no_trade":
+            if self.order_mgr.active_order_ids:
+                await self._cancel_all_guarded()
+            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+            return
 
         # Grace period: skip PnL-based risk checks for first 30s while balances settle
         _in_grace = time.time() < self._pnl_grace_until
@@ -2540,31 +3111,11 @@ class MarketMaker:
                                     self._catastrophic_count, reason)
                         self._catastrophic_count = 0
             if should_pause:
-                log.warning(f"Exit trigger: {reason}")
-                self._paused = False
-                self._pause_reason = ""
-                # Lock prices at trigger time
-                best_bid_up, best_bid_dn = await self._get_liq_lock_best_bids()
-                self._liq_lock = self.risk_mgr.lock_pnl(
-                    self.inventory, fv_up, fv_dn,
-                    margin=self.config.liq_price_floor_margin,
-                    best_bid_up=best_bid_up,
-                    best_bid_dn=best_bid_dn,
+                await self._trigger_drawdown_exit(
+                    reason,
+                    time_left=time_left,
+                    already_closing=self._is_closing,
                 )
-                log.info(
-                    "LIQ LOCK: trigger_pnl=$%.2f UP_avg=%.4f DN_avg=%.4f "
-                    "UP_floor=%.2f DN_floor=%.2f",
-                    self._liq_lock.trigger_pnl,
-                    self._liq_lock.up_avg_entry, self._liq_lock.dn_avg_entry,
-                    self._liq_lock.min_sell_price_up, self._liq_lock.min_sell_price_dn,
-                )
-                self._liq_chunk_index = 0
-                self._liq_last_chunk_time = 0.0
-                self._is_closing = True
-                self._closing_start_time_left = self.market.time_remaining
-                self._merge_failed_this_cycle = False
-                await self._cancel_all_guarded()
-                self._current_quotes = {"up": (None, None), "dn": (None, None)}
                 return
 
         # Inventory limit: hard-stop and enter closing/liquidation mode.
@@ -2582,6 +3133,8 @@ class MarketMaker:
             self._liq_chunk_index = 0
             self._liq_last_chunk_time = 0.0
             self._is_closing = True
+            self._cycle_guard.current_cycle_forced_close = True
+            self._set_liquidation_mode("close_only", reason)
             self._closing_start_time_left = self.market.time_remaining
             self._merge_failed_this_cycle = False
             await self._cancel_all_guarded()
@@ -2648,6 +3201,8 @@ class MarketMaker:
                 self._liq_chunk_index = 0
                 self._liq_last_chunk_time = 0.0
                 self._is_closing = True
+                self._cycle_guard.current_cycle_forced_close = True
+                self._set_liquidation_mode("close_only", "one-sided exposure early close")
                 self._closing_start_time_left = time_left
                 self._merge_failed_this_cycle = False
                 await self._cancel_all_guarded()
@@ -2722,6 +3277,8 @@ class MarketMaker:
                     self._liq_chunk_index = 0
                     self._liq_last_chunk_time = 0.0
                     self._is_closing = True
+                    self._cycle_guard.current_cycle_forced_close = True
+                    self._set_liquidation_mode("close_only", reason)
                     self._closing_start_time_left = self.market.time_remaining
                     self._merge_failed_this_cycle = False
                     await self._cancel_all_guarded()
@@ -2748,6 +3305,42 @@ class MarketMaker:
             max_divergence=max_divergence,
             quality_refreshed=quality_refreshed,
         )
+        toxic_checks_required = max(
+            1,
+            int(getattr(self.config, "close_only_toxic_checks", 3) or 3),
+        )
+        toxic_spread_bps = float(
+            getattr(self.config, "close_only_toxic_spread_bps", 1200.0) or 1200.0
+        )
+        held_position = self._has_material_position()
+        toxic_reasons: list[str] = []
+        if held_position:
+            if toxic_entry_block:
+                toxic_reasons.append("persistent toxic divergence")
+            if self._post_fill_entry_guard_active:
+                toxic_reasons.append(
+                    self._post_fill_entry_guard_reason or "post-fill quality degraded"
+                )
+            if self._last_quality and float(self._last_quality.spread_bps) >= toxic_spread_bps:
+                toxic_reasons.append(
+                    f"spread {float(self._last_quality.spread_bps):.0f}bps >= {toxic_spread_bps:.0f}bps"
+                )
+            if self._one_sided_counter >= one_sided_protect_ticks:
+                toxic_reasons.append(
+                    f"one-sided exposure {self._one_sided_counter} ticks >= {one_sided_protect_ticks}"
+                )
+        if quality_refreshed and toxic_reasons:
+            self._close_only_toxic_count += 1
+        elif quality_refreshed and not toxic_reasons and self._cycle_guard.mode != "close_only":
+            self._close_only_toxic_count = 0
+        if (
+            held_position
+            and toxic_reasons
+            and self._close_only_toxic_count >= toxic_checks_required
+            and self._cycle_guard.mode != "close_only"
+        ):
+            await self._enter_close_only("; ".join(dict.fromkeys(toxic_reasons)), aggressive=False)
+            return
         if self._quality_pause_active:
             return
 
@@ -2900,6 +3493,7 @@ class MarketMaker:
             all_quotes["dn"] = (None, all_quotes["dn"][1])
         self._apply_pre_entry_buy_block(all_quotes)
         self._apply_post_fill_entry_buy_block(all_quotes)
+        self._apply_cycle_guard_quote_block(all_quotes, is_live=is_live)
 
         # 6a. Skip quoting sides where FV is too extreme (market already decided)
         min_fv = self.config.min_fv_to_quote
@@ -3198,9 +3792,36 @@ class MarketMaker:
 
                     if place_total > 0:
                         self.sre_metrics.record_api_call(place_failed == 0)
+                        self._record_place_failures(place_failed=place_failed, place_total=place_total)
 
                     if place_failed:
                         log.warning("Order placement: %d/%d orders failed", place_failed, place_total)
+                        if self._cycle_guard.consecutive_place_failures >= self._placement_failure_threshold():
+                            duration_sec = max(
+                                10.0,
+                                float(getattr(self.config, "placement_failure_lockout_sec", 45.0) or 45.0),
+                            )
+                            if self._has_material_position():
+                                await self._enter_close_only(
+                                    (
+                                        "placement failures %d/%d for %d ticks"
+                                        % (
+                                            place_failed,
+                                            place_total,
+                                            self._cycle_guard.consecutive_place_failures,
+                                        )
+                                    ),
+                                    aggressive=False,
+                                )
+                                self._cycle_guard.lockout_until = time.time() + duration_sec
+                                return
+                            self._set_cycle_guard_mode(
+                                "no_trade",
+                                "placement failure lockout",
+                                duration_sec=duration_sec,
+                            )
+                            self._current_quotes = {"up": (None, None), "dn": (None, None)}
+                            return
 
                 # Update quote tracking while order lock is held to avoid state races.
                 for tk, (bid, ask) in pending_updates.items():
@@ -3468,11 +4089,24 @@ class MarketMaker:
 
         cfg = self.config
         time_left = self.market.time_remaining
-        min_attempt_interval = (
-            0.5
-            if time_left <= float(getattr(cfg, "liq_taker_threshold_sec", 10.0))
+        aggressive_mode = self._aggressive_liq_active()
+        active_chunk_interval = (
+            max(
+                0.5,
+                float(getattr(cfg, "aggressive_liq_chunk_interval_sec", 2.0) or 2.0),
+            )
+            if aggressive_mode
             else max(1.0, min(float(getattr(cfg, "liq_chunk_interval_sec", 5.0)), 3.0))
         )
+        active_taker_threshold = (
+            max(
+                10.0,
+                float(getattr(cfg, "aggressive_liq_taker_threshold_sec", 30.0) or 30.0),
+            )
+            if aggressive_mode
+            else float(getattr(cfg, "liq_taker_threshold_sec", 10.0))
+        )
+        min_attempt_interval = 0.5 if time_left <= active_taker_threshold else active_chunk_interval
         now = time.time()
         if self._liq_last_attempt_time > 0 and (now - self._liq_last_attempt_time) < min_attempt_interval:
             return
@@ -3526,8 +4160,9 @@ class MarketMaker:
                 log.warning("Merge failed (will not retry this cycle): %s",
                             result.get("error", "unknown"))
 
-        taker_threshold = cfg.liq_taker_threshold_sec
+        taker_threshold = active_taker_threshold
         use_taker = time_left <= taker_threshold
+        liq_reason = self._liquidation_reason or self._close_only_reason or "liquidation active"
         # Emergency drawdown check during liquidation
         # Use real PM balances (not internal inventory) and starting portfolio (with tokens)
         if self._starting_portfolio_pm > 0 and self._cached_usdc_balance > 0:
@@ -3536,7 +4171,7 @@ class MarketMaker:
             _pos_val = self._cached_pm_up_shares * _pm_up + self._cached_pm_dn_shares * _pm_dn
             _liq_pnl = (self._cached_usdc_balance + _pos_val) - self._starting_portfolio_pm
             effective_drawdown = self._effective_max_drawdown_usd()
-            catastrophic_limit = -effective_drawdown if effective_drawdown > 0 else float("-inf")
+            catastrophic_limit = -(2.0 * effective_drawdown) if effective_drawdown > 0 else float("-inf")
             if _liq_pnl < catastrophic_limit:
                 self._catastrophic_count += 1
                 log.warning(
@@ -3586,9 +4221,41 @@ class MarketMaker:
                     return  # Wait for more readings before deciding
             else:
                 self._catastrophic_count = 0  # Reset counter on non-catastrophic reading
-            if effective_drawdown > 0 and _liq_pnl < -effective_drawdown and not use_taker:
-                log.warning("Max drawdown exceeded during liquidation: sPnL=$%.2f, forcing taker mode", _liq_pnl)
-                use_taker = True
+            if effective_drawdown > 0 and _liq_pnl < -effective_drawdown:
+                self._drawdown_liquidation_breach_count += 1
+                aggressive_mode = True
+                active_chunk_interval = max(
+                    0.5,
+                    float(getattr(cfg, "aggressive_liq_chunk_interval_sec", 2.0) or 2.0),
+                )
+                active_taker_threshold = max(
+                    10.0,
+                    float(getattr(cfg, "aggressive_liq_taker_threshold_sec", 30.0) or 30.0),
+                )
+                taker_threshold = active_taker_threshold
+                liq_reason = f"Max drawdown liquidation: sPnL=${_liq_pnl:.2f}"
+                if self._drawdown_liquidation_breach_count >= 2:
+                    if not use_taker:
+                        log.warning(
+                            "Persistent drawdown during liquidation (%d): sPnL=$%.2f, forcing taker mode",
+                            self._drawdown_liquidation_breach_count,
+                            _liq_pnl,
+                        )
+                    use_taker = True
+                else:
+                    log.warning(
+                        "Max drawdown exceeded during liquidation: sPnL=$%.2f, escalating to aggressive liquidation",
+                        _liq_pnl,
+                    )
+                    use_taker = time_left <= taker_threshold
+                self._liq_last_chunk_time = 0.0
+            else:
+                self._drawdown_liquidation_breach_count = 0
+
+        self._set_liquidation_mode(
+            "taker" if use_taker else ("aggressive" if aggressive_mode else "close_only"),
+            liq_reason,
+        )
 
         # 1. Prune filled/cancelled liquidation orders
         active = set(self.order_mgr.active_order_ids)
@@ -3605,7 +4272,7 @@ class MarketMaker:
         # 3. If limit orders are still live, wait for chunk interval then cancel & re-place
         if self._liquidation_order_ids and not use_taker:
             elapsed = now - self._liq_last_chunk_time if self._liq_last_chunk_time else 0
-            if elapsed < cfg.liq_chunk_interval_sec:
+            if elapsed < active_chunk_interval:
                 log.info("Liquidation limit orders active (%d), waiting (%.0fs left, %.1fs since last)",
                          len(self._liquidation_order_ids), time_left, elapsed)
                 return
@@ -3664,6 +4331,7 @@ class MarketMaker:
             if up_rem_pf < pm_min_pf and dn_rem_pf < pm_min_pf:
                 fv_up_pf, fv_dn_pf = self._compute_fv()
                 dust_val = up_rem_pf * fv_up_pf + dn_rem_pf * fv_dn_pf
+                self._residual_inventory_failure = True
                 self._throttled_warn(
                     "liq_dust_preflight",
                     f"Liquidation dust: UP={up_rem_pf:.2f} DN={dn_rem_pf:.2f} "
@@ -3759,7 +4427,15 @@ class MarketMaker:
             else:
                 # ── Phase 1: Gradual Limit ──
                 # Price: max(floor, FV - discount), improve to best_bid if higher
-                sell_price = max(floor, fv - cfg.liq_max_discount_from_fv)
+                active_discount = (
+                    max(
+                        0.03,
+                        float(getattr(cfg, "aggressive_liq_max_discount_from_fv", 0.06) or 0.06),
+                    )
+                    if aggressive_mode
+                    else float(cfg.liq_max_discount_from_fv)
+                )
+                sell_price = max(floor, fv - active_discount)
                 if best_bid and best_bid > sell_price:
                     resting_min = best_bid + tick_size
                     if best_ask is not None and best_ask > 0:
@@ -3882,6 +4558,7 @@ class MarketMaker:
                         await self._cancel_order_guarded(oid)
                     self._liquidation_order_ids.clear()
                 log.info("Liquidation complete — PM inventory cleared")
+                self._residual_inventory_failure = False
                 self._maybe_exit_inventory_close_mode_after_clear()
                 return
 
@@ -3897,6 +4574,7 @@ class MarketMaker:
             if all_dust:
                 fv_up_d, fv_dn_d = self._compute_fv()
                 dust_value = up_rem * fv_up_d + dn_rem * fv_dn_d
+                self._residual_inventory_failure = True
                 self._throttled_warn(
                     "liq_dust",
                     f"Liquidation dust: UP={up_rem:.2f} DN={dn_rem:.2f} "
@@ -4000,6 +4678,7 @@ class MarketMaker:
         self._post_fill_entry_guard_active = False
         self._post_fill_entry_guard_reason = ""
         self._post_fill_entry_guard_trigger_count = 0
+        self._reset_cycle_window_state()
         self._liquidation_order_ids.clear()
         self._one_sided_counter = 0
         self._toxicity_spread_mult = 1.0
@@ -4024,6 +4703,10 @@ class MarketMaker:
 
         # Update market info
         self.market = new_market
+        self.order_mgr.set_market_context(
+            min_order_size=new_market.min_order_size,
+            token_ids={new_market.up_token_id, new_market.dn_token_id},
+        )
         log.info(f"New window: strike={new_market.strike:.2f} "
                  f"UP={new_market.up_token_id[:12]}... "
                  f"DN={new_market.dn_token_id[:12]}...")
@@ -4235,6 +4918,15 @@ class MarketMaker:
                 "suppressed_total": self._settlement_lag_suppressed_total,
                 "escalated_total": self._settlement_lag_escalated_total,
             },
+            "order_tracking": {
+                "active_count": len(self.order_mgr.active_orders),
+                "recent_count": len(getattr(self.order_mgr, "_recent_orders", {})),
+                "current_generation": int(getattr(self.order_mgr, "_tracking_generation", 0)),
+                "last_fallback_poll_count": int(getattr(self.order_mgr, "_last_fallback_poll_count", 0)),
+                "max_recent_per_token": int(getattr(self.order_mgr, "_recent_order_max_per_token", 0)),
+                "current_tokens": sorted(getattr(self.order_mgr, "_current_token_ids", set())),
+            },
+            "api_errors": self.order_mgr.get_api_error_stats(),
             "pre_entry_guard": {
                 "active": self._pre_entry_guard_active,
                 "reason": self._pre_entry_guard_reason,
@@ -4265,6 +4957,53 @@ class MarketMaker:
                 "anchor_spread_bps": round(self._post_fill_entry_guard_anchor.spread_bps, 1)
                 if self._post_fill_entry_guard_anchor
                 else None,
+            },
+            "cycle_guard": {
+                "active": self._cycle_guard.active,
+                "mode": self._cycle_guard.mode,
+                "reason": self._cycle_guard.reason,
+                "seconds_left": round(self._cycle_guard_seconds_left(), 2),
+                "bad_cycle_count": self._cycle_guard.bad_cycle_count,
+                "consecutive_place_failures": self._cycle_guard.consecutive_place_failures,
+                "current_cycle_active": self._cycle_guard.current_cycle_active,
+                "current_cycle_fill_count": self._cycle_guard.current_cycle_fill_count,
+                "last_cycle_pnl": round(self._cycle_guard.last_cycle_pnl, 4),
+            },
+            "negative_edge_guard": {
+                "active": self._negative_edge_guard.active,
+                "mode": self._negative_edge_guard.mode,
+                "reason": self._negative_edge_guard.reason,
+                "seconds_left": round(self._negative_edge_seconds_left(), 2),
+                "trigger_count": self._negative_edge_guard.trigger_count,
+                "last_total_fills": self._negative_edge_guard.last_total_fills,
+                "last_avg_markout_5s": round(self._negative_edge_guard.last_avg_markout_5s, 6),
+                "last_adverse_pct_5s": round(self._negative_edge_guard.last_adverse_pct_5s, 1),
+                "last_spread_capture_usd": round(self._negative_edge_guard.last_spread_capture_usd, 4),
+                "last_spread_capture_count": self._negative_edge_guard.last_spread_capture_count,
+                "last_triggered_at": round(self._negative_edge_guard.last_triggered_at, 3)
+                if self._negative_edge_guard.last_triggered_at > 0
+                else 0.0,
+            },
+            "liquidation": {
+                "mode": self._liquidation_mode,
+                "reason": self._liquidation_reason,
+                "seconds_in_mode": round(
+                    max(0.0, time.time() - self._liquidation_mode_started_at),
+                    2,
+                ) if self._liquidation_mode_started_at > 0 else 0.0,
+                "chunk_interval_sec_current": round(
+                    float(getattr(self.config, "aggressive_liq_chunk_interval_sec", 2.0))
+                    if self._aggressive_liq_active()
+                    else float(getattr(self.config, "liq_chunk_interval_sec", 5.0)),
+                    2,
+                ),
+                "taker_threshold_sec_current": round(
+                    float(getattr(self.config, "aggressive_liq_taker_threshold_sec", 30.0))
+                    if self._aggressive_liq_active()
+                    else float(getattr(self.config, "liq_taker_threshold_sec", 10.0)),
+                    2,
+                ),
+                "residual_inventory_failure": self._residual_inventory_failure,
             },
 
             # PnL & Risk (override fill-based with PM-balance-based)

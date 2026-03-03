@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -841,6 +843,268 @@ def test_pre_entry_guard_rearms_after_inventory_returns_flat():
     assert mm._pre_entry_guard_reason == "stable quality warmup 0/2"
 
 
+def test_bad_cycle_count_increments_on_negative_roundtrip():
+    mm = _make_mm(live=True)
+    mm._running = True
+
+    mm._cached_pm_up_shares = 5.0
+    mm.inventory.up_shares = 5.0
+    mm._update_cycle_guard(current_portfolio_pm=100.0, time_left=600.0)
+    assert mm._cycle_guard.current_cycle_active is True
+
+    mm._cached_pm_up_shares = 0.0
+    mm.inventory.up_shares = 0.0
+    mm._update_cycle_guard(current_portfolio_pm=98.8, time_left=600.0)
+
+    assert mm._cycle_guard.current_cycle_active is False
+    assert mm._cycle_guard.bad_cycle_count == 1
+    assert mm._cycle_guard.last_cycle_pnl == pytest.approx(-1.2)
+
+
+def test_cycle_lockout_blocks_new_buys_until_window_end():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.config.cycle_lockout_bad_cycles = 2
+    mm.config.cycle_lockout_loss_usd = 1.0
+
+    for portfolio in (100.0, 98.6, 97.1):
+        if portfolio == 100.0:
+            mm._cached_pm_up_shares = 5.0
+            mm.inventory.up_shares = 5.0
+            mm._update_cycle_guard(current_portfolio_pm=portfolio, time_left=600.0)
+            mm._cached_pm_up_shares = 0.0
+            mm.inventory.up_shares = 0.0
+        elif portfolio == 98.6:
+            mm._update_cycle_guard(current_portfolio_pm=portfolio, time_left=600.0)
+            mm._cached_pm_up_shares = 5.0
+            mm.inventory.up_shares = 5.0
+            mm._update_cycle_guard(current_portfolio_pm=portfolio, time_left=550.0)
+            mm._cached_pm_up_shares = 0.0
+            mm.inventory.up_shares = 0.0
+        else:
+            mm._update_cycle_guard(current_portfolio_pm=portfolio, time_left=500.0)
+
+    assert mm._cycle_guard.active is True
+    assert mm._cycle_guard.mode == "no_trade"
+    assert mm._cycle_guard.bad_cycle_count == 2
+    assert mm._cycle_guard.reason == "bad cycle lockout for current window"
+
+
+def test_close_only_blocks_all_new_buys():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._cycle_guard.active = True
+    mm._cycle_guard.mode = "close_only"
+    mm._cycle_guard.reason = "toxic market"
+    mm._cached_pm_up_shares = 5.0
+    mm._cached_pm_dn_shares = 0.0
+
+    quotes = {
+        "up": (
+            Quote(side="BUY", token_id=mm.market.up_token_id, price=0.45, size=5.0),
+            Quote(side="SELL", token_id=mm.market.up_token_id, price=0.55, size=5.0),
+        ),
+        "dn": (
+            Quote(side="BUY", token_id=mm.market.dn_token_id, price=0.45, size=5.0),
+            Quote(side="SELL", token_id=mm.market.dn_token_id, price=0.55, size=5.0),
+        ),
+    }
+
+    mm._apply_cycle_guard_quote_block(quotes, is_live=True)
+
+    assert quotes["up"][0] is None
+    assert quotes["up"][1] is not None
+    assert quotes["dn"][0] is None
+    assert quotes["dn"][1] is None
+
+
+@pytest.mark.anyio
+async def test_placement_failure_lockout_enters_close_only_when_nonflat():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._cached_pm_up_shares = 5.0
+    mm.inventory.up_shares = 5.0
+    mm.order_mgr.cancel_all = AsyncMock(return_value=1)
+
+    for _ in range(3):
+        mm._record_place_failures(place_failed=1, place_total=1)
+
+    assert mm._cycle_guard.consecutive_place_failures == 3
+
+    await mm._enter_close_only("placement failures 1/1 for 3 ticks", aggressive=False)
+
+    assert mm._cycle_guard.active is True
+    assert mm._cycle_guard.mode == "close_only"
+    assert mm._liquidation_mode == "close_only"
+    mm.order_mgr.cancel_all.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_aggressive_liquidation_shortens_replace_interval():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm._liquidation_mode = "aggressive"
+    mm._liquidation_reason = "test"
+    mm._liquidation_mode_started_at = time.time() - 5.0
+    mm._liq_last_chunk_time = time.time() - 3.0
+    mm._liquidation_order_ids = {"oid-1"}
+    mm.order_mgr._active_orders = {
+        "oid-1": Quote(side="SELL", token_id=mm.market.up_token_id, price=0.55, size=5.0)
+    }
+    mm._cancel_order_guarded = AsyncMock(return_value=True)
+    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[0.0, 0.0, 0.0, 0.0])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+
+    await mm._liquidate_inventory()
+
+    mm._cancel_order_guarded.assert_awaited_once()
+    assert mm._liquidation_order_ids == set()
+
+
+@pytest.mark.anyio
+async def test_residual_inventory_failure_flagged_after_close():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm._liquidation_mode = "aggressive"
+    mm._liquidation_reason = "test"
+    mm._liquidation_mode_started_at = time.time() - 5.0
+    mm.market.window_end = time.time() + 120.0
+    mm.order_mgr.ensure_sell_allowance = AsyncMock(return_value=True)
+    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[1.0, 0.0, 1.0, 0.0])
+    mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": 0.40, "best_ask": 0.42})
+    mm._place_order_guarded = AsyncMock(return_value=None)
+
+    await mm._liquidate_inventory()
+
+    assert mm._residual_inventory_failure is True
+
+
+def test_negative_edge_signal_trips_on_bad_markout_and_negative_spread_capture():
+    mm = _make_mm(live=True)
+
+    triggered, reason, metrics = mm._negative_edge_signal(
+        stats={
+            "total_fills": 12,
+            "avg_markout_5s": -0.007583,
+            "adverse_pct_5s": 33.3,
+        },
+        spread_capture_total=-1.15,
+        spread_capture_count=5,
+    )
+
+    assert triggered is True
+    assert "negative edge confirmed" in reason
+    assert "avg_markout_5s" in reason
+    assert "spread_capture" in reason
+    assert metrics["avg_markout_5s"] == pytest.approx(-0.007583)
+    assert metrics["spread_capture_usd"] == pytest.approx(-1.15)
+
+
+@pytest.mark.anyio
+async def test_negative_edge_guard_flat_enters_no_trade():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+
+    activated = await mm._maybe_activate_negative_edge_guard(
+        time_left=420.0,
+        stats={
+            "total_fills": 12,
+            "avg_markout_5s": -0.007583,
+            "adverse_pct_5s": 33.3,
+        },
+        spread_capture_total=-1.15,
+        spread_capture_count=5,
+    )
+
+    assert activated is True
+    assert mm._negative_edge_guard.active is True
+    assert mm._negative_edge_guard.mode == "no_trade"
+    assert mm._cycle_guard.active is True
+    assert mm._cycle_guard.mode == "no_trade"
+    assert "negative edge confirmed" in mm._cycle_guard.reason
+
+
+@pytest.mark.anyio
+async def test_negative_edge_guard_nonflat_enters_aggressive_close_only():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._cached_pm_up_shares = 11.38
+    mm.inventory.up_shares = 11.38
+    mm.order_mgr.cancel_all = AsyncMock(return_value=0)
+
+    activated = await mm._maybe_activate_negative_edge_guard(
+        time_left=180.0,
+        stats={
+            "total_fills": 12,
+            "avg_markout_5s": -0.007583,
+            "adverse_pct_5s": 33.3,
+        },
+        spread_capture_total=-1.15,
+        spread_capture_count=5,
+    )
+
+    assert activated is True
+    assert mm._negative_edge_guard.active is True
+    assert mm._negative_edge_guard.mode == "close_only"
+    assert mm._cycle_guard.mode == "close_only"
+    assert mm._is_closing is True
+    assert mm._liquidation_mode == "aggressive"
+
+
+def test_negative_edge_close_only_flips_to_no_trade_after_flatten():
+    mm = _make_mm(live=True)
+    mm._running = True
+    mm._is_closing = True
+    mm.market.window_end = time.time() + 600.0
+    mm._negative_edge_guard.active = True
+    mm._negative_edge_guard.mode = "close_only"
+    mm._negative_edge_guard.reason = "negative edge confirmed"
+    mm._negative_edge_guard.lockout_until = time.time() + 300.0
+    mm._cycle_guard.active = True
+    mm._cycle_guard.mode = "close_only"
+    mm._cycle_guard.reason = "negative edge confirmed"
+    mm._cached_pm_up_shares = 0.0
+    mm._cached_pm_dn_shares = 0.0
+    mm.inventory.up_shares = 0.0
+    mm.inventory.dn_shares = 0.0
+
+    mm._maybe_exit_inventory_close_mode_after_clear()
+
+    assert mm._is_closing is False
+    assert mm._negative_edge_guard.mode == "no_trade"
+    assert mm._cycle_guard.mode == "no_trade"
+
+
+def test_audit_artifact_failed_window_trips_negative_edge_guard():
+    artifact = (
+        Path(BASE)
+        / "audit"
+        / "2026-03-02_23-23-54"
+        / "last_failed_window_state_raw.json"
+    )
+    if not artifact.exists():
+        pytest.skip("audit artifact not present")
+
+    payload = json.loads(artifact.read_text())
+    mm = _make_mm(live=True)
+
+    triggered, reason, metrics = mm._negative_edge_signal(
+        stats=payload["markout_tca"],
+        spread_capture_total=payload["pnl_decomposition"]["components"]["spread_capture"]["total_usd"],
+        spread_capture_count=payload["pnl_decomposition"]["components"]["spread_capture"]["count"],
+    )
+
+    assert triggered is True
+    assert "negative edge confirmed" in reason
+    assert metrics["avg_markout_5s"] == pytest.approx(payload["markout_tca"]["avg_markout_5s"])
+    assert metrics["spread_capture_usd"] == pytest.approx(
+        payload["pnl_decomposition"]["components"]["spread_capture"]["total_usd"]
+    )
+
+
 def test_session_pnl_prevents_false_drawdown():
     risk_mgr, inventory = _make_risk_setup()
 
@@ -859,6 +1123,107 @@ def test_session_pnl_triggers_real_drawdown():
     should_pause, reason = risk_mgr.should_pause(inventory, session_pnl=-10.0)
     assert should_pause is True
     assert reason == "Max drawdown exceeded: PnL=$-10.00"
+
+
+def test_snapshot_exposes_api_error_stats():
+    mm = _make_mm(live=True)
+    mm.order_mgr._record_api_error(
+        op="place_batch",
+        token_id=mm.market.up_token_id,
+        order_id="oid-1234567890",
+        status_code=400,
+        message="batch rejected",
+        details={"transient": False},
+    )
+
+    snap = mm.snapshot()
+
+    assert "api_errors" in snap
+    assert snap["api_errors"]["total_by_op"]["place_batch"] == 1
+    assert snap["api_errors"]["recent"][-1]["status_code"] == 400
+    assert snap["api_errors"]["recent"][-1]["order_id"] == "oid-12345678"
+
+
+def test_drawdown_exit_returns_before_quote_generation():
+    mm = _make_mm(live=True)
+    mm._started_at = time.time()
+    mm._cached_usdc_balance = 100.0
+    mm._cached_usdc_available_balance = 100.0
+    mm.feed_state.mid = 100.0
+    mm.feed_state.pm_up = 0.5
+    mm.feed_state.pm_dn = 0.5
+    mm.feed_state.pm_up_bid = 0.49
+    mm.feed_state.pm_dn_bid = 0.49
+    mm.feed_state.pm_last_update_ts = time.time()
+    mm._catastrophic_count = mm._catastrophic_threshold - 1
+
+    mm.order_mgr.check_fills = AsyncMock(return_value=[])
+    mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(100.0, 100.0))
+    mm.order_mgr.place_orders_batch = AsyncMock(return_value=[])
+    mm._cancel_all_guarded = AsyncMock(return_value=0)  # type: ignore[assignment]
+    mm._get_liq_lock_best_bids = AsyncMock(return_value=(0.49, 0.49))
+    mm.risk_mgr.should_pause = lambda *_args, **_kwargs: (True, "Max drawdown exceeded: PnL=$-5.00")
+
+    asyncio.run(mm._tick())
+
+    mm.order_mgr.place_orders_batch.assert_not_awaited()
+    mm._cancel_all_guarded.assert_awaited_once()
+    assert mm._is_closing is True
+    assert mm._liquidation_mode == "close_only"
+    assert mm._cycle_guard.current_cycle_forced_close is True
+
+
+def test_drawdown_while_closing_escalates_to_aggressive_liquidation():
+    mm = _make_mm(live=True)
+    mm._is_closing = True
+    mm.feed_state.pm_up = 0.5
+    mm.feed_state.pm_dn = 0.5
+    mm._cancel_all_guarded = AsyncMock(return_value=0)  # type: ignore[assignment]
+    mm._get_liq_lock_best_bids = AsyncMock(return_value=(0.49, 0.49))
+
+    asyncio.run(
+        mm._trigger_drawdown_exit(
+            "Max drawdown exceeded: PnL=$-5.00",
+            time_left=mm.market.time_remaining,
+            already_closing=True,
+        )
+    )
+
+    assert mm._liquidation_mode == "aggressive"
+    assert mm._liquidation_reason == "Max drawdown exceeded: PnL=$-5.00"
+    mm._cancel_all_guarded.assert_awaited_once()
+
+
+def test_persistent_drawdown_during_liquidation_forces_fastest_exit_path():
+    mm = _make_mm(live=False)
+    mm._is_closing = True
+    mm._close_only_reason = "drawdown exit"
+    mm._liquidation_mode = "aggressive"
+    mm._liquidation_mode_started_at = time.time() - 5.0
+    mm._starting_portfolio_pm = 100.0
+    mm._cached_usdc_balance = 86.0
+    mm._cached_pm_up_shares = 6.0
+    mm.feed_state.pm_up = 0.5
+    mm.feed_state.pm_up_bid = 0.5
+    mm.feed_state.pm_dn = 0.5
+    mm.feed_state.pm_dn_bid = 0.5
+    mm.config.max_drawdown_usd = 8.0
+    mm._drawdown_liquidation_breach_count = 1
+    mm.inventory.up_shares = 6.0
+    mm.inventory.up_cost.total_shares = 6.0
+    mm.inventory.up_cost.total_cost = 6.0 * 0.8
+
+    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[6.0, 0.0, 6.0, 0.0])
+    mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": 0.55, "best_ask": 0.56})
+    mm.order_mgr.place_order = AsyncMock(return_value="liq-1")
+    mm.order_mgr.active_order_ids.clear()
+
+    asyncio.run(mm._liquidate_inventory())
+
+    assert mm._liquidation_mode == "taker"
+    assert mm._drawdown_liquidation_breach_count == 2
+    assert mm.order_mgr.place_order.await_args.kwargs["post_only"] is False
 
 
 def test_reconcile_resets_on_window_transition():

@@ -231,26 +231,35 @@ def test_session_exposure_cap_scales_buys_to_remaining_headroom():
 
 
 @pytest.mark.anyio
-async def test_liquidation_catastrophic_uses_single_drawdown_threshold():
+async def test_liquidation_drawdown_below_catastrophic_threshold_escalates_without_shutdown():
     mm = _make_mm()
     mm.config.max_drawdown_usd = 8.0
     mm._catastrophic_count = 2
     mm._starting_portfolio_pm = 50.0
-    mm._cached_usdc_balance = 41.0
-    mm._cached_usdc_available_balance = 41.0
-    mm._cached_pm_up_shares = 0.0
+    mm._cached_usdc_balance = 37.0
+    mm._cached_usdc_available_balance = 37.0
+    mm._cached_pm_up_shares = 6.0
     mm._cached_pm_dn_shares = 0.0
+    mm._is_closing = True
+    mm.inventory.up_shares = 6.0
+    mm.inventory.up_cost.record_buy(0.80, 6.0, 0.0)
+    mm.feed_state.pm_up = 0.5
+    mm.feed_state.pm_up_bid = 0.5
+    mm.feed_state.pm_dn = 0.5
+    mm.feed_state.pm_dn_bid = 0.5
 
-    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[0.0, 0.0])
-    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(41.0, 41.0))
+    mm.order_mgr.get_token_balance = AsyncMock(side_effect=[6.0, 0.0, 6.0, 0.0])
+    mm.order_mgr.get_usdc_balances = AsyncMock(return_value=(37.0, 37.0))
     mm.order_mgr.get_all_token_balances = AsyncMock(return_value=(0.0, 0.0))
+    mm.order_mgr.get_book_summary = AsyncMock(return_value={"best_bid": 0.55, "best_ask": 0.56})
+    mm.order_mgr.place_order = AsyncMock(return_value="liq-1")
     mm._emergency_shutdown = AsyncMock()
 
     await mm._liquidate_inventory()
 
-    mm._emergency_shutdown.assert_awaited_once()
-    reason = mm._emergency_shutdown.await_args.args[0]
-    assert "CATASTROPHIC LOSS confirmed" in reason
+    mm._emergency_shutdown.assert_not_awaited()
+    assert mm._liquidation_mode == "aggressive"
+    assert "Max drawdown liquidation" in mm._liquidation_reason
 
 
 @pytest.mark.anyio

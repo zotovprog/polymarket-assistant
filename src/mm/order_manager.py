@@ -8,11 +8,13 @@ Uses py_clob_client for:
 """
 from __future__ import annotations
 import asyncio
+from collections import deque
 import inspect
 import json
 import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 import websockets
 
@@ -102,6 +104,38 @@ class TradeLedger:
         }
 
 
+@dataclass
+class RecentOrderState:
+    quote: Quote
+    removed_ts: float
+    token_id: str
+    reason: str
+    last_polled_ts: float
+    generation: int
+
+
+@dataclass
+class APIErrorEvent:
+    ts: float
+    op: str
+    token_id: str | None
+    order_id: str | None
+    status_code: int | None
+    message: str
+    details: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ts": round(float(self.ts), 3),
+            "op": self.op,
+            "token_id": self.token_id[:12] if self.token_id else None,
+            "order_id": self.order_id[:12] if self.order_id else None,
+            "status_code": self.status_code,
+            "message": self.message,
+            "details": dict(self.details),
+        }
+
+
 class OrderManager:
     """Manage orders on Polymarket CLOB."""
 
@@ -116,7 +150,7 @@ class OrderManager:
         self._log = log
         self._active_orders: dict[str, Quote] = {}  # order_id -> Quote
         self._order_post_only: dict[str, bool] = {}  # order_id -> placement post_only flag
-        self._recent_orders: dict[str, tuple[Quote, float]] = {}  # order_id -> (Quote, removed_ts)
+        self._recent_orders: dict[str, RecentOrderState] = {}
         self._filled_order_ids: set[str] = set()
         self._partial_fill_reported: dict[str, float] = {}  # order_id -> last reported size_matched
         self._pending_cancels: set[str] = set()
@@ -136,7 +170,18 @@ class OrderManager:
         self._usdc_available_cache: float | None = None
         self._usdc_balance_cache_ts: float = 0.0
         self._usdc_cache_ttl: float = 5.0  # Cache USDC balance for 5 seconds
-        self._recent_order_retention_sec: float = 120.0
+        self._recent_order_retention_sec: float = max(
+            5.0,
+            float(getattr(config, "recent_order_retention_sec", 20.0) or 20.0),
+        )
+        self._recent_order_max_per_token: int = max(
+            2,
+            int(getattr(config, "recent_order_max_per_token", 8) or 8),
+        )
+        self._fallback_poll_cap: int = max(
+            4,
+            int(getattr(config, "fallback_poll_cap", 12) or 12),
+        )
         self._recent_poll_interval_sec: float = 3.0
         self._on_fill_callback: Any = None  # Callable or None — called on WS fill
         self._reconcile_requested: bool = False
@@ -149,7 +194,13 @@ class OrderManager:
             float(getattr(config, "sell_reject_cooldown_sec", 8.0) or 8.0),
         )
         self._market_min_order_size: float = 5.0
+        self._current_token_ids: set[str] = set()
+        self._tracking_generation: int = 0
+        self._last_fallback_poll_count: int = 0
         self._order_args_supports_fee_rate: bool = self._detect_order_args_fee_rate_support()
+        self._recent_api_errors: deque[APIErrorEvent] = deque(maxlen=50)
+        self._api_error_counts: dict[str, int] = {}
+        self._last_api_error_ts: float = 0.0
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
@@ -159,14 +210,28 @@ class OrderManager:
         """Set callback invoked when fill WS disconnects/reconnect loop kicks in."""
         self._on_ws_reconnect = callback
 
-    def set_market_context(self, *, min_order_size: float | None = None) -> None:
+    def set_market_context(
+        self,
+        *,
+        min_order_size: float | None = None,
+        token_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
         """Set market-dependent runtime parameters used by pre-trade checks."""
-        if min_order_size is None:
-            return
-        try:
-            self._market_min_order_size = max(0.01, float(min_order_size))
-        except (TypeError, ValueError):
-            self._market_min_order_size = 5.0
+        if min_order_size is not None:
+            try:
+                self._market_min_order_size = max(0.01, float(min_order_size))
+            except (TypeError, ValueError):
+                self._market_min_order_size = 5.0
+        if token_ids is not None:
+            new_token_ids = {
+                str(token_id)
+                for token_id in token_ids
+                if token_id
+            }
+            if new_token_ids != self._current_token_ids:
+                self._tracking_generation += 1
+                self._current_token_ids = new_token_ids
+                self._prune_recent_orders(prune_all_out_of_scope=True)
 
     def _pm_min_order_size(self) -> float:
         """Current PM minimum size from market context (safe default = 5)."""
@@ -472,6 +537,86 @@ class OrderManager:
         return raw
 
     @staticmethod
+    def _extract_status_code(payload: Any) -> int | None:
+        if payload is None:
+            return None
+        if isinstance(payload, dict):
+            for key in ("status_code", "statusCode", "code"):
+                raw = payload.get(key)
+                try:
+                    if raw is None:
+                        continue
+                    return int(raw)
+                except (TypeError, ValueError):
+                    continue
+            error = payload.get("error")
+            if isinstance(error, dict):
+                for key in ("status_code", "statusCode", "code"):
+                    raw = error.get(key)
+                    try:
+                        if raw is None:
+                            continue
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        for attr in ("status_code", "status"):
+            raw = getattr(payload, attr, None)
+            try:
+                if raw is None:
+                    continue
+                return int(raw)
+            except (TypeError, ValueError):
+                continue
+        response = getattr(payload, "response", None)
+        if response is not None:
+            for attr in ("status_code", "status"):
+                raw = getattr(response, attr, None)
+                try:
+                    if raw is None:
+                        continue
+                    return int(raw)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _record_api_error(
+        self,
+        *,
+        op: str,
+        message: str,
+        token_id: str | None = None,
+        order_id: str | None = None,
+        status_code: int | None = None,
+        details: dict[str, Any] | None = None,
+        transient: bool = False,
+    ) -> None:
+        safe_message = self._safe_str(message) or "unknown api error"
+        safe_details = dict(details or {})
+        if transient:
+            safe_details["transient"] = True
+        event = APIErrorEvent(
+            ts=time.time(),
+            op=op,
+            token_id=self._safe_str(token_id) or None,
+            order_id=self._safe_str(order_id) or None,
+            status_code=status_code,
+            message=safe_message,
+            details=safe_details,
+        )
+        self._recent_api_errors.append(event)
+        self._api_error_counts[op] = int(self._api_error_counts.get(op, 0)) + 1
+        self._last_api_error_ts = event.ts
+
+    def get_api_error_stats(self) -> dict[str, Any]:
+        return {
+            "total_by_op": dict(sorted(self._api_error_counts.items())),
+            "recent": [event.to_dict() for event in list(self._recent_api_errors)[-10:]],
+            "last_error_ts": round(self._last_api_error_ts, 3) if self._last_api_error_ts > 0 else 0.0,
+        }
+
+    @staticmethod
     def _clone_quote(quote: Quote) -> Quote:
         """Detach quote snapshot for post-cancel fill reconciliation."""
         return Quote(
@@ -483,21 +628,74 @@ class OrderManager:
             placed_at=float(quote.placed_at or 0.0),
         )
 
-    def _track_recent_order(self, order_id: str, quote: Quote | None) -> None:
+    def _track_recent_order(
+        self,
+        order_id: str,
+        quote: Quote | None,
+        *,
+        reason: str = "cancelled",
+    ) -> None:
         """Keep recently removed order for late fill accounting."""
         if not order_id or quote is None:
             return
-        self._recent_orders[order_id] = (self._clone_quote(quote), time.time())
+        if order_id in self._filled_order_ids or reason in {"matched", "closed"}:
+            self._recent_orders.pop(order_id, None)
+            self._partial_fill_reported.pop(order_id, None)
+            return
+        token_id = self._safe_str(getattr(quote, "token_id", "")) or ""
+        if self._current_token_ids and token_id and token_id not in self._current_token_ids:
+            return
+        self._recent_orders[order_id] = RecentOrderState(
+            quote=self._clone_quote(quote),
+            removed_ts=time.time(),
+            token_id=token_id,
+            reason=reason,
+            last_polled_ts=0.0,
+            generation=self._tracking_generation,
+        )
+        self._prune_recent_orders()
 
-    def _prune_recent_orders(self, now: float | None = None) -> None:
+    def _prune_recent_orders(
+        self,
+        now: float | None = None,
+        *,
+        prune_all_out_of_scope: bool = False,
+    ) -> None:
         """Drop expired recently removed orders."""
         ts = now if now is not None else time.time()
         ttl = max(5.0, float(self._recent_order_retention_sec))
-        stale_ids = [
-            oid
-            for oid, (_q, removed_ts) in self._recent_orders.items()
-            if (ts - removed_ts) > ttl
-        ]
+        stale_ids: list[str] = []
+        scoped_recent: list[tuple[str, RecentOrderState]] = []
+        for oid, state in self._recent_orders.items():
+            if prune_all_out_of_scope and (
+                state.generation != self._tracking_generation
+                or (self._current_token_ids and state.token_id not in self._current_token_ids)
+            ):
+                stale_ids.append(oid)
+                continue
+            if (ts - state.removed_ts) > ttl:
+                stale_ids.append(oid)
+                continue
+            if state.generation != self._tracking_generation:
+                stale_ids.append(oid)
+                continue
+            if self._current_token_ids and state.token_id and state.token_id not in self._current_token_ids:
+                stale_ids.append(oid)
+                continue
+            scoped_recent.append((oid, state))
+
+        if scoped_recent:
+            by_token: dict[str, list[tuple[str, RecentOrderState]]] = {}
+            for oid, state in scoped_recent:
+                by_token.setdefault(state.token_id or "", []).append((oid, state))
+            for items in by_token.values():
+                items.sort(key=lambda entry: entry[1].removed_ts, reverse=True)
+                for oid, _state in items[self._recent_order_max_per_token:]:
+                    stale_ids.append(oid)
+            scoped_recent.sort(key=lambda entry: entry[1].removed_ts, reverse=True)
+            for oid, _state in scoped_recent[max(16, self._fallback_poll_cap + 4):]:
+                stale_ids.append(oid)
+
         for oid in stale_ids:
             self._recent_orders.pop(oid, None)
             self._partial_fill_reported.pop(oid, None)
@@ -509,7 +707,7 @@ class OrderManager:
             return quote
         recent = self._recent_orders.get(order_id)
         if recent is not None:
-            return recent[0]
+            return recent.quote
         return None
 
     @classmethod
@@ -1190,6 +1388,17 @@ class OrderManager:
             self._allowance_cap_shares[token_id] = cap_shares
             return True
         except Exception as e:
+            self._record_api_error(
+                op="ensure_sell_allowance",
+                token_id=token_id,
+                status_code=self._extract_status_code(e),
+                message=str(e),
+                details={
+                    "required_shares": req_shares,
+                    "force_refresh": force_refresh,
+                    "transient": True,
+                },
+            )
             log.error(f"Failed to ensure allowance for {token_id[:12]}...: {e}")
             return False
 
@@ -1427,6 +1636,18 @@ class OrderManager:
             return await self._place_order_inner(quote, use_post_only)
         except Exception as e:
             error_msg = str(e)
+            self._record_api_error(
+                op="place_order",
+                token_id=quote.token_id,
+                status_code=self._extract_status_code(e),
+                message=error_msg,
+                details={
+                    "side": quote.side,
+                    "price": quote.price,
+                    "size": quote.size,
+                    "post_only": use_post_only,
+                },
+            )
             self._handle_fee_or_signature_reject(
                 quote,
                 reason=error_msg,
@@ -1458,6 +1679,18 @@ class OrderManager:
                     try:
                         return await self._place_order_inner(quote, False)
                     except Exception as e2:
+                        self._record_api_error(
+                            op="place_order_taker_fallback",
+                            token_id=quote.token_id,
+                            status_code=self._extract_status_code(e2),
+                            message=str(e2),
+                            details={
+                                "side": quote.side,
+                                "price": quote.price,
+                                "size": quote.size,
+                                "post_only": False,
+                            },
+                        )
                         log.error(f"Taker fallback also failed: {e2}")
                         return None
                 else:
@@ -1570,6 +1803,17 @@ class OrderManager:
                 signed = await asyncio.to_thread(self.client.create_order, oa)
                 signed_orders.append(signed)
             except Exception as e:
+                self._record_api_error(
+                    op="sign_order",
+                    token_id=quote.token_id,
+                    status_code=self._extract_status_code(e),
+                    message=str(e),
+                    details={
+                        "side": quote.side,
+                        "price": quote.price,
+                        "size": quote.size,
+                    },
+                )
                 log.warning("Failed to sign order %s: %s", quote.side, e)
                 signed_orders.append(None)
 
@@ -1604,6 +1848,19 @@ class OrderManager:
                     order_resp = order_results[pos] if pos < len(order_results) else None
                     if not isinstance(order_resp, dict):
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._record_api_error(
+                            op="place_batch_item",
+                            token_id=quote.token_id,
+                            status_code=self._extract_status_code(order_resp),
+                            message=reason,
+                            details={
+                                "side": quote.side,
+                                "price": quote.price,
+                                "size": quote.size,
+                                "raw": self._compact_raw(order_resp),
+                                "transient": False,
+                            },
+                        )
                         self._handle_fee_or_signature_reject(
                             quote,
                             reason=reason,
@@ -1644,6 +1901,19 @@ class OrderManager:
                         )
                     else:
                         reason = self._extract_batch_reject_reason(order_resp)
+                        self._record_api_error(
+                            op="place_batch_item",
+                            token_id=quote.token_id,
+                            status_code=self._extract_status_code(order_resp),
+                            message=reason,
+                            details={
+                                "side": quote.side,
+                                "price": quote.price,
+                                "size": quote.size,
+                                "raw": self._compact_raw(order_resp),
+                                "transient": False,
+                            },
+                        )
                         self._handle_fee_or_signature_reject(
                             quote,
                             reason=reason,
@@ -1665,6 +1935,16 @@ class OrderManager:
                             self._compact_raw(order_resp),
                         )
             except Exception as e:
+                self._record_api_error(
+                    op="place_batch",
+                    status_code=self._extract_status_code(e),
+                    message=str(e),
+                    details={
+                        "batch_size": len(batch_indices),
+                        "post_only": use_post_only,
+                        "transient": self._is_balance_or_allowance_reject(str(e)),
+                    },
+                )
                 log.error("Batch post_orders failed: %s", e)
                 if self._is_balance_or_allowance_reject(str(e)):
                     for idx in batch_indices:
@@ -1735,6 +2015,16 @@ class OrderManager:
                 # Assume full batch success if API didn't raise.
                 cancelled_ids.update(batch)
             except Exception as e:
+                self._record_api_error(
+                    op="cancel_orders_batch",
+                    status_code=self._extract_status_code(e),
+                    message=str(e),
+                    details={
+                        "count": len(batch),
+                        "order_ids": list(batch),
+                        "transient": True,
+                    },
+                )
                 log.warning("Batch cancel failed: %s, falling back to individual", e)
                 for oid in batch:
                     try:
@@ -1743,8 +2033,14 @@ class OrderManager:
                             timeout=5.0,
                         )
                         cancelled_ids.add(oid)
-                    except Exception:
-                        pass
+                    except Exception as inner_exc:
+                        self._record_api_error(
+                            op="cancel_order",
+                            order_id=oid,
+                            status_code=self._extract_status_code(inner_exc),
+                            message=str(inner_exc),
+                            details={"transient": True, "fallback": "batch_cancel"},
+                        )
 
         for oid in cancelled_ids:
             self._track_recent_order(oid, self._active_orders.get(oid))
@@ -1783,6 +2079,14 @@ class OrderManager:
 
             return {"best_bid": best_bid, "best_ask": best_ask}
         except Exception as e:
+            self._record_api_error(
+                op="get_book_summary",
+                token_id=token_id,
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                details={"token_id": token_id[:12]},
+                transient=True,
+            )
             log.debug(f"Failed to get book for {token_id[:12]}...: {e}")
             return {"best_bid": None, "best_ask": None}
 
@@ -1839,6 +2143,14 @@ class OrderManager:
                 "num_bids": len(bids), "num_asks": len(asks),
             }
         except Exception as e:
+            self._record_api_error(
+                op="get_full_book",
+                token_id=token_id,
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                details={"token_id": token_id[:12]},
+                transient=True,
+            )
             log.debug(f"Failed to get full book for {token_id[:12]}...: {e}")
             return empty
 
@@ -1866,6 +2178,14 @@ class OrderManager:
             )
             return float(result["balance"]) / 1e6
         except Exception as e:
+            self._record_api_error(
+                op="get_token_balance",
+                token_id=token_id,
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                details={"token_id": token_id[:12]},
+                transient=True,
+            )
             log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
             return None
 
@@ -1974,6 +2294,12 @@ class OrderManager:
             self._usdc_balance_cache_ts = now
             return total, available
         except Exception as e:
+            self._record_api_error(
+                op="get_usdc_balances",
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                transient=True,
+            )
             log.warning(f"Failed to fetch USDC balance: {e}")
             return None, None
 
@@ -2046,13 +2372,20 @@ class OrderManager:
             )
             quote = self._active_orders.get(order_id)
             if quote is not None:
-                self._track_recent_order(order_id, quote)
+                self._track_recent_order(order_id, quote, reason="cancelled")
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
             self._notify_heartbeat_id(resp)
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
         except Exception as e:
+            self._record_api_error(
+                op="cancel_order",
+                order_id=order_id,
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                details={"order_id": order_id[:12]},
+            )
             log.warning(f"Cancel failed for {order_id[:12]}...: {e}")
             return False
 
@@ -2070,6 +2403,7 @@ class OrderManager:
         self._pending_cancels.clear()
         self._reconcile_requested = False
         self._sell_reject_cooldown_until.clear()
+        self._last_fallback_poll_count = 0
         if clear_recent:
             self._recent_orders.clear()
         if clear_ws_queue:
@@ -2102,7 +2436,7 @@ class OrderManager:
             self._notify_heartbeat_id(batch_resp)
             cancelled = len(ids)
             for oid, quote in existing.items():
-                self._track_recent_order(oid, quote)
+                self._track_recent_order(oid, quote, reason="batch_cancel")
             for oid in ids:
                 self._active_orders.pop(oid, None)
                 self._order_post_only.pop(oid, None)
@@ -2113,8 +2447,20 @@ class OrderManager:
                 log.info("Forced batch cancel submitted with no locally tracked orders")
         except Exception as e:
             if not ids:
+                self._record_api_error(
+                    op="cancel_all",
+                    message=str(e),
+                    status_code=self._extract_status_code(e),
+                    details={"force_exchange": force_exchange, "tracked_orders": len(ids)},
+                )
                 log.error("Forced batch cancel failed with no local order IDs: %s", e)
                 raise
+            self._record_api_error(
+                op="cancel_all",
+                message=str(e),
+                status_code=self._extract_status_code(e),
+                details={"force_exchange": force_exchange, "tracked_orders": len(ids)},
+            )
             log.warning(f"Batch cancel failed: {e}, trying individual...")
             for oid in ids:
                 if await self.cancel_order(oid):
@@ -2443,13 +2789,27 @@ class OrderManager:
         )
         if recent_due:
             self._last_recent_poll_ts = now
-            for oid, (quote, _removed_ts) in self._recent_orders.items():
+            recent_candidates: list[tuple[str, RecentOrderState]] = []
+            for oid, state in self._recent_orders.items():
                 if oid in ws_processed_oids or oid in removed_set:
                     continue
-                poll_map.setdefault(oid, quote)
+                if state.generation != self._tracking_generation:
+                    continue
+                if self._current_token_ids and state.token_id not in self._current_token_ids:
+                    continue
+                if (now - state.last_polled_ts) < max(1.0, float(self._recent_poll_interval_sec)):
+                    continue
+                recent_candidates.append((oid, state))
+            recent_candidates.sort(key=lambda entry: entry[1].removed_ts, reverse=True)
+            for oid, state in recent_candidates:
+                if len(poll_map) >= self._fallback_poll_cap:
+                    break
+                poll_map.setdefault(oid, state.quote)
+                state.last_polled_ts = now
 
         if poll_map:
-            poll_items = list(poll_map.items())
+            poll_items = list(poll_map.items())[:self._fallback_poll_cap]
+            self._last_fallback_poll_count = len(poll_items)
             if is_mock_client:
                 log.info("Paper fill poll: checking %d tracked orders", len(poll_items))
             else:
@@ -2465,7 +2825,24 @@ class OrderManager:
                 return_exceptions=True,
             )
             for (oid, quote), result in zip(poll_items, fetch_results):
-                if isinstance(result, Exception) or result is None:
+                if isinstance(result, Exception):
+                    self._record_api_error(
+                        op="fallback_poll",
+                        token_id=quote.token_id,
+                        order_id=oid,
+                        status_code=self._extract_status_code(result),
+                        message=str(result),
+                        details={"transient": True},
+                    )
+                    continue
+                if result is None:
+                    self._record_api_error(
+                        op="fallback_poll",
+                        token_id=quote.token_id,
+                        order_id=oid,
+                        message="empty order status response",
+                        details={"transient": True},
+                    )
                     continue
                 status = result.get("status", "")
                 size_matched = self._safe_float(result.get("size_matched", 0)) or 0.0
@@ -2522,10 +2899,13 @@ class OrderManager:
                 if status in ("MATCHED", "CLOSED"):
                     self._filled_order_ids.add(oid)
                     to_remove.append(oid)
+                    self._recent_orders.pop(oid, None)
                     self._partial_fill_reported.pop(oid, None)
                 elif status in ("CANCELLED", "EXPIRED"):
                     to_remove.append(oid)
                     self._partial_fill_reported.pop(oid, None)
+        else:
+            self._last_fallback_poll_count = 0
 
         for oid in set(to_remove):
             self._active_orders.pop(oid, None)
@@ -2608,6 +2988,16 @@ class OrderManager:
                     break
                 cursor = next_cursor
         except Exception as e:
+            self._record_api_error(
+                op="backfill_trades",
+                status_code=self._extract_status_code(e),
+                message=str(e),
+                details={
+                    "market_id": market_id,
+                    "token_id": token_id,
+                    "transient": True,
+                },
+            )
             log.warning("Trade backfill failed: %s", e)
 
         if new_count > 0:
@@ -2676,7 +3066,11 @@ class OrderManager:
         self._last_fill_check_ts = 0.0
         self._last_recent_poll_ts = 0.0
         self._session_spent = 0.0
+        self._last_fallback_poll_count = 0
         self._warn_cooldowns = {}
+        self._recent_api_errors.clear()
+        self._api_error_counts = {}
+        self._last_api_error_ts = 0.0
 
     def get_stats(self) -> dict:
         """Get order manager stats."""
@@ -2684,6 +3078,9 @@ class OrderManager:
             "active_orders": len(self._active_orders),
             "active_bids": sum(1 for q in self._active_orders.values() if q.side == "BUY"),
             "active_asks": sum(1 for q in self._active_orders.values() if q.side == "SELL"),
+            "recent_orders": len(self._recent_orders),
+            "tracking_generation": self._tracking_generation,
+            "fallback_poll_count": self._last_fallback_poll_count,
         }
 
     def get_active_orders_detail(self, liquidation_ids: set[str] | None = None,
