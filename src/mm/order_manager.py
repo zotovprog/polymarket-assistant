@@ -201,6 +201,11 @@ class OrderManager:
         self._recent_api_errors: deque[APIErrorEvent] = deque(maxlen=50)
         self._api_error_counts: dict[str, int] = {}
         self._last_api_error_ts: float = 0.0
+        if hasattr(clob_client, "_mock_token_balances") and isinstance(
+            getattr(clob_client, "_mock_token_balances", None),
+            dict,
+        ):
+            self._mock_token_balances = clob_client._mock_token_balances
 
     def set_heartbeat_id_callback(self, callback) -> None:
         """Set callback to notify HeartbeatManager of new heartbeat_id from PM responses."""
@@ -615,6 +620,17 @@ class OrderManager:
             "recent": [event.to_dict() for event in list(self._recent_api_errors)[-10:]],
             "last_error_ts": round(self._last_api_error_ts, 3) if self._last_api_error_ts > 0 else 0.0,
         }
+
+    def get_placement_error_total(self) -> int:
+        """Count real placement/signing failures recorded through API-error paths."""
+        placement_ops = (
+            "place_order",
+            "place_order_taker_fallback",
+            "place_batch",
+            "place_batch_item",
+            "sign_order",
+        )
+        return sum(int(self._api_error_counts.get(op, 0)) for op in placement_ops)
 
     @staticmethod
     def _clone_quote(quote: Quote) -> Quote:
@@ -1449,6 +1465,7 @@ class OrderManager:
         quote.placed_at = time.time()
         self._active_orders[order_id] = quote
         self._order_post_only[order_id] = post_only
+        self.invalidate_usdc_cache()
         if quote.side == "SELL":
             self._sell_reject_cooldown_until.pop(quote.token_id, None)
         self._notify_heartbeat_id(resp)
@@ -2270,11 +2287,20 @@ class OrderManager:
 
         try:
             if hasattr(self.client, "_orders"):
-                balance = float(getattr(self.client, '_usdc_balance', 0.0))
-                self._usdc_balance_cache = balance
-                self._usdc_available_cache = balance
+                total = None
+                get_balance = getattr(self.client, "get_balance", None)
+                if callable(get_balance):
+                    try:
+                        total = float(get_balance())
+                    except Exception:
+                        total = None
+                available = float(getattr(self.client, "_usdc_balance", 0.0))
+                if total is None:
+                    total = available
+                self._usdc_balance_cache = total
+                self._usdc_available_cache = available
                 self._usdc_balance_cache_ts = now
-                return balance, balance
+                return total, available
             if not _HAS_CLOB_TYPES:
                 self._usdc_balance_cache = 0.0
                 self._usdc_available_cache = 0.0
@@ -2375,6 +2401,7 @@ class OrderManager:
                 self._track_recent_order(order_id, quote, reason="cancelled")
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
+            self.invalidate_usdc_cache()
             self._notify_heartbeat_id(resp)
             log.info(f"Cancelled order {order_id[:12]}...")
             return True
@@ -2441,6 +2468,7 @@ class OrderManager:
                 self._active_orders.pop(oid, None)
                 self._order_post_only.pop(oid, None)
                 self._pending_cancels.discard(oid)
+            self.invalidate_usdc_cache()
             if cancelled > 0:
                 log.info(f"Batch cancelled {cancelled} orders")
             elif force_exchange:
@@ -2665,6 +2693,7 @@ class OrderManager:
                     fee=fee, order_id=oid, is_maker=is_maker,
                 )
                 fills.append(fill)
+                self.invalidate_usdc_cache()
                 trade_id = self._build_ledger_trade_id(
                     "ws_trade", ws_msg, oid, fill_size, fill_price, prev_matched
                 )
@@ -2686,7 +2715,7 @@ class OrderManager:
                 elif quote.side == "SELL":
                     self._session_spent = max(0.0, self._session_spent - fill_size * fill_price)
 
-                if hasattr(self.client, "_orders"):
+                if hasattr(self.client, "_orders") and not getattr(self.client, "_manages_mock_balances", False):
                     if quote.side == "BUY":
                         actual_size = (
                             net_shares_after_buy_fee(fill_size, fill_price, token_id=quote.token_id)
@@ -2732,6 +2761,7 @@ class OrderManager:
                                 fee=fee, order_id=oid, is_maker=is_maker,
                             )
                             fills.append(fill)
+                            self.invalidate_usdc_cache()
                             trade_id = self._build_ledger_trade_id(
                                 "ws_order", ws_msg, oid, missed, fill_price, prev
                             )
@@ -2862,7 +2892,14 @@ class OrderManager:
                         price=fill_price, size=round(new_fill, 4),
                         fee=fee, order_id=oid, is_maker=is_maker,
                     )
+                    if quote.side == "SELL":
+                        inventory_backed_total = float(result.get("inventory_backed_size", 0.0) or 0.0)
+                        inv_prev = min(inventory_backed_total, prev)
+                        inv_new = min(inventory_backed_total, size_matched)
+                        fill.inventory_backed_size = round(max(0.0, inv_new - inv_prev), 4)
+                        fill.short_backed_size = round(max(0.0, new_fill - fill.inventory_backed_size), 4)
                     fills.append(fill)
+                    self.invalidate_usdc_cache()
                     trade_id = self._build_ledger_trade_id(
                         "http_poll", result, oid, new_fill, fill_price, prev
                     )
@@ -2883,7 +2920,7 @@ class OrderManager:
                         self._session_spent += new_fill * fill_price
                     elif quote.side == "SELL":
                         self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
-                    if hasattr(self.client, "_orders"):
+                    if hasattr(self.client, "_orders") and not getattr(self.client, "_manages_mock_balances", False):
                         if quote.side == "BUY":
                             actual = (
                                 net_shares_after_buy_fee(new_fill, fill_price, token_id=quote.token_id)

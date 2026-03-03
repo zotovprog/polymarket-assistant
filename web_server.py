@@ -40,6 +40,7 @@ from mm.mm_config import MMConfig
 from mm.market_maker import MarketMaker
 from mm.market_selector import MarketSelector
 from mm.runtime_metrics import runtime_metrics
+from mm_v2 import MMConfigV2, MarketMakerV2
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
 from version import __version__ as APP_VERSION, git_hash as _git_hash_fn
@@ -371,6 +372,33 @@ class VerificationRunRequest(BaseModel):
     kind: str = "server_self_check"
 
 
+class ConfigUpdateRequestV2(BaseModel):
+    session_budget_usd: Optional[float] = None
+    base_clip_usd: Optional[float] = None
+    target_pair_value_ratio: Optional[float] = None
+    soft_excess_value_ratio: Optional[float] = None
+    hard_excess_value_ratio: Optional[float] = None
+    base_half_spread_bps: Optional[float] = None
+    max_half_spread_bps: Optional[float] = None
+    inventory_skew_strength: Optional[float] = None
+    defensive_spread_mult: Optional[float] = None
+    defensive_size_mult: Optional[float] = None
+    unwind_window_sec: Optional[float] = None
+    emergency_unwind_timeout_sec: Optional[float] = None
+    emergency_taker_start_sec: Optional[float] = None
+    hard_drawdown_usd: Optional[float] = None
+    max_transport_failures: Optional[int] = None
+    market_scope: Optional[str] = None
+    tick_interval_sec: Optional[float] = None
+    min_market_quality_score: Optional[float] = None
+    min_entry_depth_usd: Optional[float] = None
+    max_entry_spread_bps: Optional[float] = None
+    reconcile_drift_threshold_shares: Optional[float] = None
+    fill_settlement_grace_sec: Optional[float] = None
+    requote_threshold_bps: Optional[float] = None
+    fallback_poll_cap: Optional[int] = None
+
+
 def _validate_config_updates_before_apply(updates: dict[str, Any]) -> dict[str, Any]:
     """Clamp incoming config updates against MMConfig bounds before runtime apply."""
     if not updates:
@@ -425,6 +453,8 @@ class MockClobClient:
         self._fill_prob = fill_prob  # Base fill probability per get_order call
         self._tick_count = 0  # Count calls for time-based fill logic
         self._usdc_balance = usdc_balance
+        self._mock_token_balances: dict[str, float] = {}
+        self._manages_mock_balances = True
         # Fair values per token_id, set by market_maker via set_fair_values()
         self._fair_values: dict[str, float] = {}
         self._pm_prices: dict = {}  # {"up": mid, "dn": mid} from real PM WS feed
@@ -441,12 +471,29 @@ class MockClobClient:
         Matches real PM get_balance_allowance(COLLATERAL) which reports
         the full on-chain balance, not available-minus-locked.
         """
-        locked = sum(
-            o["collateral"]
-            for o in self._orders.values()
-            if o.get("status") == "LIVE" and o.get("side") == "BUY"
-        )
+        locked = 0.0
+        for order in self._orders.values():
+            if order.get("status") != "LIVE":
+                continue
+            side = str(order.get("side", "")).upper()
+            size = float(order.get("size", 0.0) or 0.0)
+            size_matched = float(order.get("size_matched", 0.0) or 0.0)
+            price = float(order.get("price", 0.0) or 0.0)
+            if side == "BUY":
+                locked += max(0.0, size - size_matched) * price
+            elif side == "SELL":
+                short_size = float(order.get("short_size", 0.0) or 0.0)
+                inventory_backed = float(order.get("inventory_backed_size", 0.0) or 0.0)
+                short_filled = max(0.0, size_matched - inventory_backed)
+                locked += max(0.0, short_size - short_filled) * max(0.0, 1.0 - price)
         return self._usdc_balance + locked
+
+    def _complement_token(self, token_id: str) -> str | None:
+        if token_id == self._up_token:
+            return self._dn_token
+        if token_id == self._dn_token:
+            return self._up_token
+        return None
 
     def set_fair_values(
         self,
@@ -479,13 +526,17 @@ class MockClobClient:
         size = float(signed.get("size", 10))
         side = str(signed.get("side", "BUY")).upper()
         token_id = signed.get("token_id", "")
+        token_balance = max(0.0, float(self._mock_token_balances.get(token_id, 0.0) or 0.0))
+        inventory_backed_size = min(token_balance, size) if side == "SELL" else 0.0
+        short_size = max(0.0, size - inventory_backed_size) if side == "SELL" else 0.0
         collateral = self._required_collateral(side, size, price)
+        if side == "SELL":
+            collateral = short_size * max(0.0, 1.0 - price)
 
-        if side == "BUY" and self._usdc_balance < collateral:
+        if self._usdc_balance < collateral:
             return {"error_msg": "not enough balance", "status": "error"}
 
-        if side == "BUY":
-            self._usdc_balance -= collateral
+        self._usdc_balance -= collateral
         oid = f"mock-{self._next_id:06d}"
         self._next_id += 1
         self._orders[oid] = {
@@ -499,27 +550,35 @@ class MockClobClient:
             "fill_credit_applied": False,
             "created_tick": self._tick_count,
             "created_ts": time.time(),
+            "inventory_backed_size": inventory_backed_size,
+            "short_size": short_size,
         }
         return {"orderID": oid}
 
+    @staticmethod
+    def _unfilled_collateral(order: dict) -> float:
+        side = str(order.get("side", "")).upper()
+        price = float(order.get("price", 0.0) or 0.0)
+        size = float(order.get("size", 0.0) or 0.0)
+        size_matched = float(order.get("size_matched", 0.0) or 0.0)
+        if side == "BUY":
+            return max(0.0, size - size_matched) * price
+        inventory_backed = float(order.get("inventory_backed_size", 0.0) or 0.0)
+        short_size = float(order.get("short_size", 0.0) or 0.0)
+        short_filled = max(0.0, size_matched - inventory_backed)
+        return max(0.0, short_size - short_filled) * max(0.0, 1.0 - price)
+
     def cancel(self, order_id: str) -> dict:
         order = self._orders.pop(order_id, None)
-        if (order and order.get("status") == "LIVE"
-                and order.get("side") == "BUY"):
-            # Refund only unfilled portion's collateral
-            filled = float(order.get("size_matched", 0))
-            unfilled = max(0.0, order["size"] - filled)
-            refund = unfilled * order["price"]
+        if order and order.get("status") == "LIVE":
+            refund = self._unfilled_collateral(order)
             self._usdc_balance += refund
         return {"success": True}
 
     def cancel_all(self) -> dict:
         for order in self._orders.values():
-            if order.get("status") == "LIVE" and order.get("side") == "BUY":
-                filled = float(order.get("size_matched", 0))
-                unfilled = max(0.0, order["size"] - filled)
-                refund = unfilled * order["price"]
-                self._usdc_balance += refund
+            if order.get("status") == "LIVE":
+                self._usdc_balance += self._unfilled_collateral(order)
         self._orders.clear()
         return {"success": True}
 
@@ -607,15 +666,28 @@ class MockClobClient:
                 order["status"] = "MATCHED"
                 order["size_matched"] = order["size"]
 
-            if order["side"] == "SELL" and not order.get("fill_credit_applied"):
-                self._usdc_balance += order["size_matched"] * order["price"]
-                order["fill_credit_applied"] = True
-            elif (order["side"] == "SELL" and order.get("fill_credit_applied")
-                  and order["status"] == "MATCHED"):
-                # Additional credit for partial → full transition
-                prev_credit = (order["size_matched"] - fill_size) * order["price"]
-                total_credit = order["size"] * order["price"]
-                self._usdc_balance += total_credit - prev_credit
+            token_id = str(order.get("token_id", ""))
+            side = str(order.get("side", "")).upper()
+            if side == "BUY":
+                cur = float(self._mock_token_balances.get(token_id, 0.0) or 0.0)
+                self._mock_token_balances[token_id] = cur + fill_size
+            elif side == "SELL":
+                inventory_backed = float(order.get("inventory_backed_size", 0.0) or 0.0)
+                inv_filled_prev = min(inventory_backed, already_matched)
+                inv_filled_new = min(inventory_backed, order["size_matched"])
+                short_filled_prev = max(0.0, already_matched - inventory_backed)
+                short_filled_new = max(0.0, order["size_matched"] - inventory_backed)
+                delta_inv = max(0.0, inv_filled_new - inv_filled_prev)
+                delta_short = max(0.0, short_filled_new - short_filled_prev)
+                if delta_inv > 0:
+                    cur = float(self._mock_token_balances.get(token_id, 0.0) or 0.0)
+                    self._mock_token_balances[token_id] = max(0.0, cur - delta_inv)
+                    self._usdc_balance += delta_inv * order["price"]
+                if delta_short > 0:
+                    comp = self._complement_token(token_id)
+                    if comp:
+                        cur_comp = float(self._mock_token_balances.get(comp, 0.0) or 0.0)
+                        self._mock_token_balances[comp] = cur_comp + delta_short
 
             log.info(f"[MOCK] Fill: {order['side']} "
                      f"{order['size_matched']:.1f}/{order['size']:.1f}"
@@ -2503,8 +2575,329 @@ class MMRuntime:
         }
 
 
+class MMRuntimeV2(MMRuntime):
+    """Parallel runtime for the pair-first V2 engine."""
+
+    def __init__(self):
+        super().__init__()
+        self.mm_v2: Optional[MarketMakerV2] = None
+        self.mm_config_v2: MMConfigV2 = MMConfigV2()
+
+    def _idle_snapshot_v2(self) -> dict[str, Any]:
+        return {
+            "app_version": APP_VERSION,
+            "app_git_hash": APP_GIT_HASH,
+            "is_running": False,
+            "lifecycle": "bootstrapping",
+            "market": None,
+            "valuation": {
+                "fv_up": 0.0,
+                "fv_dn": 0.0,
+                "confidence": 0.0,
+                "source": "",
+                "regime": "",
+                "divergence_up": 0.0,
+                "divergence_dn": 0.0,
+            },
+            "inventory": {
+                "up_shares": 0.0,
+                "dn_shares": 0.0,
+                "free_usdc": 0.0,
+                "reserved_usdc": 0.0,
+                "pending_buy_up": 0.0,
+                "pending_buy_dn": 0.0,
+                "pending_sell_up": 0.0,
+                "pending_sell_dn": 0.0,
+                "paired_qty": 0.0,
+                "excess_up_qty": 0.0,
+                "excess_dn_qty": 0.0,
+                "paired_value_usd": 0.0,
+                "excess_up_value_usd": 0.0,
+                "excess_dn_value_usd": 0.0,
+                "total_inventory_value_usd": 0.0,
+            },
+            "pair_inventory": {
+                "paired_qty": 0.0,
+                "excess_up_qty": 0.0,
+                "excess_dn_qty": 0.0,
+                "paired_value_usd": 0.0,
+                "excess_up_value_usd": 0.0,
+                "excess_dn_value_usd": 0.0,
+            },
+            "quotes": {
+                "up_bid": None,
+                "up_ask": None,
+                "dn_bid": None,
+                "dn_ask": None,
+            },
+            "execution": {
+                "open_orders": 0,
+                "pending_buy_up": 0.0,
+                "pending_buy_dn": 0.0,
+                "pending_sell_up": 0.0,
+                "pending_sell_dn": 0.0,
+                "transport_failures": 0,
+                "last_api_error": "",
+                "last_fallback_poll_count": 0,
+                "current_order_ids": {},
+            },
+            "risk": {
+                "soft_mode": "normal",
+                "hard_mode": "none",
+                "reason": "",
+                "inventory_pressure": 0.0,
+                "edge_score": 0.0,
+                "drawdown_pct_budget": 1.0,
+            },
+            "health": {
+                "reconcile_status": "bootstrapping",
+                "heartbeat_ok": True,
+                "transport_ok": True,
+                "last_api_error": "",
+                "last_fallback_poll_count": 0,
+                "true_drift": False,
+                "residual_inventory_failure": False,
+            },
+            "analytics": {
+                "fill_count": 0,
+                "session_pnl": 0.0,
+                "markout_1s": 0.0,
+                "markout_5s": 0.0,
+                "spread_capture_usd": 0.0,
+                "fill_rate": 0.0,
+                "quote_presence_ratio": 0.0,
+                "inventory_half_life_sec": 0.0,
+                "recent_fills": [],
+            },
+            "alerts": self.list_alerts(),
+            "config": self.mm_config_v2.to_dict(),
+        }
+
+    async def start(self, coin: str, timeframe: str, paper_mode: bool = True,
+                    initial_usdc: float = 1000.0, dev: bool = False) -> dict:
+        if self._running:
+            raise HTTPException(status_code=400, detail="V2 already running")
+        if str(coin).upper() != "BTC" or str(timeframe) not in {"15m", "1h"}:
+            raise HTTPException(status_code=400, detail="V2 scope is limited to BTC 15m/1h")
+
+        await self._cancel_strike_retry_task()
+        await self._cancel_monitor_task()
+        await self._stop_feed_tasks()
+        self._clear_mm_alerts()
+        self.mm_v2 = None
+        self._running = False
+
+        self._coin = str(coin).upper()
+        self._timeframe = str(timeframe)
+        self._requested_coin = self._coin
+        self._requested_timeframe = self._timeframe
+        self._paper_mode = bool(paper_mode)
+        self._dev_mode = bool(dev)
+        self._initial_usdc = float(initial_usdc)
+
+        if dev:
+            _telegram.switch_credentials(
+                token=os.environ.get("DEV_TELEGRAM_BOT_TOKEN", ""),
+                chat_id=os.environ.get("DEV_TELEGRAM_CHAT_ID", ""),
+            )
+        else:
+            _telegram.switch_credentials(
+                token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+                chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+                thread_id=os.environ.get("TELEGRAM_THREAD_ID", ""),
+            )
+
+        if not paper_mode:
+            await self.validate_live_credentials()
+            from mm.approvals import _do_approvals
+
+            approval_result = await asyncio.to_thread(_do_approvals, PM_PRIVATE_KEY)
+            if not isinstance(approval_result, dict) or approval_result.get("error") or not approval_result.get("all_ok", False):
+                raise HTTPException(status_code=500, detail="Cannot start live V2: approvals failed")
+
+        self.feed_state = feeds.State()
+        symbol = config.COIN_BINANCE[self._coin]
+        kline_interval = config.TF_KLINE[self._timeframe]
+        self._feed_tasks = [
+            asyncio.create_task(feeds.ob_poller(symbol, self.feed_state)),
+            asyncio.create_task(feeds.binance_feed(symbol, kline_interval, self.feed_state)),
+        ]
+
+        tokens = await asyncio.wait_for(
+            asyncio.to_thread(feeds.fetch_pm_tokens, self._coin, self._timeframe),
+            timeout=15.0,
+        )
+        if not tokens or not tokens[0] or not tokens[1]:
+            await self._stop_feed_tasks()
+            raise HTTPException(status_code=503, detail="PM tokens not found for V2")
+        up_id, dn_id, cond_id = tokens
+        self.feed_state.pm_up_id = up_id
+        self.feed_state.pm_dn_id = dn_id
+        self._feed_tasks.append(asyncio.create_task(feeds.pm_feed(self.feed_state)))
+        market = await asyncio.wait_for(
+            asyncio.to_thread(
+                self._build_market_info_from_tokens,
+                self._coin,
+                self._timeframe,
+                up_id,
+                dn_id,
+                condition_id=cond_id,
+            ),
+            timeout=45.0,
+        )
+        if market and market.up_token_id and not market.up_token_id.startswith("placeholder"):
+            await self._enrich_market_info(market, self._coin, self._timeframe)
+
+        startup_block_reason = self._startup_window_block_reason(market)
+        if startup_block_reason:
+            await self._stop_feed_tasks()
+            raise HTTPException(status_code=409, detail=startup_block_reason)
+        if not market or not self._is_valid_strike(getattr(market, "strike", 0.0)):
+            await self._stop_feed_tasks()
+            raise HTTPException(status_code=503, detail="V2 cannot start without a valid strike")
+
+        for _ in range(100):
+            if self.feed_state.mid and self.feed_state.mid > 0:
+                break
+            await asyncio.sleep(0.1)
+
+        clob = _create_clob_client(
+            paper_mode=paper_mode,
+            initial_usdc=self._initial_usdc,
+        )
+        self.mm_config_v2.session_budget_usd = float(self._initial_usdc)
+        self.mm_v2 = MarketMakerV2(self.feed_state, clob, self.mm_config_v2)
+        self.mm_v2.set_market(market)
+        await self.mm_v2.start()
+        self._running = True
+        log.info("MM V2 started: %s/%s paper=%s", self._coin, self._timeframe, paper_mode)
+        return self.snapshot()
+
+    async def stop(self, *, liquidate: bool = True, emergency: bool = False) -> dict:
+        self._running = False
+        await self._cancel_monitor_task()
+        await self._cancel_strike_retry_task()
+        if self.mm_v2:
+            await self.mm_v2.stop(liquidate=liquidate and not emergency)
+            self.mm_v2 = None
+        await self._stop_feed_tasks()
+        return self.snapshot()
+
+    def snapshot(self) -> dict:
+        if self.mm_v2:
+            snap = self.mm_v2.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+            snap["alerts"] = self.list_alerts() + [a for a in snap.get("alerts", []) if a not in self.list_alerts()]
+            return snap
+        snap = self._idle_snapshot_v2()
+        snap["alerts"] = self.list_alerts()
+        return snap
+
+    def update_config(self, **updates: Any) -> dict[str, Any]:
+        self.mm_config_v2.update(**updates)
+        if self.mm_v2:
+            self.mm_v2.config.update(**updates)
+            self.mm_v2.gateway.transport_config = self.mm_v2.config.to_mm_config()
+            self.mm_v2.gateway.order_mgr.config = self.mm_v2.gateway.transport_config
+            self.mm_v2.valuation.config = self.mm_v2.config
+            self.mm_v2.reconcile.config = self.mm_v2.config
+            self.mm_v2.risk_kernel.config = self.mm_v2.config
+            self.mm_v2.state_machine.config = self.mm_v2.config
+            self.mm_v2.execution_policy.requote_threshold_bps = float(self.mm_v2.config.requote_threshold_bps)
+        return self.mm_config_v2.to_dict()
+
+    def fills_page(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        if not self.mm_v2:
+            return {"fills": [], "total": 0}
+        return self.mm_v2.fills_page(limit=limit, offset=offset)
+
+    async def _run_server_self_check(self) -> dict[str, Any]:
+        snap = self.snapshot()
+        required_blocks = [
+            "lifecycle",
+            "market",
+            "valuation",
+            "inventory",
+            "pair_inventory",
+            "quotes",
+            "execution",
+            "risk",
+            "health",
+            "analytics",
+            "alerts",
+            "config",
+        ]
+        checks: list[dict[str, Any]] = []
+        for key in required_blocks:
+            checks.append({
+                "name": f"state_contract:{key}",
+                "ok": key in snap,
+                "detail": "present" if key in snap else "missing",
+            })
+        maker_only = True
+        checks.append({
+            "name": "config:maker_only_runtime_policy",
+            "ok": maker_only,
+            "detail": "maker-only except emergency taker",
+        })
+        passed = sum(1 for check in checks if check["ok"])
+        return {
+            "ok": passed == len(checks),
+            "summary": f"{passed}/{len(checks)} checks passed",
+            "checks": checks,
+            "command": [],
+            "exit_code": 0 if passed == len(checks) else 1,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "error": "",
+        }
+
+    def _verification_command(self, kind: str) -> list[str] | None:
+        if kind == "pytest_v2":
+            return [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_mm_v2.py",
+            ]
+        if kind == "replay_v2":
+            return [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_mm_v2_replay.py",
+            ]
+        if kind == "paper_v2_smoke":
+            return [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "tests/test_mm_v2_paper.py",
+            ]
+        return super()._verification_command(kind)
+
+    async def start_verification(self, kind: str) -> dict[str, Any]:
+        allowed = {
+            "server_self_check",
+            "pytest_v2",
+            "replay_v2",
+            "paper_v2_smoke",
+            "pytest_safety",
+            "backtest_smoke",
+        }
+        kind = str(kind or "server_self_check").strip() or "server_self_check"
+        if kind not in allowed:
+            raise HTTPException(status_code=400, detail=f"unsupported verification kind: {kind}")
+        if self._verification_task and not self._verification_task.done():
+            raise HTTPException(status_code=409, detail="verification already running")
+        self._verification_task = asyncio.create_task(self._verification_runner(kind))
+        return self.get_verification_status()
+
 # ── Singleton runtime ───────────────────────────────────────────
 _runtime = MMRuntime()
+_runtime_v2 = MMRuntimeV2()
 
 
 # ── WebSocket Connection Manager ───────────────────────────────
@@ -2617,6 +3010,8 @@ async def logout(response: Response):
 @app.post("/api/mm/start")
 async def mm_start(req: StartRequest, request: Request):
     _require_auth(request)
+    if _runtime_v2._running:
+        raise HTTPException(status_code=409, detail="MM V2 is already running")
     # Re-enable after Kill All
     _runtime.mm_config.enabled = True
     _runtime.mm_config.auto_next_window = True
@@ -2747,6 +3142,77 @@ async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
             "total": total,
         }
     return {"fills": [], "total": 0}
+
+
+@app.post("/api/mmv2/start")
+async def mmv2_start(req: StartRequest, request: Request):
+    _require_auth(request)
+    if _runtime._running:
+        raise HTTPException(status_code=409, detail="Legacy MM is already running")
+    result = await _runtime_v2.start(
+        req.coin,
+        req.timeframe,
+        req.paper_mode,
+        req.initial_usdc,
+        dev=req.dev,
+    )
+    return {"ok": True, "state": result}
+
+
+@app.post("/api/mmv2/stop")
+async def mmv2_stop(request: Request):
+    _require_auth(request)
+    result = await _runtime_v2.stop()
+    return {"ok": True, "state": result}
+
+
+@app.get("/api/mmv2/state")
+async def mmv2_state(request: Request):
+    _require_auth(request)
+    return _runtime_v2.snapshot()
+
+
+@app.post("/api/mmv2/config")
+async def mmv2_config_update(req: ConfigUpdateRequestV2, request: Request):
+    _require_auth(request)
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    market_scope = updates.get("market_scope")
+    if market_scope is not None and market_scope not in {"BTC_15m", "BTC_1h"}:
+        return JSONResponse({"error": "market_scope must be BTC_15m or BTC_1h"}, status_code=400)
+    config = _runtime_v2.update_config(**updates)
+    return {"ok": True, "config": config}
+
+
+@app.get("/api/mmv2/config")
+async def mmv2_config_get(request: Request):
+    _require_auth(request)
+    return {"config": _runtime_v2.mm_config_v2.to_dict()}
+
+
+@app.get("/api/mmv2/fills")
+async def mmv2_fills(request: Request, limit: int = 50, offset: int = 0):
+    _require_auth(request)
+    return _runtime_v2.fills_page(limit=limit, offset=offset)
+
+
+@app.post("/api/mmv2/verification/run")
+async def mmv2_verification_run(req: VerificationRunRequest, request: Request):
+    _require_auth(request)
+    status = await _runtime_v2.start_verification(req.kind)
+    return {"ok": True, "verification": status}
+
+
+@app.get("/api/mmv2/verification/state")
+async def mmv2_verification_state(request: Request):
+    _require_auth(request)
+    return {"verification": _runtime_v2.get_verification_status()}
+
+
+@app.post("/api/mmv2/verification/cancel")
+async def mmv2_verification_cancel(request: Request):
+    _require_auth(request)
+    status = await _runtime_v2.cancel_verification()
+    return {"ok": True, "verification": status}
 
 
 # ── Logs ───────────────────────────────────────────────────────

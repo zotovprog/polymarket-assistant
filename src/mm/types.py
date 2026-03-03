@@ -61,6 +61,8 @@ class Fill:
     fee: float = 0.0
     order_id: str = ""
     is_maker: bool = True
+    inventory_backed_size: float = 0.0
+    short_backed_size: float = 0.0
 
     @property
     def notional(self) -> float:
