@@ -44,6 +44,9 @@ class MarketMakerV2:
         self._alerts: dict[str, dict[str, Any]] = {}
         self._snapshot_callbacks: list[Any] = []
         self._fills: list[Fill] = []
+        self._excess_history: list[tuple[float, float]] = []
+        self._quote_presence_history: list[tuple[float, tuple[bool, bool]]] = []
+        self._mode_history: list[tuple[float, str]] = []
         self._starting_portfolio = 0.0
         self._starting_usdc = 0.0
         self._session_pnl = 0.0
@@ -64,6 +67,10 @@ class MarketMakerV2:
             excess_up_value_usd=0.0,
             excess_dn_value_usd=0.0,
             total_inventory_value_usd=0.0,
+            excess_value_usd=0.0,
+            signed_excess_value_usd=0.0,
+            inventory_pressure_abs=0.0,
+            inventory_pressure_signed=0.0,
         )
         self._last_risk = RiskRegime(
             soft_mode="normal",
@@ -72,6 +79,10 @@ class MarketMakerV2:
             inventory_pressure=0.0,
             edge_score=0.0,
             drawdown_pct_budget=1.0,
+            inventory_side="flat",
+            inventory_pressure_abs=0.0,
+            inventory_pressure_signed=0.0,
+            quality_pressure=0.0,
         )
         self._last_plan = QuotePlan(None, None, None, None, "boot", "boot")
         self._last_analytics = AnalyticsState()
@@ -200,6 +211,31 @@ class MarketMakerV2:
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
         )
 
+    def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
+        cutoff = time.time() - max_age_sec
+        while entries and entries[0][0] < cutoff:
+            entries.pop(0)
+
+    def _estimate_inventory_half_life(self) -> float:
+        if len(self._excess_history) < 2:
+            return 0.0
+        start_ts, start_excess = self._excess_history[0]
+        if start_excess <= 0:
+            return 0.0
+        target = start_excess * 0.5
+        for ts, excess in self._excess_history[1:]:
+            if excess <= target:
+                return max(0.0, ts - start_ts)
+        return 0.0
+
+    def _quote_presence_ratio(self) -> tuple[float, float]:
+        if not self._quote_presence_history:
+            return 0.0, 0.0
+        total = len(self._quote_presence_history)
+        any_quote = sum(1 for _, present in self._quote_presence_history if present[0])
+        four_quote = sum(1 for _, present in self._quote_presence_history if present[1])
+        return any_quote / total, four_quote / total
+
     async def _tick(self) -> None:
         if not self.market:
             return
@@ -234,33 +270,19 @@ class MarketMakerV2:
             fv_dn=valuation.fv_dn,
         )
         self._update_session_pnl(inventory)
-        analytics = AnalyticsState(
+        pre_analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,
-            markout_1s=0.0,
-            markout_5s=0.0,
-            spread_capture_usd=0.0,
-            fill_rate=0.0,
-            quote_presence_ratio=1.0 if any([self._last_plan.up_bid, self._last_plan.up_ask, self._last_plan.dn_bid, self._last_plan.dn_ask]) else 0.0,
-            inventory_half_life_sec=0.0,
-            recent_fills=[
-                {
-                    "ts": f.ts,
-                    "side": f.side,
-                    "token_id": f.token_id,
-                    "price": f.price,
-                    "size": f.size,
-                }
-                for f in self._fills[-20:]
-            ],
         )
         health = self._build_health()
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
             inventory=inventory,
-            analytics=analytics,
+            analytics=pre_analytics,
             health=health,
         )
+        inventory.inventory_pressure_abs = risk.inventory_pressure_abs
+        inventory.inventory_pressure_signed = risk.inventory_pressure_signed
         lifecycle = self.state_machine.transition(
             snapshot=snapshot,
             inventory=inventory,
@@ -281,6 +303,58 @@ class MarketMakerV2:
                 ctx=ctx,
             )
             await self.execution_policy.sync(plan)
+        helpful_quote_count = sum(
+            1
+            for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+            if intent and intent.inventory_effect == "helpful"
+        )
+        harmful_quote_count = sum(
+            1
+            for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+            if intent and intent.inventory_effect == "harmful"
+        )
+        now = time.time()
+        self._excess_history.append((now, float(inventory.excess_value_usd)))
+        self._quote_presence_history.append(
+            (
+                now,
+                (
+                    any([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+                    all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask]),
+                ),
+            )
+        )
+        self._mode_history.append((now, risk.soft_mode))
+        self._prune_history(self._excess_history)
+        self._prune_history(self._quote_presence_history)
+        self._prune_history(self._mode_history)
+        quote_presence_ratio, four_quote_presence_ratio = self._quote_presence_ratio()
+        analytics = AnalyticsState(
+            fill_count=len(self._fills),
+            session_pnl=self._session_pnl,
+            markout_1s=0.0,
+            markout_5s=0.0,
+            spread_capture_usd=0.0,
+            fill_rate=0.0,
+            quote_presence_ratio=quote_presence_ratio,
+            excess_value_usd=float(inventory.excess_value_usd),
+            inventory_pressure_abs=float(risk.inventory_pressure_abs),
+            inventory_pressure_signed=float(risk.inventory_pressure_signed),
+            inventory_half_life_sec=self._estimate_inventory_half_life(),
+            four_quote_presence_ratio=four_quote_presence_ratio,
+            helpful_quote_count=helpful_quote_count,
+            harmful_quote_count=harmful_quote_count,
+            recent_fills=[
+                {
+                    "ts": f.ts,
+                    "side": f.side,
+                    "token_id": f.token_id,
+                    "price": f.price,
+                    "size": f.size,
+                }
+                for f in self._fills[-20:]
+            ],
+        )
         if lifecycle in {"emergency_unwind", "unwind"} and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):
             if inventory.up_shares > 0.5 or inventory.dn_shares > 0.5:
                 self.set_alert("emergency_unwind_v2", f"{lifecycle}: {risk.reason}", level="warning")

@@ -6,6 +6,16 @@ from typing import Any, ClassVar
 
 from mm.mm_config import MMConfig
 
+ENTER_CONFIRM_TICKS = 2
+EXIT_CONFIRM_TICKS = 5
+QUALITY_DEFENSIVE_TICKS = 3
+HELPFUL_SIZE_MULT_MAX = 1.80
+HARMFUL_SIZE_MULT_MIN = 0.25
+HELPFUL_PRICE_TICKS_MAX = 3
+HARMFUL_PRICE_TICKS_MAX = 5
+UNWIND_STUCK_WINDOW_SEC = 20.0
+UNWIND_MIN_PROGRESS_RATIO = 0.20
+
 
 @dataclass
 class MMConfigV2:
@@ -19,6 +29,7 @@ class MMConfigV2:
         "base_clip_usd": (1.0, 100.0),
         "target_pair_value_ratio": (0.10, 0.95),
         "soft_excess_value_ratio": (0.05, 0.60),
+        "defensive_excess_value_ratio": (0.10, 0.80),
         "hard_excess_value_ratio": (0.10, 0.90),
         "base_half_spread_bps": (5.0, 5000.0),
         "max_half_spread_bps": (25.0, 10000.0),
@@ -43,7 +54,8 @@ class MMConfigV2:
     session_budget_usd: float = 15.0
     base_clip_usd: float = 3.0
     target_pair_value_ratio: float = 0.70
-    soft_excess_value_ratio: float = 0.15
+    soft_excess_value_ratio: float = 0.10
+    defensive_excess_value_ratio: float = 0.18
     hard_excess_value_ratio: float = 0.25
     base_half_spread_bps: float = 150.0
     max_half_spread_bps: float = 600.0
@@ -81,11 +93,11 @@ class MMConfigV2:
                 setattr(self, field_name, int(round(value)))
             else:
                 setattr(self, field_name, float(value))
-        if self.soft_excess_value_ratio > self.hard_excess_value_ratio:
-            self.soft_excess_value_ratio = min(
-                self.soft_excess_value_ratio,
-                self.hard_excess_value_ratio,
-            )
+        self.soft_excess_value_ratio = min(self.soft_excess_value_ratio, self.defensive_excess_value_ratio)
+        self.defensive_excess_value_ratio = min(
+            max(self.defensive_excess_value_ratio, self.soft_excess_value_ratio),
+            self.hard_excess_value_ratio,
+        )
         if self.base_half_spread_bps > self.max_half_spread_bps:
             self.base_half_spread_bps = self.max_half_spread_bps
 

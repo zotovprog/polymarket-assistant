@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import math
 from typing import Literal
 
-from .config import MMConfigV2
+from .config import HARMFUL_PRICE_TICKS_MAX, HARMFUL_SIZE_MULT_MIN, HELPFUL_PRICE_TICKS_MAX, HELPFUL_SIZE_MULT_MAX, MMConfigV2
 from .types import PairInventoryState, PairMarketSnapshot, QuoteIntent, QuotePlan, RiskRegime
 
 
@@ -68,10 +68,82 @@ class QuotePolicyV2:
             base *= max(2.0, float(self.config.defensive_spread_mult))
         return min(self._bps_to_price(self.config.max_half_spread_bps), base)
 
-    def _excess_bias(self, inventory: PairInventoryState) -> float:
-        hard_cap = max(1e-9, float(self.config.hard_excess_value_ratio) * float(self.config.session_budget_usd))
-        signed_excess = inventory.excess_up_value_usd - inventory.excess_dn_value_usd
-        return max(-1.0, min(1.0, signed_excess / hard_cap))
+    @staticmethod
+    def _classify_inventory_effect(
+        *,
+        token: str,
+        side: Literal["BUY", "SELL"],
+        inventory_side: str,
+        up_token_id: str,
+        dn_token_id: str,
+    ) -> Literal["helpful", "neutral", "harmful"]:
+        if inventory_side == "flat":
+            return "neutral"
+        if inventory_side == "up":
+            if token == up_token_id and side == "BUY":
+                return "harmful"
+            if token == up_token_id and side == "SELL":
+                return "helpful"
+            if token == dn_token_id and side == "BUY":
+                return "helpful"
+            if token == dn_token_id and side == "SELL":
+                return "harmful"
+        if inventory_side == "dn":
+            if token == dn_token_id and side == "BUY":
+                return "harmful"
+            if token == dn_token_id and side == "SELL":
+                return "helpful"
+            if token == up_token_id and side == "BUY":
+                return "helpful"
+            if token == up_token_id and side == "SELL":
+                return "harmful"
+        return "neutral"
+
+    @staticmethod
+    def _size_multiplier(effect: str, pressure: float) -> float:
+        if effect == "helpful":
+            return min(HELPFUL_SIZE_MULT_MAX, 1.0 + 0.8 * pressure)
+        if effect == "harmful":
+            return max(HARMFUL_SIZE_MULT_MIN, 1.0 - 0.75 * pressure)
+        return 1.0
+
+    @staticmethod
+    def _price_adjust_ticks(effect: str, pressure: float) -> int:
+        if effect == "helpful":
+            return int(math.ceil(pressure * HELPFUL_PRICE_TICKS_MAX))
+        if effect == "harmful":
+            return int(math.ceil(pressure * HARMFUL_PRICE_TICKS_MAX))
+        return 0
+
+    @staticmethod
+    def _would_expand_excess(
+        *,
+        token: str,
+        side: Literal["BUY", "SELL"],
+        inventory_side: str,
+        up_token_id: str,
+        dn_token_id: str,
+    ) -> bool:
+        if inventory_side == "up":
+            return (token == up_token_id and side == "BUY") or (token == dn_token_id and side == "SELL")
+        if inventory_side == "dn":
+            return (token == dn_token_id and side == "BUY") or (token == up_token_id and side == "SELL")
+        return False
+
+    def _maker_clamp(
+        self,
+        *,
+        side: Literal["BUY", "SELL"],
+        price: float,
+        best_bid: float | None,
+        best_ask: float | None,
+        tick_size: float,
+    ) -> float:
+        if side == "BUY" and best_ask is not None:
+            price = min(price, float(best_ask) - tick_size)
+        if side == "SELL" and best_bid is not None:
+            price = max(price, float(best_bid) + tick_size)
+        return price
 
     def _make_intent(
         self,
@@ -83,6 +155,9 @@ class QuotePolicyV2:
         ctx: QuoteContext,
         role: str,
         post_only: bool,
+        inventory_effect: Literal["helpful", "neutral", "harmful"],
+        size_mult: float,
+        price_adjust_ticks: int,
         size_override: float | None = None,
     ) -> QuoteIntent | None:
         if size_override is not None:
@@ -101,6 +176,9 @@ class QuotePolicyV2:
             size=size,
             quote_role=role,  # type: ignore[arg-type]
             post_only=post_only,
+            inventory_effect=inventory_effect,
+            size_mult=size_mult,
+            price_adjust_ticks=price_adjust_ticks,
         )
 
     def generate(
@@ -116,129 +194,82 @@ class QuotePolicyV2:
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
         per_quote_budget = min(clip_usd, max(1.0, free_usdc * 0.20))
-        bias = self._excess_bias(inventory)
-        skew = bias * float(self.config.inventory_skew_strength) * 0.0075
-        pair_mid = max(0.01, min(0.99, base_mid - skew))
+        pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
+        mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
+        pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
 
-        up_bid_half = spread
-        up_ask_half = spread
-        dn_bid_half = spread
-        dn_ask_half = spread
-        if bias > 0:
-            up_bid_half *= 1.4
-            up_ask_half *= 0.8
-            dn_bid_half *= 0.9
-            dn_ask_half *= 1.1
-        elif bias < 0:
-            dn_bid_half *= 1.4
-            dn_ask_half *= 0.8
-            up_bid_half *= 0.9
-            up_ask_half *= 1.1
-
-        up_bid_price = pair_mid - up_bid_half
-        up_ask_price = pair_mid + up_ask_half
+        up_bid_price = pair_mid - spread
+        up_ask_price = pair_mid + spread
         dn_mid = 1.0 - pair_mid
-        dn_bid_price = dn_mid - dn_bid_half
-        dn_ask_price = dn_mid + dn_ask_half
+        dn_bid_price = dn_mid - spread
+        dn_ask_price = dn_mid + spread
 
-        if snapshot.up_best_ask is not None:
-            up_bid_price = min(up_bid_price, float(snapshot.up_best_ask) - ctx.tick_size)
-        if snapshot.up_best_bid is not None:
-            up_ask_price = max(up_ask_price, float(snapshot.up_best_bid) + ctx.tick_size)
-        if snapshot.dn_best_ask is not None:
-            dn_bid_price = min(dn_bid_price, float(snapshot.dn_best_ask) - ctx.tick_size)
-        if snapshot.dn_best_bid is not None:
-            dn_ask_price = max(dn_ask_price, float(snapshot.dn_best_bid) + ctx.tick_size)
+        raw_quotes = {
+            "up_bid": ("BUY", snapshot.up_token_id, up_bid_price, snapshot.up_best_bid, snapshot.up_best_ask, "base_bid"),
+            "up_ask": ("SELL", snapshot.up_token_id, up_ask_price, snapshot.up_best_bid, snapshot.up_best_ask, "base_ask"),
+            "dn_bid": ("BUY", snapshot.dn_token_id, dn_bid_price, snapshot.dn_best_bid, snapshot.dn_best_ask, "base_bid"),
+            "dn_ask": ("SELL", snapshot.dn_token_id, dn_ask_price, snapshot.dn_best_bid, snapshot.dn_best_ask, "base_ask"),
+        }
+        built: dict[str, QuoteIntent | None] = {}
 
-        # Preserve pair complementarity with a one-tick safety gap.
+        for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
+            effect = self._classify_inventory_effect(
+                token=token,
+                side=side,
+                inventory_side=risk.inventory_side,
+                up_token_id=snapshot.up_token_id,
+                dn_token_id=snapshot.dn_token_id,
+            )
+            if risk.soft_mode == "unwind" and self._would_expand_excess(
+                token=token,
+                side=side,
+                inventory_side=risk.inventory_side,
+                up_token_id=snapshot.up_token_id,
+                dn_token_id=snapshot.dn_token_id,
+            ):
+                built[slot] = None
+                continue
+            ticks = self._price_adjust_ticks(effect, pressure)
+            adjusted_price = base_price
+            if effect == "helpful":
+                adjusted_price += ctx.tick_size * ticks if side == "BUY" else -(ctx.tick_size * ticks)
+            elif effect == "harmful":
+                adjusted_price += -(ctx.tick_size * ticks) if side == "BUY" else (ctx.tick_size * ticks)
+            adjusted_price = self._maker_clamp(
+                side=side,
+                price=adjusted_price,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                tick_size=ctx.tick_size,
+            )
+            size_mult = self._size_multiplier(effect, pressure)
+            role_name = role if risk.soft_mode != "unwind" else "unwind"
+            built[slot] = self._make_intent(
+                token=token,
+                side=side,
+                price=adjusted_price,
+                clip_usd=per_quote_budget * size_mult,
+                ctx=ctx,
+                role=role_name,
+                post_only=True,
+                inventory_effect=effect,
+                size_mult=size_mult,
+                price_adjust_ticks=ticks,
+            )
+
         pair_ceiling = 1.0 - ctx.tick_size
-        if up_bid_price + dn_ask_price > pair_ceiling:
-            up_bid_price = min(up_bid_price, pair_ceiling - dn_ask_price)
-        if dn_bid_price + up_ask_price > pair_ceiling:
-            dn_bid_price = min(dn_bid_price, pair_ceiling - up_ask_price)
-        up_bid_price = max(ctx.tick_size, up_bid_price)
-        dn_bid_price = max(ctx.tick_size, dn_bid_price)
-
-        up_bid = self._make_intent(
-            token=snapshot.up_token_id,
-            side="BUY",
-            price=up_bid_price,
-            clip_usd=per_quote_budget,
-            ctx=ctx,
-            role="base_bid",
-            post_only=True,
-        )
-        dn_bid = self._make_intent(
-            token=snapshot.dn_token_id,
-            side="BUY",
-            price=dn_bid_price,
-            clip_usd=per_quote_budget,
-            ctx=ctx,
-            role="base_bid",
-            post_only=True,
-        )
-        up_ask = self._make_intent(
-            token=snapshot.up_token_id,
-            side="SELL",
-            price=up_ask_price,
-            clip_usd=per_quote_budget,
-            ctx=ctx,
-            role="base_ask",
-            post_only=True,
-        )
-        dn_ask = self._make_intent(
-            token=snapshot.dn_token_id,
-            side="SELL",
-            price=dn_ask_price,
-            clip_usd=per_quote_budget,
-            ctx=ctx,
-            role="base_ask",
-            post_only=True,
-        )
-
-        if up_bid and dn_ask and up_bid.price + dn_ask.price > (1.0 - ctx.tick_size):
-            up_bid.price = _floor_price((1.0 - ctx.tick_size) - dn_ask.price, ctx.tick_size)
-        if dn_bid and up_ask and dn_bid.price + up_ask.price > (1.0 - ctx.tick_size):
-            dn_bid.price = _floor_price((1.0 - ctx.tick_size) - up_ask.price, ctx.tick_size)
+        if built["up_bid"] and built["dn_ask"] and built["up_bid"].price + built["dn_ask"].price > pair_ceiling:
+            built["up_bid"].price = _floor_price(pair_ceiling - built["dn_ask"].price, ctx.tick_size)
+        if built["dn_bid"] and built["up_ask"] and built["dn_bid"].price + built["up_ask"].price > pair_ceiling:
+            built["dn_bid"].price = _floor_price(pair_ceiling - built["up_ask"].price, ctx.tick_size)
 
         regime = risk.soft_mode
         reason = risk.reason
-        if risk.soft_mode == "unwind":
-            if inventory.excess_up_qty > 0:
-                up_bid = None
-                up_ask = self._make_intent(
-                    token=snapshot.up_token_id,
-                    side="SELL",
-                    price=max(up_ask_price - ctx.tick_size, snapshot.up_best_bid + ctx.tick_size if snapshot.up_best_bid else up_ask_price),
-                    clip_usd=per_quote_budget,
-                    ctx=ctx,
-                    role="unwind",
-                    post_only=True,
-                    size_override=max(
-                        inventory.excess_up_qty,
-                        round(self._sell_size_from_clip(per_quote_budget, up_ask_price), 2),
-                    ),
-                )
-            elif inventory.excess_dn_qty > 0:
-                dn_bid = None
-                dn_ask = self._make_intent(
-                    token=snapshot.dn_token_id,
-                    side="SELL",
-                    price=max(dn_ask_price - ctx.tick_size, snapshot.dn_best_bid + ctx.tick_size if snapshot.dn_best_bid else dn_ask_price),
-                    clip_usd=per_quote_budget,
-                    ctx=ctx,
-                    role="unwind",
-                    post_only=True,
-                    size_override=max(
-                        inventory.excess_dn_qty,
-                        round(self._sell_size_from_clip(per_quote_budget, dn_ask_price), 2),
-                    ),
-                )
         if risk.hard_mode == "emergency_unwind":
             regime = "emergency_unwind"
             if inventory.up_shares > 0:
-                up_bid = None
-                up_ask = self._make_intent(
+                built["up_bid"] = None
+                built["up_ask"] = self._make_intent(
                     token=snapshot.up_token_id,
                     side="SELL",
                     price=float(snapshot.up_best_bid or max(0.01, up_ask_price)),
@@ -247,13 +278,16 @@ class QuotePolicyV2:
                     role="emergency_unwind",
                     post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
                     size_override=inventory.up_shares,
+                    inventory_effect="helpful" if risk.inventory_side == "up" else "neutral",
+                    size_mult=1.0,
+                    price_adjust_ticks=0,
                 )
             else:
-                up_bid = None
-                up_ask = None
+                built["up_bid"] = None
+                built["up_ask"] = None
             if inventory.dn_shares > 0:
-                dn_bid = None
-                dn_ask = self._make_intent(
+                built["dn_bid"] = None
+                built["dn_ask"] = self._make_intent(
                     token=snapshot.dn_token_id,
                     side="SELL",
                     price=float(snapshot.dn_best_bid or max(0.01, dn_ask_price)),
@@ -262,16 +296,19 @@ class QuotePolicyV2:
                     role="emergency_unwind",
                     post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
                     size_override=inventory.dn_shares,
+                    inventory_effect="helpful" if risk.inventory_side == "dn" else "neutral",
+                    size_mult=1.0,
+                    price_adjust_ticks=0,
                 )
             else:
-                dn_bid = None
-                dn_ask = None
+                built["dn_bid"] = None
+                built["dn_ask"] = None
 
         return QuotePlan(
-            up_bid=up_bid,
-            up_ask=up_ask,
-            dn_bid=dn_bid,
-            dn_ask=dn_ask,
+            up_bid=built["up_bid"],
+            up_ask=built["up_ask"],
+            dn_bid=built["dn_bid"],
+            dn_ask=built["dn_ask"],
             regime=regime,
             reason=reason,
         )

@@ -90,6 +90,10 @@ def _inventory(**overrides) -> PairInventoryState:
         excess_up_value_usd=0.0,
         excess_dn_value_usd=0.0,
         total_inventory_value_usd=0.0,
+        excess_value_usd=0.0,
+        signed_excess_value_usd=0.0,
+        inventory_pressure_abs=0.0,
+        inventory_pressure_signed=0.0,
     )
     payload.update(overrides)
     return PairInventoryState(**payload)
@@ -170,6 +174,8 @@ def test_quote_policy_skews_against_excess_up_inventory():
         excess_up_qty=6.0,
         paired_value_usd=2.0,
         excess_up_value_usd=3.24,
+        excess_value_usd=3.24,
+        signed_excess_value_usd=3.24,
         total_inventory_value_usd=4.16,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -188,6 +194,8 @@ def test_quote_policy_skews_against_excess_up_inventory():
     assert skewed_plan.dn_bid is not None and flat_plan.dn_bid is not None
     assert skewed_plan.up_bid.price <= flat_plan.up_bid.price
     assert skewed_plan.dn_bid.price >= flat_plan.dn_bid.price
+    assert skewed_plan.up_bid.inventory_effect == "harmful"
+    assert skewed_plan.dn_bid.inventory_effect == "helpful"
     assert skewed_plan.regime in {"inventory_skewed", "unwind", "defensive", "normal"}
 
 
@@ -224,21 +232,103 @@ def test_hard_excess_transitions_state_machine_to_unwind():
         excess_up_qty=11.0,
         paired_value_usd=1.0,
         excess_up_value_usd=6.16,
+        excess_value_usd=6.16,
+        signed_excess_value_usd=6.16,
         total_inventory_value_usd=6.62,
     )
+    sm = StateMachineV2(cfg)
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=_snapshot(),
         inventory=inventory,
         analytics=AnalyticsState(),
         health=HealthState(),
     )
-    lifecycle = StateMachineV2(cfg).transition(
+    lifecycle = sm.transition(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        risk=risk,
+    )
+    assert lifecycle == "quoting"
+    lifecycle = sm.transition(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        risk=risk,
+    )
+    assert lifecycle == "inventory_skewed"
+    lifecycle = sm.transition(
+        snapshot=_snapshot(),
+        inventory=inventory,
+        risk=risk,
+    )
+    assert lifecycle == "defensive"
+    lifecycle = sm.transition(
         snapshot=_snapshot(),
         inventory=inventory,
         risk=risk,
     )
     assert risk.soft_mode == "unwind"
     assert lifecycle == "unwind"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_state_surfaces_inventory_pressure_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "risk": {
+                "soft_mode": "inventory_skewed",
+                "inventory_side": "dn",
+                "inventory_pressure_abs": 0.42,
+                "inventory_pressure_signed": -0.42,
+                "quality_pressure": 0.1,
+            },
+            "analytics": {
+                "excess_value_usd": 6.3,
+                "inventory_half_life_sec": 28.0,
+                "four_quote_presence_ratio": 0.75,
+                "helpful_quote_count": 2,
+                "harmful_quote_count": 2,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["risk"]["inventory_side"] == "dn"
+    assert resp["risk"]["inventory_pressure_abs"] == pytest.approx(0.42)
+    assert resp["analytics"]["excess_value_usd"] == pytest.approx(6.3)
+    assert resp["analytics"]["inventory_half_life_sec"] == pytest.approx(28.0)
+
+
+@pytest.mark.asyncio
+async def test_mmv2_state_exposes_quote_inventory_effect(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "quoting",
+            "quotes": {
+                "up_bid": {
+                    "token": "up-token",
+                    "side": "BUY",
+                    "price": 0.52,
+                    "size": 5.0,
+                    "inventory_effect": "helpful",
+                    "size_mult": 1.4,
+                    "price_adjust_ticks": 2,
+                }
+            },
+            "risk": {"soft_mode": "inventory_skewed"},
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["quotes"]["up_bid"]["inventory_effect"] == "helpful"
+    assert resp["quotes"]["up_bid"]["size_mult"] == pytest.approx(1.4)
+    assert resp["quotes"]["up_bid"]["price_adjust_ticks"] == 2
 
 
 @pytest.mark.asyncio

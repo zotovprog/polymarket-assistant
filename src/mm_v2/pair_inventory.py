@@ -60,6 +60,8 @@ def build_pair_inventory(
     paired_value_usd = paired_qty * max(0.0, fv_up + fv_dn)
     excess_up_value_usd = excess_up_qty * max(0.0, fv_up)
     excess_dn_value_usd = excess_dn_qty * max(0.0, fv_dn)
+    excess_value_usd = excess_up_value_usd + excess_dn_value_usd
+    signed_excess_value_usd = excess_up_value_usd - excess_dn_value_usd
     total_inventory_value_usd = max(0.0, up_shares) * max(0.0, fv_up) + max(0.0, dn_shares) * max(0.0, fv_dn)
     free_usdc = float(available_usdc) if available_usdc is not None else max(0.0, float(total_usdc) - pending["reserved_usdc"])
     reserved_usdc = max(0.0, float(total_usdc) - free_usdc, pending["reserved_usdc"])
@@ -79,4 +81,6 @@ def build_pair_inventory(
         excess_up_value_usd=excess_up_value_usd,
         excess_dn_value_usd=excess_dn_value_usd,
         total_inventory_value_usd=total_inventory_value_usd,
+        excess_value_usd=excess_value_usd,
+        signed_excess_value_usd=signed_excess_value_usd,
     )

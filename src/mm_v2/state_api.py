@@ -23,6 +23,10 @@ def serialize_engine_state(
         "paired_value_usd": round(state.inventory.paired_value_usd, 4),
         "excess_up_value_usd": round(state.inventory.excess_up_value_usd, 4),
         "excess_dn_value_usd": round(state.inventory.excess_dn_value_usd, 4),
+        "excess_value_usd": round(state.inventory.excess_value_usd, 4),
+        "signed_excess_value_usd": round(state.inventory.signed_excess_value_usd, 4),
+        "inventory_pressure_abs": round(state.inventory.inventory_pressure_abs, 6),
+        "inventory_pressure_signed": round(state.inventory.inventory_pressure_signed, 6),
     }
     quotes = {
         "up_bid": asdict(state.current_quotes.up_bid) if state.current_quotes.up_bid else None,

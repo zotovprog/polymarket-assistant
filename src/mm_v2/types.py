@@ -50,6 +50,10 @@ class PairInventoryState:
     excess_up_value_usd: float
     excess_dn_value_usd: float
     total_inventory_value_usd: float
+    excess_value_usd: float = 0.0
+    signed_excess_value_usd: float = 0.0
+    inventory_pressure_abs: float = 0.0
+    inventory_pressure_signed: float = 0.0
 
 
 @dataclass
@@ -66,6 +70,9 @@ class QuoteIntent:
         "emergency_unwind",
     ]
     post_only: bool
+    inventory_effect: Literal["helpful", "neutral", "harmful"] = "neutral"
+    size_mult: float = 1.0
+    price_adjust_ticks: int = 0
 
 
 @dataclass
@@ -86,6 +93,10 @@ class RiskRegime:
     inventory_pressure: float
     edge_score: float
     drawdown_pct_budget: float
+    inventory_side: Literal["flat", "up", "dn"] = "flat"
+    inventory_pressure_abs: float = 0.0
+    inventory_pressure_signed: float = 0.0
+    quality_pressure: float = 0.0
 
 
 @dataclass
@@ -110,7 +121,13 @@ class AnalyticsState:
     spread_capture_usd: float = 0.0
     fill_rate: float = 0.0
     quote_presence_ratio: float = 0.0
+    excess_value_usd: float = 0.0
+    inventory_pressure_abs: float = 0.0
+    inventory_pressure_signed: float = 0.0
     inventory_half_life_sec: float = 0.0
+    four_quote_presence_ratio: float = 0.0
+    helpful_quote_count: int = 0
+    harmful_quote_count: int = 0
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
 
 
