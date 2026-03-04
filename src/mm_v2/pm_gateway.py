@@ -60,11 +60,26 @@ class PMGateway:
         total_usdc, available_usdc = await self.order_mgr.get_usdc_balances()
         return up_dn[0], up_dn[1], total_usdc, available_usdc
 
-    async def get_sellable_balances(self) -> tuple[float | None, float | None]:
+    async def get_sellable_balances(
+        self,
+        *,
+        reference_balances: tuple[float, float] | None = None,
+    ) -> tuple[float | None, float | None]:
         assert self.market is not None
+        up_reference = None
+        dn_reference = None
+        if reference_balances is not None:
+            up_reference = float(reference_balances[0])
+            dn_reference = float(reference_balances[1])
         up_sellable, dn_sellable = await asyncio.gather(
-            self.order_mgr.get_sellable_token_balance(self.market.up_token_id),
-            self.order_mgr.get_sellable_token_balance(self.market.dn_token_id),
+            self.order_mgr.get_sellable_token_balance(
+                self.market.up_token_id,
+                reference_shares=up_reference,
+            ),
+            self.order_mgr.get_sellable_token_balance(
+                self.market.dn_token_id,
+                reference_shares=dn_reference,
+            ),
         )
         return up_sellable, dn_sellable
 
@@ -203,8 +218,13 @@ class PMGateway:
         min_size = max(0.0, float(self.market.min_order_size or 0.0))
 
         for round_idx in range(max(1, int(rounds))):
-            up_sellable, dn_sellable = await self.get_sellable_balances()
             up_owned, dn_owned, _, _ = await self.get_wallet_balances()
+            up_sellable, dn_sellable = await self.get_sellable_balances(
+                reference_balances=(
+                    float(up_owned or 0.0),
+                    float(dn_owned or 0.0),
+                ),
+            )
             per_round_order_ids: list[str] = []
             for token_id, raw_sellable, raw_owned in (
                 (self.market.up_token_id, up_sellable, up_owned),

@@ -150,6 +150,21 @@ async def test_get_reconcile_token_balance_uses_recent_cancelled_reserve(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_get_sellable_token_balance_with_reference_avoids_active_sell_overstatement(monkeypatch):
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    om = OrderManager(_CancelOnlyClient(), cfg)
+    om._active_orders["active-sell"] = Quote(side="SELL", token_id="tok-up", price=0.56, size=5.42)
+
+    async def _fake_token_balance(_token_id: str):
+        return 7.92
+
+    monkeypatch.setattr(om, "get_token_balance", _fake_token_balance)
+    sellable = await om.get_sellable_token_balance("tok-up", reference_shares=13.34)
+    assert sellable == pytest.approx(7.92)
+
+
+@pytest.mark.asyncio
 async def test_close_only_sell_blocks_immediate_repost_during_release_grace(monkeypatch):
     cfg = MMConfig()
     cfg.sell_release_grace_sec = 3.0

@@ -446,10 +446,17 @@ class MarketMakerV2:
             fv_dn=valuation.fv_dn,
             pm_prices={"up": snapshot.pm_mid_up, "dn": snapshot.pm_mid_dn},
         )
-        reference_balances = (
-            float(self._last_inventory.up_shares),
-            float(self._last_inventory.dn_shares),
-        )
+        expected_up, expected_dn = self.reconcile.expected_balances()
+        if expected_up is not None and expected_dn is not None:
+            reference_balances = (
+                float(expected_up),
+                float(expected_dn),
+            )
+        else:
+            reference_balances = (
+                float(self._last_inventory.up_shares),
+                float(self._last_inventory.dn_shares),
+            )
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances(
             reference_balances=reference_balances,
         )
@@ -459,7 +466,9 @@ class MarketMakerV2:
             total_usdc=total_usdc_raw,
             available_usdc=available_usdc_raw,
         )
-        sellable_up, sellable_dn = await self.gateway.get_sellable_balances()
+        sellable_up, sellable_dn = await self.gateway.get_sellable_balances(
+            reference_balances=(float(up), float(dn)),
+        )
         sell_release_lag = self.gateway.sell_release_lag_state()
         if stale_wallet:
             self.set_alert(

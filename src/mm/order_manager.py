@@ -808,7 +808,12 @@ class OrderManager:
                 reserve.remaining_size = max(0.0, reserve.remaining_size - remaining_fill)
                 remaining_fill = 0.0
 
-    async def get_sellable_token_balance(self, token_id: str) -> Optional[float]:
+    async def get_sellable_token_balance(
+        self,
+        token_id: str,
+        *,
+        reference_shares: float | None = None,
+    ) -> Optional[float]:
         """Best-effort estimate of how many shares can be safely sold right now.
 
         For live CONDITIONAL balances PM may lag when releasing inventory after a
@@ -819,10 +824,31 @@ class OrderManager:
         if raw_balance is None:
             return None
         if hasattr(self.client, "_orders"):
-            return max(0.0, float(await self.get_reconcile_token_balance(token_id) or 0.0))
+            return max(
+                0.0,
+                float(
+                    await self.get_reconcile_token_balance(
+                        token_id,
+                        reference_shares=reference_shares,
+                    )
+                    or 0.0
+                ),
+            )
+        raw = max(0.0, float(raw_balance))
         active_sell_reserve = self._active_sell_inventory(token_id)
         recent_cancelled_reserve = self._recent_cancelled_sell_inventory(token_id)
-        return max(0.0, float(raw_balance) + active_sell_reserve - recent_cancelled_reserve)
+        adjusted_wallet = max(0.0, raw + active_sell_reserve + recent_cancelled_reserve)
+
+        wallet_total = raw
+        if reference_shares is not None:
+            try:
+                reference = max(0.0, float(reference_shares))
+                if abs(adjusted_wallet - reference) < abs(raw - reference):
+                    wallet_total = adjusted_wallet
+            except (TypeError, ValueError):
+                wallet_total = raw
+
+        return max(0.0, wallet_total - active_sell_reserve - recent_cancelled_reserve)
 
     def get_sell_release_lag_snapshot(
         self,

@@ -187,8 +187,10 @@ async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(mon
     gateway = PMGateway(_MockClient(), MMConfigV2())
     gateway.set_market(_market())
     calls: list[tuple[Quote, dict]] = []
+    sellable_refs: list[tuple[float, float] | None] = []
 
-    async def _sellable_balances():
+    async def _sellable_balances(*, reference_balances=None):
+        sellable_refs.append(reference_balances)
         return 0.0, 0.0
 
     async def _wallet_balances(*, reference_balances=None):
@@ -216,6 +218,8 @@ async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(mon
     assert result["attempted_orders"] == 2
     assert result["placed_orders"] == 2
     assert len(calls) == 2
+    assert sellable_refs
+    assert sellable_refs[0] == pytest.approx((6.2, 7.4))
     for _quote, kwargs in calls:
         assert kwargs.get("post_only") is False
         assert kwargs.get("ignore_sell_cooldowns") is True
