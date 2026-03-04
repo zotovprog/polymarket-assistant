@@ -355,25 +355,30 @@ class QuotePolicyV2:
             else:
                 nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
             effective_clip_usd = nominal_quote_clip_usd
+            floor_allowed = False
             if (
-                (
-                    effect == "helpful"
-                    and risk.soft_mode in {"inventory_skewed", "defensive"}
-                    and risk.inventory_side != "flat"
-                )
-                or (
-                    effect == "neutral"
-                    and risk.inventory_side == "flat"
-                    and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
-                )
-            ) and (
-                (
-                    side == "SELL"
-                    and inventory_backed_sell
-                    and owned_share_cap >= ctx.min_order_size
-                )
-                or min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
+                effect == "helpful"
+                and risk.soft_mode in {"inventory_skewed", "defensive"}
+                and risk.inventory_side != "flat"
             ):
+                floor_allowed = (
+                    (
+                        side == "SELL"
+                        and inventory_backed_sell
+                        and owned_share_cap >= ctx.min_order_size
+                    )
+                    or min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
+                )
+            elif (
+                effect == "neutral"
+                and risk.inventory_side == "flat"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            ):
+                # Flat-start maker quoting should use real free USDC viability,
+                # not the tighter BUY headroom cap, otherwise defensive starts
+                # can collapse into "all quotes below min size" with cash idle.
+                floor_allowed = min_viable_clip_usd <= free_usdc
+            if floor_allowed:
                 effective_clip_usd = max(effective_clip_usd, min_viable_clip_usd)
                 if effective_clip_usd > nominal_quote_clip_usd + 1e-9:
                     if effect == "helpful":

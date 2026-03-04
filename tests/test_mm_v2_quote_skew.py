@@ -383,6 +383,44 @@ def test_flat_defensive_applies_min_viable_floor_and_keeps_quotes():
     assert plan.quote_viability_reason in {"balanced", "min_viable_floor_applied"}
 
 
+def test_live_like_flat_defensive_start_with_real_free_usdc_keeps_quotes():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.016881827209533264,
+        fv_dn=0.9831181727904666,
+        pm_mid_up=0.02,
+        pm_mid_dn=0.99,
+        up_best_bid=0.01,
+        up_best_ask=0.02,
+        dn_best_bid=0.98,
+        dn_best_ask=0.99,
+        up_bid_depth_usd=11.0186,
+        up_ask_depth_usd=30985.2231,
+        dn_bid_depth_usd=31387.8769,
+        dn_ask_depth_usd=1090.8414,
+        market_quality_score=0.6,
+        market_tradeable=False,
+    )
+    inventory = _inventory(free_usdc=16.098201)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    assert risk.inventory_side == "flat"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.quote_balance_state != "none"
+    assert plan.quote_viability_reason in {"balanced", "min_viable_floor_applied", "reduced"}
+    assert any([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
+
+
 def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(
