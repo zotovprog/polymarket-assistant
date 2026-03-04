@@ -332,3 +332,172 @@ def test_quote_state_includes_suppressed_reason_for_blocked_harmful_intents(monk
         ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
     )
     assert plan.suppressed_reasons["dn_bid"] == "harmful blocked without helpful viability"
+
+
+def test_default_clip_6_produces_flat_start_quotes_at_pm_min_size():
+    cfg = MMConfigV2()
+    snapshot = _snapshot()
+    inventory = _inventory(free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert cfg.base_clip_usd == pytest.approx(6.0)
+    assert plan.quote_balance_state != "none"
+    assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
+
+
+def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    helpful_count = sum(
+        1
+        for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+        if intent and intent.inventory_effect == "helpful"
+    )
+    assert helpful_count >= 1
+    assert plan.quote_balance_state != "none"
+    assert plan.quote_viability_reason in {"balanced", "helpful_floor_applied", "reduced", "helpful_only"}
+
+
+def test_harmful_quotes_do_not_receive_min_viable_floor():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_bid is not None
+    assert plan.up_bid.inventory_effect == "helpful"
+    if plan.dn_bid is not None:
+        assert plan.dn_bid.inventory_effect == "harmful"
+        assert plan.up_bid.size >= plan.dn_bid.size
+    else:
+        assert plan.suppressed_reasons["dn_bid"] == "below_min_order_size"
+
+
+def test_no_viable_quotes_reason_is_explicit_when_all_quotes_below_min_size():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=1.0)
+    snapshot = _snapshot()
+    inventory = _inventory(free_usdc=2.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=20.0),
+    )
+    assert plan.quote_balance_state == "none"
+    assert plan.quote_viability_reason == "all_quotes_below_min_size"
+
+
+def test_pair_share_cap_still_limits_endpoint_explosion_after_helpful_floor():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.99,
+        fv_dn=0.01,
+        pm_mid_up=0.99,
+        pm_mid_dn=0.01,
+        up_best_bid=0.98,
+        up_best_ask=0.99,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.8,
+        excess_value_usd=9.8,
+        signed_excess_value_usd=-9.8,
+        total_inventory_value_usd=9.8,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    helpful_intents = [
+        intent
+        for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+        if intent and intent.inventory_effect == "helpful"
+    ]
+    assert helpful_intents
+    assert max(intent.size for intent in helpful_intents) <= 6.0

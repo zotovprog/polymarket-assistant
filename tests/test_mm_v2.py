@@ -401,6 +401,43 @@ async def test_mmv2_state_exposes_quote_suppressed_reason(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_state_exposes_min_viable_clip_usd(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "analytics": {
+                "min_viable_clip_usd": 4.9,
+                "quote_viability_reason": "helpful_floor_applied",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["min_viable_clip_usd"] == pytest.approx(4.9)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_quote_viability_reason(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "analytics": {
+                "quote_viability_reason": "all_quotes_below_min_size",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["quote_viability_reason"] == "all_quotes_below_min_size"
+
+
+@pytest.mark.asyncio
 async def test_mmv2_state_endpoint_returns_runtime_snapshot(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)

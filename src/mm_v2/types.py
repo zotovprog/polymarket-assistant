@@ -91,6 +91,7 @@ class QuotePlan:
         "reduced",
         "none",
     ] = "none"
+    quote_viability_reason: str = ""
     suppressed_reasons: dict[str, str] = field(default_factory=dict)
 
 
@@ -139,6 +140,8 @@ class AnalyticsState:
     helpful_quote_count: int = 0
     harmful_quote_count: int = 0
     quote_balance_state: str = "none"
+    min_viable_clip_usd: float = 0.0
+    quote_viability_reason: str = ""
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
 
 

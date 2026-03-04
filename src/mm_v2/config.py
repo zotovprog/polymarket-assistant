@@ -56,7 +56,7 @@ class MMConfigV2:
     }
 
     session_budget_usd: float = 15.0
-    base_clip_usd: float = 3.0
+    base_clip_usd: float = 6.0
     target_pair_value_ratio: float = 0.70
     soft_excess_value_ratio: float = 0.10
     defensive_excess_value_ratio: float = 0.18

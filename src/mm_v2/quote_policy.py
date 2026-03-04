@@ -59,6 +59,9 @@ class QuotePolicyV2:
             return max(1.0, base * 0.5)
         return base
 
+    def _min_viable_clip_usd(self, snapshot: PairMarketSnapshot, ctx: QuoteContext) -> float:
+        return float(ctx.min_order_size) * self._pair_reference_price(snapshot)
+
     @staticmethod
     def _buy_size_from_clip(clip_usd: float, price: float) -> float:
         return clip_usd / max(0.01, float(price))
@@ -226,6 +229,8 @@ class QuotePolicyV2:
             if promoted <= round(max(0.0, share_cap * HELPFUL_MIN_PROMOTION_MULT), 2):
                 size = promoted
         if size < ctx.min_order_size:
+            if inventory_effect == "helpful":
+                return None, "below_min_order_size_after_helpful_floor"
             return None, "below_min_order_size"
         return (
             QuoteIntent(
@@ -255,12 +260,12 @@ class QuotePolicyV2:
         spread = self._spread(risk)
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
-        per_quote_budget = min(clip_usd, max(1.0, free_usdc * 0.20))
+        budget_headroom_usd = max(1.0, free_usdc * 0.20)
+        min_viable_clip_usd = self._min_viable_clip_usd(snapshot, ctx)
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
         mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
         pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
         pair_reference_price = self._pair_reference_price(snapshot)
-        base_share_clip = max(0.0, per_quote_budget / pair_reference_price)
 
         up_bid_price = pair_mid - spread
         up_ask_price = pair_mid + spread
@@ -276,6 +281,7 @@ class QuotePolicyV2:
         }
         built: dict[str, QuoteIntent | None] = {}
         suppressed_reasons: dict[str, str] = {}
+        helpful_floor_applied = False
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
             effect = self._classify_inventory_effect(
@@ -309,13 +315,25 @@ class QuotePolicyV2:
                 tick_size=ctx.tick_size,
             )
             size_mult = self._size_multiplier(effect, pressure)
+            nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
+            effective_clip_usd = nominal_quote_clip_usd
+            if (
+                effect == "helpful"
+                and risk.soft_mode in {"inventory_skewed", "defensive"}
+                and risk.inventory_side != "flat"
+                and min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
+            ):
+                effective_clip_usd = max(effective_clip_usd, min_viable_clip_usd)
+                if effective_clip_usd > nominal_quote_clip_usd + 1e-9:
+                    helpful_floor_applied = True
+            share_cap = max(0.0, effective_clip_usd / pair_reference_price)
             role_name = role if risk.soft_mode != "unwind" else "unwind"
             intent, suppressed = self._make_intent(
                 token=token,
                 side=side,
                 price=adjusted_price,
-                clip_usd=per_quote_budget * size_mult,
-                share_cap=max(0.0, base_share_clip * size_mult),
+                clip_usd=effective_clip_usd,
+                share_cap=share_cap,
                 ctx=ctx,
                 role=role_name,
                 post_only=True,
@@ -399,6 +417,27 @@ class QuotePolicyV2:
             harmful_count=harmful_count,
             harmful_blocked=harmful_blocked,
         )
+        all_quotes_below_min = (
+            not any(built.values())
+            and bool(suppressed_reasons)
+            and all(
+                value in {"below_min_order_size", "below_min_order_size_after_helpful_floor"}
+                for value in suppressed_reasons.values()
+            )
+        )
+        quote_viability_reason = quote_balance_state
+        if harmful_blocked:
+            quote_viability_reason = "harmful_only_blocked"
+        elif all_quotes_below_min:
+            quote_viability_reason = "all_quotes_below_min_size"
+            if risk.hard_mode == "none" and risk.inventory_side != "flat":
+                reason = "no viable quotes after min-size checks"
+        elif helpful_floor_applied:
+            quote_viability_reason = "helpful_floor_applied"
+        elif quote_balance_state == "reduced":
+            quote_viability_reason = "reduced"
+        elif quote_balance_state == "none":
+            quote_viability_reason = "none"
 
         return QuotePlan(
             up_bid=built["up_bid"],
@@ -408,5 +447,6 @@ class QuotePolicyV2:
             regime=regime,
             reason=reason,
             quote_balance_state=quote_balance_state,  # type: ignore[arg-type]
+            quote_viability_reason=quote_viability_reason,
             suppressed_reasons=suppressed_reasons,
         )

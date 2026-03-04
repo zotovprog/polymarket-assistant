@@ -217,3 +217,64 @@ def test_hard_cap_exceeded_disables_pair_expanding_intents_without_halt():
     assert risk.hard_mode == "none"
     assert plan.dn_bid is None
     assert plan.up_ask is None
+
+
+def test_first_skew_fill_below_hard_cap_keeps_helpful_quotes_alive():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=50.0,
+    )
+    risk, plan, viability = _risk_and_plan(cfg, snapshot, inventory)
+    assert risk.hard_mode == "none"
+    assert viability.helpful_count >= 1
+    assert plan.quote_balance_state != "none"
+
+
+def test_below_hard_cap_no_early_unwind_when_helpful_quotes_alive_after_first_fill():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=50.0,
+    )
+    risk, _, viability = _risk_and_plan(cfg, snapshot, inventory)
+    sm = StateMachineV2(cfg)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = inventory.excess_value_usd
+    result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    assert viability.helpful_count >= 1
+    assert result.lifecycle in {"inventory_skewed", "defensive"}
+    assert result.lifecycle != "unwind"

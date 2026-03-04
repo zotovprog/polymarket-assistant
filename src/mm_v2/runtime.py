@@ -381,7 +381,7 @@ class MarketMakerV2:
                 ),
             )
         )
-        self._mode_history.append((now, risk.soft_mode))
+        self._mode_history.append((now, effective_risk.soft_mode))
         self._prune_history(self._excess_history)
         self._prune_history(self._quote_presence_history)
         self._prune_history(self._mode_history)
@@ -402,6 +402,8 @@ class MarketMakerV2:
             helpful_quote_count=helpful_quote_count,
             harmful_quote_count=harmful_quote_count,
             quote_balance_state=plan.quote_balance_state,
+            min_viable_clip_usd=float(QuotePolicyV2(self.config)._min_viable_clip_usd(snapshot, ctx)),
+            quote_viability_reason=plan.quote_viability_reason,
             recent_fills=[
                 {
                     "ts": f.ts,
