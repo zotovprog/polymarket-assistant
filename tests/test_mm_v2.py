@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import os
 import sys
 import time
@@ -491,6 +492,12 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     assert captured["paper_mode"] is False
     assert captured["initial_usdc"] == pytest.approx(1000.0)
     assert captured["session_budget_usd"] == pytest.approx(15.0)
+
+
+def test_runtime_v2_start_accepts_session_budget_kwarg():
+    web_server = importlib.import_module("web_server")
+    params = inspect.signature(web_server._runtime_v2.start).parameters
+    assert "session_budget_usd" in params
 
 
 @pytest.mark.asyncio

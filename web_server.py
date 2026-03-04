@@ -2680,8 +2680,15 @@ class MMRuntimeV2(MMRuntime):
             "config": self.mm_config_v2.to_dict(),
         }
 
-    async def start(self, coin: str, timeframe: str, paper_mode: bool = True,
-                    initial_usdc: float = 1000.0, dev: bool = False) -> dict:
+    async def start(
+        self,
+        coin: str,
+        timeframe: str,
+        paper_mode: bool = True,
+        initial_usdc: float = 1000.0,
+        dev: bool = False,
+        session_budget_usd: Optional[float] = None,
+    ) -> dict:
         if self._running:
             raise HTTPException(status_code=400, detail="V2 already running")
         if str(coin).upper() != "BTC" or str(timeframe) not in {"15m", "1h"}:
