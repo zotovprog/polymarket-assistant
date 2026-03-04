@@ -355,6 +355,34 @@ def test_default_clip_6_produces_flat_start_quotes_at_pm_min_size():
     assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
 
 
+def test_flat_defensive_applies_min_viable_floor_and_keeps_quotes():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        market_quality_score=0.2,
+        market_tradeable=False,
+        divergence_up=0.13,
+        divergence_dn=0.13,
+    )
+    inventory = _inventory(free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    assert risk.inventory_side == "flat"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.quote_balance_state != "none"
+    assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
+    assert plan.quote_viability_reason in {"balanced", "min_viable_floor_applied"}
+
+
 def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(
@@ -459,6 +487,38 @@ def test_no_viable_quotes_reason_is_explicit_when_all_quotes_below_min_size():
     )
     assert plan.quote_balance_state == "none"
     assert plan.quote_viability_reason == "all_quotes_below_min_size"
+
+
+def test_neutral_floor_reason_is_exposed_for_flat_defensive_state():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+        market_quality_score=0.2,
+        market_tradeable=False,
+        divergence_up=0.13,
+        divergence_dn=0.13,
+    )
+    inventory = _inventory(free_usdc=50.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.quote_viability_reason == "min_viable_floor_applied"
 
 
 def test_pair_share_cap_still_limits_endpoint_explosion_after_helpful_floor():

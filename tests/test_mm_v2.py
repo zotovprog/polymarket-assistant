@@ -464,6 +464,36 @@ async def test_mmv2_start_rejects_when_legacy_runtime_is_running(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 15.0
+    captured = {}
+
+    async def _fake_start(coin, timeframe, paper_mode, initial_usdc, dev=False, session_budget_usd=None):
+        captured.update(
+            {
+                "coin": coin,
+                "timeframe": timeframe,
+                "paper_mode": paper_mode,
+                "initial_usdc": initial_usdc,
+                "dev": dev,
+                "session_budget_usd": session_budget_usd,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(web_server._runtime_v2, "start", _fake_start)
+    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=False, dev=True)
+    resp = await web_server.mmv2_start(req=req, request=object())
+    assert resp["ok"] is True
+    assert captured["paper_mode"] is False
+    assert captured["initial_usdc"] == pytest.approx(1000.0)
+    assert captured["session_budget_usd"] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
 async def test_mmv2_verification_route_delegates_to_runtime(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)

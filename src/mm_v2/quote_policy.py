@@ -282,6 +282,7 @@ class QuotePolicyV2:
         built: dict[str, QuoteIntent | None] = {}
         suppressed_reasons: dict[str, str] = {}
         helpful_floor_applied = False
+        neutral_floor_applied = False
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
             effect = self._classify_inventory_effect(
@@ -318,14 +319,23 @@ class QuotePolicyV2:
             nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
             effective_clip_usd = nominal_quote_clip_usd
             if (
-                effect == "helpful"
-                and risk.soft_mode in {"inventory_skewed", "defensive"}
-                and risk.inventory_side != "flat"
-                and min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
-            ):
+                (
+                    effect == "helpful"
+                    and risk.soft_mode in {"inventory_skewed", "defensive"}
+                    and risk.inventory_side != "flat"
+                )
+                or (
+                    effect == "neutral"
+                    and risk.inventory_side == "flat"
+                    and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                )
+            ) and min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult):
                 effective_clip_usd = max(effective_clip_usd, min_viable_clip_usd)
                 if effective_clip_usd > nominal_quote_clip_usd + 1e-9:
-                    helpful_floor_applied = True
+                    if effect == "helpful":
+                        helpful_floor_applied = True
+                    elif effect == "neutral":
+                        neutral_floor_applied = True
             share_cap = max(0.0, effective_clip_usd / pair_reference_price)
             role_name = role if risk.soft_mode != "unwind" else "unwind"
             intent, suppressed = self._make_intent(
@@ -434,6 +444,8 @@ class QuotePolicyV2:
                 reason = "no viable quotes after min-size checks"
         elif helpful_floor_applied:
             quote_viability_reason = "helpful_floor_applied"
+        elif neutral_floor_applied:
+            quote_viability_reason = "min_viable_floor_applied"
         elif quote_balance_state == "reduced":
             quote_viability_reason = "reduced"
         elif quote_balance_state == "none":

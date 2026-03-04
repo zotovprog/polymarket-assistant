@@ -1596,8 +1596,15 @@ class MMRuntime:
             log.warning(f"Credential validation failed: {error_msg}")
             raise HTTPException(status_code=400, detail=detail)
 
-    async def start(self, coin: str, timeframe: str, paper_mode: bool = True,
-                    initial_usdc: float = 1000.0, dev: bool = False) -> dict:
+    async def start(
+        self,
+        coin: str,
+        timeframe: str,
+        paper_mode: bool = True,
+        initial_usdc: float = 1000.0,
+        dev: bool = False,
+        session_budget_usd: Optional[float] = None,
+    ) -> dict:
         """Start feeds and market maker."""
         if self._running:
             raise HTTPException(status_code=400, detail="Already running")
@@ -2765,7 +2772,12 @@ class MMRuntimeV2(MMRuntime):
             paper_mode=paper_mode,
             initial_usdc=self._initial_usdc,
         )
-        self.mm_config_v2.session_budget_usd = float(self._initial_usdc)
+        effective_session_budget = (
+            float(session_budget_usd)
+            if session_budget_usd is not None
+            else float(self._initial_usdc)
+        )
+        self.mm_config_v2.session_budget_usd = effective_session_budget
         self.mm_v2 = MarketMakerV2(self.feed_state, clob, self.mm_config_v2)
         self.mm_v2.set_market(market)
         await self.mm_v2.start()
@@ -3322,12 +3334,19 @@ async def mmv2_start(req: StartRequest, request: Request):
     _require_auth(request)
     if _runtime._running:
         raise HTTPException(status_code=409, detail="Legacy MM is already running")
+    if req.paper_mode:
+        session_budget_usd = float(req.initial_usdc)
+    elif "initial_usdc" in req.model_fields_set:
+        session_budget_usd = float(req.initial_usdc)
+    else:
+        session_budget_usd = float(_runtime_v2.mm_config_v2.session_budget_usd)
     result = await _runtime_v2.start(
         req.coin,
         req.timeframe,
         req.paper_mode,
         req.initial_usdc,
         dev=req.dev,
+        session_budget_usd=session_budget_usd,
     )
     return {"ok": True, "state": result}
 
