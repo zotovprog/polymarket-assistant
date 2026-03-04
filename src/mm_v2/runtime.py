@@ -97,6 +97,7 @@ class MarketMakerV2:
             quality_pressure=0.0,
         )
         self._last_plan = QuotePlan(None, None, None, None, "boot", "boot")
+        self._last_execution = ExecutionState()
         self._last_analytics = AnalyticsState()
         self._last_health = HealthState()
         self.heartbeat = HeartbeatManager(
@@ -164,7 +165,7 @@ class MarketMakerV2:
             raise RuntimeError("market is not set")
         self._running = True
         self._started_at = time.time()
-        up, dn, total_usdc, available_usdc = await self.gateway.get_balances()
+        up, dn, total_usdc, available_usdc = await self.gateway.get_wallet_balances()
         if up is None or dn is None:
             up = 0.0
             dn = 0.0
@@ -232,7 +233,7 @@ class MarketMakerV2:
         current_portfolio = inventory.free_usdc + inventory.reserved_usdc + inventory.total_inventory_value_usd
         self._session_pnl = current_portfolio - self._starting_portfolio
 
-    def _build_health(self) -> HealthState:
+    def _build_health(self, *, sellability_lag_active: bool = False) -> HealthState:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
         last_message = ""
@@ -250,6 +251,7 @@ class MarketMakerV2:
             last_fallback_poll_count=last_fallback,
             true_drift=self.reconcile.true_drift,
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
+            sellability_lag_active=bool(sellability_lag_active),
         )
 
     def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
@@ -299,10 +301,20 @@ class MarketMakerV2:
             fv_dn=valuation.fv_dn,
             pm_prices={"up": snapshot.pm_mid_up, "dn": snapshot.pm_mid_dn},
         )
-        up, dn, total_usdc, available_usdc = await self.gateway.get_balances()
+        reference_balances = (
+            float(self._last_inventory.up_shares),
+            float(self._last_inventory.dn_shares),
+        )
+        up, dn, total_usdc, available_usdc = await self.gateway.get_wallet_balances(
+            reference_balances=reference_balances,
+        )
+        sellable_up, sellable_dn = await self.gateway.get_sellable_balances()
+        sell_release_lag = self.gateway.sell_release_lag_state()
         up = float(up or 0.0)
         dn = float(dn or 0.0)
         total_usdc = float(total_usdc or 0.0)
+        sellable_up = max(0.0, float(up if sellable_up is None else sellable_up))
+        sellable_dn = max(0.0, float(dn if sellable_dn is None else sellable_dn))
         inventory = self.reconcile.reconcile(
             market=self.market,
             real_up=up,
@@ -313,12 +325,16 @@ class MarketMakerV2:
             fv_up=valuation.fv_up,
             fv_dn=valuation.fv_dn,
         )
+        inventory.sellable_up_shares = sellable_up
+        inventory.sellable_dn_shares = sellable_dn
         self._update_session_pnl(inventory)
         pre_analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,
         )
-        health = self._build_health()
+        health = self._build_health(
+            sellability_lag_active=bool(sell_release_lag.get("active")),
+        )
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
             inventory=inventory,
@@ -434,20 +450,42 @@ class MarketMakerV2:
         self._last_plan = plan
         self._last_analytics = analytics
         self._last_health = health
+        transport_failures = int(
+            sum(
+                int(v or 0)
+                for v in (
+                    (
+                        self.gateway.api_error_stats().get("transport_total_by_op")
+                        or self.gateway.api_error_stats().get("total_by_op")
+                        or {}
+                    ).values()
+                )
+            )
+        )
+        execution = self.tracker.execution_state(
+            active_orders=self.gateway.active_orders(),
+            transport_failures=transport_failures,
+            last_api_error=health.last_api_error,
+            last_fallback_poll_count=health.last_fallback_poll_count,
+            up_token_id=self.market.up_token_id,
+            dn_token_id=self.market.dn_token_id,
+        )
+        execution = replace(
+            execution,
+            recent_cancelled_sell_reserve_up=float(sell_release_lag.get("up_reserve", 0.0) or 0.0),
+            recent_cancelled_sell_reserve_dn=float(sell_release_lag.get("dn_reserve", 0.0) or 0.0),
+            sell_release_lag_up_sec=float(sell_release_lag.get("up_seconds_left", 0.0) or 0.0),
+            sell_release_lag_dn_sec=float(sell_release_lag.get("dn_seconds_left", 0.0) or 0.0),
+            last_sellability_lag_reason=str(sell_release_lag.get("reason") or ""),
+        )
+        self._last_execution = execution
         state = EngineState(
             lifecycle=lifecycle,  # type: ignore[arg-type]
             market=snapshot,
             inventory=inventory,
-            risk=risk,
+            risk=effective_risk,
             current_quotes=plan,
-            execution=self.tracker.execution_state(
-                active_orders=self.gateway.active_orders(),
-                transport_failures=int(sum(int(v or 0) for v in ((self.gateway.api_error_stats().get("transport_total_by_op") or self.gateway.api_error_stats().get("total_by_op") or {}).values()))),
-                last_api_error=health.last_api_error,
-                last_fallback_poll_count=health.last_fallback_poll_count,
-                up_token_id=self.market.up_token_id,
-                dn_token_id=self.market.dn_token_id,
-            ),
+            execution=execution,
             analytics=analytics,
             health=health,
             alerts=sorted(self._alerts.values(), key=lambda x: x.get("ts", 0.0), reverse=True),
@@ -465,14 +503,7 @@ class MarketMakerV2:
             inventory=self._last_inventory,
             risk=self._last_risk,
             current_quotes=self._last_plan,
-            execution=self.tracker.execution_state(
-                active_orders=self.gateway.active_orders(),
-                transport_failures=int(sum(int(v or 0) for v in ((self.gateway.api_error_stats().get("transport_total_by_op") or self.gateway.api_error_stats().get("total_by_op") or {}).values()))),
-                last_api_error=self._last_health.last_api_error,
-                last_fallback_poll_count=self._last_health.last_fallback_poll_count,
-                up_token_id=self.market.up_token_id if self.market else "",
-                dn_token_id=self.market.dn_token_id if self.market else "",
-            ),
+            execution=self._last_execution,
             analytics=self._last_analytics,
             health=self._last_health,
             alerts=sorted(self._alerts.values(), key=lambda x: x.get("ts", 0.0), reverse=True),

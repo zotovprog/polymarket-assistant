@@ -51,6 +51,7 @@ class MMConfigV2:
         "max_entry_spread_bps": (50.0, 5000.0),
         "reconcile_drift_threshold_shares": (0.25, 50.0),
         "fill_settlement_grace_sec": (1.0, 15.0),
+        "sell_release_grace_sec": (0.5, 10.0),
         "requote_threshold_bps": (1.0, 500.0),
         "fallback_poll_cap": (1.0, 30.0),
     }
@@ -80,6 +81,7 @@ class MMConfigV2:
     max_entry_spread_bps: float = 800.0
     reconcile_drift_threshold_shares: float = 1.5
     fill_settlement_grace_sec: float = 6.0
+    sell_release_grace_sec: float = 3.0
     requote_threshold_bps: float = 15.0
     fallback_poll_cap: int = 12
 
@@ -151,6 +153,7 @@ class MMConfigV2:
         cfg.requote_threshold_bps = float(self.requote_threshold_bps)
         cfg.fallback_poll_cap = int(self.fallback_poll_cap)
         cfg.fill_settlement_grace_sec = float(self.fill_settlement_grace_sec)
+        cfg.sell_release_grace_sec = float(self.sell_release_grace_sec)
         cfg.critical_reconcile_drift_shares = float(self.reconcile_drift_threshold_shares)
         cfg.heartbeat_interval_sec = 5
         cfg.heartbeat_failures_before_shutdown = 3

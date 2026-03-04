@@ -37,14 +37,44 @@ class PMGateway:
             self.order_mgr.get_full_book(self.market.dn_token_id),
         )
 
-    async def get_balances(self) -> tuple[float | None, float | None, float | None, float | None]:
+    async def get_wallet_balances(
+        self,
+        *,
+        reference_balances: tuple[float, float] | None = None,
+    ) -> tuple[float | None, float | None, float | None, float | None]:
         assert self.market is not None
+        references: dict[str, float] | None = None
+        if reference_balances is not None:
+            references = {
+                self.market.up_token_id: float(reference_balances[0]),
+                self.market.dn_token_id: float(reference_balances[1]),
+            }
         up_dn = await self.order_mgr.get_all_token_balances(
             self.market.up_token_id,
             self.market.dn_token_id,
+            reference_balances=references,
         )
         total_usdc, available_usdc = await self.order_mgr.get_usdc_balances()
         return up_dn[0], up_dn[1], total_usdc, available_usdc
+
+    async def get_sellable_balances(self) -> tuple[float | None, float | None]:
+        assert self.market is not None
+        up_sellable, dn_sellable = await asyncio.gather(
+            self.order_mgr.get_sellable_token_balance(self.market.up_token_id),
+            self.order_mgr.get_sellable_token_balance(self.market.dn_token_id),
+        )
+        return up_sellable, dn_sellable
+
+    def sell_release_lag_state(self) -> dict[str, Any]:
+        assert self.market is not None
+        return self.order_mgr.get_sell_release_lag_snapshot(
+            up_token_id=self.market.up_token_id,
+            dn_token_id=self.market.dn_token_id,
+        )
+
+    async def get_balances(self) -> tuple[float | None, float | None, float | None, float | None]:
+        """Backward-compatible alias for wallet balances."""
+        return await self.get_wallet_balances()
 
     def active_orders(self) -> dict[str, Quote]:
         return self.order_mgr.active_orders

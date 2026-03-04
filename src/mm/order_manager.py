@@ -115,6 +115,15 @@ class RecentOrderState:
 
 
 @dataclass
+class RecentCancelledSellReserve:
+    order_id: str
+    token_id: str
+    remaining_size: float
+    cancelled_ts: float
+    grace_until: float
+
+
+@dataclass
 class APIErrorEvent:
     ts: float
     op: str
@@ -202,6 +211,8 @@ class OrderManager:
         self._api_error_counts: dict[str, int] = {}
         self._transport_error_counts: dict[str, int] = {}
         self._last_api_error_ts: float = 0.0
+        self._recent_cancelled_sell_reserves: dict[str, RecentCancelledSellReserve] = {}
+        self._last_sellability_lag_reason: str = ""
         if hasattr(clob_client, "_mock_token_balances") and isinstance(
             getattr(clob_client, "_mock_token_balances", None),
             dict,
@@ -694,6 +705,132 @@ class OrderManager:
         )
         self._prune_recent_orders()
 
+    def _prune_recent_cancelled_sell_reserves(self, now: float | None = None) -> None:
+        ts = now if now is not None else time.time()
+        stale = [
+            order_id
+            for order_id, reserve in self._recent_cancelled_sell_reserves.items()
+            if reserve.grace_until <= ts or reserve.remaining_size <= 0.0
+        ]
+        for order_id in stale:
+            self._recent_cancelled_sell_reserves.pop(order_id, None)
+
+    def _active_sell_inventory(self, token_id: str) -> float:
+        reserved = 0.0
+        for order_id, quote in self._active_orders.items():
+            if quote.token_id != token_id:
+                continue
+            reserved += self._remaining_active_sell_size(order_id, quote)
+        return reserved
+
+    def _recent_cancelled_sell_inventory(self, token_id: str, now: float | None = None) -> float:
+        if bool(getattr(self.config, "allow_short_sells", False)):
+            return 0.0
+        self._prune_recent_cancelled_sell_reserves(now)
+        reserved = 0.0
+        for reserve in self._recent_cancelled_sell_reserves.values():
+            if reserve.token_id != token_id:
+                continue
+            reserved += max(0.0, float(reserve.remaining_size))
+        return reserved
+
+    def _add_recent_cancelled_sell_reserve(self, order_id: str, quote: Quote | None) -> None:
+        if bool(getattr(self.config, "allow_short_sells", False)):
+            return
+        if not order_id or quote is None or (quote.side or "").upper() != "SELL":
+            return
+        remaining = self._remaining_active_sell_size(order_id, quote)
+        if remaining <= 0.0:
+            return
+        now = time.time()
+        self._recent_cancelled_sell_reserves[order_id] = RecentCancelledSellReserve(
+            order_id=order_id,
+            token_id=quote.token_id,
+            remaining_size=float(remaining),
+            cancelled_ts=now,
+            grace_until=now + float(getattr(self.config, "sell_release_grace_sec", 3.0) or 3.0),
+        )
+
+    def _clear_recent_cancelled_sell_reserves_for_token(self, token_id: str) -> None:
+        if not token_id:
+            return
+        stale = [
+            order_id
+            for order_id, reserve in self._recent_cancelled_sell_reserves.items()
+            if reserve.token_id == token_id
+        ]
+        for order_id in stale:
+            self._recent_cancelled_sell_reserves.pop(order_id, None)
+
+    def _reduce_recent_cancelled_sell_reserves(self, token_id: str, filled_size: float) -> None:
+        remaining_fill = max(0.0, float(filled_size))
+        if remaining_fill <= 0.0:
+            return
+        self._prune_recent_cancelled_sell_reserves()
+        ordered = sorted(
+            (
+                (order_id, reserve)
+                for order_id, reserve in self._recent_cancelled_sell_reserves.items()
+                if reserve.token_id == token_id
+            ),
+            key=lambda item: item[1].cancelled_ts,
+        )
+        for order_id, reserve in ordered:
+            if remaining_fill <= 0.0:
+                break
+            if reserve.remaining_size <= remaining_fill + 1e-9:
+                remaining_fill -= reserve.remaining_size
+                self._recent_cancelled_sell_reserves.pop(order_id, None)
+            else:
+                reserve.remaining_size = max(0.0, reserve.remaining_size - remaining_fill)
+                remaining_fill = 0.0
+
+    async def get_sellable_token_balance(self, token_id: str) -> Optional[float]:
+        """Best-effort estimate of how many shares can be safely sold right now.
+
+        For live CONDITIONAL balances PM may lag when releasing inventory after a
+        SELL cancel. We therefore keep recently cancelled SELL reserve separate
+        from wallet truth and expose a conservative sellable balance to V2 asks.
+        """
+        raw_balance = await self.get_token_balance(token_id)
+        if raw_balance is None:
+            return None
+        if hasattr(self.client, "_orders"):
+            return max(0.0, float(await self.get_reconcile_token_balance(token_id) or 0.0))
+        active_sell_reserve = self._active_sell_inventory(token_id)
+        recent_cancelled_reserve = self._recent_cancelled_sell_inventory(token_id)
+        return max(0.0, float(raw_balance) + active_sell_reserve - recent_cancelled_reserve)
+
+    def get_sell_release_lag_snapshot(
+        self,
+        *,
+        up_token_id: str | None = None,
+        dn_token_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        self._prune_recent_cancelled_sell_reserves(now)
+
+        def _seconds_left(token_id: str | None) -> float:
+            if not token_id:
+                return 0.0
+            left = 0.0
+            for reserve in self._recent_cancelled_sell_reserves.values():
+                if reserve.token_id != token_id:
+                    continue
+                left = max(left, max(0.0, reserve.grace_until - now))
+            return left
+
+        up_reserve = self._recent_cancelled_sell_inventory(up_token_id or "", now) if up_token_id else 0.0
+        dn_reserve = self._recent_cancelled_sell_inventory(dn_token_id or "", now) if dn_token_id else 0.0
+        return {
+            "active": bool(self._recent_cancelled_sell_reserves),
+            "up_reserve": round(float(up_reserve), 4),
+            "dn_reserve": round(float(dn_reserve), 4),
+            "up_seconds_left": round(_seconds_left(up_token_id), 3),
+            "dn_seconds_left": round(_seconds_left(dn_token_id), 3),
+            "reason": self._last_sellability_lag_reason,
+        }
+
     def _prune_recent_orders(
         self,
         now: float | None = None,
@@ -882,13 +1019,27 @@ class OrderManager:
         self.invalidate_usdc_cache()
         extra = ""
         if quote.side == "SELL":
-            self._allowance_set.discard(quote.token_id)
-            self._allowance_cap_shares.pop(quote.token_id, None)
+            recent_cancelled = self._recent_cancelled_sell_inventory(quote.token_id)
+            sellability_lag = recent_cancelled > 0.0
+            if sellability_lag:
+                self._last_sellability_lag_reason = (
+                    f"{source}: sellability_lag ({recent_cancelled:.2f} recently cancelled shares)"
+                )
+            else:
+                self._last_sellability_lag_reason = ""
+                self._allowance_set.discard(quote.token_id)
+                self._allowance_cap_shares.pop(quote.token_id, None)
             until = time.time() + self._sell_reject_cooldown_sec
             prev = float(self._sell_reject_cooldown_until.get(quote.token_id, 0.0))
             if until > prev:
                 self._sell_reject_cooldown_until[quote.token_id] = until
-            extra = f", sell_cooldown={self._sell_reject_cooldown_sec:.1f}s"
+            if sellability_lag:
+                extra = (
+                    f", classify=sellability_lag, recent_cancelled={recent_cancelled:.2f}, "
+                    f"sell_cooldown={self._sell_reject_cooldown_sec:.1f}s"
+                )
+            else:
+                extra = f", sell_cooldown={self._sell_reject_cooldown_sec:.1f}s"
 
         raw_suffix = ""
         if raw is not None:
@@ -1219,12 +1370,12 @@ class OrderManager:
             )
             return False
 
-        active_sell_exposure = sum(
-            max(0.0, float(q.size))
-            for q in self._active_orders.values()
-            if q.side == "SELL" and q.token_id == quote.token_id
+        active_sell_exposure = self._active_sell_inventory(quote.token_id)
+        recent_cancelled_exposure = self._recent_cancelled_sell_inventory(quote.token_id)
+        free_inventory = max(
+            0.0,
+            float(token_bal) - active_sell_exposure - recent_cancelled_exposure,
         )
-        free_inventory = max(0.0, float(token_bal) - active_sell_exposure)
 
         pm_min = self._pm_min_order_size()
         # Keep a tiny safety buffer for live SELLs to avoid exchange-side
@@ -1247,7 +1398,8 @@ class OrderManager:
                 (
                     f"SELL trimmed (close-only) {quote.token_id[:8]} "
                     f"{old:.1f}→{quote.size:.1f} shares "
-                    f"(free={free_inventory:.2f}, effective={effective_free:.2f})"
+                    f"(free={free_inventory:.2f}, active={active_sell_exposure:.2f}, "
+                    f"recent_cancelled={recent_cancelled_exposure:.2f}, effective={effective_free:.2f})"
                 ),
                 cooldown=5.0,
             )
@@ -1257,7 +1409,9 @@ class OrderManager:
             "sell_close_only_blocked",
             (
                 f"SELL blocked (close-only) {quote.token_id[:8]} "
-                f"need={quote.size:.1f} free={free_inventory:.2f} effective={effective_free:.2f}"
+                f"need={quote.size:.1f} free={free_inventory:.2f} "
+                f"active={active_sell_exposure:.2f} recent_cancelled={recent_cancelled_exposure:.2f} "
+                f"effective={effective_free:.2f}"
             ),
             cooldown=5.0,
         )
@@ -1491,6 +1645,8 @@ class OrderManager:
         self.invalidate_usdc_cache()
         if quote.side == "SELL":
             self._sell_reject_cooldown_until.pop(quote.token_id, None)
+            self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)
+            self._last_sellability_lag_reason = ""
         self._notify_heartbeat_id(resp)
         log.info(f"Placed {quote.side} {quote.size:.1f}@{quote.price:.2f} "
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
@@ -1614,26 +1770,27 @@ class OrderManager:
             # - True short SELL: only short remainder requires USDC collateral.
             free_inventory = 0.0
             token_bal = await self.get_token_balance(quote.token_id)
-            active_sell_exposure = sum(
-                q.size
-                for q in self._active_orders.values()
-                if q.side == "SELL" and q.token_id == quote.token_id
-            )
-            local_inventory = quote.size + active_sell_exposure
+            active_sell_exposure = self._active_sell_inventory(quote.token_id)
+            recent_cancelled_exposure = self._recent_cancelled_sell_inventory(quote.token_id)
+            local_inventory = quote.size + active_sell_exposure + recent_cancelled_exposure
             # If token balance unavailable, fall back to local inventory for close detection
             if token_bal is None:
                 # Use local inventory estimate — safer than assuming short
                 token_balance_for_close_check = local_inventory if local_inventory > 0 else 0.0
             else:
                 token_balance_for_close_check = token_bal
-            free_inventory = max(0.0, token_balance_for_close_check - active_sell_exposure)
+            free_inventory = max(
+                0.0,
+                token_balance_for_close_check - active_sell_exposure - recent_cancelled_exposure,
+            )
             if free_inventory + 0.01 >= quote.size:
                 log.debug(
                     "SELL pre-check: inventory-backed close %.2f shares "
-                    "(token=%.2f active_sell=%.2f) — skipping USDC collateral check",
+                    "(token=%.2f active_sell=%.2f recent_cancelled=%.2f) — skipping USDC collateral check",
                     quote.size,
                     token_balance_for_close_check,
                     active_sell_exposure,
+                    recent_cancelled_exposure,
                 )
 
             allow_short_sells = bool(getattr(self.config, "allow_short_sells", False))
@@ -1934,6 +2091,8 @@ class OrderManager:
                         self._order_post_only[order_id] = use_post_only
                         if quote.side == "SELL":
                             self._sell_reject_cooldown_until.pop(quote.token_id, None)
+                            self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)
+                            self._last_sellability_lag_reason = ""
                         results[idx] = order_id
                         log.info(
                             "Batch placed %s %s %.1f@%.2f id=%s...",
@@ -2039,7 +2198,9 @@ class OrderManager:
                 except Exception:
                     pass
             for oid in cancelled_ids:
-                self._track_recent_order(oid, self._active_orders.get(oid))
+                quote = self._active_orders.get(oid)
+                self._add_recent_cancelled_sell_reserve(oid, quote)
+                self._track_recent_order(oid, quote)
                 self._active_orders.pop(oid, None)
                 self._order_post_only.pop(oid, None)
             return len(cancelled_ids)
@@ -2083,7 +2244,9 @@ class OrderManager:
                         )
 
         for oid in cancelled_ids:
-            self._track_recent_order(oid, self._active_orders.get(oid))
+            quote = self._active_orders.get(oid)
+            self._add_recent_cancelled_sell_reserve(oid, quote)
+            self._track_recent_order(oid, quote)
             self._active_orders.pop(oid, None)
             self._order_post_only.pop(oid, None)
             self._pending_cancels.discard(oid)
@@ -2238,7 +2401,7 @@ class OrderManager:
         return max(0.0, total - matched)
 
     def _reserved_sell_inventory(self, token_id: str) -> float:
-        """Shares reserved by our active close-only SELL orders for this token.
+        """Shares reserved by active and just-cancelled close-only SELL orders.
 
         When short selling is disabled, PM's CONDITIONAL balance endpoint may
         return free inventory with open SELL sizes deducted. Reconcile/startup
@@ -2247,12 +2410,10 @@ class OrderManager:
         if bool(getattr(self.config, "allow_short_sells", False)):
             return 0.0
 
-        reserved = 0.0
-        for order_id, quote in self._active_orders.items():
-            if quote.token_id != token_id:
-                continue
-            reserved += self._remaining_active_sell_size(order_id, quote)
-        return reserved
+        return (
+            self._active_sell_inventory(token_id)
+            + self._recent_cancelled_sell_inventory(token_id)
+        )
 
     async def get_reconcile_token_balance(
         self,
@@ -2265,7 +2426,8 @@ class OrderManager:
         PM's CONDITIONAL endpoint is inconsistent in live mode: sometimes it
         reports free balance (open SELL inventory already deducted), sometimes
         total wallet inventory. Reconcile therefore evaluates both candidates:
-        the raw endpoint response, and raw + still-open tracked SELL reserve.
+        the raw endpoint response, and raw + tracked SELL reserve
+        (active + recently cancelled within release-grace window).
 
         When a reference inventory is available from the MM state, prefer the
         candidate closer to that expected total. This prevents both under-counts
@@ -2421,6 +2583,7 @@ class OrderManager:
             )
             quote = self._active_orders.get(order_id)
             if quote is not None:
+                self._add_recent_cancelled_sell_reserve(order_id, quote)
                 self._track_recent_order(order_id, quote, reason="cancelled")
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
@@ -2451,6 +2614,8 @@ class OrderManager:
         self._filled_order_ids.clear()
         self._partial_fill_reported.clear()
         self._pending_cancels.clear()
+        self._recent_cancelled_sell_reserves.clear()
+        self._last_sellability_lag_reason = ""
         self._reconcile_requested = False
         self._sell_reject_cooldown_until.clear()
         self._last_fallback_poll_count = 0
@@ -2486,6 +2651,7 @@ class OrderManager:
             self._notify_heartbeat_id(batch_resp)
             cancelled = len(ids)
             for oid, quote in existing.items():
+                self._add_recent_cancelled_sell_reserve(oid, quote)
                 self._track_recent_order(oid, quote, reason="batch_cancel")
             for oid in ids:
                 self._active_orders.pop(oid, None)
@@ -2737,6 +2903,7 @@ class OrderManager:
                     self._session_spent += fill_size * fill_price
                 elif quote.side == "SELL":
                     self._session_spent = max(0.0, self._session_spent - fill_size * fill_price)
+                    self._reduce_recent_cancelled_sell_reserves(quote.token_id, fill_size)
 
                 if hasattr(self.client, "_orders") and not getattr(self.client, "_manages_mock_balances", False):
                     if quote.side == "BUY":
@@ -2804,10 +2971,12 @@ class OrderManager:
                                 self._session_spent += missed * fill_price
                             elif quote.side == "SELL":
                                 self._session_spent = max(0.0, self._session_spent - missed * fill_price)
+                                self._reduce_recent_cancelled_sell_reserves(quote.token_id, missed)
                     self._filled_order_ids.add(oid)
                     to_remove.append(oid)
                     self._partial_fill_reported.pop(oid, None)
                 elif status in ("CANCELLED", "EXPIRED"):
+                    self._add_recent_cancelled_sell_reserve(oid, quote)
                     to_remove.append(oid)
                     self._partial_fill_reported.pop(oid, None)
 
@@ -2943,6 +3112,7 @@ class OrderManager:
                         self._session_spent += new_fill * fill_price
                     elif quote.side == "SELL":
                         self._session_spent = max(0.0, self._session_spent - new_fill * fill_price)
+                        self._reduce_recent_cancelled_sell_reserves(quote.token_id, new_fill)
                     if hasattr(self.client, "_orders") and not getattr(self.client, "_manages_mock_balances", False):
                         if quote.side == "BUY":
                             actual = (
@@ -2962,6 +3132,7 @@ class OrderManager:
                     self._recent_orders.pop(oid, None)
                     self._partial_fill_reported.pop(oid, None)
                 elif status in ("CANCELLED", "EXPIRED"):
+                    self._add_recent_cancelled_sell_reserve(oid, quote)
                     to_remove.append(oid)
                     self._partial_fill_reported.pop(oid, None)
         else:

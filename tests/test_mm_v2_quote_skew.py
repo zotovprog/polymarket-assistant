@@ -199,6 +199,67 @@ def test_paper_flat_start_keeps_two_sided_quotes():
     assert plan.dn_ask is not None
 
 
+def test_live_asks_use_sellable_not_owned_inventory():
+    cfg = MMConfigV2(base_clip_usd=6.0, session_budget_usd=50.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=12.0,
+        dn_shares=0.0,
+        sellable_up_shares=0.0,
+        sellable_dn_shares=0.0,
+        excess_up_qty=12.0,
+        excess_up_value_usd=6.48,
+        excess_value_usd=6.48,
+        signed_excess_value_usd=6.48,
+        total_inventory_value_usd=6.48,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0, allow_naked_sells=False),
+    )
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons["up_ask"] == "live_requires_inventory_backed_sell"
+
+
+def test_paper_asks_still_use_owned_inventory():
+    cfg = MMConfigV2(base_clip_usd=6.0, session_budget_usd=50.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=12.0,
+        dn_shares=0.0,
+        sellable_up_shares=0.0,
+        sellable_dn_shares=0.0,
+        excess_up_qty=12.0,
+        excess_up_value_usd=6.48,
+        excess_value_usd=6.48,
+        signed_excess_value_usd=6.48,
+        total_inventory_value_usd=6.48,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0, allow_naked_sells=True),
+    )
+    assert plan.up_ask is not None
+
+
 def test_unwind_mode_disables_only_pair_expanding_intents():
     risk, plan = _plan_for(
         _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5),

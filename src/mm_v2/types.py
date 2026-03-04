@@ -54,6 +54,8 @@ class PairInventoryState:
     signed_excess_value_usd: float = 0.0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
+    sellable_up_shares: float = 0.0
+    sellable_dn_shares: float = 0.0
 
 
 @dataclass
@@ -121,6 +123,11 @@ class ExecutionState:
     last_api_error: str = ""
     last_fallback_poll_count: int = 0
     current_order_ids: dict[str, str] = field(default_factory=dict)
+    recent_cancelled_sell_reserve_up: float = 0.0
+    recent_cancelled_sell_reserve_dn: float = 0.0
+    sell_release_lag_up_sec: float = 0.0
+    sell_release_lag_dn_sec: float = 0.0
+    last_sellability_lag_reason: str = ""
 
 
 @dataclass
@@ -184,6 +191,7 @@ class HealthState:
     last_fallback_poll_count: int = 0
     true_drift: bool = False
     residual_inventory_failure: bool = False
+    sellability_lag_active: bool = False
 
 
 @dataclass

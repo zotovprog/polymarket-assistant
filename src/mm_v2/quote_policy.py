@@ -184,6 +184,26 @@ class QuotePolicyV2:
         return 0.0
 
     @staticmethod
+    def _sellable_share_cap(
+        *,
+        token: str,
+        inventory: PairInventoryState,
+        up_token_id: str,
+        dn_token_id: str,
+    ) -> float:
+        if token == up_token_id:
+            return max(
+                0.0,
+                float(inventory.sellable_up_shares) - float(inventory.pending_sell_up),
+            )
+        if token == dn_token_id:
+            return max(
+                0.0,
+                float(inventory.sellable_dn_shares) - float(inventory.pending_sell_dn),
+            )
+        return 0.0
+
+    @staticmethod
     def _count_effects(built: dict[str, QuoteIntent | None]) -> tuple[int, int, int]:
         helpful = 0
         harmful = 0
@@ -340,6 +360,7 @@ class QuotePolicyV2:
             )
             size_mult = self._size_multiplier(effect, pressure)
             owned_share_cap = 0.0
+            live_sellable_share_cap = 0.0
             inventory_backed_sell = False
             if side == "SELL":
                 owned_share_cap = self._owned_share_cap(
@@ -348,7 +369,14 @@ class QuotePolicyV2:
                     up_token_id=snapshot.up_token_id,
                     dn_token_id=snapshot.dn_token_id,
                 )
-                inventory_backed_sell = owned_share_cap >= ctx.min_order_size
+                live_sellable_share_cap = self._sellable_share_cap(
+                    token=token,
+                    inventory=inventory,
+                    up_token_id=snapshot.up_token_id,
+                    dn_token_id=snapshot.dn_token_id,
+                )
+                share_cap_for_sell = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
+                inventory_backed_sell = share_cap_for_sell >= ctx.min_order_size
                 if not ctx.allow_naked_sells and not inventory_backed_sell:
                     built[slot] = None
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
@@ -391,7 +419,7 @@ class QuotePolicyV2:
                     elif effect == "neutral":
                         neutral_floor_applied = True
             if inventory_backed_sell:
-                share_cap = owned_share_cap
+                share_cap = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
             else:
                 share_cap = max(0.0, effective_clip_usd / pair_reference_price)
             role_name = role if risk.soft_mode != "unwind" else "unwind"

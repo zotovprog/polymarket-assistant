@@ -79,6 +79,7 @@ class MMConfig:
         "toxic_divergence_ticks": (1.0, 120.0),
         "critical_reconcile_drift_shares": (0.5, 50.0),
         "fill_settlement_grace_sec": (1.0, 15.0),
+        "sell_release_grace_sec": (0.5, 10.0),
         "recent_order_retention_sec": (5.0, 60.0),
         "recent_order_max_per_token": (2.0, 20.0),
         "fallback_poll_cap": (4.0, 30.0),
@@ -168,6 +169,7 @@ class MMConfig:
     toxic_divergence_ticks: int = 8            # Consecutive toxic ticks before quote freeze
     critical_reconcile_drift_shares: float = 1.5  # Immediate pause if |internal-real| exceeds this many shares
     fill_settlement_grace_sec: float = 6.0    # Grace window for PM balance lag right after live fills
+    sell_release_grace_sec: float = 3.0       # Grace window for PM token release after cancelling SELL
     recent_order_retention_sec: float = 20.0  # Retain recently removed orders briefly for late-fill accounting
     recent_order_max_per_token: int = 8       # Cap recent tracked orders per token to avoid fallback polling bloat
     fallback_poll_cap: int = 12               # Max tracked orders to poll in HTTP fallback per pass

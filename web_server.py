@@ -395,6 +395,7 @@ class ConfigUpdateRequestV2(BaseModel):
     max_entry_spread_bps: Optional[float] = None
     reconcile_drift_threshold_shares: Optional[float] = None
     fill_settlement_grace_sec: Optional[float] = None
+    sell_release_grace_sec: Optional[float] = None
     requote_threshold_bps: Optional[float] = None
     fallback_poll_cap: Optional[int] = None
 
@@ -2622,6 +2623,8 @@ class MMRuntimeV2(MMRuntime):
                 "excess_up_value_usd": 0.0,
                 "excess_dn_value_usd": 0.0,
                 "total_inventory_value_usd": 0.0,
+                "sellable_up_shares": 0.0,
+                "sellable_dn_shares": 0.0,
             },
             "pair_inventory": {
                 "paired_qty": 0.0,
@@ -2630,6 +2633,8 @@ class MMRuntimeV2(MMRuntime):
                 "paired_value_usd": 0.0,
                 "excess_up_value_usd": 0.0,
                 "excess_dn_value_usd": 0.0,
+                "sellable_up_shares": 0.0,
+                "sellable_dn_shares": 0.0,
             },
             "quotes": {
                 "up_bid": None,
@@ -2646,6 +2651,11 @@ class MMRuntimeV2(MMRuntime):
                 "transport_failures": 0,
                 "last_api_error": "",
                 "last_fallback_poll_count": 0,
+                "recent_cancelled_sell_reserve_up": 0.0,
+                "recent_cancelled_sell_reserve_dn": 0.0,
+                "sell_release_lag_up_sec": 0.0,
+                "sell_release_lag_dn_sec": 0.0,
+                "last_sellability_lag_reason": "",
                 "current_order_ids": {},
             },
             "risk": {
@@ -2664,6 +2674,7 @@ class MMRuntimeV2(MMRuntime):
                 "last_fallback_poll_count": 0,
                 "true_drift": False,
                 "residual_inventory_failure": False,
+                "sellability_lag_active": False,
             },
             "analytics": {
                 "fill_count": 0,
@@ -2882,6 +2893,7 @@ class MMRuntimeV2(MMRuntime):
                 "tests/test_mm_v2_quote_skew.py",
                 "tests/test_mm_v2_paper_multiwindow.py",
                 "tests/test_mm_v2_runtime_skew_flow.py",
+                "tests/test_mm_v2_sell_release_lag.py",
             ]
         if kind == "replay_v2":
             return [

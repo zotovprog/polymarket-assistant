@@ -558,6 +558,69 @@ async def test_state_exposes_quote_viability_reason(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_state_exposes_sellable_inventory_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "pair_inventory": {
+                "sellable_up_shares": 4.25,
+                "sellable_dn_shares": 1.75,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["pair_inventory"]["sellable_up_shares"] == pytest.approx(4.25)
+    assert resp["pair_inventory"]["sellable_dn_shares"] == pytest.approx(1.75)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_sell_release_lag_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "execution": {
+                "recent_cancelled_sell_reserve_up": 3.0,
+                "recent_cancelled_sell_reserve_dn": 1.5,
+                "sell_release_lag_up_sec": 2.2,
+                "sell_release_lag_dn_sec": 0.8,
+                "last_sellability_lag_reason": "batch_place: sellability_lag",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    execution = resp["execution"]
+    assert execution["recent_cancelled_sell_reserve_up"] == pytest.approx(3.0)
+    assert execution["recent_cancelled_sell_reserve_dn"] == pytest.approx(1.5)
+    assert execution["sell_release_lag_up_sec"] == pytest.approx(2.2)
+    assert execution["sell_release_lag_dn_sec"] == pytest.approx(0.8)
+    assert "sellability_lag" in execution["last_sellability_lag_reason"]
+
+
+@pytest.mark.asyncio
+async def test_health_exposes_sellability_lag_active(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "health": {"sellability_lag_active": True},
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["health"]["sellability_lag_active"] is True
+
+
+@pytest.mark.asyncio
 async def test_mmv2_state_endpoint_returns_runtime_snapshot(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
