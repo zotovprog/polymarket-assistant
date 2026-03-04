@@ -260,6 +260,60 @@ async def test_runtime_start_requires_initial_wallet_snapshot(monkeypatch):
     assert mm._running is False
 
 
+@pytest.mark.asyncio
+async def test_mmv2_stop_runs_emergency_flatten_when_liquidate_true(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    calls: list[str] = []
+
+    async def _cancel_all():
+        calls.append("cancel_all")
+        return 0
+
+    async def _flatten():
+        calls.append("flatten")
+        return {"done": True, "remaining_up": 0.0, "remaining_dn": 0.0}
+
+    async def _hb_stop():
+        calls.append("heartbeat_stop")
+
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.gateway, "emergency_flatten_on_stop", _flatten)
+    monkeypatch.setattr(mm.heartbeat, "stop", _hb_stop)
+
+    await mm.stop(liquidate=True)
+    assert calls == ["cancel_all", "flatten", "cancel_all", "heartbeat_stop"]
+
+
+@pytest.mark.asyncio
+async def test_mmv2_stop_skips_emergency_flatten_when_liquidate_false(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    calls: list[str] = []
+
+    async def _cancel_all():
+        calls.append("cancel_all")
+        return 0
+
+    async def _flatten():
+        calls.append("flatten")
+        return {"done": True}
+
+    async def _hb_stop():
+        calls.append("heartbeat_stop")
+
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.gateway, "emergency_flatten_on_stop", _flatten)
+    monkeypatch.setattr(mm.heartbeat, "stop", _hb_stop)
+
+    await mm.stop(liquidate=False)
+    assert calls == ["cancel_all", "cancel_all", "heartbeat_stop"]
+
+
 def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
     active_orders = {
         "b-up": Quote(side="BUY", token_id="up-token", price=0.45, size=5.0),

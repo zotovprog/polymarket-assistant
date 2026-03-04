@@ -173,6 +173,92 @@ class PMGateway:
     async def cancel_all(self) -> int:
         return await self.order_mgr.cancel_all(force_exchange=True)
 
+    async def emergency_flatten_on_stop(
+        self,
+        *,
+        rounds: int = 3,
+        round_delay_sec: float = 0.8,
+    ) -> dict[str, Any]:
+        """Best-effort forced inventory unwind used by manual stop().
+
+        This path is intentionally taker-capable (post_only=False): once the
+        operator requests stop, priority is flattening exposure, not passive MM.
+        """
+        if not self.market:
+            return {
+                "attempted_orders": 0,
+                "placed_orders": 0,
+                "remaining_up": 0.0,
+                "remaining_dn": 0.0,
+                "done": True,
+                "reason": "no_market",
+            }
+
+        attempted_orders = 0
+        placed_orders = 0
+        tick = max(0.0001, float(self.market.tick_size or 0.01))
+        min_size = max(0.0, float(self.market.min_order_size or 0.0))
+
+        for _ in range(max(1, int(rounds))):
+            up_sellable, dn_sellable = await self.get_sellable_balances()
+            per_round_order_ids: list[str] = []
+            for token_id, raw_sellable in (
+                (self.market.up_token_id, up_sellable),
+                (self.market.dn_token_id, dn_sellable),
+            ):
+                sellable = max(0.0, float(raw_sellable or 0.0))
+                size = math.floor(sellable * 100.0) / 100.0
+                if size < min_size:
+                    continue
+                book = await self.order_mgr.get_full_book(token_id)
+                best_bid_raw = book.get("best_bid")
+                try:
+                    best_bid = float(best_bid_raw)
+                except Exception:
+                    best_bid = 0.0
+                if best_bid <= 0:
+                    continue
+                # Use a crossing SELL price to prioritize execution.
+                price = max(0.01, round(best_bid - tick, 10))
+                quote = Quote(
+                    side="SELL",
+                    token_id=token_id,
+                    price=float(price),
+                    size=float(size),
+                )
+                attempted_orders += 1
+                order_id = await self.order_mgr.place_order(
+                    quote,
+                    post_only=False,
+                    fallback_taker=False,
+                )
+                if order_id:
+                    placed_orders += 1
+                    per_round_order_ids.append(order_id)
+
+            if not per_round_order_ids:
+                break
+
+            await asyncio.sleep(max(0.05, float(round_delay_sec)))
+            await self.order_mgr.check_fills()
+            active_ids = set(self.order_mgr.active_order_ids)
+            for order_id in per_round_order_ids:
+                if order_id in active_ids:
+                    await self.order_mgr.cancel_order(order_id)
+
+        up_remaining, dn_remaining = await self.get_sellable_balances()
+        rem_up = max(0.0, float(up_remaining or 0.0))
+        rem_dn = max(0.0, float(dn_remaining or 0.0))
+        done = rem_up < min_size and rem_dn < min_size
+        return {
+            "attempted_orders": attempted_orders,
+            "placed_orders": placed_orders,
+            "remaining_up": round(rem_up, 4),
+            "remaining_dn": round(rem_dn, 4),
+            "done": bool(done),
+            "reason": "ok",
+        }
+
     async def check_fills(self) -> list[Fill]:
         return await self.order_mgr.check_fills()
 

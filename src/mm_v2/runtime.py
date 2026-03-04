@@ -245,6 +245,24 @@ class MarketMakerV2:
                 pass
         self._task = None
         await self.gateway.cancel_all()
+        if liquidate:
+            try:
+                liq = await self.gateway.emergency_flatten_on_stop()
+                if not bool(liq.get("done", True)):
+                    self.set_alert(
+                        "stop_liquidation_v2",
+                        (
+                            "Stop liquidation incomplete: "
+                            f"remaining_up={liq.get('remaining_up')} "
+                            f"remaining_dn={liq.get('remaining_dn')}"
+                        ),
+                        level="warning",
+                    )
+                else:
+                    self.clear_alert("stop_liquidation_v2")
+            except Exception as exc:
+                self.set_alert("stop_liquidation_v2", f"Stop liquidation failed: {exc}", level="error")
+        await self.gateway.cancel_all()
         await self.heartbeat.stop()
 
     def fills_page(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
