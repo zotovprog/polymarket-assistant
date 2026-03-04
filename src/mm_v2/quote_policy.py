@@ -71,6 +71,10 @@ class QuotePolicyV2:
         collateral_per_share = max(0.01, 1.0 - float(price))
         return clip_usd / collateral_per_share
 
+    @staticmethod
+    def _inventory_backed_sell_size_from_clip(clip_usd: float, price: float) -> float:
+        return clip_usd / max(0.01, float(price))
+
     def _spread(self, risk: RiskRegime) -> float:
         base = self._bps_to_price(self.config.base_half_spread_bps)
         if risk.soft_mode == "defensive":
@@ -165,6 +169,20 @@ class QuotePolicyV2:
         )
 
     @staticmethod
+    def _owned_share_cap(
+        *,
+        token: str,
+        inventory: PairInventoryState,
+        up_token_id: str,
+        dn_token_id: str,
+    ) -> float:
+        if token == up_token_id:
+            return max(0.0, float(inventory.up_shares) - float(inventory.pending_sell_up))
+        if token == dn_token_id:
+            return max(0.0, float(inventory.dn_shares) - float(inventory.pending_sell_dn))
+        return 0.0
+
+    @staticmethod
     def _count_effects(built: dict[str, QuoteIntent | None]) -> tuple[int, int, int]:
         helpful = 0
         harmful = 0
@@ -213,6 +231,7 @@ class QuotePolicyV2:
         inventory_effect: Literal["helpful", "neutral", "harmful"],
         size_mult: float,
         price_adjust_ticks: int,
+        inventory_backed_sell: bool = False,
         size_override: float | None = None,
     ) -> tuple[QuoteIntent | None, str | None]:
         if size_override is not None:
@@ -221,7 +240,10 @@ class QuotePolicyV2:
             economic_size = self._buy_size_from_clip(clip_usd, price)
             size = min(economic_size, share_cap)
         else:
-            economic_size = self._sell_size_from_clip(clip_usd, price)
+            if inventory_backed_sell:
+                economic_size = self._inventory_backed_sell_size_from_clip(clip_usd, price)
+            else:
+                economic_size = self._sell_size_from_clip(clip_usd, price)
             size = min(economic_size, share_cap)
         size = round(max(0.0, float(size)), 2)
         if 0.0 < size < ctx.min_order_size and inventory_effect == "helpful":
@@ -316,7 +338,22 @@ class QuotePolicyV2:
                 tick_size=ctx.tick_size,
             )
             size_mult = self._size_multiplier(effect, pressure)
-            nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
+            owned_share_cap = 0.0
+            inventory_backed_sell = False
+            if side == "SELL":
+                owned_share_cap = self._owned_share_cap(
+                    token=token,
+                    inventory=inventory,
+                    up_token_id=snapshot.up_token_id,
+                    dn_token_id=snapshot.dn_token_id,
+                )
+                inventory_backed_sell = owned_share_cap >= ctx.min_order_size
+            if side == "BUY":
+                nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
+            elif inventory_backed_sell:
+                nominal_quote_clip_usd = clip_usd * size_mult
+            else:
+                nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
             effective_clip_usd = nominal_quote_clip_usd
             if (
                 (
@@ -329,14 +366,24 @@ class QuotePolicyV2:
                     and risk.inventory_side == "flat"
                     and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
                 )
-            ) and min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult):
+            ) and (
+                (
+                    side == "SELL"
+                    and inventory_backed_sell
+                    and owned_share_cap >= ctx.min_order_size
+                )
+                or min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
+            ):
                 effective_clip_usd = max(effective_clip_usd, min_viable_clip_usd)
                 if effective_clip_usd > nominal_quote_clip_usd + 1e-9:
                     if effect == "helpful":
                         helpful_floor_applied = True
                     elif effect == "neutral":
                         neutral_floor_applied = True
-            share_cap = max(0.0, effective_clip_usd / pair_reference_price)
+            if inventory_backed_sell:
+                share_cap = owned_share_cap
+            else:
+                share_cap = max(0.0, effective_clip_usd / pair_reference_price)
             role_name = role if risk.soft_mode != "unwind" else "unwind"
             intent, suppressed = self._make_intent(
                 token=token,
@@ -350,6 +397,7 @@ class QuotePolicyV2:
                 inventory_effect=effect,
                 size_mult=size_mult,
                 price_adjust_ticks=ticks,
+                inventory_backed_sell=inventory_backed_sell,
             )
             built[slot] = intent
             if suppressed:
@@ -371,7 +419,7 @@ class QuotePolicyV2:
                     token=snapshot.up_token_id,
                     side="SELL",
                     price=float(snapshot.up_best_bid or max(0.01, up_ask_price)),
-                    clip_usd=per_quote_budget,
+                    clip_usd=clip_usd,
                     share_cap=max(0.0, inventory.up_shares),
                     ctx=ctx,
                     role="emergency_unwind",
@@ -380,6 +428,7 @@ class QuotePolicyV2:
                     inventory_effect="helpful" if risk.inventory_side == "up" else "neutral",
                     size_mult=1.0,
                     price_adjust_ticks=0,
+                    inventory_backed_sell=True,
                 )
             else:
                 built["up_bid"] = None
@@ -390,7 +439,7 @@ class QuotePolicyV2:
                     token=snapshot.dn_token_id,
                     side="SELL",
                     price=float(snapshot.dn_best_bid or max(0.01, dn_ask_price)),
-                    clip_usd=per_quote_budget,
+                    clip_usd=clip_usd,
                     share_cap=max(0.0, inventory.dn_shares),
                     ctx=ctx,
                     role="emergency_unwind",
@@ -399,6 +448,7 @@ class QuotePolicyV2:
                     inventory_effect="helpful" if risk.inventory_side == "dn" else "neutral",
                     size_mult=1.0,
                     price_adjust_ticks=0,
+                    inventory_backed_sell=True,
                 )
             else:
                 built["dn_bid"] = None

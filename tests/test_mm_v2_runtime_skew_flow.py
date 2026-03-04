@@ -278,3 +278,77 @@ def test_below_hard_cap_no_early_unwind_when_helpful_quotes_alive_after_first_fi
     assert viability.helpful_count >= 1
     assert result.lifecycle in {"inventory_skewed", "defensive"}
     assert result.lifecycle != "unwind"
+
+
+def test_live_like_paired_inventory_with_low_free_usdc_keeps_helpful_quotes_alive():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.59,
+        fv_dn=0.41,
+        pm_mid_up=0.58,
+        pm_mid_dn=0.42,
+        up_best_bid=0.57,
+        up_best_ask=0.59,
+        dn_best_bid=0.40,
+        dn_best_ask=0.42,
+        market_quality_score=0.40,
+        market_tradeable=True,
+        divergence_up=0.02,
+        divergence_dn=0.02,
+    )
+    inventory = _inventory(
+        up_shares=5.84,
+        dn_shares=6.16,
+        paired_qty=5.84,
+        excess_dn_qty=0.32,
+        paired_value_usd=5.84,
+        excess_dn_value_usd=0.19,
+        excess_value_usd=0.19,
+        signed_excess_value_usd=-0.19,
+        total_inventory_value_usd=6.03,
+        free_usdc=9.94,
+    )
+    risk, plan, viability = _risk_and_plan(cfg, snapshot, inventory)
+    assert risk.hard_mode == "none"
+    assert viability.helpful_count >= 1
+    assert plan.quote_balance_state != "none"
+    assert plan.quote_viability_reason != "all_quotes_below_min_size"
+
+
+def test_live_like_paired_inventory_below_hard_cap_does_not_early_unwind():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    sm = StateMachineV2(cfg)
+    snapshot = _snapshot(
+        fv_up=0.59,
+        fv_dn=0.41,
+        pm_mid_up=0.58,
+        pm_mid_dn=0.42,
+        up_best_bid=0.57,
+        up_best_ask=0.59,
+        dn_best_bid=0.40,
+        dn_best_ask=0.42,
+        market_quality_score=0.40,
+        market_tradeable=True,
+        divergence_up=0.02,
+        divergence_dn=0.02,
+    )
+    inventory = _inventory(
+        up_shares=5.84,
+        dn_shares=6.16,
+        paired_qty=5.84,
+        excess_dn_qty=0.32,
+        paired_value_usd=5.84,
+        excess_dn_value_usd=0.19,
+        excess_value_usd=0.19,
+        signed_excess_value_usd=-0.19,
+        total_inventory_value_usd=6.03,
+        free_usdc=9.94,
+    )
+    risk, _, viability = _risk_and_plan(cfg, snapshot, inventory)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = inventory.excess_value_usd
+    result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    assert viability.helpful_count >= 1
+    assert result.lifecycle != "unwind"

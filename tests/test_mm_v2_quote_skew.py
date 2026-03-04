@@ -561,3 +561,92 @@ def test_pair_share_cap_still_limits_endpoint_explosion_after_helpful_floor():
     ]
     assert helpful_intents
     assert max(intent.size for intent in helpful_intents) <= 6.0
+
+
+def test_inventory_backed_sells_survive_low_free_usdc_after_live_like_fills():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.59,
+        fv_dn=0.41,
+        pm_mid_up=0.58,
+        pm_mid_dn=0.42,
+        up_best_bid=0.57,
+        up_best_ask=0.59,
+        dn_best_bid=0.40,
+        dn_best_ask=0.42,
+        market_quality_score=0.40,
+        market_tradeable=True,
+        divergence_up=0.02,
+        divergence_dn=0.02,
+    )
+    inventory = _inventory(
+        up_shares=5.84,
+        dn_shares=6.16,
+        paired_qty=5.84,
+        excess_dn_qty=0.32,
+        paired_value_usd=5.84,
+        excess_dn_value_usd=0.19,
+        excess_value_usd=0.19,
+        signed_excess_value_usd=-0.19,
+        total_inventory_value_usd=6.03,
+        free_usdc=9.94,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert risk.hard_mode == "none"
+    assert plan.quote_balance_state != "none"
+    assert plan.dn_ask is not None
+    assert plan.dn_ask.inventory_effect == "helpful"
+    assert plan.dn_ask.size >= 5.0
+    assert plan.quote_viability_reason != "all_quotes_below_min_size"
+
+
+def test_inventory_backed_asks_ignore_buy_headroom_cap_when_owned_shares_exist():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.59,
+        fv_dn=0.41,
+        pm_mid_up=0.58,
+        pm_mid_dn=0.42,
+        up_best_bid=0.57,
+        up_best_ask=0.59,
+        dn_best_bid=0.40,
+        dn_best_ask=0.42,
+    )
+    inventory = _inventory(
+        up_shares=5.84,
+        dn_shares=6.16,
+        paired_qty=5.84,
+        excess_dn_qty=0.32,
+        excess_dn_value_usd=0.19,
+        excess_value_usd=0.19,
+        signed_excess_value_usd=-0.19,
+        total_inventory_value_usd=6.03,
+        free_usdc=9.94,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    buy_headroom_usd = max(1.0, inventory.free_usdc * 0.20)
+    assert buy_headroom_usd < 5.0
+    assert plan.dn_ask is not None
+    assert plan.dn_ask.size > buy_headroom_usd / max(0.01, plan.dn_ask.price)

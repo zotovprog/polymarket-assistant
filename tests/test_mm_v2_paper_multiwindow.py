@@ -74,7 +74,13 @@ def _inventory(**overrides) -> PairInventoryState:
     return PairInventoryState(**payload)
 
 
-def _evaluate(cfg: MMConfigV2, snapshot: PairMarketSnapshot, inventory: PairInventoryState):
+def _evaluate(
+    cfg: MMConfigV2,
+    snapshot: PairMarketSnapshot,
+    inventory: PairInventoryState,
+    *,
+    min_order_size: float = 1.0,
+):
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
         inventory=inventory,
@@ -85,7 +91,7 @@ def _evaluate(cfg: MMConfigV2, snapshot: PairMarketSnapshot, inventory: PairInve
         snapshot=snapshot,
         inventory=inventory,
         risk=risk,
-        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+        ctx=QuoteContext(tick_size=0.01, min_order_size=min_order_size),
     )
     return risk, plan
 
@@ -231,3 +237,33 @@ def test_below_hard_cap_with_helpful_quotes_does_not_enter_unwind():
     assert viability.helpful_count > 0
     assert plan.quote_balance_state != "none"
     assert result.lifecycle != "unwind"
+
+
+def test_live_like_low_free_usdc_does_not_collapse_to_none_below_hard_cap():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.59,
+        fv_dn=0.41,
+        pm_mid_up=0.58,
+        pm_mid_dn=0.42,
+        up_best_bid=0.57,
+        up_best_ask=0.59,
+        dn_best_bid=0.40,
+        dn_best_ask=0.42,
+    )
+    inventory = _inventory(
+        up_shares=5.84,
+        dn_shares=6.16,
+        paired_qty=5.84,
+        excess_dn_qty=0.32,
+        paired_value_usd=5.84,
+        excess_dn_value_usd=0.19,
+        excess_value_usd=0.19,
+        signed_excess_value_usd=-0.19,
+        total_inventory_value_usd=6.03,
+        free_usdc=9.94,
+    )
+    risk, plan = _evaluate(cfg, snapshot, inventory, min_order_size=5.0)
+    assert risk.hard_mode == "none"
+    assert plan.quote_balance_state != "none"
+    assert plan.quote_viability_reason != "all_quotes_below_min_size"
