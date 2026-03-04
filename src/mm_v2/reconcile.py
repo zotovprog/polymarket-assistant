@@ -17,11 +17,17 @@ class SettlementDelta:
 
 
 class ReconcileV2:
+    STARTUP_RECONCILE_GRACE_SEC = 20.0
+    STARTUP_REALIGN_LIMIT = 3
+
     def __init__(self, config: MMConfigV2):
         self.config = config
         self._expected_up: float | None = None
         self._expected_dn: float | None = None
         self._settlement: dict[str, SettlementDelta] = {}
+        self._session_started_ts: float = 0.0
+        self._fills_seen: int = 0
+        self._startup_realign_count: int = 0
         self.status: str = "bootstrapping"
         self.true_drift: bool = False
 
@@ -31,6 +37,14 @@ class ReconcileV2:
         self.status = "ok"
         self.true_drift = False
 
+    def start_session(self, up_shares: float, dn_shares: float) -> None:
+        """Initialize expected balances for a fresh runtime session."""
+        self.align(up_shares, dn_shares)
+        self._session_started_ts = time.time()
+        self._fills_seen = 0
+        self._startup_realign_count = 0
+        self._settlement.clear()
+
     def _add_settlement_delta(self, token_id: str, delta: float) -> None:
         if abs(float(delta)) <= 1e-9:
             return
@@ -38,7 +52,17 @@ class ReconcileV2:
         entry.delta += float(delta)
         entry.grace_until = time.time() + float(self.config.fill_settlement_grace_sec)
 
+    def _startup_realign_allowed(self) -> bool:
+        if self._fills_seen > 0:
+            return False
+        if self._session_started_ts <= 0:
+            return False
+        if (time.time() - self._session_started_ts) > self.STARTUP_RECONCILE_GRACE_SEC:
+            return False
+        return self._startup_realign_count < self.STARTUP_REALIGN_LIMIT
+
     def record_fill(self, fill: Fill, market: MarketInfo) -> None:
+        self._fills_seen += 1
         token_id = fill.token_id
         size = float(fill.size)
         explicit_inventory_backed = max(0.0, float(getattr(fill, "inventory_backed_size", 0.0) or 0.0))
@@ -119,6 +143,10 @@ class ReconcileV2:
             self.true_drift = False
         elif explained:
             self.status = "settlement_lag"
+            self.true_drift = False
+        elif self._startup_realign_allowed():
+            self._startup_realign_count += 1
+            self.status = "startup_realign"
             self.true_drift = False
         else:
             self.status = "broken"

@@ -343,6 +343,65 @@ def test_reconcile_settlement_lag_does_not_trigger_true_drift():
     assert state.up_shares == 0.0
 
 
+def test_reconcile_startup_balance_jump_without_fills_realigns_not_broken():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.start_session(0.0, 0.0)
+
+    state = reconcile.reconcile(
+        market=market,
+        real_up=5.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+    )
+    assert reconcile.status == "startup_realign"
+    assert reconcile.true_drift is False
+    assert state.up_shares == pytest.approx(5.0)
+
+    reconcile.reconcile(
+        market=market,
+        real_up=5.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+    )
+    assert reconcile.status == "ok"
+    assert reconcile.true_drift is False
+
+
+def test_reconcile_startup_realign_limit_still_allows_true_drift():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.start_session(0.0, 0.0)
+    sequence = [(5.0, 0.0), (0.0, 5.0), (5.0, 0.0), (0.0, 5.0)]
+    statuses: list[str] = []
+    for up, dn in sequence:
+        reconcile.reconcile(
+            market=market,
+            real_up=up,
+            real_dn=dn,
+            total_usdc=15.0,
+            available_usdc=15.0,
+            active_orders={},
+            fv_up=0.54,
+            fv_dn=0.46,
+        )
+        statuses.append(reconcile.status)
+
+    assert statuses[:3] == ["startup_realign", "startup_realign", "startup_realign"]
+    assert statuses[3] == "broken"
+    assert reconcile.true_drift is True
+
+
 def test_hard_excess_transitions_state_machine_to_unwind():
     cfg = MMConfigV2(session_budget_usd=15.0, hard_excess_value_ratio=0.25)
     inventory = _inventory(

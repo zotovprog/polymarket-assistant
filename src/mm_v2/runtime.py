@@ -169,7 +169,7 @@ class MarketMakerV2:
         if up is None or dn is None:
             up = 0.0
             dn = 0.0
-        self.reconcile.align(up, dn)
+        self.reconcile.start_session(up, dn)
         self._starting_usdc = float(total_usdc or 0.0)
         fv_up = float(getattr(self.feed_state, "pm_up", 0.5) or 0.5)
         fv_dn = float(getattr(self.feed_state, "pm_dn", 0.5) or max(0.01, 1.0 - fv_up))
