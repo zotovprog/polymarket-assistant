@@ -152,6 +152,53 @@ def test_skewed_mode_keeps_four_quotes_below_hard_cap():
     assert plan.dn_ask is not None
 
 
+def test_live_flat_start_suppresses_naked_sells_but_keeps_bids():
+    cfg = MMConfigV2(base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(free_usdc=15.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0, allow_naked_sells=False),
+    )
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.up_ask is None
+    assert plan.dn_ask is None
+    assert plan.suppressed_reasons["up_ask"] == "live_requires_inventory_backed_sell"
+    assert plan.suppressed_reasons["dn_ask"] == "live_requires_inventory_backed_sell"
+    assert plan.quote_balance_state == "reduced"
+
+
+def test_paper_flat_start_keeps_two_sided_quotes():
+    cfg = MMConfigV2(base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(free_usdc=15.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0, allow_naked_sells=True),
+    )
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.up_ask is not None
+    assert plan.dn_ask is not None
+
+
 def test_unwind_mode_disables_only_pair_expanding_intents():
     risk, plan = _plan_for(
         _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5),

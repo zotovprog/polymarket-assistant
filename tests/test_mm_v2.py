@@ -20,6 +20,7 @@ if BASE not in sys.path:
 from mm.types import Fill, MarketInfo, Quote
 from mm_v2.config import MMConfigV2
 from mm_v2.pair_inventory import build_pair_inventory
+from mm_v2.pm_gateway import PMGateway
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
@@ -98,6 +99,24 @@ def _inventory(**overrides) -> PairInventoryState:
     )
     payload.update(overrides)
     return PairInventoryState(**payload)
+
+
+def test_pmgateway_disables_naked_sells_for_live_client():
+    class _LiveClient:
+        pass
+
+    gateway = PMGateway(_LiveClient(), MMConfigV2())
+    assert gateway.supports_naked_sells() is False
+    assert gateway.transport_config.allow_short_sells is False
+
+
+def test_pmgateway_keeps_naked_sells_for_mock_client():
+    class _MockClient:
+        _orders = {}
+
+    gateway = PMGateway(_MockClient(), MMConfigV2())
+    assert gateway.supports_naked_sells() is True
+    assert gateway.transport_config.allow_short_sells is True
 
 
 def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():

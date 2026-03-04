@@ -14,6 +14,11 @@ class PMGateway:
     def __init__(self, clob_client: Any, config: MMConfigV2):
         self.config = config
         self.transport_config = config.to_mm_config()
+        self._supports_naked_sells = bool(hasattr(clob_client, "_orders"))
+        if not self._supports_naked_sells:
+            # Current live transport path does not support naked conditional SELLs
+            # reliably; keep live asks inventory-backed until a verified short path exists.
+            self.transport_config.allow_short_sells = False
         self.order_mgr = OrderManager(clob_client, self.transport_config)
         self.market: MarketInfo | None = None
 
@@ -45,6 +50,9 @@ class PMGateway:
 
     def active_order_ids(self) -> list[str]:
         return self.order_mgr.active_order_ids
+
+    def supports_naked_sells(self) -> bool:
+        return self._supports_naked_sells
 
     def sync_paper_prices(self, *, fv_up: float, fv_dn: float, pm_prices: dict[str, float | None]) -> None:
         client = self.order_mgr.client

@@ -329,6 +329,7 @@ class MarketMakerV2:
         ctx = QuoteContext(
             tick_size=float(self.market.tick_size),
             min_order_size=float(self.market.min_order_size),
+            allow_naked_sells=self.gateway.supports_naked_sells(),
         )
         provisional_plan = QuotePolicyV2(self.config).generate(
             snapshot=snapshot,

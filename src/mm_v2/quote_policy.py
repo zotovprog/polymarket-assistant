@@ -39,6 +39,7 @@ def _floor_price(price: float, tick_size: float) -> float:
 class QuoteContext:
     tick_size: float
     min_order_size: float
+    allow_naked_sells: bool = True
 
 
 class QuotePolicyV2:
@@ -348,6 +349,10 @@ class QuotePolicyV2:
                     dn_token_id=snapshot.dn_token_id,
                 )
                 inventory_backed_sell = owned_share_cap >= ctx.min_order_size
+                if not ctx.allow_naked_sells and not inventory_backed_sell:
+                    built[slot] = None
+                    suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
+                    continue
             if side == "BUY":
                 nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
             elif inventory_backed_sell:
