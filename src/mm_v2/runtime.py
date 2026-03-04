@@ -238,7 +238,8 @@ class MarketMakerV2:
         last_message = ""
         if recent:
             last_message = str(recent[-1].get("message") or "")
-        total_failures = int(sum(int(v or 0) for v in (api_stats.get("total_by_op") or {}).values()))
+        transport_totals = api_stats.get("transport_total_by_op") or api_stats.get("total_by_op") or {}
+        total_failures = int(sum(int(v or 0) for v in transport_totals.values()))
         transport_ok = total_failures < int(self.config.max_transport_failures)
         last_fallback = int(getattr(self.gateway.order_mgr, "_last_fallback_poll_count", 0))
         return HealthState(
@@ -441,7 +442,7 @@ class MarketMakerV2:
             current_quotes=plan,
             execution=self.tracker.execution_state(
                 active_orders=self.gateway.active_orders(),
-                transport_failures=int(sum(int(v or 0) for v in (self.gateway.api_error_stats().get("total_by_op") or {}).values())),
+                transport_failures=int(sum(int(v or 0) for v in ((self.gateway.api_error_stats().get("transport_total_by_op") or self.gateway.api_error_stats().get("total_by_op") or {}).values()))),
                 last_api_error=health.last_api_error,
                 last_fallback_poll_count=health.last_fallback_poll_count,
                 up_token_id=self.market.up_token_id,
@@ -466,7 +467,7 @@ class MarketMakerV2:
             current_quotes=self._last_plan,
             execution=self.tracker.execution_state(
                 active_orders=self.gateway.active_orders(),
-                transport_failures=int(sum(int(v or 0) for v in (self.gateway.api_error_stats().get("total_by_op") or {}).values())),
+                transport_failures=int(sum(int(v or 0) for v in ((self.gateway.api_error_stats().get("transport_total_by_op") or self.gateway.api_error_stats().get("total_by_op") or {}).values()))),
                 last_api_error=self._last_health.last_api_error,
                 last_fallback_poll_count=self._last_health.last_fallback_poll_count,
                 up_token_id=self.market.up_token_id if self.market else "",

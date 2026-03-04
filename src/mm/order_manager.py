@@ -200,6 +200,7 @@ class OrderManager:
         self._order_args_supports_fee_rate: bool = self._detect_order_args_fee_rate_support()
         self._recent_api_errors: deque[APIErrorEvent] = deque(maxlen=50)
         self._api_error_counts: dict[str, int] = {}
+        self._transport_error_counts: dict[str, int] = {}
         self._last_api_error_ts: float = 0.0
         if hasattr(clob_client, "_mock_token_balances") and isinstance(
             getattr(clob_client, "_mock_token_balances", None),
@@ -612,11 +613,33 @@ class OrderManager:
         )
         self._recent_api_errors.append(event)
         self._api_error_counts[op] = int(self._api_error_counts.get(op, 0)) + 1
+        if self._is_transport_error_event(op=op, message=safe_message, details=safe_details, status_code=status_code):
+            self._transport_error_counts[op] = int(self._transport_error_counts.get(op, 0)) + 1
         self._last_api_error_ts = event.ts
+
+    def _is_transport_error_event(
+        self,
+        *,
+        op: str,
+        message: str,
+        details: dict[str, Any] | None,
+        status_code: int | None,
+    ) -> bool:
+        del status_code
+        payload = details or {}
+        if bool(payload.get("transient")):
+            return False
+        message_l = str(message or "").lower()
+        if "crosses book" in message_l or "invalid post-only order" in message_l:
+            return False
+        if self._is_balance_or_allowance_reject(message_l):
+            return False
+        return True
 
     def get_api_error_stats(self) -> dict[str, Any]:
         return {
             "total_by_op": dict(sorted(self._api_error_counts.items())),
+            "transport_total_by_op": dict(sorted(self._transport_error_counts.items())),
             "recent": [event.to_dict() for event in list(self._recent_api_errors)[-10:]],
             "last_error_ts": round(self._last_api_error_ts, 3) if self._last_api_error_ts > 0 else 0.0,
         }
@@ -3107,6 +3130,7 @@ class OrderManager:
         self._warn_cooldowns = {}
         self._recent_api_errors.clear()
         self._api_error_counts = {}
+        self._transport_error_counts = {}
         self._last_api_error_ts = 0.0
 
     def get_stats(self) -> dict:

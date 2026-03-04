@@ -18,14 +18,17 @@ if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
 from mm.types import Fill, MarketInfo, Quote
+from mm.mm_config import MMConfig
+from mm.order_manager import OrderManager
 from mm_v2.config import MMConfigV2
 from mm_v2.pair_inventory import build_pair_inventory
 from mm_v2.pm_gateway import PMGateway
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
+from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteIntent, QuoteViabilitySummary
 
 
 def _market() -> MarketInfo:
@@ -117,6 +120,103 @@ def test_pmgateway_keeps_naked_sells_for_mock_client():
     gateway = PMGateway(_MockClient(), MMConfigV2())
     assert gateway.supports_naked_sells() is True
     assert gateway.transport_config.allow_short_sells is True
+
+
+@pytest.mark.asyncio
+async def test_pmgateway_reprices_post_only_sell_after_crosses_book(monkeypatch):
+    class _LiveClient:
+        pass
+
+    gateway = PMGateway(_LiveClient(), MMConfigV2())
+    gateway.set_market(_market())
+    calls: list[Quote] = []
+
+    async def _place_order(quote: Quote, *, post_only=None, fallback_taker=False):
+        calls.append(quote)
+        if len(calls) == 1:
+            return None
+        return "oid-2"
+
+    async def _get_full_book(token_id: str):
+        assert token_id == "up-token"
+        return {"best_bid": 0.58, "best_ask": 0.60, "bids": [], "asks": []}
+
+    monkeypatch.setattr(gateway.order_mgr, "place_order", _place_order)
+    monkeypatch.setattr(
+        gateway.order_mgr,
+        "get_api_error_stats",
+        lambda: {
+            "total_by_op": {"place_order": 1},
+            "transport_total_by_op": {},
+            "recent": [
+                {
+                    "op": "place_order",
+                    "token_id": "up-token",
+                    "message": "PolyApiException[status_code=400, error_message={'error': 'invalid post-only order: order crosses book'}]",
+                    "details": {"side": "SELL"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(gateway.order_mgr, "get_full_book", _get_full_book)
+
+    order_id = await gateway.place_intent(
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.58,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+        )
+    )
+
+    assert order_id == "oid-2"
+    assert len(calls) == 2
+    assert calls[1].price > calls[0].price
+    assert calls[1].price > 0.58
+
+
+def test_order_manager_crosses_book_not_counted_as_transport_failure():
+    class _MockClient:
+        _orders = {}
+
+    mgr = OrderManager(_MockClient(), MMConfig())
+    mgr._record_api_error(
+        op="place_order",
+        token_id="up-token",
+        status_code=400,
+        message="invalid post-only order: order crosses book",
+        details={"side": "SELL", "post_only": True},
+    )
+    stats = mgr.get_api_error_stats()
+    assert stats["total_by_op"]["place_order"] == 1
+    assert stats["transport_total_by_op"] == {}
+
+
+def test_mmv2_health_ignores_crosses_book_when_transport_totals_empty(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    monkeypatch.setattr(
+        mm.gateway,
+        "api_error_stats",
+        lambda: {
+            "total_by_op": {"place_order": 3},
+            "transport_total_by_op": {},
+            "recent": [
+                {
+                    "op": "place_order",
+                    "message": "invalid post-only order: order crosses book",
+                }
+            ],
+        },
+    )
+    health = mm._build_health()
+    assert health.transport_ok is True
+    assert "crosses book" in health.last_api_error
 
 
 def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
