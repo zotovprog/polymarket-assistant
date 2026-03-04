@@ -140,12 +140,12 @@ def test_excess_beyond_hard_cap_moves_into_unwind_without_halt():
     sm = StateMachineV2(cfg)
     snapshot = _snapshot()
     inventory = _inventory(
-        dn_shares=9.0,
-        excess_dn_qty=9.0,
-        excess_dn_value_usd=4.5,
-        excess_value_usd=4.5,
-        signed_excess_value_usd=-4.5,
-        total_inventory_value_usd=4.5,
+        dn_shares=11.0,
+        excess_dn_qty=11.0,
+        excess_dn_value_usd=5.8,
+        excess_value_usd=5.8,
+        signed_excess_value_usd=-5.8,
+        total_inventory_value_usd=5.8,
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
     transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
@@ -167,18 +167,18 @@ def test_no_progress_in_unwind_keeps_engine_in_unwind():
     sm = StateMachineV2(cfg)
     snapshot = _snapshot()
     inventory = _inventory(
-        dn_shares=9.0,
-        excess_dn_qty=9.0,
-        excess_dn_value_usd=4.5,
-        excess_value_usd=4.5,
-        signed_excess_value_usd=-4.5,
-        total_inventory_value_usd=4.5,
+        dn_shares=11.0,
+        excess_dn_qty=11.0,
+        excess_dn_value_usd=5.8,
+        excess_value_usd=5.8,
+        signed_excess_value_usd=-5.8,
+        total_inventory_value_usd=5.8,
     )
     risk, _ = _evaluate(cfg, snapshot, inventory)
     sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
     sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
     sm._excess_baseline_ts = time.time() - 31.0
-    sm._excess_baseline_value_usd = 4.5
+    sm._excess_baseline_value_usd = 5.8
     for _ in range(3):
         result = sm.transition(
             snapshot=snapshot,

@@ -174,7 +174,7 @@ def test_soft_mode_unwind_above_hard_threshold():
     cfg = MMConfigV2(session_budget_usd=15.0)
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=_snapshot(),
-        inventory=_inventory(excess_dn_value_usd=4.2, excess_value_usd=4.2, signed_excess_value_usd=-4.2),
+        inventory=_inventory(excess_dn_value_usd=5.6, excess_value_usd=5.6, signed_excess_value_usd=-5.6),
         analytics=AnalyticsState(),
         health=HealthState(),
     )

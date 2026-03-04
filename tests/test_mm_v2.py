@@ -603,6 +603,16 @@ def test_hard_excess_transitions_state_machine_to_unwind():
     assert transition.effective_soft_mode == "unwind"
 
 
+def test_low_budget_profile_reduces_effective_clip_usd():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    assert cfg.effective_base_clip_usd() == pytest.approx(4.5)
+
+
+def test_low_budget_profile_raises_effective_hard_excess_ratio():
+    cfg = MMConfigV2(session_budget_usd=15.0, hard_excess_value_ratio=0.25)
+    assert cfg.effective_hard_excess_value_ratio() == pytest.approx(0.35)
+
+
 @pytest.mark.asyncio
 async def test_dashboard_state_surfaces_inventory_pressure_fields(monkeypatch):
     web_server = importlib.import_module("web_server")

@@ -51,7 +51,7 @@ class QuotePolicyV2:
         return float(bps) / 10000.0
 
     def _clip_usd(self, risk: RiskRegime) -> float:
-        base = float(self.config.base_clip_usd)
+        base = float(self.config.effective_base_clip_usd())
         if risk.soft_mode == "inventory_skewed":
             return base * 0.7
         if risk.soft_mode == "defensive":

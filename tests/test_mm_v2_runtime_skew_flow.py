@@ -211,7 +211,7 @@ def test_no_progress_for_30s_and_no_helpful_quotes_enters_unwind():
 def test_hard_cap_exceeded_disables_pair_expanding_intents_without_halt():
     cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
     snapshot = _snapshot()
-    inventory = _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5)
+    inventory = _inventory(excess_dn_value_usd=5.8, excess_value_usd=5.8, signed_excess_value_usd=-5.8)
     risk, plan, _ = _risk_and_plan(cfg, snapshot, inventory)
     assert risk.target_soft_mode == "unwind"
     assert risk.hard_mode == "none"

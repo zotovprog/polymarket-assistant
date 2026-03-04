@@ -39,7 +39,7 @@ class SoftRiskKernel:
         budget = max(0.01, float(self.config.session_budget_usd))
         soft_cap = max(0.01, float(self.config.soft_excess_value_ratio) * budget)
         defensive_cap = max(soft_cap, float(self.config.defensive_excess_value_ratio) * budget)
-        hard_cap = max(defensive_cap, float(self.config.hard_excess_value_ratio) * budget)
+        hard_cap = max(defensive_cap, float(self.config.effective_hard_excess_value_ratio()) * budget)
 
         excess_value_usd = max(0.0, float(inventory.excess_value_usd))
         signed_excess_value_usd = float(inventory.signed_excess_value_usd)

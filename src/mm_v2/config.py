@@ -19,6 +19,10 @@ UNWIND_STUCK_WINDOW_SEC = 30.0
 UNWIND_MIN_PROGRESS_RATIO = 0.10
 FOUR_QUOTE_MIN_RATIO_FOR_MM = 0.35
 NO_HELPFUL_TICKS_FOR_UNWIND = 3
+LOW_BUDGET_PROFILE_THRESHOLD_USD = 15.0
+LOW_BUDGET_CLIP_RATIO = 0.30
+LOW_BUDGET_CLIP_MIN_USD = 3.0
+LOW_BUDGET_HARD_EXCESS_MIN_RATIO = 0.35
 
 
 @dataclass
@@ -84,6 +88,21 @@ class MMConfigV2:
     sell_release_grace_sec: float = 3.0
     requote_threshold_bps: float = 15.0
     fallback_poll_cap: int = 12
+
+    def effective_base_clip_usd(self) -> float:
+        base = float(self.base_clip_usd)
+        budget = max(0.01, float(self.session_budget_usd))
+        if budget <= LOW_BUDGET_PROFILE_THRESHOLD_USD:
+            low_budget_cap = max(LOW_BUDGET_CLIP_MIN_USD, budget * LOW_BUDGET_CLIP_RATIO)
+            return min(base, low_budget_cap)
+        return base
+
+    def effective_hard_excess_value_ratio(self) -> float:
+        ratio = float(self.hard_excess_value_ratio)
+        budget = max(0.01, float(self.session_budget_usd))
+        if budget <= LOW_BUDGET_PROFILE_THRESHOLD_USD:
+            return max(ratio, LOW_BUDGET_HARD_EXCESS_MIN_RATIO)
+        return ratio
 
     def validate(self) -> None:
         for field_name, (lo, hi) in self.VALIDATION_BOUNDS.items():

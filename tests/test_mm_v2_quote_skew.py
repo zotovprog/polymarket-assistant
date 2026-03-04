@@ -262,7 +262,7 @@ def test_paper_asks_still_use_owned_inventory():
 
 def test_unwind_mode_disables_only_pair_expanding_intents():
     risk, plan = _plan_for(
-        _inventory(excess_dn_value_usd=4.5, excess_value_usd=4.5, signed_excess_value_usd=-4.5),
+        _inventory(excess_dn_value_usd=5.8, excess_value_usd=5.8, signed_excess_value_usd=-5.8),
     )
     assert risk.soft_mode == "unwind"
     assert plan.dn_bid is None
