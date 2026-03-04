@@ -419,16 +419,26 @@ class QuotePolicyV2:
         if risk.hard_mode == "emergency_unwind":
             regime = "emergency_unwind"
             if inventory.up_shares > 0:
+                up_post_only = bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec)
+                up_emergency_price = float(snapshot.up_best_bid or max(0.01, up_ask_price))
+                if up_post_only:
+                    up_emergency_price = self._maker_clamp(
+                        side="SELL",
+                        price=up_emergency_price,
+                        best_bid=snapshot.up_best_bid,
+                        best_ask=snapshot.up_best_ask,
+                        tick_size=ctx.tick_size,
+                    )
                 built["up_bid"] = None
                 built["up_ask"], _ = self._make_intent(
                     token=snapshot.up_token_id,
                     side="SELL",
-                    price=float(snapshot.up_best_bid or max(0.01, up_ask_price)),
+                    price=up_emergency_price,
                     clip_usd=clip_usd,
                     share_cap=max(0.0, inventory.up_shares),
                     ctx=ctx,
                     role="emergency_unwind",
-                    post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
+                    post_only=up_post_only,
                     size_override=inventory.up_shares,
                     inventory_effect="helpful" if risk.inventory_side == "up" else "neutral",
                     size_mult=1.0,
@@ -439,16 +449,26 @@ class QuotePolicyV2:
                 built["up_bid"] = None
                 built["up_ask"] = None
             if inventory.dn_shares > 0:
+                dn_post_only = bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec)
+                dn_emergency_price = float(snapshot.dn_best_bid or max(0.01, dn_ask_price))
+                if dn_post_only:
+                    dn_emergency_price = self._maker_clamp(
+                        side="SELL",
+                        price=dn_emergency_price,
+                        best_bid=snapshot.dn_best_bid,
+                        best_ask=snapshot.dn_best_ask,
+                        tick_size=ctx.tick_size,
+                    )
                 built["dn_bid"] = None
                 built["dn_ask"], _ = self._make_intent(
                     token=snapshot.dn_token_id,
                     side="SELL",
-                    price=float(snapshot.dn_best_bid or max(0.01, dn_ask_price)),
+                    price=dn_emergency_price,
                     clip_usd=clip_usd,
                     share_cap=max(0.0, inventory.dn_shares),
                     ctx=ctx,
                     role="emergency_unwind",
-                    post_only=bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec),
+                    post_only=dn_post_only,
                     size_override=inventory.dn_shares,
                     inventory_effect="helpful" if risk.inventory_side == "dn" else "neutral",
                     size_mult=1.0,

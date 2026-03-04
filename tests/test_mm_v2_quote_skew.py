@@ -688,3 +688,43 @@ def test_inventory_backed_asks_ignore_buy_headroom_cap_when_owned_shares_exist()
     assert buy_headroom_usd < 5.0
     assert plan.dn_ask is not None
     assert plan.dn_ask.size > buy_headroom_usd / max(0.01, plan.dn_ask.price)
+
+
+def test_emergency_unwind_post_only_sell_is_priced_above_best_bid():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        time_left_sec=300.0,
+        fv_up=0.83,
+        fv_dn=0.17,
+        pm_mid_up=0.75,
+        pm_mid_dn=0.26,
+        up_best_bid=0.74,
+        up_best_ask=0.75,
+        dn_best_bid=0.25,
+        dn_best_ask=0.26,
+    )
+    inventory = _inventory(
+        up_shares=9.75,
+        excess_up_qty=9.75,
+        excess_up_value_usd=8.10,
+        excess_value_usd=8.10,
+        signed_excess_value_usd=8.10,
+        total_inventory_value_usd=8.10,
+        free_usdc=11.13,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(transport_ok=False, last_api_error="crosses book"),
+    )
+    assert risk.hard_mode == "emergency_unwind"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.up_ask.post_only is True
+    assert plan.up_ask.price > float(snapshot.up_best_bid)
