@@ -421,7 +421,11 @@ function updateUI(s) {
         setNumberAnimated('inv-delta', s.inventory.net_delta || 0, '', 1);
         const totalUsdc = (s.usdc_balance_pm != null) ? s.usdc_balance_pm : (s.inventory.usdc || 0);
         const freeUsdcDisplay = (s.usdc_free_pm != null) ? s.usdc_free_pm : totalUsdc;
+        const reservedUsdcDisplay = (s.usdc_reserved_pm != null)
+            ? s.usdc_reserved_pm
+            : Math.max(0, totalUsdc - freeUsdcDisplay);
         setNumberAnimated('inv-usdc', freeUsdcDisplay, '$', 2);
+        setNumberAnimated('inv-usdc-reserved', reservedUsdcDisplay, '$', 2);
         updateInventoryBar(s.inventory);
         // Avg entry prices
         setText('inv-up-avg', s.inventory.up_avg_entry != null ? s.inventory.up_avg_entry.toFixed(4) : '\u2014');
@@ -435,7 +439,9 @@ function updateUI(s) {
         setText('inv-dn-mark', dnP > 0 ? dnP.toFixed(4) : '\u2014');
         setNumberAnimated('inv-up-worth', upW, '$', 2);
         setNumberAnimated('inv-dn-worth', dnW, '$', 2);
-        const portfolioTotal = (s.portfolio_value != null) ? s.portfolio_value : (upW + dnW + totalUsdc);
+        const portfolioTotal = (s.portfolio_value != null)
+            ? s.portfolio_value
+            : (upW + dnW + freeUsdcDisplay + reservedUsdcDisplay);
         setNumberAnimated('inv-total-value', portfolioTotal, '$', 2);
     }
 
@@ -569,18 +575,20 @@ function updateUI(s) {
 
     // Risk status
     const risk = document.getElementById('risk-status');
-    if (s.is_paused) {
-        risk.className = 'risk-danger';
-        risk.innerHTML = '<i class="fas fa-shield-alt"></i> ' + (s.pause_reason || 'PAUSED');
-    } else if (s.is_closing) {
-        risk.className = 'risk-warn';
-        risk.innerHTML = '<i class="fas fa-hourglass-end"></i> CLOSING';
-    } else if (isRunning) {
-        risk.className = 'risk-ok';
-        risk.innerHTML = '<i class="fas fa-shield-alt"></i> OK';
-    } else {
-        risk.className = '';
-        risk.innerHTML = '<i class="fas fa-shield-alt"></i> Idle';
+    if (risk) {
+        if (s.is_paused) {
+            risk.className = 'risk-danger';
+            risk.innerHTML = '<i class="fas fa-shield-alt"></i> ' + (s.pause_reason || 'PAUSED');
+        } else if (s.is_closing) {
+            risk.className = 'risk-warn';
+            risk.innerHTML = '<i class="fas fa-hourglass-end"></i> CLOSING';
+        } else if (isRunning) {
+            risk.className = 'risk-ok';
+            risk.innerHTML = '<i class="fas fa-shield-alt"></i> OK';
+        } else {
+            risk.className = '';
+            risk.innerHTML = '<i class="fas fa-shield-alt"></i> Idle';
+        }
     }
 
     // App version in footer

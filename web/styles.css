@@ -578,7 +578,7 @@ body {
 /* ── 9. Inventory + Orders Row ─────────────────────────────── */
 .inv-orders-row {
     display: grid;
-    grid-template-columns: 340px 1fr;
+    grid-template-columns: minmax(460px, 520px) 1fr;
     gap: var(--sp-3);
     margin: 0 var(--sp-4) var(--sp-3);
 }
@@ -595,6 +595,108 @@ body {
 .port-row:last-of-type,
 .port-row.usdc-row {
     border-bottom: none;
+}
+
+.mini-quotes {
+    margin-top: var(--sp-3);
+    border-top: 1px solid var(--border);
+    padding-top: var(--sp-3);
+}
+
+.mini-quotes-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: var(--sp-2);
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.mini-quotes-header i {
+    margin-right: var(--sp-1);
+    color: var(--text-muted);
+}
+
+.mini-binance-price {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.mini-quotes-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--sp-2);
+}
+
+.mini-token-col {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface-elevated);
+    padding: var(--sp-2);
+}
+
+.mini-token-title {
+    font-size: var(--text-xs);
+    font-weight: 700;
+    margin-bottom: var(--sp-1);
+    letter-spacing: 0.04em;
+}
+
+.mini-token-title.up { color: var(--success); }
+.mini-token-title.dn { color: var(--destructive); }
+
+.mini-quote-row {
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    gap: var(--sp-2);
+    align-items: center;
+    margin-bottom: var(--sp-1);
+}
+
+.mini-q-label {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.mini-q-price {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.mini-q-size {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+}
+
+.mini-meta-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-top: 1px;
+}
+
+.mini-meta-label {
+    font-size: 0.625rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.mini-meta-value {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    color: var(--info);
 }
 
 .port-header {

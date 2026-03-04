@@ -296,12 +296,30 @@ def test_runtime_session_pnl_uses_wallet_total_not_reserved_bookkeeping():
     mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
     mm._starting_portfolio = 15.0
     inventory = _inventory(
+        up_shares=2.0,
         free_usdc=9.0,
         reserved_usdc=8.0,  # stale/local reservation can exceed true wallet lock
-        total_inventory_value_usd=1.0,
     )
-    mm._update_session_pnl(inventory, total_usdc=10.0)
+    mm._update_session_pnl(inventory, total_usdc=10.0, snapshot=_snapshot(pm_mid_up=0.5, pm_mid_dn=0.5))
     assert mm._session_pnl == pytest.approx(-4.0)
+
+
+def test_runtime_session_pnl_marks_inventory_with_pm_mid_when_available():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._starting_portfolio = 10.0
+    inventory = _inventory(
+        up_shares=1.0,
+        dn_shares=0.0,
+        free_usdc=8.0,
+        reserved_usdc=1.0,
+    )
+    # PM mid must drive mark-to-market, not fv fallback.
+    snap = _snapshot(pm_mid_up=0.9, pm_mid_dn=0.1, fv_up=0.2, fv_dn=0.8)
+    mm._update_session_pnl(inventory, total_usdc=8.0, snapshot=snap)
+    assert mm._session_pnl == pytest.approx(-1.1)
 
 
 @pytest.mark.asyncio
@@ -1148,7 +1166,7 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "dn_shares": 1.0,
                 "free_usdc": 40.0,
                 "reserved_usdc": 5.0,
-                "total_inventory_value_usd": 3.12,
+                "total_inventory_value_usd": 999.0,
             },
             "quotes": {
                 "up_bid": {"price": 0.52, "size": 5.0},
@@ -1174,6 +1192,9 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["session_limit"] == pytest.approx(50.0)
     assert resp["inventory"]["net_delta"] == pytest.approx(4.0)
     assert resp["active_orders_detail"][0]["token"] == "UP"
+    assert resp["usdc_reserved_pm"] == pytest.approx(5.0)
+    assert resp["position_value_pm"] == pytest.approx(3.12)
+    assert resp["portfolio_value"] == pytest.approx(48.12)
     assert resp["fill_count"] == 1
 
 

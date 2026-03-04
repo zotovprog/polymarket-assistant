@@ -3036,12 +3036,16 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
     }
     up_mid = market.get("pm_mid_up")
     dn_mid = market.get("pm_mid_dn")
+    up_mark = float(up_mid) if up_mid is not None else float(valuation.get("fv_up") or 0.0)
+    dn_mark = float(dn_mid) if dn_mid is not None else float(valuation.get("fv_dn") or 0.0)
+    up_mark = max(0.0, up_mark)
+    dn_mark = max(0.0, dn_mark)
     free_usdc = float(inventory.get("free_usdc") or 0.0)
     reserved_usdc = float(inventory.get("reserved_usdc") or 0.0)
-    position_value = float(inventory.get("total_inventory_value_usd") or 0.0)
-    portfolio_value = free_usdc + reserved_usdc + position_value
     up_shares = float(inventory.get("up_shares") or 0.0)
     dn_shares = float(inventory.get("dn_shares") or 0.0)
+    position_value = up_shares * up_mark + dn_shares * dn_mark
+    portfolio_value = free_usdc + reserved_usdc + position_value
     feed_mid = float(getattr(_runtime_v2.feed_state, "mid", 0.0) or 0.0) if _runtime_v2.feed_state else 0.0
     lifecycle = str(raw.get("lifecycle") or "bootstrapping")
     is_running = bool(raw.get("is_running", False))
@@ -3059,6 +3063,7 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
         "session_limit": float((raw.get("config") or {}).get("session_budget_usd") or _runtime_v2._initial_usdc or 0.0),
         "usdc_balance_pm": round(free_usdc + reserved_usdc, 4),
         "usdc_free_pm": round(free_usdc, 4),
+        "usdc_reserved_pm": round(reserved_usdc, 4),
         "portfolio_value": round(portfolio_value, 4),
         "position_value_pm": round(position_value, 4),
         "session_pnl": float(analytics.get("session_pnl") or 0.0),
@@ -3084,14 +3089,15 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
             "dn_ask": quotes.get("dn_ask"),
         },
         "pm_prices": {
-            "up": float(up_mid or 0.0),
-            "dn": float(dn_mid or 0.0),
+            "up": up_mark,
+            "dn": dn_mark,
         },
         "inventory": {
             "up_shares": up_shares,
             "dn_shares": dn_shares,
             "net_delta": round(up_shares - dn_shares, 4),
             "usdc": round(free_usdc, 4),
+            "usdc_reserved": round(reserved_usdc, 4),
             "up_avg_entry": None,
             "dn_avg_entry": None,
         },
