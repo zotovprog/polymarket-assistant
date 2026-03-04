@@ -139,8 +139,16 @@ class HardSafetyKernel:
             )
 
         if health.true_drift:
-            hard_mode = "halted"
-            hard_reason = "true inventory drift"
+            if has_material_position:
+                if float(getattr(health, "true_drift_no_progress_sec", 0.0) or 0.0) >= 20.0:
+                    hard_mode = "halted"
+                    hard_reason = "true inventory drift: no unwind progress"
+                else:
+                    hard_mode = "emergency_unwind"
+                    hard_reason = "true inventory drift: controlled unwind"
+            else:
+                hard_mode = "halted"
+                hard_reason = "true inventory drift"
         elif not health.transport_ok and health.last_api_error:
             hard_mode = "emergency_unwind" if has_material_position else "halted"
             hard_reason = f"transport unhealthy: {health.last_api_error}"

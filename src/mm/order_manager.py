@@ -202,6 +202,7 @@ class OrderManager:
             2.0,
             float(getattr(config, "sell_reject_cooldown_sec", 8.0) or 8.0),
         )
+        self._cancel_repost_cooldown_until: dict[str, float] = {}
         self._market_min_order_size: float = 5.0
         self._current_token_ids: set[str] = set()
         self._tracking_generation: int = 0
@@ -715,6 +716,28 @@ class OrderManager:
         for order_id in stale:
             self._recent_cancelled_sell_reserves.pop(order_id, None)
 
+    def _set_cancel_repost_cooldown(self, token_id: str) -> None:
+        token = self._safe_str(token_id)
+        if not token:
+            return
+        until = time.time() + float(getattr(self.config, "sell_release_grace_sec", 3.0) or 3.0)
+        prev = float(self._cancel_repost_cooldown_until.get(token, 0.0))
+        if until > prev:
+            self._cancel_repost_cooldown_until[token] = until
+
+    def _cancel_repost_cooldown_left(self, token_id: str) -> float:
+        token = self._safe_str(token_id)
+        if not token:
+            return 0.0
+        until = float(self._cancel_repost_cooldown_until.get(token, 0.0))
+        if until <= 0:
+            return 0.0
+        now = time.time()
+        if until <= now:
+            self._cancel_repost_cooldown_until.pop(token, None)
+            return 0.0
+        return until - now
+
     def _active_sell_inventory(self, token_id: str) -> float:
         reserved = 0.0
         for order_id, quote in self._active_orders.items():
@@ -822,13 +845,28 @@ class OrderManager:
 
         up_reserve = self._recent_cancelled_sell_inventory(up_token_id or "", now) if up_token_id else 0.0
         dn_reserve = self._recent_cancelled_sell_inventory(dn_token_id or "", now) if dn_token_id else 0.0
+        up_cooldown = self._cancel_repost_cooldown_left(up_token_id or "")
+        dn_cooldown = self._cancel_repost_cooldown_left(dn_token_id or "")
+        has_reserve = up_reserve > 0.0 or dn_reserve > 0.0
+        has_cooldown = up_cooldown > 0.0 or dn_cooldown > 0.0
+        if has_reserve and has_cooldown:
+            active_reason = "both"
+        elif has_reserve:
+            active_reason = "recent_cancelled_reserve"
+        elif has_cooldown:
+            active_reason = "post_cancel_cooldown"
+        else:
+            active_reason = ""
         return {
-            "active": bool(self._recent_cancelled_sell_reserves),
+            "active": bool(has_reserve or has_cooldown),
             "up_reserve": round(float(up_reserve), 4),
             "dn_reserve": round(float(dn_reserve), 4),
             "up_seconds_left": round(_seconds_left(up_token_id), 3),
             "dn_seconds_left": round(_seconds_left(dn_token_id), 3),
-            "reason": self._last_sellability_lag_reason,
+            "up_cooldown_sec": round(float(up_cooldown), 3),
+            "dn_cooldown_sec": round(float(dn_cooldown), 3),
+            "active_reason": active_reason,
+            "reason": self._last_sellability_lag_reason or active_reason,
         }
 
     def _prune_recent_orders(
@@ -998,6 +1036,24 @@ class OrderManager:
                 f"SELL skipped ({source}) {quote.token_id[:8]} "
                 f"{quote.size:.1f}@{quote.price:.2f}: cooldown {cooldown_left:.1f}s "
                 f"after balance/allowance reject"
+            ),
+            cooldown=2.0,
+        )
+        return True
+
+    def _should_skip_sell_after_cancel(self, quote: Quote, *, source: str) -> bool:
+        """Block immediate SELL repost right after SELL cancel for same token."""
+        if quote.side != "SELL":
+            return False
+        cooldown_left = self._cancel_repost_cooldown_left(quote.token_id)
+        if cooldown_left <= 0:
+            return False
+        self._throttled_warn(
+            f"sell_post_cancel_cooldown:{source}:{quote.token_id}",
+            (
+                f"SELL skipped ({source}) {quote.token_id[:8]} "
+                f"{quote.size:.1f}@{quote.price:.2f}: post-cancel cooldown "
+                f"{cooldown_left:.1f}s"
             ),
             cooldown=2.0,
         )
@@ -1645,6 +1701,7 @@ class OrderManager:
         self.invalidate_usdc_cache()
         if quote.side == "SELL":
             self._sell_reject_cooldown_until.pop(quote.token_id, None)
+            self._cancel_repost_cooldown_until.pop(quote.token_id, None)
             self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)
             self._last_sellability_lag_reason = ""
         self._notify_heartbeat_id(resp)
@@ -1664,6 +1721,8 @@ class OrderManager:
         """
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
+        if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="single_place"):
+            return None
         if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="single_place"):
             return None
 
@@ -1936,6 +1995,9 @@ class OrderManager:
         token_fee_rate_bps: dict[str, int] = {}
 
         for quote in quotes:
+            if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="batch_precheck"):
+                signed_orders.append(None)
+                continue
             if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="batch_precheck"):
                 signed_orders.append(None)
                 continue
@@ -2091,6 +2153,7 @@ class OrderManager:
                         self._order_post_only[order_id] = use_post_only
                         if quote.side == "SELL":
                             self._sell_reject_cooldown_until.pop(quote.token_id, None)
+                            self._cancel_repost_cooldown_until.pop(quote.token_id, None)
                             self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)
                             self._last_sellability_lag_reason = ""
                         results[idx] = order_id
@@ -2200,6 +2263,8 @@ class OrderManager:
             for oid in cancelled_ids:
                 quote = self._active_orders.get(oid)
                 self._add_recent_cancelled_sell_reserve(oid, quote)
+                if quote is not None and (quote.side or "").upper() == "SELL":
+                    self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(oid, quote)
                 self._active_orders.pop(oid, None)
                 self._order_post_only.pop(oid, None)
@@ -2246,6 +2311,8 @@ class OrderManager:
         for oid in cancelled_ids:
             quote = self._active_orders.get(oid)
             self._add_recent_cancelled_sell_reserve(oid, quote)
+            if quote is not None and (quote.side or "").upper() == "SELL":
+                self._set_cancel_repost_cooldown(quote.token_id)
             self._track_recent_order(oid, quote)
             self._active_orders.pop(oid, None)
             self._order_post_only.pop(oid, None)
@@ -2584,6 +2651,8 @@ class OrderManager:
             quote = self._active_orders.get(order_id)
             if quote is not None:
                 self._add_recent_cancelled_sell_reserve(order_id, quote)
+                if (quote.side or "").upper() == "SELL":
+                    self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(order_id, quote, reason="cancelled")
             self._active_orders.pop(order_id, None)
             self._order_post_only.pop(order_id, None)
@@ -2618,6 +2687,7 @@ class OrderManager:
         self._last_sellability_lag_reason = ""
         self._reconcile_requested = False
         self._sell_reject_cooldown_until.clear()
+        self._cancel_repost_cooldown_until.clear()
         self._last_fallback_poll_count = 0
         if clear_recent:
             self._recent_orders.clear()
@@ -2652,6 +2722,8 @@ class OrderManager:
             cancelled = len(ids)
             for oid, quote in existing.items():
                 self._add_recent_cancelled_sell_reserve(oid, quote)
+                if quote is not None and (quote.side or "").upper() == "SELL":
+                    self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(oid, quote, reason="batch_cancel")
             for oid in ids:
                 self._active_orders.pop(oid, None)

@@ -153,10 +153,17 @@ class StateMachineV2:
                         break
         elif target_level < current_level:
             baseline = self._excess_baseline_value_usd if self._excess_baseline_ts > 0 else float(inventory.excess_value_usd)
+            # Unwind should be able to de-escalate when soft target is already lower.
+            # Quality pressure may remain high in defensive markets, but if target mode
+            # dropped below unwind and excess is not worsening, do not pin lifecycle.
+            quality_allows_exit = (
+                float(risk.quality_pressure) < 1.0
+                or self.lifecycle == "unwind"
+            )
             is_healthy = (
                 target_level < current_level
                 and float(inventory.excess_value_usd) <= max(0.0, baseline * 1.02)
-                and float(risk.quality_pressure) < 1.0
+                and quality_allows_exit
             )
             if is_healthy:
                 self._healthy_ticks += 1
@@ -186,14 +193,20 @@ class StateMachineV2:
                         / self._excess_baseline_value_usd,
                     )
                 no_progress = progress_ratio < UNWIND_MIN_PROGRESS_RATIO
-                if viability.helpful_count == 0:
+                # For flat inventory there is no "helpful" side by design.
+                # Missing helpful quotes must not force unwind escalation.
+                missing_helpful_actionable = (
+                    risk.inventory_side != "flat"
+                    and viability.helpful_count == 0
+                )
+                if missing_helpful_actionable:
                     self._no_helpful_ticks += 1
                 else:
                     self._no_helpful_ticks = 0
                 if no_progress and (
                     self._no_helpful_ticks >= NO_HELPFUL_TICKS_FOR_UNWIND
                     or (
-                        viability.helpful_count == 0
+                        missing_helpful_actionable
                         and viability.four_quote_presence_ratio < FOUR_QUOTE_MIN_RATIO_FOR_MM
                     )
                 ):

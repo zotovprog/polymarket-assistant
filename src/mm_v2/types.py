@@ -127,6 +127,9 @@ class ExecutionState:
     recent_cancelled_sell_reserve_dn: float = 0.0
     sell_release_lag_up_sec: float = 0.0
     sell_release_lag_dn_sec: float = 0.0
+    up_cooldown_sec: float = 0.0
+    dn_cooldown_sec: float = 0.0
+    active_sell_release_reason: str = ""
     last_sellability_lag_reason: str = ""
 
 
@@ -193,6 +196,9 @@ class HealthState:
     residual_inventory_failure: bool = False
     sellability_lag_active: bool = False
     wallet_snapshot_stale: bool = False
+    true_drift_age_sec: float = 0.0
+    true_drift_no_progress_sec: float = 0.0
+    drift_evidence: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

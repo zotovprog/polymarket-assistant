@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from fastapi import Response
 
 
 BASE = os.path.dirname(os.path.dirname(__file__))
@@ -502,7 +503,7 @@ def test_reconcile_startup_realign_limit_still_allows_true_drift():
     reconcile = ReconcileV2(cfg)
     market = _market()
     reconcile.start_session(0.0, 0.0)
-    sequence = [(5.0, 0.0), (0.0, 5.0), (5.0, 0.0), (0.0, 5.0), (0.0, 5.0), (0.0, 5.0)]
+    sequence = [(5.0, 0.0), (0.0, 5.0), (5.0, 0.0), (0.0, 5.0), (0.0, 5.0)]
     statuses: list[str] = []
     for up, dn in sequence:
         reconcile.reconcile(
@@ -516,6 +517,20 @@ def test_reconcile_startup_realign_limit_still_allows_true_drift():
             fv_dn=0.46,
         )
         statuses.append(reconcile.status)
+
+    # Drift confirmation now requires minimum candidate age.
+    reconcile._drift_candidate_started_ts = time.time() - 9.0
+    reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=5.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+    )
+    statuses.append(reconcile.status)
 
     assert statuses[:3] == ["startup_realign", "startup_realign", "startup_realign"]
     assert statuses[3] == "drift_pending"
@@ -545,6 +560,8 @@ def test_reconcile_requires_persistent_unexplained_mismatch_before_true_drift():
         )
         statuses.append(reconcile.status)
         flags.append(reconcile.true_drift)
+        if len(statuses) == 2:
+            reconcile._drift_candidate_started_ts = time.time() - 9.0
     assert statuses[0] == "drift_pending"
     assert statuses[1] == "drift_pending"
     assert statuses[2] == "broken"
@@ -809,6 +826,9 @@ async def test_state_exposes_sell_release_lag_fields(monkeypatch):
                 "recent_cancelled_sell_reserve_dn": 1.5,
                 "sell_release_lag_up_sec": 2.2,
                 "sell_release_lag_dn_sec": 0.8,
+                "up_cooldown_sec": 1.8,
+                "dn_cooldown_sec": 0.5,
+                "active_sell_release_reason": "both",
                 "last_sellability_lag_reason": "batch_place: sellability_lag",
             },
         },
@@ -819,6 +839,9 @@ async def test_state_exposes_sell_release_lag_fields(monkeypatch):
     assert execution["recent_cancelled_sell_reserve_dn"] == pytest.approx(1.5)
     assert execution["sell_release_lag_up_sec"] == pytest.approx(2.2)
     assert execution["sell_release_lag_dn_sec"] == pytest.approx(0.8)
+    assert execution["up_cooldown_sec"] == pytest.approx(1.8)
+    assert execution["dn_cooldown_sec"] == pytest.approx(0.5)
+    assert execution["active_sell_release_reason"] == "both"
     assert "sellability_lag" in execution["last_sellability_lag_reason"]
 
 
@@ -836,6 +859,51 @@ async def test_health_exposes_sellability_lag_active(monkeypatch):
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["health"]["sellability_lag_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_drift_evidence(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "health": {
+                "true_drift": False,
+                "drift_evidence": {
+                    "classification": "drift_pending",
+                    "candidate_count": 2,
+                    "candidate_age_sec": 6.4,
+                    "reason": "unexplained drift candidate",
+                },
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["health"]["drift_evidence"]["classification"] == "drift_pending"
+    assert resp["health"]["drift_evidence"]["candidate_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_runtime_terminal_reason(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "bootstrapping",
+            "runtime": {
+                "last_terminal_reason": "true inventory drift: no unwind progress",
+                "last_terminal_ts": 123456.0,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["runtime"]["last_terminal_reason"] == "true inventory drift: no unwind progress"
+    assert resp["runtime"]["last_terminal_ts"] == pytest.approx(123456.0)
 
 
 @pytest.mark.asyncio
@@ -1036,6 +1104,8 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     web_server._runtime_v2.feed_state = SimpleNamespace(mid=99999.0)
     req = SimpleNamespace(query_params={})
     resp = await web_server.mm_state(request=req)
+    assert resp["legacy_alias"] is True
+    assert "deprecated" in resp["legacy_warning"].lower()
     assert resp["dashboard_engine"] == "v2"
     assert resp["market"]["coin"] == "BTC"
     assert resp["market"]["timeframe"] == "15m"
@@ -1043,6 +1113,18 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["inventory"]["net_delta"] == pytest.approx(4.0)
     assert resp["active_orders_detail"][0]["token"] == "UP"
     assert resp["fill_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_alias_sets_deprecation_headers(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server, "_dashboard_snapshot", lambda preferred=None: {"dashboard_engine": "v2"})
+    response = Response()
+    payload = await web_server.mm_state(request=SimpleNamespace(query_params={}), response=response)
+    assert payload["legacy_alias"] is True
+    assert response.headers.get("Deprecation") == "true"
+    assert response.headers.get("Sunset")
 
 
 @pytest.mark.asyncio

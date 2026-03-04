@@ -3,12 +3,28 @@ variables:
   GIT_STRATEGY: clone
 
 stages:
+  - test
   - build
   - deploy
 
 
+Test:
+  stage: test
+  tags:
+    - shell
+    - rabbit2
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - docker build -f Dockerfile --target test --tag ${IMAGE_NAME}:test-${CI_PIPELINE_IID} .
+    - docker run --rm ${IMAGE_NAME}:test-${CI_PIPELINE_IID}
+    - docker image rm --force ${IMAGE_NAME}:test-${CI_PIPELINE_IID} || true
+
+
 Build:
   stage: build
+  needs:
+    - job: Test
   tags:
     - shell
     - rabbit2

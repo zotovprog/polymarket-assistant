@@ -2655,6 +2655,9 @@ class MMRuntimeV2(MMRuntime):
                 "recent_cancelled_sell_reserve_dn": 0.0,
                 "sell_release_lag_up_sec": 0.0,
                 "sell_release_lag_dn_sec": 0.0,
+                "up_cooldown_sec": 0.0,
+                "dn_cooldown_sec": 0.0,
+                "active_sell_release_reason": "",
                 "last_sellability_lag_reason": "",
                 "current_order_ids": {},
             },
@@ -2675,6 +2678,10 @@ class MMRuntimeV2(MMRuntime):
                 "true_drift": False,
                 "residual_inventory_failure": False,
                 "sellability_lag_active": False,
+                "wallet_snapshot_stale": False,
+                "true_drift_age_sec": 0.0,
+                "true_drift_no_progress_sec": 0.0,
+                "drift_evidence": {},
             },
             "analytics": {
                 "fill_count": 0,
@@ -2689,6 +2696,10 @@ class MMRuntimeV2(MMRuntime):
             },
             "alerts": self.list_alerts(),
             "config": self.mm_config_v2.to_dict(),
+            "runtime": {
+                "last_terminal_reason": "",
+                "last_terminal_ts": 0.0,
+            },
         }
 
     async def start(
@@ -2871,6 +2882,7 @@ class MMRuntimeV2(MMRuntime):
             "analytics",
             "alerts",
             "config",
+            "runtime",
         ]
         checks: list[dict[str, Any]] = []
         for key in required_blocks:
@@ -3213,8 +3225,39 @@ async def logout(response: Response):
 
 
 # ── MM Control ──────────────────────────────────────────────────
+LEGACY_MM_SUNSET = "Wed, 30 Apr 2026 00:00:00 GMT"
+
+
+def _legacy_alias_headers() -> dict[str, str]:
+    return {
+        "Deprecation": "true",
+        "Sunset": LEGACY_MM_SUNSET,
+    }
+
+
+def _legacy_alias_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = dict(payload or {})
+    data.setdefault("legacy_alias", True)
+    data.setdefault(
+        "legacy_warning",
+        "Legacy /api/mm/* alias is deprecated; switch to /api/mmv2/* before sunset.",
+    )
+    return data
+
+
+def _legacy_alias_response_payload(
+    payload: dict[str, Any],
+    *,
+    response: Response = None,
+) -> dict[str, Any]:
+    if response is not None:
+        for key, value in _legacy_alias_headers().items():
+            response.headers[key] = value
+    return _legacy_alias_payload(payload)
+
+
 @app.post("/api/mm/start")
-async def mm_start(req: StartRequest, request: Request):
+async def mm_start(req: StartRequest, request: Request, response: Response = None):
     """Legacy alias: routes to V2 start."""
     _require_auth(request)
     if req.paper_mode:
@@ -3231,32 +3274,36 @@ async def mm_start(req: StartRequest, request: Request):
         dev=req.dev,
         session_budget_usd=session_budget_usd,
     )
-    return {"ok": True, "state": result}
+    return _legacy_alias_response_payload({"ok": True, "state": result}, response=response)
 
 
 @app.post("/api/mm/stop")
-async def mm_stop(request: Request):
+async def mm_stop(request: Request, response: Response = None):
     """Legacy alias: routes to V2 stop."""
     _require_auth(request)
     result = await _runtime_v2.stop()
-    return {"ok": True, "state": result}
+    return _legacy_alias_response_payload({"ok": True, "state": result}, response=response)
 
 
 @app.get("/api/mm/state")
-async def mm_state(request: Request):
+async def mm_state(request: Request, response: Response = None):
     """Legacy alias: routes to V2 dashboard snapshot."""
     _require_auth(request)
-    return _dashboard_snapshot("v2")
+    return _legacy_alias_response_payload(_dashboard_snapshot("v2"), response=response)
 
 
 @app.post("/api/mm/config")
-async def mm_config_update(req: ConfigUpdateRequest, request: Request):
+async def mm_config_update(req: ConfigUpdateRequest, request: Request, response: Response = None):
     """Legacy alias: maps safe subset to V2 config."""
     _require_auth(request)
     updates: dict[str, Any] = {}
     if req.session_limit is not None:
         if req.session_limit < 5:
-            return JSONResponse({"error": "session_limit must be >= 5"}, status_code=400)
+            return JSONResponse(
+                _legacy_alias_payload({"error": "session_limit must be >= 5"}),
+                status_code=400,
+                headers=_legacy_alias_headers(),
+            )
         updates["session_budget_usd"] = float(req.session_limit)
     if req.order_size_usd is not None:
         updates["base_clip_usd"] = float(req.order_size_usd)
@@ -3271,33 +3318,36 @@ async def mm_config_update(req: ConfigUpdateRequest, request: Request):
     if req.critical_reconcile_drift_shares is not None:
         updates["reconcile_drift_threshold_shares"] = float(req.critical_reconcile_drift_shares)
     new_config = _runtime_v2.update_config(**updates)
-    return {"ok": True, "config": new_config, "legacy": True}
+    return _legacy_alias_response_payload({"ok": True, "config": new_config, "legacy": True}, response=response)
 
 
 @app.get("/api/mm/config")
-async def mm_config_get(request: Request):
+async def mm_config_get(request: Request, response: Response = None):
     """Legacy alias: returns V2 config."""
     _require_auth(request)
     cfg = dict(_runtime_v2.mm_config_v2.to_dict())
     cfg["session_limit"] = cfg.get("session_budget_usd", 0.0)
-    return {"config": cfg, "legacy": True}
+    return _legacy_alias_response_payload({"config": cfg, "legacy": True}, response=response)
 
 
 @app.post("/api/mm/emergency")
-async def mm_emergency(request: Request):
+async def mm_emergency(request: Request, response: Response = None):
     """Legacy alias: routes to V2 emergency stop."""
     _require_auth(request)
     snap = await _runtime_v2.stop(liquidate=False, emergency=True)
     cancelled_estimate = int((snap.get("execution") or {}).get("open_orders") or 0)
-    return {"ok": True, "cancelled": cancelled_estimate, "state": snap}
+    return _legacy_alias_response_payload(
+        {"ok": True, "cancelled": cancelled_estimate, "state": snap},
+        response=response,
+    )
 
 
 @app.post("/api/mm/kill")
-async def mm_kill(request: Request):
+async def mm_kill(request: Request, response: Response = None):
     """Legacy alias: routes to V2 stop+liquidate."""
     _require_auth(request)
     snap = await _runtime_v2.stop()
-    return {"ok": True, "state": snap}
+    return _legacy_alias_response_payload({"ok": True, "state": snap}, response=response)
 
 
 @app.post("/api/mm/watch")
@@ -3305,32 +3355,40 @@ async def mm_watch(request: Request, body: dict):
     """Legacy watch mode is removed in V2-only runtime."""
     del body
     _require_auth(request)
-    raise HTTPException(status_code=410, detail="legacy watch mode removed; use /api/mmv2/start")
+    raise HTTPException(
+        status_code=410,
+        detail=_legacy_alias_payload({"error": "legacy watch mode removed; use /api/mmv2/start"}),
+        headers=_legacy_alias_headers(),
+    )
 
 
 @app.post("/api/mm/watch/stop")
 async def mm_watch_stop(request: Request):
     """Legacy watch mode is removed in V2-only runtime."""
     _require_auth(request)
-    raise HTTPException(status_code=410, detail="legacy watch mode removed")
+    raise HTTPException(
+        status_code=410,
+        detail=_legacy_alias_payload({"error": "legacy watch mode removed"}),
+        headers=_legacy_alias_headers(),
+    )
 
 
 @app.post("/api/mm/validate-credentials")
-async def mm_validate_credentials(request: Request):
+async def mm_validate_credentials(request: Request, response: Response = None):
     """Legacy alias: validate credentials through V2 runtime."""
     _require_auth(request)
     try:
         result = await _runtime_v2.validate_live_credentials()
-        return {"valid": True, **result}
+        return _legacy_alias_response_payload({"valid": True, **result}, response=response)
     except HTTPException as e:
-        return {"valid": False, "detail": e.detail}
+        return _legacy_alias_response_payload({"valid": False, "detail": e.detail}, response=response)
 
 
 @app.get("/api/mm/fills")
-async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
+async def mm_fills(request: Request, limit: int = 50, offset: int = 0, response: Response = None):
     """Legacy alias: routes to V2 fills."""
     _require_auth(request)
-    return _runtime_v2.fills_page(limit=limit, offset=offset)
+    return _legacy_alias_response_payload(_runtime_v2.fills_page(limit=limit, offset=offset), response=response)
 
 
 @app.post("/api/mmv2/start")

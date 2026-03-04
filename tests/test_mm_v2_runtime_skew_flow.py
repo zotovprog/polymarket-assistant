@@ -14,9 +14,11 @@ if BASE not in sys.path:
 
 from mm_v2.config import MMConfigV2
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
+from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
 from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
+from mm.types import MarketInfo
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -72,6 +74,23 @@ def _inventory(**overrides) -> PairInventoryState:
     )
     payload.update(overrides)
     return PairInventoryState(**payload)
+
+
+def _market() -> MarketInfo:
+    now = time.time()
+    return MarketInfo(
+        coin="BTC",
+        timeframe="15m",
+        question="BTC 15m",
+        condition_id="cond",
+        up_token_id="up-token",
+        dn_token_id="dn-token",
+        strike=100000.0,
+        tick_size=0.01,
+        min_order_size=5.0,
+        window_start=now,
+        window_end=now + 900.0,
+    )
 
 
 def _risk_and_plan(cfg: MMConfigV2, snapshot: PairMarketSnapshot, inventory: PairInventoryState):
@@ -354,3 +373,113 @@ def test_live_like_paired_inventory_below_hard_cap_does_not_early_unwind():
     assert risk.inventory_side == "flat"
     assert viability.four_quotes is True
     assert result.lifecycle != "unwind"
+
+
+def test_wallet_stale_does_not_trigger_true_drift():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.align(0.0, 0.0)
+    reconcile.reconcile(
+        market=market,
+        real_up=8.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=True,
+    )
+    assert reconcile.status == "wallet_stale"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.classification == "wallet_stale"
+
+
+def test_sellability_lag_does_not_trigger_true_drift():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.align(0.0, 6.0)
+    reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        sellability_lag_active=True,
+    )
+    assert reconcile.status == "sellability_lag"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.classification == "sellability_lag"
+
+
+def test_true_drift_with_position_enters_emergency_unwind_before_halt():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=6.0,
+        excess_up_qty=6.0,
+        excess_up_value_usd=3.24,
+        excess_value_usd=3.24,
+        signed_excess_value_usd=3.24,
+        total_inventory_value_usd=3.24,
+    )
+    analytics = AnalyticsState()
+
+    risk_emergency = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=analytics,
+        health=HealthState(true_drift=True, true_drift_no_progress_sec=5.0),
+    )
+    assert risk_emergency.hard_mode == "emergency_unwind"
+
+    risk_halted = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=analytics,
+        health=HealthState(true_drift=True, true_drift_no_progress_sec=25.0),
+    )
+    assert risk_halted.hard_mode == "halted"
+
+
+def test_cancel_repost_sell_lag_does_not_halt_runtime():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5, session_budget_usd=15.0, base_clip_usd=6.0)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    snapshot = _snapshot()
+
+    # Start with inventory on DN leg, then emulate PM post-cancel release lag:
+    # free DN appears as zero for a few ticks even though wallet truth is not broken.
+    reconcile.align(0.0, 6.0)
+    inventory = reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        sellability_lag_active=True,
+    )
+
+    assert reconcile.status == "sellability_lag"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.classification == "sellability_lag"
+
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(
+            reconcile_status=reconcile.status,
+            true_drift=reconcile.true_drift,
+            sellability_lag_active=True,
+        ),
+    )
+    assert risk.hard_mode == "none"

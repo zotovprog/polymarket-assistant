@@ -36,6 +36,10 @@ class _MockPlaceClient:
         self._orders[order_id] = dict(signed_order)
         return {"orderID": order_id}
 
+    def cancel(self, order_id: str):
+        self._orders.pop(order_id, None)
+        return {"ok": True}
+
 
 @pytest.mark.asyncio
 async def test_recent_cancelled_sell_reserve_added_on_cancel():
@@ -52,6 +56,39 @@ async def test_recent_cancelled_sell_reserve_added_on_cancel():
     assert reserve.token_id == "tok-up"
     assert reserve.remaining_size == pytest.approx(7.0)
     assert reserve.grace_until > reserve.cancelled_ts
+
+
+@pytest.mark.asyncio
+async def test_cancel_sell_starts_repost_cooldown():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    om = OrderManager(_CancelOnlyClient(), cfg)
+    oid = "sell-2"
+    om._active_orders[oid] = Quote(side="SELL", token_id="tok-up", price=0.51, size=6.0)
+
+    ok = await om.cancel_order(oid)
+    assert ok is True
+    assert om._cancel_repost_cooldown_left("tok-up") > 0.0
+    snapshot = om.get_sell_release_lag_snapshot(up_token_id="tok-up")
+    assert snapshot["up_cooldown_sec"] > 0.0
+    assert snapshot["active"] is True
+    assert snapshot["active_reason"] in {"both", "post_cancel_cooldown", "recent_cancelled_reserve"}
+
+
+@pytest.mark.asyncio
+async def test_sell_during_cooldown_is_locally_suppressed():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    client = _MockPlaceClient()
+    om = OrderManager(client, cfg)
+    om._set_cancel_repost_cooldown("tok-up")
+
+    result = await om.place_order(
+        Quote(side="SELL", token_id="tok-up", price=0.51, size=5.0),
+        post_only=True,
+    )
+    assert result is None
+    assert client._order_idx == 0
 
 
 def test_reserved_sell_inventory_includes_recent_cancelled_reserve():
@@ -160,7 +197,7 @@ def test_sell_reject_during_recent_cancel_is_classified_as_sellability_lag():
     assert om._sell_reject_cooldown_left("tok-up") > 0.0
 
 
-def test_sell_balance_reject_with_lag_not_counted_as_transport_failure():
+def test_sellability_lag_reject_not_counted_as_transport_failure():
     cfg = MMConfig()
     cfg.sell_release_grace_sec = 3.0
     om = OrderManager(_CancelOnlyClient(), cfg)

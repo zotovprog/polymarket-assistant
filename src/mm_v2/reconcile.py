@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import time
 from dataclasses import dataclass
 
@@ -16,11 +17,29 @@ class SettlementDelta:
     grace_until: float = 0.0
 
 
+@dataclass
+class DriftEvidence:
+    up_diff: float = 0.0
+    dn_diff: float = 0.0
+    threshold: float = 0.0
+    candidate_count: int = 0
+    candidate_started_ts: float = 0.0
+    candidate_age_sec: float = 0.0
+    sellability_lag_active: bool = False
+    wallet_snapshot_stale: bool = False
+    classification: str = "bootstrapping"
+    reason: str = "bootstrapping"
+
+    def to_dict(self) -> dict[str, float | int | str | bool]:
+        return asdict(self)
+
+
 class ReconcileV2:
     STARTUP_RECONCILE_GRACE_SEC = 20.0
     STARTUP_REALIGN_LIMIT = 3
     DRIFT_CONFIRM_TICKS = 3
     DRIFT_CONFIRM_WINDOW_SEC = 20.0
+    DRIFT_CONFIRM_MIN_AGE_SEC = 8.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -34,6 +53,7 @@ class ReconcileV2:
         self._drift_candidate_started_ts: float = 0.0
         self.status: str = "bootstrapping"
         self.true_drift: bool = False
+        self.drift_evidence: DriftEvidence = DriftEvidence()
 
     def align(self, up_shares: float, dn_shares: float) -> None:
         self._expected_up = max(0.0, float(up_shares))
@@ -42,6 +62,16 @@ class ReconcileV2:
         self.true_drift = False
         self._drift_candidate_count = 0
         self._drift_candidate_started_ts = 0.0
+        self.drift_evidence = DriftEvidence(
+            up_diff=0.0,
+            dn_diff=0.0,
+            threshold=float(self.config.reconcile_drift_threshold_shares),
+            candidate_count=0,
+            candidate_started_ts=0.0,
+            candidate_age_sec=0.0,
+            classification="ok",
+            reason="aligned",
+        )
 
     def start_session(self, up_shares: float, dn_shares: float) -> None:
         """Initialize expected balances for a fresh runtime session."""
@@ -63,7 +93,11 @@ class ReconcileV2:
             self._drift_candidate_started_ts = now
         else:
             self._drift_candidate_count += 1
-        return self._drift_candidate_count >= self.DRIFT_CONFIRM_TICKS
+        candidate_age = max(0.0, now - self._drift_candidate_started_ts)
+        return (
+            self._drift_candidate_count >= self.DRIFT_CONFIRM_TICKS
+            and candidate_age >= self.DRIFT_CONFIRM_MIN_AGE_SEC
+        )
 
     def expected_balances(self) -> tuple[float | None, float | None]:
         """Return latest internal expected wallet balances."""
@@ -153,6 +187,7 @@ class ReconcileV2:
         fv_up: float,
         fv_dn: float,
         sellability_lag_active: bool = False,
+        wallet_snapshot_stale: bool = False,
     ) -> PairInventoryState:
         if self._expected_up is None or self._expected_dn is None:
             self.align(real_up, real_dn)
@@ -163,6 +198,7 @@ class ReconcileV2:
             (up_diff <= threshold or self._diff_explained(market.up_token_id, float(self._expected_up or 0.0), real_up))
             and (dn_diff <= threshold or self._diff_explained(market.dn_token_id, float(self._expected_dn or 0.0), real_dn))
         )
+        status_reason = "drift within threshold"
         if up_diff <= threshold and dn_diff <= threshold:
             self.status = "ok"
             self.true_drift = False
@@ -173,6 +209,15 @@ class ReconcileV2:
             self.true_drift = False
             self._drift_candidate_count = 0
             self._drift_candidate_started_ts = 0.0
+            status_reason = "diff explained by settlement lag"
+        elif wallet_snapshot_stale:
+            # PM wallet endpoints can be transiently stale/unavailable.
+            # Never escalate stale snapshots to true drift.
+            self.status = "wallet_stale"
+            self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
+            status_reason = "wallet snapshot stale"
         elif sellability_lag_active:
             # PM may briefly report constrained free token balance after SELL
             # cancel/repost. Treat this window as transient execution lag.
@@ -180,22 +225,43 @@ class ReconcileV2:
             self.true_drift = False
             self._drift_candidate_count = 0
             self._drift_candidate_started_ts = 0.0
+            status_reason = "sellability lag active"
         elif self._startup_realign_allowed():
             self._startup_realign_count += 1
             self.status = "startup_realign"
             self.true_drift = False
             self._drift_candidate_count = 0
             self._drift_candidate_started_ts = 0.0
+            status_reason = "startup realign"
         else:
             if self._mark_drift_candidate():
                 self.status = "broken"
                 self.true_drift = True
+                status_reason = "persistent unexplained drift confirmed"
             else:
                 self.status = "drift_pending"
                 self.true_drift = False
-        if self.status in {"ok", "settlement_lag", "sellability_lag", "startup_realign"}:
+                status_reason = "unexplained drift candidate"
+        if self.status in {"ok", "settlement_lag", "sellability_lag", "startup_realign", "wallet_stale"}:
             self._expected_up = max(0.0, float(real_up))
             self._expected_dn = max(0.0, float(real_dn))
+
+        now = time.time()
+        candidate_age = 0.0
+        if self._drift_candidate_count > 0 and self._drift_candidate_started_ts > 0:
+            candidate_age = max(0.0, now - self._drift_candidate_started_ts)
+        self.drift_evidence = DriftEvidence(
+            up_diff=float(up_diff),
+            dn_diff=float(dn_diff),
+            threshold=float(threshold),
+            candidate_count=int(self._drift_candidate_count),
+            candidate_started_ts=float(self._drift_candidate_started_ts),
+            candidate_age_sec=float(candidate_age),
+            sellability_lag_active=bool(sellability_lag_active),
+            wallet_snapshot_stale=bool(wallet_snapshot_stale),
+            classification=self.status,
+            reason=status_reason,
+        )
         return build_pair_inventory(
             up_shares=float(real_up),
             dn_shares=float(real_dn),

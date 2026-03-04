@@ -100,6 +100,11 @@ class MarketMakerV2:
         self._last_execution = ExecutionState()
         self._last_analytics = AnalyticsState()
         self._last_health = HealthState()
+        self._last_terminal_reason: str = ""
+        self._last_terminal_ts: float = 0.0
+        self._true_drift_started_ts: float = 0.0
+        self._true_drift_last_progress_ts: float = 0.0
+        self._true_drift_best_exposure: float = 0.0
         self.heartbeat = HeartbeatManager(
             clob_client,
             5,
@@ -284,6 +289,8 @@ class MarketMakerV2:
                 }
         await self.gateway.cancel_all()
         await self.heartbeat.stop()
+        if not self._last_terminal_reason:
+            self._set_terminal_reason("manual_stop")
         return liquidation_result
 
     def fills_page(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
@@ -330,7 +337,14 @@ class MarketMakerV2:
         current_portfolio = inventory.free_usdc + inventory.reserved_usdc + inventory.total_inventory_value_usd
         self._session_pnl = current_portfolio - self._starting_portfolio
 
-    def _build_health(self, *, sellability_lag_active: bool = False, wallet_snapshot_stale: bool = False) -> HealthState:
+    def _build_health(
+        self,
+        *,
+        sellability_lag_active: bool = False,
+        wallet_snapshot_stale: bool = False,
+        true_drift_age_sec: float = 0.0,
+        true_drift_no_progress_sec: float = 0.0,
+    ) -> HealthState:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
         last_message = ""
@@ -352,7 +366,38 @@ class MarketMakerV2:
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
             sellability_lag_active=bool(sellability_lag_active),
             wallet_snapshot_stale=bool(wallet_snapshot_stale),
+            true_drift_age_sec=max(0.0, float(true_drift_age_sec)),
+            true_drift_no_progress_sec=max(0.0, float(true_drift_no_progress_sec)),
+            drift_evidence=self.reconcile.drift_evidence.to_dict(),
         )
+
+    def _set_terminal_reason(self, reason: str) -> None:
+        text = str(reason or "").strip()
+        if not text:
+            return
+        self._last_terminal_reason = text
+        self._last_terminal_ts = time.time()
+
+    def _update_true_drift_progress(self, inventory: PairInventoryState) -> tuple[float, float]:
+        if not self.reconcile.true_drift:
+            self._true_drift_started_ts = 0.0
+            self._true_drift_last_progress_ts = 0.0
+            self._true_drift_best_exposure = 0.0
+            return 0.0, 0.0
+
+        now = time.time()
+        exposure = max(0.0, float(inventory.up_shares) + float(inventory.dn_shares))
+        if self._true_drift_started_ts <= 0.0:
+            self._true_drift_started_ts = now
+            self._true_drift_last_progress_ts = now
+            self._true_drift_best_exposure = exposure
+        elif exposure < (self._true_drift_best_exposure - 0.25):
+            self._true_drift_best_exposure = exposure
+            self._true_drift_last_progress_ts = now
+
+        age = max(0.0, now - self._true_drift_started_ts)
+        no_progress = max(0.0, now - self._true_drift_last_progress_ts)
+        return age, no_progress
 
     def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
         cutoff = time.time() - max_age_sec
@@ -436,6 +481,7 @@ class MarketMakerV2:
             fv_up=valuation.fv_up,
             fv_dn=valuation.fv_dn,
             sellability_lag_active=bool(sell_release_lag.get("active")),
+            wallet_snapshot_stale=stale_wallet,
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
@@ -444,9 +490,12 @@ class MarketMakerV2:
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,
         )
+        true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
         health = self._build_health(
             sellability_lag_active=bool(sell_release_lag.get("active")),
             wallet_snapshot_stale=stale_wallet,
+            true_drift_age_sec=true_drift_age_sec,
+            true_drift_no_progress_sec=true_drift_no_progress_sec,
         )
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
@@ -483,6 +532,8 @@ class MarketMakerV2:
         if lifecycle in {"halted", "expired"}:
             await self.gateway.cancel_all()
             plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
+            terminal_reason = risk.reason if lifecycle == "halted" else "expired"
+            self._set_terminal_reason(terminal_reason or lifecycle)
         else:
             plan = QuotePolicyV2(self.config).generate(
                 snapshot=snapshot,
@@ -582,6 +633,9 @@ class MarketMakerV2:
             recent_cancelled_sell_reserve_dn=float(sell_release_lag.get("dn_reserve", 0.0) or 0.0),
             sell_release_lag_up_sec=float(sell_release_lag.get("up_seconds_left", 0.0) or 0.0),
             sell_release_lag_dn_sec=float(sell_release_lag.get("dn_seconds_left", 0.0) or 0.0),
+            up_cooldown_sec=float(sell_release_lag.get("up_cooldown_sec", 0.0) or 0.0),
+            dn_cooldown_sec=float(sell_release_lag.get("dn_cooldown_sec", 0.0) or 0.0),
+            active_sell_release_reason=str(sell_release_lag.get("active_reason") or ""),
             last_sellability_lag_reason=str(sell_release_lag.get("reason") or ""),
         )
         self._last_execution = execution
@@ -620,6 +674,10 @@ class MarketMakerV2:
             app_version=app_version,
             app_git_hash=app_git_hash,
         )
+        snap["runtime"] = {
+            "last_terminal_reason": self._last_terminal_reason,
+            "last_terminal_ts": self._last_terminal_ts,
+        }
         snap["is_running"] = bool(self._running)
         snap["started_at"] = self._started_at
         return snap
