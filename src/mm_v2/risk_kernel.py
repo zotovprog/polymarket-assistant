@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from .config import MMConfigV2
 from .types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, RiskRegime
 
+INVENTORY_SIDE_DEADBAND_USD = 0.50
+FLAT_BOOTSTRAP_DIVERGENCE_DEFENSIVE = 0.20
+FLAT_BOOTSTRAP_QUALITY_MULT = 0.50
+
 
 @dataclass
 class SoftRiskAssessment:
@@ -39,9 +43,10 @@ class SoftRiskKernel:
 
         excess_value_usd = max(0.0, float(inventory.excess_value_usd))
         signed_excess_value_usd = float(inventory.signed_excess_value_usd)
-        if signed_excess_value_usd > 1e-6:
+        deadband_usd = max(0.01, INVENTORY_SIDE_DEADBAND_USD)
+        if signed_excess_value_usd > deadband_usd:
             inventory_side = "up"
-        elif signed_excess_value_usd < -1e-6:
+        elif signed_excess_value_usd < -deadband_usd:
             inventory_side = "dn"
         else:
             inventory_side = "flat"
@@ -49,16 +54,20 @@ class SoftRiskKernel:
         pressure_abs = self._clamp(excess_value_usd / hard_cap, 0.0, 1.0)
         pressure_signed = self._clamp(signed_excess_value_usd / hard_cap, -1.0, 1.0)
 
+        max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
+        min_quality = float(self.config.min_market_quality_score)
+        flat_bootstrap = inventory_side == "flat" and excess_value_usd < max(soft_cap * 0.5, deadband_usd)
+
         quality_pressure = 0.0
         if not snapshot.market_tradeable:
             quality_pressure = 1.0
-        if float(self.config.min_market_quality_score) > 0:
+        if min_quality > 0:
             quality_deficit = max(
                 0.0,
-                float(self.config.min_market_quality_score) - float(snapshot.market_quality_score),
-            ) / float(self.config.min_market_quality_score)
+                min_quality - float(snapshot.market_quality_score),
+            ) / min_quality
             quality_pressure = max(quality_pressure, self._clamp(quality_deficit, 0.0, 1.0))
-        divergence_pressure = max(float(snapshot.divergence_up), float(snapshot.divergence_dn)) / 0.12
+        divergence_pressure = max_divergence / 0.12
         quality_pressure = max(quality_pressure, self._clamp(divergence_pressure, 0.0, 1.0))
 
         target_soft_mode = "normal"
@@ -69,15 +78,30 @@ class SoftRiskKernel:
         elif excess_value_usd >= hard_cap:
             target_soft_mode = "unwind"
             soft_reason = f"hard excess ${excess_value_usd:.2f}"
-        elif (
-            excess_value_usd >= defensive_cap
-            or not snapshot.market_tradeable
-            or float(snapshot.market_quality_score) < float(self.config.min_market_quality_score)
-            or max(float(snapshot.divergence_up), float(snapshot.divergence_dn)) > 0.12
-        ):
+        elif excess_value_usd >= defensive_cap:
             target_soft_mode = "defensive"
-            soft_reason = "defensive market regime"
-        elif excess_value_usd >= soft_cap:
+            soft_reason = "defensive excess regime"
+        else:
+            market_quality_bad = float(snapshot.market_quality_score) < min_quality
+            divergence_bad = max_divergence > 0.12
+            if not snapshot.market_tradeable:
+                target_soft_mode = "defensive"
+                soft_reason = "defensive market regime (untradeable)"
+            elif flat_bootstrap:
+                # When inventory is effectively flat, avoid overreacting to
+                # mild quality noise. Keep two-sided MM entry possible unless
+                # degradation is severe.
+                quality_floor = min_quality * FLAT_BOOTSTRAP_QUALITY_MULT
+                if (
+                    float(snapshot.market_quality_score) < quality_floor
+                    or max_divergence > FLAT_BOOTSTRAP_DIVERGENCE_DEFENSIVE
+                ):
+                    target_soft_mode = "defensive"
+                    soft_reason = "defensive bootstrap regime"
+            elif market_quality_bad or divergence_bad:
+                target_soft_mode = "defensive"
+                soft_reason = "defensive market regime"
+        if target_soft_mode == "normal" and excess_value_usd >= soft_cap:
             target_soft_mode = "inventory_skewed"
             soft_reason = f"soft excess ${excess_value_usd:.2f}"
 

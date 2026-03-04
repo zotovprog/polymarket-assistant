@@ -85,6 +85,23 @@ def test_soft_mode_normal_below_soft_excess():
     assert risk.hard_mode == "none"
 
 
+def test_micro_excess_is_treated_as_flat_inventory_side():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(),
+        inventory=_inventory(
+            excess_up_value_usd=0.02,
+            excess_value_usd=0.02,
+            signed_excess_value_usd=0.02,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.inventory_side == "flat"
+    assert risk.soft_mode == "normal"
+    assert risk.hard_mode == "none"
+
+
 def test_soft_mode_inventory_skewed_between_soft_and_defensive_thresholds():
     cfg = MMConfigV2(session_budget_usd=15.0)
     risk = HardSafetyKernel(cfg).evaluate(
@@ -95,6 +112,48 @@ def test_soft_mode_inventory_skewed_between_soft_and_defensive_thresholds():
     )
     assert risk.soft_mode == "inventory_skewed"
     assert risk.inventory_side == "up"
+    assert risk.hard_mode == "none"
+
+
+def test_flat_bootstrap_ignores_mild_quality_noise():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=True,
+            market_quality_score=0.30,  # below 0.35 but above bootstrap floor
+            divergence_up=0.11,
+            divergence_dn=0.11,
+        ),
+        inventory=_inventory(
+            excess_value_usd=0.05,
+            signed_excess_value_usd=0.05,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.inventory_side == "flat"
+    assert risk.soft_mode == "normal"
+    assert risk.hard_mode == "none"
+
+
+def test_flat_bootstrap_enters_defensive_on_severe_quality():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=True,
+            market_quality_score=0.12,
+            divergence_up=0.22,
+            divergence_dn=0.22,
+        ),
+        inventory=_inventory(
+            excess_value_usd=0.02,
+            signed_excess_value_usd=0.02,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.inventory_side == "flat"
+    assert risk.soft_mode == "defensive"
     assert risk.hard_mode == "none"
 
 

@@ -750,9 +750,10 @@ def test_inventory_backed_sells_survive_low_free_usdc_after_live_like_fills():
         ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
     )
     assert risk.hard_mode == "none"
+    assert risk.inventory_side == "flat"
     assert plan.quote_balance_state != "none"
     assert plan.dn_ask is not None
-    assert plan.dn_ask.inventory_effect == "helpful"
+    assert plan.dn_ask.inventory_effect == "neutral"
     assert plan.dn_ask.size >= 5.0
     assert plan.quote_viability_reason != "all_quotes_below_min_size"
 

@@ -310,7 +310,8 @@ def test_live_like_paired_inventory_with_low_free_usdc_keeps_helpful_quotes_aliv
     )
     risk, plan, viability = _risk_and_plan(cfg, snapshot, inventory)
     assert risk.hard_mode == "none"
-    assert viability.helpful_count >= 1
+    assert risk.inventory_side == "flat"
+    assert viability.four_quotes is True
     assert plan.quote_balance_state != "none"
     assert plan.quote_viability_reason != "all_quotes_below_min_size"
 
@@ -350,5 +351,6 @@ def test_live_like_paired_inventory_below_hard_cap_does_not_early_unwind():
     sm._excess_baseline_ts = time.time() - 31.0
     sm._excess_baseline_value_usd = inventory.excess_value_usd
     result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
-    assert viability.helpful_count >= 1
+    assert risk.inventory_side == "flat"
+    assert viability.four_quotes is True
     assert result.lifecycle != "unwind"
