@@ -853,15 +853,32 @@ async def test_mmv2_state_endpoint_returns_runtime_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_mmv2_start_rejects_when_legacy_runtime_is_running(monkeypatch):
+async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", True)
+    captured = {}
+
+    async def _fake_start(coin, timeframe, paper_mode, initial_usdc, dev=False, session_budget_usd=None):
+        captured.update(
+            {
+                "coin": coin,
+                "timeframe": timeframe,
+                "paper_mode": paper_mode,
+                "initial_usdc": initial_usdc,
+                "dev": dev,
+                "session_budget_usd": session_budget_usd,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(web_server._runtime_v2, "start", _fake_start)
     req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=15.0, dev=True)
-    with pytest.raises(web_server.HTTPException) as exc:
-        await web_server.mmv2_start(req=req, request=object())
-    assert exc.value.status_code == 409
-    assert "Legacy MM" in str(exc.value.detail)
+    resp = await web_server.mmv2_start(req=req, request=object())
+    assert resp["ok"] is True
+    assert captured["coin"] == "BTC"
+    assert captured["timeframe"] == "15m"
+    assert captured["session_budget_usd"] == pytest.approx(15.0)
 
 
 @pytest.mark.asyncio

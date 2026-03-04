@@ -57,22 +57,15 @@
         <!-- 2. Settings Panel (full width, most prominent) -->
         <div class="settings-panel">
             <div class="settings-row-1">
-                <select id="engine-select" title="Trading engine">
+                <select id="engine-select" title="Trading engine" disabled>
                     <option value="v2">V2</option>
-                    <option value="legacy">Legacy</option>
                 </select>
                 <select id="coin-select">
                     <option value="BTC">BTC</option>
-                    <option value="ETH">ETH</option>
-                    <option value="SOL">SOL</option>
-                    <option value="XRP">XRP</option>
                 </select>
                 <select id="tf-select">
-                    <option value="5m">5m</option>
                     <option value="15m">15m</option>
                     <option value="1h">1h</option>
-                    <option value="4h">4h</option>
-                    <option value="daily">Daily</option>
                 </select>
                 <label class="paper-toggle">
                     <input type="checkbox" id="paper-mode" checked>
@@ -430,13 +423,12 @@
             </div>
         </div>
 
-        <!-- MM Config -->
+        <!-- V2 Config -->
         <div class="collapsible-section">
             <div class="collapsible-header" onclick="toggleSection(this)">
-                <span><i class="fas fa-cog"></i> MM Config</span>
+                <span><i class="fas fa-cog"></i> V2 Config</span>
                 <span class="collapsible-right">
                     <span class="config-actions-inline">
-                        <button class="btn-toggle" id="cfg-enabled-btn" onclick="event.stopPropagation(); toggleEnabled()">Enabled</button>
                         <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); saveConfig()">Apply All</button>
                     </span>
                     <span class="chevron">▸</span>

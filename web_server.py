@@ -2952,13 +2952,7 @@ _runtime_v2 = MMRuntimeV2()
 
 
 def _dashboard_engine(preferred: str | None = None) -> str:
-    preferred_norm = str(preferred or "").strip().lower()
-    if _runtime_v2._running or _runtime_v2.mm_v2:
-        return "v2"
-    if _runtime._running or _runtime.mm or _runtime._watching:
-        return "legacy"
-    if preferred_norm in {"legacy", "v2"}:
-        return preferred_norm
+    del preferred
     return "v2"
 
 
@@ -3108,12 +3102,8 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dashboard_snapshot(preferred: str | None = None) -> dict[str, Any]:
-    engine = _dashboard_engine(preferred)
-    if engine == "v2":
-        return _dashboard_snapshot_from_v2(_runtime_v2.snapshot())
-    snap = dict(_runtime.snapshot())
-    snap["dashboard_engine"] = "legacy"
-    return snap
+    del preferred
+    return _dashboard_snapshot_from_v2(_runtime_v2.snapshot())
 
 
 # ── WebSocket Connection Manager ───────────────────────────────
@@ -3175,12 +3165,12 @@ async def _ws_broadcast_loop():
 
 # ── Telegram Bot (interactive management) ──────────────────────
 def _on_telegram_conflict(reason: str) -> None:
-    _runtime.set_alert("telegram_conflict", reason, level="warning")
+    _runtime_v2.set_alert("telegram_conflict", reason, level="warning")
 
 
 _tg_bot = TelegramBotManager(
     notifier=_telegram,
-    get_runtime=lambda: _runtime,
+    get_runtime=lambda: _runtime_v2,
     access_key=ACCESS_KEY,
     on_conflict=_on_telegram_conflict,
 )
@@ -3225,150 +3215,8 @@ async def logout(response: Response):
 # ── MM Control ──────────────────────────────────────────────────
 @app.post("/api/mm/start")
 async def mm_start(req: StartRequest, request: Request):
+    """Legacy alias: routes to V2 start."""
     _require_auth(request)
-    if _runtime_v2._running:
-        raise HTTPException(status_code=409, detail="MM V2 is already running")
-    # Re-enable after Kill All
-    _runtime.mm_config.enabled = True
-    _runtime.mm_config.auto_next_window = True
-    try:
-        result = await _runtime.start(
-            req.coin,
-            req.timeframe,
-            req.paper_mode,
-            req.initial_usdc,
-            dev=req.dev,
-        )
-    except HTTPException as e:
-        if isinstance(e.detail, dict) and e.detail.get("error") == "Cannot start live: on-chain approvals failed":
-            return JSONResponse(e.detail, status_code=e.status_code)
-        raise
-    return {"ok": True, "state": result}
-
-
-@app.post("/api/mm/stop")
-async def mm_stop(request: Request):
-    _require_auth(request)
-    result = await _runtime.stop()
-    return {"ok": True, "state": result}
-
-
-@app.get("/api/mm/state")
-async def mm_state(request: Request):
-    _require_auth(request)
-    preferred = request.query_params.get("engine")
-    return _dashboard_snapshot(preferred)
-
-
-@app.post("/api/mm/config")
-async def mm_config_update(req: ConfigUpdateRequest, request: Request):
-    _require_auth(request)
-    if req.session_limit is not None:
-        if req.session_limit < 5:
-            return JSONResponse({"error": "session_limit must be >= 5"}, status_code=400)
-    if req.use_post_only is False:
-        return JSONResponse(
-            {"error": "use_post_only=false is disabled (maker-only mode enforced)"},
-            status_code=400,
-        )
-    updates = {k: v for k, v in req.model_dump().items() if v is not None}
-    updates = _validate_config_updates_before_apply(updates)
-    new_config = _runtime.update_config(**updates)
-    return {"ok": True, "config": new_config}
-
-
-@app.get("/api/mm/config")
-async def mm_config_get(request: Request):
-    _require_auth(request)
-    cfg = _runtime.mm_config.to_dict()
-    cfg["session_limit"] = _runtime._initial_usdc
-    return {"config": cfg}
-
-
-@app.post("/api/mm/emergency")
-async def mm_emergency(request: Request):
-    """Emergency stop — cancel all orders immediately."""
-    _require_auth(request)
-    cancelled_estimate = 0
-    if _runtime.mm:
-        try:
-            cancelled_estimate = len(_runtime.mm.order_mgr.active_order_ids)
-        except Exception:
-            cancelled_estimate = 0
-    snap = await _runtime.stop(liquidate=False, emergency=True)
-    return {"ok": True, "cancelled": cancelled_estimate, "state": snap}
-
-
-@app.post("/api/mm/kill")
-async def mm_kill(request: Request):
-    """Kill all: stop MM, liquidate inventory, disable auto-restart."""
-    _require_auth(request)
-    _runtime.mm_config.auto_next_window = False
-    _runtime.mm_config.enabled = False
-    snap = await _runtime.stop()
-    return {"ok": True, "state": snap}
-
-
-@app.post("/api/mm/watch")
-async def mm_watch(request: Request, body: dict):
-    """Start feeds without trading for live price monitoring."""
-    _require_auth(request)
-    coin = body.get("coin", "BTC")
-    timeframe = body.get("timeframe", "5m")
-    return await _runtime.start_watch(coin, timeframe)
-
-
-@app.post("/api/mm/watch/stop")
-async def mm_watch_stop(request: Request):
-    """Stop watch mode feeds."""
-    _require_auth(request)
-    await _runtime.stop_watch()
-    return {"ok": True}
-
-
-@app.post("/api/mm/validate-credentials")
-async def mm_validate_credentials(request: Request):
-    """Validate Polymarket API credentials without starting MM."""
-    _require_auth(request)
-    try:
-        result = await _runtime.validate_live_credentials()
-        return {"valid": True, **result}
-    except HTTPException as e:
-        return {"valid": False, "detail": e.detail}
-
-
-@app.get("/api/mm/fills")
-async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
-    _require_auth(request)
-    preferred = request.query_params.get("engine")
-    if _dashboard_engine(preferred) == "v2":
-        return _runtime_v2.fills_page(limit=limit, offset=offset)
-    if _runtime.mm:
-        fills = _runtime.mm.risk_mgr.fills
-        total = len(fills)
-        page = fills[-(offset + limit):-offset or None] if offset else fills[-limit:]
-        up_tid = _runtime.mm.market.up_token_id if _runtime.mm.market else ""
-        return {
-            "fills": [
-                {
-                    "ts": f.ts, "side": f.side,
-                    "token_type": "up" if f.token_id == up_tid else "dn",
-                    "token_id": f.token_id[:16] + "...",
-                    "price": f.price, "size": f.size,
-                    "fee": f.fee, "is_maker": f.is_maker,
-                }
-                for f in reversed(page)
-            ],
-            "total": total,
-        }
-    return {"fills": [], "total": 0}
-
-
-@app.post("/api/mmv2/start")
-async def mmv2_start(req: StartRequest, request: Request):
-    _require_auth(request)
-    if _runtime._running:
-        raise HTTPException(status_code=409, detail="Legacy MM is already running")
     if req.paper_mode:
         session_budget_usd = float(req.initial_usdc)
     elif "initial_usdc" in req.model_fields_set:
@@ -3384,6 +3232,135 @@ async def mmv2_start(req: StartRequest, request: Request):
         session_budget_usd=session_budget_usd,
     )
     return {"ok": True, "state": result}
+
+
+@app.post("/api/mm/stop")
+async def mm_stop(request: Request):
+    """Legacy alias: routes to V2 stop."""
+    _require_auth(request)
+    result = await _runtime_v2.stop()
+    return {"ok": True, "state": result}
+
+
+@app.get("/api/mm/state")
+async def mm_state(request: Request):
+    """Legacy alias: routes to V2 dashboard snapshot."""
+    _require_auth(request)
+    return _dashboard_snapshot("v2")
+
+
+@app.post("/api/mm/config")
+async def mm_config_update(req: ConfigUpdateRequest, request: Request):
+    """Legacy alias: maps safe subset to V2 config."""
+    _require_auth(request)
+    updates: dict[str, Any] = {}
+    if req.session_limit is not None:
+        if req.session_limit < 5:
+            return JSONResponse({"error": "session_limit must be >= 5"}, status_code=400)
+        updates["session_budget_usd"] = float(req.session_limit)
+    if req.order_size_usd is not None:
+        updates["base_clip_usd"] = float(req.order_size_usd)
+    if req.max_drawdown_usd is not None:
+        updates["hard_drawdown_usd"] = float(req.max_drawdown_usd)
+    if req.requote_threshold_bps is not None:
+        updates["requote_threshold_bps"] = float(req.requote_threshold_bps)
+    if req.fallback_poll_cap is not None:
+        updates["fallback_poll_cap"] = int(req.fallback_poll_cap)
+    if req.fill_settlement_grace_sec is not None:
+        updates["fill_settlement_grace_sec"] = float(req.fill_settlement_grace_sec)
+    if req.critical_reconcile_drift_shares is not None:
+        updates["reconcile_drift_threshold_shares"] = float(req.critical_reconcile_drift_shares)
+    new_config = _runtime_v2.update_config(**updates)
+    return {"ok": True, "config": new_config, "legacy": True}
+
+
+@app.get("/api/mm/config")
+async def mm_config_get(request: Request):
+    """Legacy alias: returns V2 config."""
+    _require_auth(request)
+    cfg = dict(_runtime_v2.mm_config_v2.to_dict())
+    cfg["session_limit"] = cfg.get("session_budget_usd", 0.0)
+    return {"config": cfg, "legacy": True}
+
+
+@app.post("/api/mm/emergency")
+async def mm_emergency(request: Request):
+    """Legacy alias: routes to V2 emergency stop."""
+    _require_auth(request)
+    snap = await _runtime_v2.stop(liquidate=False, emergency=True)
+    cancelled_estimate = int((snap.get("execution") or {}).get("open_orders") or 0)
+    return {"ok": True, "cancelled": cancelled_estimate, "state": snap}
+
+
+@app.post("/api/mm/kill")
+async def mm_kill(request: Request):
+    """Legacy alias: routes to V2 stop+liquidate."""
+    _require_auth(request)
+    snap = await _runtime_v2.stop()
+    return {"ok": True, "state": snap}
+
+
+@app.post("/api/mm/watch")
+async def mm_watch(request: Request, body: dict):
+    """Legacy watch mode is removed in V2-only runtime."""
+    del body
+    _require_auth(request)
+    raise HTTPException(status_code=410, detail="legacy watch mode removed; use /api/mmv2/start")
+
+
+@app.post("/api/mm/watch/stop")
+async def mm_watch_stop(request: Request):
+    """Legacy watch mode is removed in V2-only runtime."""
+    _require_auth(request)
+    raise HTTPException(status_code=410, detail="legacy watch mode removed")
+
+
+@app.post("/api/mm/validate-credentials")
+async def mm_validate_credentials(request: Request):
+    """Legacy alias: validate credentials through V2 runtime."""
+    _require_auth(request)
+    try:
+        result = await _runtime_v2.validate_live_credentials()
+        return {"valid": True, **result}
+    except HTTPException as e:
+        return {"valid": False, "detail": e.detail}
+
+
+@app.get("/api/mm/fills")
+async def mm_fills(request: Request, limit: int = 50, offset: int = 0):
+    """Legacy alias: routes to V2 fills."""
+    _require_auth(request)
+    return _runtime_v2.fills_page(limit=limit, offset=offset)
+
+
+@app.post("/api/mmv2/start")
+async def mmv2_start(req: StartRequest, request: Request):
+    _require_auth(request)
+    if req.paper_mode:
+        session_budget_usd = float(req.initial_usdc)
+    elif "initial_usdc" in req.model_fields_set:
+        session_budget_usd = float(req.initial_usdc)
+    else:
+        session_budget_usd = float(_runtime_v2.mm_config_v2.session_budget_usd)
+    result = await _runtime_v2.start(
+        req.coin,
+        req.timeframe,
+        req.paper_mode,
+        req.initial_usdc,
+        dev=req.dev,
+        session_budget_usd=session_budget_usd,
+    )
+    return {"ok": True, "state": result}
+
+
+@app.post("/api/mmv2/validate-credentials")
+async def mmv2_validate_credentials(request: Request):
+    _require_auth(request)
+    try:
+        result = await _runtime_v2.validate_live_credentials()
+        return {"valid": True, **result}
+    except HTTPException as e:
+        return {"valid": False, "detail": e.detail}
 
 
 @app.post("/api/mmv2/stop")

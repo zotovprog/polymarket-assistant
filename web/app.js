@@ -24,7 +24,7 @@ let lastStartedAt = 0;
 
 // Last known state for order distance calc
 let lastState = {};
-let selectedEngine = 'v2';
+const selectedEngine = 'v2';
 
 // Animation: previous values cache
 const _prevValues = {};
@@ -37,17 +37,15 @@ let _wsReconnectTimer = null;
 let _wsAuthKey = '';  // saved from login for WS auth
 
 function getSelectedEngine() {
-    const el = document.getElementById('engine-select');
-    if (el && el.value) selectedEngine = el.value;
     return selectedEngine;
 }
 
 function getEffectiveEngine() {
-    return (lastState && lastState.dashboard_engine) || getSelectedEngine();
+    return selectedEngine;
 }
 
 function dashboardStateUrl() {
-    return `${API_BASE}/api/mm/state?engine=${encodeURIComponent(getSelectedEngine())}`;
+    return `${API_BASE}/api/mmv2/state`;
 }
 
 // ── Collapsible Sections ─────────────────────────────
@@ -98,28 +96,10 @@ function showDashboard() {
     initCharts();
     connectWebSocket();
     pollState();
-    // Auto-start watch mode for live feed data when no session is running
-    autoWatch();
 }
 
 async function autoWatch() {
-    if (getSelectedEngine() !== 'legacy') return;
-    try {
-        const r = await fetch(dashboardStateUrl());
-        if (!r.ok) return;
-        const s = await r.json();
-        if (s.is_running) return; // Session active, no need for watch
-        // Start watch mode for live feeds
-        const coin = document.getElementById('coin-select')?.value || 'BTC';
-        const tf = document.getElementById('tf-select')?.value || '5m';
-        await fetch(`${API_BASE}/api/mm/watch`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ coin, timeframe: tf }),
-        });
-    } catch(e) {
-        // Silent fail — watch is optional
-    }
+    return;
 }
 
 // ── WebSocket Client ─────────────────────────────────
@@ -999,17 +979,14 @@ function updateCharts(s) {
 
 // ── Actions ──────────────────────────────────────────
 async function toggleMM() {
-    const engine = isRunning ? getEffectiveEngine() : getSelectedEngine();
     if (isRunning) {
-        const stopUrl = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/stop`;
-        await fetch(stopUrl, { method: 'POST' });
+        await fetch(`${API_BASE}/api/mmv2/stop`, { method: 'POST' });
     } else {
         const coin = document.getElementById('coin-select').value;
         const tf = document.getElementById('tf-select').value;
         const paper = document.getElementById('paper-mode').checked;
         const stake = parseFloat(document.getElementById('stake-usdc').value) || 10;
-        const startUrl = engine === 'v2' ? `${API_BASE}/api/mmv2/start` : `${API_BASE}/api/mm/start`;
-        const r = await fetch(startUrl, {
+        const r = await fetch(`${API_BASE}/api/mmv2/start`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ coin, timeframe: tf, paper_mode: paper, initial_usdc: stake }),
@@ -1024,22 +1001,18 @@ async function toggleMM() {
 }
 
 async function emergency() {
-    const engine = getEffectiveEngine();
     if (confirm('Emergency stop \u2014 cancel all orders?')) {
-        const url = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/emergency`;
-        await fetch(url, { method: 'POST' });
+        await fetch(`${API_BASE}/api/mmv2/stop`, { method: 'POST' });
         setTimeout(pollState, 500);
     }
 }
 
 async function killAll() {
     if (!confirm('KILL ALL: Stop trading, sell all positions, disable auto-restart. Continue?')) return;
-    const engine = getEffectiveEngine();
     try {
-        const url = engine === 'v2' ? `${API_BASE}/api/mmv2/stop` : `${API_BASE}/api/mm/kill`;
-        const r = await fetch(url, { method: 'POST' });
+        const r = await fetch(`${API_BASE}/api/mmv2/stop`, { method: 'POST' });
         if (r.ok) {
-            showToast(engine === 'v2' ? 'MM V2 stopped' : 'Kill All executed \u2014 all positions liquidated', 'warning');
+            showToast('MM V2 stopped', 'warning');
         } else {
             showToast('Kill All failed', 'error');
         }
@@ -1050,74 +1023,22 @@ async function killAll() {
 }
 
 async function saveConfig() {
-    const engine = getSelectedEngine();
-    if (engine === 'v2') {
-        const budget = parseFloat(document.getElementById('stake-usdc').value) || 10;
-        const r = await fetch(`${API_BASE}/api/mmv2/config`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ session_budget_usd: budget }),
-        });
-        if (r.ok) {
-            showToast('V2 budget updated');
-        } else {
-            showToast('V2 config update failed', 'error');
-        }
-        setTimeout(pollState, 300);
-        return;
-    }
-    const cfg = {
-        half_spread_bps: parseFloat(document.getElementById('cfg-spread').value),
-        min_spread_bps: parseFloat(document.getElementById('cfg-min-spread').value),
-        max_spread_bps: parseFloat(document.getElementById('cfg-max-spread').value),
-        vol_spread_mult: parseFloat(document.getElementById('cfg-vol-mult').value),
-        order_size_usd: parseFloat(document.getElementById('cfg-size').value),
-        min_order_size_usd: parseFloat(document.getElementById('cfg-min-size').value),
-        max_order_size_usd: parseFloat(document.getElementById('cfg-max-size').value),
-        max_inventory_shares: parseFloat(document.getElementById('cfg-max-inv').value),
-        skew_bps_per_unit: parseFloat(document.getElementById('cfg-skew').value),
-        requote_interval_sec: parseFloat(document.getElementById('cfg-requote').value),
-        requote_threshold_bps: parseFloat(document.getElementById('cfg-requote-thresh').value),
-        gtd_duration_sec: parseInt(document.getElementById('cfg-gtd-dur').value),
-        heartbeat_interval_sec: parseInt(document.getElementById('cfg-heartbeat').value),
-        use_post_only: document.getElementById('cfg-post-only').checked,
-        use_gtd: document.getElementById('cfg-use-gtd').checked,
-        max_drawdown_usd: parseFloat(document.getElementById('cfg-drawdown').value),
-        volatility_pause_mult: parseFloat(document.getElementById('cfg-vol-pause').value),
-        max_loss_per_fill_usd: parseFloat(document.getElementById('cfg-max-loss').value),
-        take_profit_usd: parseFloat(document.getElementById('cfg-take-profit').value) || 0,
-        trailing_stop_pct: (parseFloat(document.getElementById('cfg-trail-stop').value) || 0) / 100,
-        session_limit: parseFloat(document.getElementById('cfg-session-limit').value) || 25,
-    };
-    const r = await fetch(`${API_BASE}/api/mm/config`, {
+    const budget = parseFloat(document.getElementById('stake-usdc').value) || 10;
+    const r = await fetch(`${API_BASE}/api/mmv2/config`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(cfg),
+        body: JSON.stringify({ session_budget_usd: budget }),
     });
     if (r.ok) {
-        showToast('Config updated');
+        showToast('V2 budget updated');
     } else {
-        showToast('Config update failed', 'error');
+        showToast('V2 config update failed', 'error');
     }
     setTimeout(pollState, 300);
 }
 
 async function toggleEnabled() {
-    if (getSelectedEngine() === 'v2') {
-        showToast('V2 does not use legacy enabled toggle', 'warning');
-        return;
-    }
-    const btn = document.getElementById('cfg-enabled-btn');
-    const nowEnabled = btn.classList.contains('active');
-    const r = await fetch(`${API_BASE}/api/mm/config`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ enabled: !nowEnabled }),
-    });
-    if (r.ok) {
-        showToast(nowEnabled ? 'MM Disabled' : 'MM Enabled');
-    }
-    setTimeout(pollState, 300);
+    showToast('Legacy enabled toggle removed in V2 runtime', 'warning');
 }
 
 function showToast(msg, type = 'success') {
@@ -1188,7 +1109,7 @@ async function validateCredentials() {
     badge.className = 'cred-badge checking';
     text.textContent = 'Checking...';
     try {
-        const r = await fetch(`${API_BASE}/api/mm/validate-credentials`, { method: 'POST' });
+        const r = await fetch(`${API_BASE}/api/mmv2/validate-credentials`, { method: 'POST' });
         const d = await r.json();
         if (d.valid) {
             badge.className = 'cred-badge valid';
@@ -1209,12 +1130,8 @@ document.addEventListener('DOMContentLoaded', () => {
     checkAuth();
     const engineSelect = document.getElementById('engine-select');
     if (engineSelect) {
-        engineSelect.value = selectedEngine;
-        engineSelect.addEventListener('change', () => {
-            selectedEngine = engineSelect.value || 'v2';
-            pollState();
-            autoWatch();
-        });
+        engineSelect.value = 'v2';
+        engineSelect.disabled = true;
     }
     const paperToggle = document.getElementById('paper-mode');
     if (paperToggle) {
