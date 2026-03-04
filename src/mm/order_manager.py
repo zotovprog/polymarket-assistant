@@ -1403,7 +1403,12 @@ class OrderManager:
         else:
             return quote.size * (1.0 - quote.price)
 
-    async def _enforce_close_only_sell(self, quote: Quote) -> bool:
+    async def _enforce_close_only_sell(
+        self,
+        quote: Quote,
+        *,
+        ignore_recent_cancelled_reserve: bool = False,
+    ) -> bool:
         """Enforce close-only SELL behavior when shorting is disabled.
 
         Returns True when SELL can proceed (possibly with reduced size),
@@ -1427,7 +1432,9 @@ class OrderManager:
             return False
 
         active_sell_exposure = self._active_sell_inventory(quote.token_id)
-        recent_cancelled_exposure = self._recent_cancelled_sell_inventory(quote.token_id)
+        recent_cancelled_exposure = 0.0
+        if not ignore_recent_cancelled_reserve:
+            recent_cancelled_exposure = self._recent_cancelled_sell_inventory(quote.token_id)
         free_inventory = max(
             0.0,
             float(token_bal) - active_sell_exposure - recent_cancelled_exposure,
@@ -1709,7 +1716,15 @@ class OrderManager:
                  f"token={quote.token_id[:8]}... id={order_id[:12]}...")
         return order_id
 
-    async def place_order(self, quote: Quote, *, post_only: bool | None = None, fallback_taker: bool = False) -> Optional[str]:
+    async def place_order(
+        self,
+        quote: Quote,
+        *,
+        post_only: bool | None = None,
+        fallback_taker: bool = False,
+        ignore_sell_cooldowns: bool = False,
+        ignore_recent_cancelled_reserve: bool = False,
+    ) -> Optional[str]:
         """Place an order with retry on insufficient balance.
 
         Args:
@@ -1721,10 +1736,11 @@ class OrderManager:
         """
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
-        if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="single_place"):
-            return None
-        if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="single_place"):
-            return None
+        if not ignore_sell_cooldowns:
+            if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="single_place"):
+                return None
+            if quote.side == "SELL" and self._should_skip_sell_after_reject(quote, source="single_place"):
+                return None
 
         # Hard budget cap: reject BUY orders that exceed session budget
         collateral = self.required_collateral(quote)
@@ -1821,7 +1837,10 @@ class OrderManager:
             ):
                 log.warning(f"Cannot place SELL — allowance setup failed for {quote.token_id[:12]}...")
                 return None
-            if not await self._enforce_close_only_sell(quote):
+            if not await self._enforce_close_only_sell(
+                quote,
+                ignore_recent_cancelled_reserve=ignore_recent_cancelled_reserve,
+            ):
                 return None
 
             # SELL pre-check:

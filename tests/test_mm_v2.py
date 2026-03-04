@@ -179,6 +179,49 @@ async def test_pmgateway_reprices_post_only_sell_after_crosses_book(monkeypatch)
     assert calls[1].price > 0.58
 
 
+@pytest.mark.asyncio
+async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    gateway = PMGateway(_MockClient(), MMConfigV2())
+    gateway.set_market(_market())
+    calls: list[tuple[Quote, dict]] = []
+
+    async def _sellable_balances():
+        return 0.0, 0.0
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 6.2, 7.4, 15.0, 15.0
+
+    async def _get_full_book(_token_id: str):
+        return {"best_bid": 0.51}
+
+    async def _place_order(quote: Quote, **kwargs):
+        calls.append((quote, kwargs))
+        return f"oid-{len(calls)}"
+
+    async def _check_fills():
+        return []
+
+    monkeypatch.setattr(gateway, "get_sellable_balances", _sellable_balances)
+    monkeypatch.setattr(gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(gateway.order_mgr, "get_full_book", _get_full_book)
+    monkeypatch.setattr(gateway.order_mgr, "place_order", _place_order)
+    monkeypatch.setattr(gateway.order_mgr, "check_fills", _check_fills)
+
+    result = await gateway.emergency_flatten_on_stop(rounds=1, round_delay_sec=0.01)
+
+    assert result["attempted_orders"] == 2
+    assert result["placed_orders"] == 2
+    assert len(calls) == 2
+    for _quote, kwargs in calls:
+        assert kwargs.get("post_only") is False
+        assert kwargs.get("ignore_sell_cooldowns") is True
+        assert kwargs.get("ignore_recent_cancelled_reserve") is True
+
+
 def test_order_manager_crosses_book_not_counted_as_transport_failure():
     class _MockClient:
         _orders = {}

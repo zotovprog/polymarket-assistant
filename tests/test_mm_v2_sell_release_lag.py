@@ -91,6 +91,32 @@ async def test_sell_during_cooldown_is_locally_suppressed():
     assert client._order_idx == 0
 
 
+@pytest.mark.asyncio
+async def test_force_sell_bypasses_post_cancel_guards_for_stop_liquidation(monkeypatch):
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    client = _MockPlaceClient()
+    om = OrderManager(client, cfg)
+    om._set_cancel_repost_cooldown("tok-up")
+    om._add_recent_cancelled_sell_reserve(
+        "cancelled-sell",
+        Quote(side="SELL", token_id="tok-up", price=0.51, size=6.0),
+    )
+
+    async def _fake_token_balance(_token_id: str):
+        return 6.0
+
+    monkeypatch.setattr(om, "get_token_balance", _fake_token_balance)
+    result = await om.place_order(
+        Quote(side="SELL", token_id="tok-up", price=0.51, size=5.0),
+        post_only=False,
+        ignore_sell_cooldowns=True,
+        ignore_recent_cancelled_reserve=True,
+    )
+    assert result is not None
+    assert client._order_idx == 1
+
+
 def test_reserved_sell_inventory_includes_recent_cancelled_reserve():
     cfg = MMConfig()
     cfg.sell_release_grace_sec = 3.0

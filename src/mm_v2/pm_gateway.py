@@ -179,8 +179,8 @@ class PMGateway:
     async def emergency_flatten_on_stop(
         self,
         *,
-        rounds: int = 3,
-        round_delay_sec: float = 0.8,
+        rounds: int = 5,
+        round_delay_sec: float = 1.0,
     ) -> dict[str, Any]:
         """Best-effort forced inventory unwind used by manual stop().
 
@@ -202,15 +202,20 @@ class PMGateway:
         tick = max(0.0001, float(self.market.tick_size or 0.01))
         min_size = max(0.0, float(self.market.min_order_size or 0.0))
 
-        for _ in range(max(1, int(rounds))):
+        for round_idx in range(max(1, int(rounds))):
             up_sellable, dn_sellable = await self.get_sellable_balances()
+            up_owned, dn_owned, _, _ = await self.get_wallet_balances()
             per_round_order_ids: list[str] = []
-            for token_id, raw_sellable in (
-                (self.market.up_token_id, up_sellable),
-                (self.market.dn_token_id, dn_sellable),
+            for token_id, raw_sellable, raw_owned in (
+                (self.market.up_token_id, up_sellable, up_owned),
+                (self.market.dn_token_id, dn_sellable, dn_owned),
             ):
                 sellable = max(0.0, float(raw_sellable or 0.0))
-                size = math.floor(sellable * 100.0) / 100.0
+                owned = max(0.0, float(raw_owned or 0.0))
+                # During stop liquidation PM may lag token release after cancel.
+                # Use the more permissive owned-vs-sellable estimate here to
+                # keep unwind attempts progressing instead of stalling locally.
+                size = math.floor(max(sellable, owned) * 100.0) / 100.0
                 if size < min_size:
                     continue
                 book = await self.order_mgr.get_full_book(token_id)
@@ -222,7 +227,8 @@ class PMGateway:
                 if best_bid <= 0:
                     continue
                 # Use a crossing SELL price to prioritize execution.
-                price = max(0.01, round(best_bid - tick, 10))
+                discount_ticks = 1 + (2 * int(round_idx))
+                price = max(0.01, round(best_bid - (tick * discount_ticks), 10))
                 quote = Quote(
                     side="SELL",
                     token_id=token_id,
@@ -234,6 +240,8 @@ class PMGateway:
                     quote,
                     post_only=False,
                     fallback_taker=False,
+                    ignore_sell_cooldowns=True,
+                    ignore_recent_cancelled_reserve=True,
                 )
                 if order_id:
                     placed_orders += 1
@@ -256,7 +264,7 @@ class PMGateway:
                 if order_id in active_ids:
                     await self.order_mgr.cancel_order(order_id)
 
-        up_remaining, dn_remaining = await self.get_sellable_balances()
+        up_remaining, dn_remaining, _, _ = await self.get_wallet_balances()
         rem_up = max(0.0, float(up_remaining or 0.0))
         rem_dn = max(0.0, float(dn_remaining or 0.0))
         done = rem_up < min_size and rem_dn < min_size
