@@ -158,6 +158,50 @@ class MarketMakerV2:
         self._heartbeat_failed = True
         self.set_alert("heartbeat_failure_v2", "Heartbeat failure", level="error")
 
+    def _coalesce_wallet_snapshot(
+        self,
+        *,
+        up: float | None,
+        dn: float | None,
+        total_usdc: float | None,
+        available_usdc: float | None,
+    ) -> tuple[float, float, float, float, bool]:
+        """Use trusted local state when PM balance endpoints return partial data.
+
+        PM balance reads may transiently fail (timeouts/transport). Treating such
+        reads as literal zero creates false drift and false drawdown transitions.
+        """
+        stale = False
+        expected_up, expected_dn = self.reconcile.expected_balances()
+
+        up_v = up
+        if up_v is None:
+            stale = True
+            up_v = expected_up if expected_up is not None else float(self._last_inventory.up_shares)
+
+        dn_v = dn
+        if dn_v is None:
+            stale = True
+            dn_v = expected_dn if expected_dn is not None else float(self._last_inventory.dn_shares)
+
+        total_v = total_usdc
+        if total_v is None:
+            stale = True
+            total_v = float(self._last_inventory.free_usdc + self._last_inventory.reserved_usdc)
+
+        available_v = available_usdc
+        if available_v is None:
+            stale = True
+            available_v = float(self._last_inventory.free_usdc)
+
+        up_f = max(0.0, float(up_v or 0.0))
+        dn_f = max(0.0, float(dn_v or 0.0))
+        total_f = max(0.0, float(total_v or 0.0))
+        available_f = max(0.0, float(available_v or 0.0))
+        if available_f > total_f:
+            available_f = total_f
+        return up_f, dn_f, total_f, available_f, stale
+
     async def start(self) -> None:
         if self._running:
             return
@@ -165,15 +209,29 @@ class MarketMakerV2:
             raise RuntimeError("market is not set")
         self._running = True
         self._started_at = time.time()
-        up, dn, total_usdc, available_usdc = await self.gateway.get_wallet_balances()
-        if up is None or dn is None:
-            up = 0.0
-            dn = 0.0
+        up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
+        up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
+            up=up_raw,
+            dn=dn_raw,
+            total_usdc=total_usdc_raw,
+            available_usdc=available_usdc_raw,
+        )
+        if stale_wallet and self._last_inventory.free_usdc <= 0 and self._last_inventory.up_shares <= 0 and self._last_inventory.dn_shares <= 0:
+            self._running = False
+            raise RuntimeError("Unable to fetch initial PM wallet snapshot (token/USDC balances unavailable)")
+        if stale_wallet:
+            self.set_alert(
+                "wallet_snapshot_stale_v2",
+                "PM wallet snapshot partial/unavailable; using local fallback balances",
+                level="warning",
+            )
+        else:
+            self.clear_alert("wallet_snapshot_stale_v2")
         self.reconcile.start_session(up, dn)
-        self._starting_usdc = float(total_usdc or 0.0)
+        self._starting_usdc = float(total_usdc)
         fv_up = float(getattr(self.feed_state, "pm_up", 0.5) or 0.5)
         fv_dn = float(getattr(self.feed_state, "pm_dn", 0.5) or max(0.01, 1.0 - fv_up))
-        self._starting_portfolio = float(total_usdc or 0.0) + up * fv_up + dn * fv_dn
+        self._starting_portfolio = float(total_usdc) + up * fv_up + dn * fv_dn
         self.heartbeat.start()
         self._task = asyncio.create_task(self._run_loop())
 
@@ -233,13 +291,15 @@ class MarketMakerV2:
         current_portfolio = inventory.free_usdc + inventory.reserved_usdc + inventory.total_inventory_value_usd
         self._session_pnl = current_portfolio - self._starting_portfolio
 
-    def _build_health(self, *, sellability_lag_active: bool = False) -> HealthState:
+    def _build_health(self, *, sellability_lag_active: bool = False, wallet_snapshot_stale: bool = False) -> HealthState:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
         last_message = ""
         if recent:
             last_message = str(recent[-1].get("message") or "")
-        transport_totals = api_stats.get("transport_total_by_op") or api_stats.get("total_by_op") or {}
+        transport_totals = api_stats.get("transport_total_by_op")
+        if not isinstance(transport_totals, dict):
+            transport_totals = {}
         total_failures = int(sum(int(v or 0) for v in transport_totals.values()))
         transport_ok = total_failures < int(self.config.max_transport_failures)
         last_fallback = int(getattr(self.gateway.order_mgr, "_last_fallback_poll_count", 0))
@@ -252,6 +312,7 @@ class MarketMakerV2:
             true_drift=self.reconcile.true_drift,
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
             sellability_lag_active=bool(sellability_lag_active),
+            wallet_snapshot_stale=bool(wallet_snapshot_stale),
         )
 
     def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
@@ -305,14 +366,25 @@ class MarketMakerV2:
             float(self._last_inventory.up_shares),
             float(self._last_inventory.dn_shares),
         )
-        up, dn, total_usdc, available_usdc = await self.gateway.get_wallet_balances(
+        up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances(
             reference_balances=reference_balances,
+        )
+        up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
+            up=up_raw,
+            dn=dn_raw,
+            total_usdc=total_usdc_raw,
+            available_usdc=available_usdc_raw,
         )
         sellable_up, sellable_dn = await self.gateway.get_sellable_balances()
         sell_release_lag = self.gateway.sell_release_lag_state()
-        up = float(up or 0.0)
-        dn = float(dn or 0.0)
-        total_usdc = float(total_usdc or 0.0)
+        if stale_wallet:
+            self.set_alert(
+                "wallet_snapshot_stale_v2",
+                "PM wallet snapshot partial/unavailable; using local fallback balances",
+                level="warning",
+            )
+        else:
+            self.clear_alert("wallet_snapshot_stale_v2")
         sellable_up = max(0.0, float(up if sellable_up is None else sellable_up))
         sellable_dn = max(0.0, float(dn if sellable_dn is None else sellable_dn))
         inventory = self.reconcile.reconcile(
@@ -324,6 +396,7 @@ class MarketMakerV2:
             active_orders=self.gateway.active_orders(),
             fv_up=valuation.fv_up,
             fv_dn=valuation.fv_dn,
+            sellability_lag_active=bool(sell_release_lag.get("active")),
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
@@ -334,6 +407,7 @@ class MarketMakerV2:
         )
         health = self._build_health(
             sellability_lag_active=bool(sell_release_lag.get("active")),
+            wallet_snapshot_stale=stale_wallet,
         )
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
@@ -450,18 +524,11 @@ class MarketMakerV2:
         self._last_plan = plan
         self._last_analytics = analytics
         self._last_health = health
-        transport_failures = int(
-            sum(
-                int(v or 0)
-                for v in (
-                    (
-                        self.gateway.api_error_stats().get("transport_total_by_op")
-                        or self.gateway.api_error_stats().get("total_by_op")
-                        or {}
-                    ).values()
-                )
-            )
-        )
+        api_stats = self.gateway.api_error_stats()
+        transport_totals = api_stats.get("transport_total_by_op")
+        if not isinstance(transport_totals, dict):
+            transport_totals = {}
+        transport_failures = int(sum(int(v or 0) for v in transport_totals.values()))
         execution = self.tracker.execution_state(
             active_orders=self.gateway.active_orders(),
             transport_failures=transport_failures,

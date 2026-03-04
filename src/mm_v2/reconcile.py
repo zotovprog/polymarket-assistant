@@ -45,6 +45,10 @@ class ReconcileV2:
         self._startup_realign_count = 0
         self._settlement.clear()
 
+    def expected_balances(self) -> tuple[float | None, float | None]:
+        """Return latest internal expected wallet balances."""
+        return self._expected_up, self._expected_dn
+
     def _add_settlement_delta(self, token_id: str, delta: float) -> None:
         if abs(float(delta)) <= 1e-9:
             return
@@ -128,6 +132,7 @@ class ReconcileV2:
         active_orders: dict[str, Quote],
         fv_up: float,
         fv_dn: float,
+        sellability_lag_active: bool = False,
     ) -> PairInventoryState:
         if self._expected_up is None or self._expected_dn is None:
             self.align(real_up, real_dn)
@@ -143,6 +148,11 @@ class ReconcileV2:
             self.true_drift = False
         elif explained:
             self.status = "settlement_lag"
+            self.true_drift = False
+        elif sellability_lag_active:
+            # PM may briefly report constrained free token balance after SELL
+            # cancel/repost. Treat this window as transient execution lag.
+            self.status = "sellability_lag"
             self.true_drift = False
         elif self._startup_realign_allowed():
             self._startup_realign_count += 1

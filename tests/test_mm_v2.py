@@ -204,7 +204,7 @@ def test_mmv2_health_ignores_crosses_book_when_transport_totals_empty(monkeypatc
         mm.gateway,
         "api_error_stats",
         lambda: {
-            "total_by_op": {"place_order": 3},
+            "total_by_op": {"place_order": 99},
             "transport_total_by_op": {},
             "recent": [
                 {
@@ -217,6 +217,47 @@ def test_mmv2_health_ignores_crosses_book_when_transport_totals_empty(monkeypatc
     health = mm._build_health()
     assert health.transport_ok is True
     assert "crosses book" in health.last_api_error
+
+
+def test_runtime_wallet_snapshot_coalesce_uses_expected_balances_for_missing_values():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm.reconcile.start_session(7.0, 3.0)
+    mm._last_inventory = _inventory(up_shares=1.0, dn_shares=2.0, free_usdc=11.0, reserved_usdc=2.0)
+
+    up, dn, total, available, stale = mm._coalesce_wallet_snapshot(
+        up=None,
+        dn=None,
+        total_usdc=None,
+        available_usdc=None,
+    )
+
+    assert stale is True
+    assert up == pytest.approx(7.0)
+    assert dn == pytest.approx(3.0)
+    assert total == pytest.approx(13.0)
+    assert available == pytest.approx(11.0)
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_requires_initial_wallet_snapshot(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm.set_market(_market())
+
+    async def _missing_wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return None, None, None, None
+
+    monkeypatch.setattr(mm.gateway, "get_wallet_balances", _missing_wallet_balances)
+
+    with pytest.raises(RuntimeError, match="Unable to fetch initial PM wallet snapshot"):
+        await mm.start()
+    assert mm._running is False
 
 
 def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
@@ -341,6 +382,27 @@ def test_reconcile_settlement_lag_does_not_trigger_true_drift():
     assert reconcile.status == "settlement_lag"
     assert reconcile.true_drift is False
     assert state.up_shares == 0.0
+
+
+def test_reconcile_sellability_lag_does_not_trigger_true_drift():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.align(0.0, 6.0)
+    state = reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        sellability_lag_active=True,
+    )
+    assert reconcile.status == "sellability_lag"
+    assert reconcile.true_drift is False
+    assert state.dn_shares == 0.0
 
 
 def test_reconcile_startup_balance_jump_without_fills_realigns_not_broken():

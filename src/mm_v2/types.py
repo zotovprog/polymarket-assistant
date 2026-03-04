@@ -192,6 +192,7 @@ class HealthState:
     true_drift: bool = False
     residual_inventory_failure: bool = False
     sellability_lag_active: bool = False
+    wallet_snapshot_stale: bool = False
 
 
 @dataclass
