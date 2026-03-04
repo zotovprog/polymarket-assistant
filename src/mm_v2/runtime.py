@@ -333,8 +333,10 @@ class MarketMakerV2:
                 self.set_alert("runtime_v2", f"V2 tick error: {exc}", level="error")
             await asyncio.sleep(float(self.config.tick_interval_sec))
 
-    def _update_session_pnl(self, inventory: PairInventoryState) -> None:
-        current_portfolio = inventory.free_usdc + inventory.reserved_usdc + inventory.total_inventory_value_usd
+    def _update_session_pnl(self, inventory: PairInventoryState, *, total_usdc: float) -> None:
+        # PnL must use wallet-total USDC + marked inventory value.
+        # Pending/reserved order bookkeeping must not move session PnL.
+        current_portfolio = max(0.0, float(total_usdc)) + inventory.total_inventory_value_usd
         self._session_pnl = current_portfolio - self._starting_portfolio
 
     def _build_health(
@@ -494,7 +496,7 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
-        self._update_session_pnl(inventory)
+        self._update_session_pnl(inventory, total_usdc=total_usdc)
         pre_analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,

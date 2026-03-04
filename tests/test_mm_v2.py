@@ -289,6 +289,21 @@ def test_runtime_wallet_snapshot_coalesce_uses_expected_balances_for_missing_val
     assert available == pytest.approx(11.0)
 
 
+def test_runtime_session_pnl_uses_wallet_total_not_reserved_bookkeeping():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._starting_portfolio = 15.0
+    inventory = _inventory(
+        free_usdc=9.0,
+        reserved_usdc=8.0,  # stale/local reservation can exceed true wallet lock
+        total_inventory_value_usd=1.0,
+    )
+    mm._update_session_pnl(inventory, total_usdc=10.0)
+    assert mm._session_pnl == pytest.approx(-4.0)
+
+
 @pytest.mark.asyncio
 async def test_runtime_start_requires_initial_wallet_snapshot(monkeypatch):
     class _MockClient:
