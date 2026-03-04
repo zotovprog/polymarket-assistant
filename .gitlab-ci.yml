@@ -15,9 +15,23 @@ Test:
     - rabbit2
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  variables:
+    PM_WEB_ACCESS_KEY: ci-test-key
   script:
     - docker build -f Dockerfile --target test --tag ${IMAGE_NAME}:test-${CI_PIPELINE_IID} .
-    - docker run --rm ${IMAGE_NAME}:test-${CI_PIPELINE_IID}
+    - >
+      docker run --rm
+      -e PM_WEB_ACCESS_KEY=${PM_WEB_ACCESS_KEY}
+      ${IMAGE_NAME}:test-${CI_PIPELINE_IID}
+      python -m pytest -q
+      tests/test_mm_v2.py
+      tests/test_mm_v2_quote_skew.py
+      tests/test_mm_v2_inventory_modes.py
+      tests/test_mm_v2_runtime_skew_flow.py
+      tests/test_mm_v2_sell_release_lag.py
+      tests/test_mm_v2_paper.py
+      tests/test_mm_v2_paper_multiwindow.py
+      tests/test_mm_v2_replay.py
     - docker image rm --force ${IMAGE_NAME}:test-${CI_PIPELINE_IID} || true
 
 
