@@ -283,8 +283,10 @@ async def test_mmv2_stop_runs_emergency_flatten_when_liquidate_true(monkeypatch)
     monkeypatch.setattr(mm.gateway, "emergency_flatten_on_stop", _flatten)
     monkeypatch.setattr(mm.heartbeat, "stop", _hb_stop)
 
-    await mm.stop(liquidate=True)
+    result = await mm.stop(liquidate=True)
     assert calls == ["cancel_all", "flatten", "cancel_all", "heartbeat_stop"]
+    assert result["enabled"] is True
+    assert result["done"] is True
 
 
 @pytest.mark.asyncio
@@ -310,8 +312,10 @@ async def test_mmv2_stop_skips_emergency_flatten_when_liquidate_false(monkeypatc
     monkeypatch.setattr(mm.gateway, "emergency_flatten_on_stop", _flatten)
     monkeypatch.setattr(mm.heartbeat, "stop", _hb_stop)
 
-    await mm.stop(liquidate=False)
+    result = await mm.stop(liquidate=False)
     assert calls == ["cancel_all", "cancel_all", "heartbeat_stop"]
+    assert result["enabled"] is False
+    assert result["done"] is True
 
 
 def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
@@ -1012,3 +1016,37 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["inventory"]["net_delta"] == pytest.approx(4.0)
     assert resp["active_orders_detail"][0]["token"] == "UP"
     assert resp["fill_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_mmv2_stop_exposes_stop_liquidation_summary(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+
+    class _DummyMMV2:
+        async def stop(self, *, liquidate: bool = True):
+            assert liquidate is True
+            return {
+                "enabled": True,
+                "attempted_orders": 2,
+                "placed_orders": 1,
+                "remaining_up": 1.0,
+                "remaining_dn": 0.0,
+                "done": False,
+                "reason": "ok",
+            }
+
+    async def _noop():
+        return None
+
+    monkeypatch.setattr(web_server._runtime_v2, "_running", True)
+    monkeypatch.setattr(web_server._runtime_v2, "mm_v2", _DummyMMV2())
+    monkeypatch.setattr(web_server._runtime_v2, "_cancel_monitor_task", _noop)
+    monkeypatch.setattr(web_server._runtime_v2, "_cancel_strike_retry_task", _noop)
+    monkeypatch.setattr(web_server._runtime_v2, "_stop_feed_tasks", _noop)
+    monkeypatch.setattr(web_server._runtime_v2, "snapshot", lambda: {"alerts": []})
+
+    resp = await web_server.mmv2_stop(request=object())
+    assert resp["ok"] is True
+    assert resp["state"]["stop_liquidation"]["enabled"] is True
+    assert resp["state"]["stop_liquidation"]["done"] is False

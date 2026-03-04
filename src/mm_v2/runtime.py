@@ -235,7 +235,16 @@ class MarketMakerV2:
         self.heartbeat.start()
         self._task = asyncio.create_task(self._run_loop())
 
-    async def stop(self, *, liquidate: bool = True) -> None:
+    async def stop(self, *, liquidate: bool = True) -> dict[str, Any]:
+        liquidation_result: dict[str, Any] = {
+            "enabled": bool(liquidate),
+            "attempted_orders": 0,
+            "placed_orders": 0,
+            "remaining_up": 0.0,
+            "remaining_dn": 0.0,
+            "done": not bool(liquidate),
+            "reason": "skipped" if not liquidate else "",
+        }
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -248,6 +257,8 @@ class MarketMakerV2:
         if liquidate:
             try:
                 liq = await self.gateway.emergency_flatten_on_stop()
+                liquidation_result = dict(liq or {})
+                liquidation_result["enabled"] = True
                 if not bool(liq.get("done", True)):
                     self.set_alert(
                         "stop_liquidation_v2",
@@ -262,8 +273,18 @@ class MarketMakerV2:
                     self.clear_alert("stop_liquidation_v2")
             except Exception as exc:
                 self.set_alert("stop_liquidation_v2", f"Stop liquidation failed: {exc}", level="error")
+                liquidation_result = {
+                    "enabled": True,
+                    "attempted_orders": 0,
+                    "placed_orders": 0,
+                    "remaining_up": 0.0,
+                    "remaining_dn": 0.0,
+                    "done": False,
+                    "reason": f"exception: {exc}",
+                }
         await self.gateway.cancel_all()
         await self.heartbeat.stop()
+        return liquidation_result
 
     def fills_page(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
         total = len(self._fills)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from typing import Any
 
@@ -9,6 +10,8 @@ from mm.types import MarketInfo, Quote, Fill
 
 from .config import MMConfigV2
 from .types import QuoteIntent
+
+log = logging.getLogger("mm.v2.gateway")
 
 
 class PMGateway:
@@ -235,6 +238,13 @@ class PMGateway:
                 if order_id:
                     placed_orders += 1
                     per_round_order_ids.append(order_id)
+                    log.info(
+                        "Stop liquidation placed SELL %s %.2f@%.2f id=%s",
+                        token_id[:8],
+                        size,
+                        price,
+                        order_id[:12],
+                    )
 
             if not per_round_order_ids:
                 break
@@ -250,6 +260,14 @@ class PMGateway:
         rem_up = max(0.0, float(up_remaining or 0.0))
         rem_dn = max(0.0, float(dn_remaining or 0.0))
         done = rem_up < min_size and rem_dn < min_size
+        log.info(
+            "Stop liquidation summary: attempted=%d placed=%d rem_up=%.4f rem_dn=%.4f done=%s",
+            attempted_orders,
+            placed_orders,
+            rem_up,
+            rem_dn,
+            done,
+        )
         return {
             "attempted_orders": attempted_orders,
             "placed_orders": placed_orders,

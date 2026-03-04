@@ -2807,11 +2807,27 @@ class MMRuntimeV2(MMRuntime):
         self._running = False
         await self._cancel_monitor_task()
         await self._cancel_strike_retry_task()
+        stop_liquidation: dict[str, Any] | None = None
         if self.mm_v2:
-            await self.mm_v2.stop(liquidate=liquidate and not emergency)
+            stop_liquidation = await self.mm_v2.stop(liquidate=liquidate and not emergency)
             self.mm_v2 = None
         await self._stop_feed_tasks()
-        return self.snapshot()
+        snap = self.snapshot()
+        if stop_liquidation is not None:
+            snap["stop_liquidation"] = stop_liquidation
+            if bool(stop_liquidation.get("enabled")) and not bool(stop_liquidation.get("done", True)):
+                self.set_alert(
+                    "mmv2_stop_liquidation",
+                    (
+                        "Stop liquidation incomplete: "
+                        f"rem_up={stop_liquidation.get('remaining_up')} "
+                        f"rem_dn={stop_liquidation.get('remaining_dn')}"
+                    ),
+                    level="warning",
+                )
+            else:
+                self.clear_alert("mmv2_stop_liquidation")
+        return snap
 
     def snapshot(self) -> dict:
         if self.mm_v2:
