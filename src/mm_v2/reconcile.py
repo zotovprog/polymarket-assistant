@@ -19,6 +19,8 @@ class SettlementDelta:
 class ReconcileV2:
     STARTUP_RECONCILE_GRACE_SEC = 20.0
     STARTUP_REALIGN_LIMIT = 3
+    DRIFT_CONFIRM_TICKS = 3
+    DRIFT_CONFIRM_WINDOW_SEC = 20.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -28,6 +30,8 @@ class ReconcileV2:
         self._session_started_ts: float = 0.0
         self._fills_seen: int = 0
         self._startup_realign_count: int = 0
+        self._drift_candidate_count: int = 0
+        self._drift_candidate_started_ts: float = 0.0
         self.status: str = "bootstrapping"
         self.true_drift: bool = False
 
@@ -36,6 +40,8 @@ class ReconcileV2:
         self._expected_dn = max(0.0, float(dn_shares))
         self.status = "ok"
         self.true_drift = False
+        self._drift_candidate_count = 0
+        self._drift_candidate_started_ts = 0.0
 
     def start_session(self, up_shares: float, dn_shares: float) -> None:
         """Initialize expected balances for a fresh runtime session."""
@@ -44,6 +50,20 @@ class ReconcileV2:
         self._fills_seen = 0
         self._startup_realign_count = 0
         self._settlement.clear()
+
+    def _mark_drift_candidate(self) -> bool:
+        """Return True when persistent mismatch is confirmed as true drift."""
+        now = time.time()
+        if (
+            self._drift_candidate_count <= 0
+            or self._drift_candidate_started_ts <= 0
+            or (now - self._drift_candidate_started_ts) > self.DRIFT_CONFIRM_WINDOW_SEC
+        ):
+            self._drift_candidate_count = 1
+            self._drift_candidate_started_ts = now
+        else:
+            self._drift_candidate_count += 1
+        return self._drift_candidate_count >= self.DRIFT_CONFIRM_TICKS
 
     def expected_balances(self) -> tuple[float | None, float | None]:
         """Return latest internal expected wallet balances."""
@@ -146,22 +166,34 @@ class ReconcileV2:
         if up_diff <= threshold and dn_diff <= threshold:
             self.status = "ok"
             self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
         elif explained:
             self.status = "settlement_lag"
             self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
         elif sellability_lag_active:
             # PM may briefly report constrained free token balance after SELL
             # cancel/repost. Treat this window as transient execution lag.
             self.status = "sellability_lag"
             self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
         elif self._startup_realign_allowed():
             self._startup_realign_count += 1
             self.status = "startup_realign"
             self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
         else:
-            self.status = "broken"
-            self.true_drift = True
-        if not self.true_drift:
+            if self._mark_drift_candidate():
+                self.status = "broken"
+                self.true_drift = True
+            else:
+                self.status = "drift_pending"
+                self.true_drift = False
+        if self.status in {"ok", "settlement_lag", "sellability_lag", "startup_realign"}:
             self._expected_up = max(0.0, float(real_up))
             self._expected_dn = max(0.0, float(real_dn))
         return build_pair_inventory(
