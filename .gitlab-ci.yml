@@ -25,6 +25,7 @@ Test:
       ${IMAGE_NAME}:test-${CI_PIPELINE_IID}
       python -m pytest -q
       tests/test_mm_v2.py
+      tests/test_mm_v2_pnl_accounting.py
       tests/test_mm_v2_quote_skew.py
       tests/test_mm_v2_inventory_modes.py
       tests/test_mm_v2_runtime_skew_flow.py

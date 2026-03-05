@@ -873,6 +873,55 @@ async def test_state_exposes_quote_viability_reason(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_state_exposes_wallet_inventory_usdc_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "quoting",
+            "inventory": {
+                "wallet_total_usdc": 27.5,
+                "wallet_reserved_usdc": 4.5,
+                "pending_buy_reserved_usdc": 1.2,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["inventory"]["wallet_total_usdc"] == pytest.approx(27.5)
+    assert resp["inventory"]["wallet_reserved_usdc"] == pytest.approx(4.5)
+    assert resp["inventory"]["pending_buy_reserved_usdc"] == pytest.approx(1.2)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_pnl_component_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "quoting",
+            "analytics": {
+                "session_pnl": 0.42,
+                "position_mark_value_usd": 8.15,
+                "portfolio_mark_value_usd": 23.15,
+                "tradeable_portfolio_value_usd": 21.0,
+                "pnl_calc_mode": "wallet_total_plus_mark",
+                "pnl_updated_ts": 123456.0,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["position_mark_value_usd"] == pytest.approx(8.15)
+    assert resp["analytics"]["portfolio_mark_value_usd"] == pytest.approx(23.15)
+    assert resp["analytics"]["tradeable_portfolio_value_usd"] == pytest.approx(21.0)
+    assert resp["analytics"]["pnl_calc_mode"] == "wallet_total_plus_mark"
+    assert resp["analytics"]["pnl_updated_ts"] == pytest.approx(123456.0)
+
+
+@pytest.mark.asyncio
 async def test_state_exposes_sellable_inventory_fields(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
@@ -1166,6 +1215,9 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "dn_shares": 1.0,
                 "free_usdc": 40.0,
                 "reserved_usdc": 5.0,
+                "wallet_total_usdc": 45.0,
+                "wallet_reserved_usdc": 5.0,
+                "pending_buy_reserved_usdc": 2.6,
                 "total_inventory_value_usd": 999.0,
             },
             "quotes": {
@@ -1176,7 +1228,14 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
             },
             "risk": {"hard_mode": "none", "reason": ""},
             "health": {"last_fallback_poll_count": 4},
-            "analytics": {"session_pnl": 1.23, "fill_count": 1, "spread_capture_usd": 0.0},
+            "analytics": {
+                "session_pnl": 1.23,
+                "fill_count": 1,
+                "spread_capture_usd": 0.0,
+                "position_mark_value_usd": 3.12,
+                "tradeable_portfolio_value_usd": 43.12,
+                "portfolio_mark_value_usd": 48.12,
+            },
             "alerts": [],
             "config": {"session_budget_usd": 50.0},
         },
@@ -1194,7 +1253,8 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["active_orders_detail"][0]["token"] == "UP"
     assert resp["usdc_reserved_pm"] == pytest.approx(5.0)
     assert resp["position_value_pm"] == pytest.approx(3.12)
-    assert resp["portfolio_value"] == pytest.approx(48.12)
+    assert resp["portfolio_value"] == pytest.approx(43.12)
+    assert resp["wallet_portfolio_value"] == pytest.approx(48.12)
     assert resp["fill_count"] == 1
 
 

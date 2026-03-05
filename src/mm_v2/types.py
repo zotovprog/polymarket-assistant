@@ -50,6 +50,9 @@ class PairInventoryState:
     excess_up_value_usd: float
     excess_dn_value_usd: float
     total_inventory_value_usd: float
+    wallet_total_usdc: float = 0.0
+    wallet_reserved_usdc: float = 0.0
+    pending_buy_reserved_usdc: float = 0.0
     excess_value_usd: float = 0.0
     signed_excess_value_usd: float = 0.0
     inventory_pressure_abs: float = 0.0
@@ -137,6 +140,11 @@ class ExecutionState:
 class AnalyticsState:
     fill_count: int = 0
     session_pnl: float = 0.0
+    position_mark_value_usd: float = 0.0
+    portfolio_mark_value_usd: float = 0.0
+    tradeable_portfolio_value_usd: float = 0.0
+    pnl_calc_mode: str = "wallet_total_plus_mark"
+    pnl_updated_ts: float = 0.0
     markout_1s: float = 0.0
     markout_5s: float = 0.0
     spread_capture_usd: float = 0.0

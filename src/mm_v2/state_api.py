@@ -43,6 +43,9 @@ def serialize_engine_state(
         "inventory_pressure_signed": round(state.inventory.inventory_pressure_signed, 6),
         "sellable_up_shares": round(state.inventory.sellable_up_shares, 4),
         "sellable_dn_shares": round(state.inventory.sellable_dn_shares, 4),
+        "wallet_total_usdc": round(state.inventory.wallet_total_usdc, 4),
+        "wallet_reserved_usdc": round(state.inventory.wallet_reserved_usdc, 4),
+        "pending_buy_reserved_usdc": round(state.inventory.pending_buy_reserved_usdc, 4),
     }
     quotes = {
         "up_bid": _serialize_quote(state.current_quotes.up_bid, suppressed_reason=state.current_quotes.suppressed_reasons.get("up_bid")),

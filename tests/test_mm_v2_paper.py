@@ -170,3 +170,34 @@ async def test_mmv2_paper_partial_fills_do_not_trigger_true_drift(monkeypatch):
         assert snap["lifecycle"] != "halted"
     finally:
         await mm.stop(liquidate=False)
+
+
+@pytest.mark.asyncio
+async def test_mmv2_paper_place_cancel_without_fills_keeps_session_pnl_stable(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server.random, "random", lambda: 1.0)
+    monkeypatch.setattr(web_server.random, "uniform", lambda a, _b: a)
+
+    client = web_server.MockClobClient(fill_prob=0.0, usdc_balance=50.0)
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0, tick_interval_sec=10.0)
+    mm = MarketMakerV2(_feed_state(), client, cfg)
+    mm.set_market(_market())
+
+    await mm.start()
+    try:
+        await mm._tick()
+        snap_before = mm.snapshot()
+        pnl_before = float(snap_before["analytics"]["session_pnl"])
+        fills_before = int(snap_before["analytics"]["fill_count"])
+
+        await mm.gateway.cancel_all()
+        await mm._tick()
+        snap_after = mm.snapshot()
+        pnl_after = float(snap_after["analytics"]["session_pnl"])
+        fills_after = int(snap_after["analytics"]["fill_count"])
+
+        assert fills_before == 0
+        assert fills_after == 0
+        assert pnl_after == pytest.approx(pnl_before, abs=1e-9)
+    finally:
+        await mm.stop(liquidate=False)

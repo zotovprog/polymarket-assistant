@@ -3041,11 +3041,13 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
     up_mark = max(0.0, up_mark)
     dn_mark = max(0.0, dn_mark)
     free_usdc = float(inventory.get("free_usdc") or 0.0)
-    reserved_usdc = float(inventory.get("reserved_usdc") or 0.0)
+    reserved_usdc = float(inventory.get("wallet_reserved_usdc") or inventory.get("reserved_usdc") or 0.0)
+    wallet_total_usdc = float(inventory.get("wallet_total_usdc") or (free_usdc + reserved_usdc))
     up_shares = float(inventory.get("up_shares") or 0.0)
     dn_shares = float(inventory.get("dn_shares") or 0.0)
-    position_value = up_shares * up_mark + dn_shares * dn_mark
-    portfolio_value = free_usdc + reserved_usdc + position_value
+    position_value = float(analytics.get("position_mark_value_usd") or (up_shares * up_mark + dn_shares * dn_mark))
+    portfolio_value = float(analytics.get("tradeable_portfolio_value_usd") or (free_usdc + position_value))
+    wallet_portfolio_value = float(analytics.get("portfolio_mark_value_usd") or (wallet_total_usdc + position_value))
     feed_mid = float(getattr(_runtime_v2.feed_state, "mid", 0.0) or 0.0) if _runtime_v2.feed_state else 0.0
     lifecycle = str(raw.get("lifecycle") or "bootstrapping")
     is_running = bool(raw.get("is_running", False))
@@ -3061,10 +3063,11 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
         "started_at": started_at,
         "uptime_sec": round(max(0.0, now_ts - started_at), 2) if started_at else 0.0,
         "session_limit": float((raw.get("config") or {}).get("session_budget_usd") or _runtime_v2._initial_usdc or 0.0),
-        "usdc_balance_pm": round(free_usdc + reserved_usdc, 4),
+        "usdc_balance_pm": round(wallet_total_usdc, 4),
         "usdc_free_pm": round(free_usdc, 4),
         "usdc_reserved_pm": round(reserved_usdc, 4),
         "portfolio_value": round(portfolio_value, 4),
+        "wallet_portfolio_value": round(wallet_portfolio_value, 4),
         "position_value_pm": round(position_value, 4),
         "session_pnl": float(analytics.get("session_pnl") or 0.0),
         "realized_pnl": float(analytics.get("spread_capture_usd") or 0.0),

@@ -441,7 +441,7 @@ function updateUI(s) {
         setNumberAnimated('inv-dn-worth', dnW, '$', 2);
         const portfolioTotal = (s.portfolio_value != null)
             ? s.portfolio_value
-            : (upW + dnW + freeUsdcDisplay + reservedUsdcDisplay);
+            : (upW + dnW + freeUsdcDisplay);
         setNumberAnimated('inv-total-value', portfolioTotal, '$', 2);
     }
 

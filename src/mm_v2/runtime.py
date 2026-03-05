@@ -340,17 +340,34 @@ class MarketMakerV2:
         dn_mark = max(0.0, dn_mark)
         return max(0.0, float(inventory.up_shares)) * up_mark + max(0.0, float(inventory.dn_shares)) * dn_mark
 
+    def _portfolio_components(
+        self,
+        *,
+        inventory: PairInventoryState,
+        total_usdc: float,
+        snapshot: PairMarketSnapshot,
+    ) -> tuple[float, float, float]:
+        position_mark_value = self._position_mark_value(snapshot=snapshot, inventory=inventory)
+        portfolio_mark_value = max(0.0, float(total_usdc)) + position_mark_value
+        tradeable_portfolio_value = max(0.0, float(inventory.free_usdc)) + position_mark_value
+        return position_mark_value, portfolio_mark_value, tradeable_portfolio_value
+
     def _update_session_pnl(
         self,
         inventory: PairInventoryState,
         *,
         total_usdc: float,
         snapshot: PairMarketSnapshot,
-    ) -> None:
+    ) -> tuple[float, float, float]:
         # PnL must use wallet-total USDC + marked inventory value.
         # Pending/reserved order bookkeeping must not move session PnL.
-        current_portfolio = max(0.0, float(total_usdc)) + self._position_mark_value(snapshot=snapshot, inventory=inventory)
+        position_mark_value, current_portfolio, tradeable_portfolio = self._portfolio_components(
+            inventory=inventory,
+            total_usdc=total_usdc,
+            snapshot=snapshot,
+        )
         self._session_pnl = current_portfolio - self._starting_portfolio
+        return position_mark_value, current_portfolio, tradeable_portfolio
 
     def _build_health(
         self,
@@ -509,7 +526,31 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
-        self._update_session_pnl(inventory, total_usdc=total_usdc, snapshot=snapshot)
+        position_mark_value, portfolio_mark_value, tradeable_portfolio_value = self._update_session_pnl(
+            inventory,
+            total_usdc=total_usdc,
+            snapshot=snapshot,
+        )
+        if inventory.free_usdc > (inventory.wallet_total_usdc + 1e-6):
+            self.set_alert(
+                "wallet_invariant_v2",
+                (
+                    "wallet invariant violated: free_usdc exceeds wallet_total_usdc "
+                    f"({inventory.free_usdc:.4f}>{inventory.wallet_total_usdc:.4f})"
+                ),
+                level="warning",
+            )
+        elif abs((inventory.free_usdc + inventory.wallet_reserved_usdc) - inventory.wallet_total_usdc) > 1e-6:
+            self.set_alert(
+                "wallet_invariant_v2",
+                (
+                    "wallet invariant violated: free+reserved != total "
+                    f"({inventory.free_usdc + inventory.wallet_reserved_usdc:.4f}!={inventory.wallet_total_usdc:.4f})"
+                ),
+                level="warning",
+            )
+        else:
+            self.clear_alert("wallet_invariant_v2")
         pre_analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,
@@ -595,6 +636,11 @@ class MarketMakerV2:
         analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl,
+            position_mark_value_usd=float(position_mark_value),
+            portfolio_mark_value_usd=float(portfolio_mark_value),
+            tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
+            pnl_calc_mode="wallet_total_plus_mark",
+            pnl_updated_ts=float(now),
             markout_1s=0.0,
             markout_5s=0.0,
             spread_capture_usd=0.0,
