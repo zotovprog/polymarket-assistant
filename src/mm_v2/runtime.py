@@ -623,9 +623,19 @@ class MarketMakerV2:
             "emergency_unwind_ratio_60s": counts["emergency_unwind"] / total,
         }
 
-    def _update_mm_regime_alert(self, *, quoting_ratio_60s: float, unwind_ratio_60s: float) -> None:
+    def _update_mm_regime_alert(
+        self,
+        *,
+        quoting_ratio_60s: float,
+        inventory_skewed_ratio_60s: float,
+        defensive_ratio_60s: float,
+        unwind_ratio_60s: float,
+    ) -> None:
         now = time.time()
-        degraded = bool(unwind_ratio_60s > 0.50 or quoting_ratio_60s < 0.30)
+        mm_active_ratio_60s = float(
+            quoting_ratio_60s + inventory_skewed_ratio_60s + defensive_ratio_60s
+        )
+        degraded = bool(unwind_ratio_60s > 0.50 or mm_active_ratio_60s < 0.30)
         if degraded:
             if self._mm_regime_degraded_started_ts <= 0.0:
                 self._mm_regime_degraded_started_ts = now
@@ -633,7 +643,8 @@ class MarketMakerV2:
                 self.set_alert(
                     "mm_regime_degraded",
                     (
-                        f"MM regime degraded: quoting_ratio_60s={quoting_ratio_60s:.2f}, "
+                        f"MM regime degraded: mm_active_ratio_60s={mm_active_ratio_60s:.2f}, "
+                        f"quoting_ratio_60s={quoting_ratio_60s:.2f}, "
                         f"unwind_ratio_60s={unwind_ratio_60s:.2f}"
                     ),
                     level="warning",
@@ -859,6 +870,8 @@ class MarketMakerV2:
         regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC))
         self._update_mm_regime_alert(
             quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
+            inventory_skewed_ratio_60s=float(regime_ratios["inventory_skewed_ratio_60s"]),
+            defensive_ratio_60s=float(regime_ratios["defensive_ratio_60s"]),
             unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
         )
         analytics = AnalyticsState(

@@ -545,8 +545,28 @@ def test_mm_regime_degraded_alert_fires_on_unwind_dominance():
     mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
     # Emulate prolonged degraded regime.
     mm._mm_regime_degraded_started_ts = time.time() - 130.0
-    mm._update_mm_regime_alert(quoting_ratio_60s=0.10, unwind_ratio_60s=0.80)
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.10,
+        inventory_skewed_ratio_60s=0.05,
+        defensive_ratio_60s=0.05,
+        unwind_ratio_60s=0.80,
+    )
     assert "mm_regime_degraded" in mm._alerts
+
+
+def test_mm_regime_degraded_alert_does_not_fire_for_defensive_mm_activity():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.00,
+        inventory_skewed_ratio_60s=0.30,
+        defensive_ratio_60s=0.40,
+        unwind_ratio_60s=0.27,
+    )
+    assert "mm_regime_degraded" not in mm._alerts
 
 
 def test_hard_cap_entry_then_recovery_exits_unwind_before_expiry():
