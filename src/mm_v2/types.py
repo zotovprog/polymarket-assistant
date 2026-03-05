@@ -172,6 +172,9 @@ class AnalyticsState:
     unwind_ratio_60s: float = 0.0
     emergency_unwind_ratio_60s: float = 0.0
     four_quote_ratio_60s: float = 0.0
+    unwind_target_mismatch_ticks: int = 0
+    unwind_target_mismatch_sec: float = 0.0
+    unwind_exit_armed: bool = False
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -203,6 +206,7 @@ class SoftTransitionResult:
     progress_ratio: float = 0.0
     no_progress: bool = False
     reason: str = ""
+    unwind_exit_armed: bool = False
 
 
 @dataclass

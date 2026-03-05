@@ -381,8 +381,11 @@ class QuotePolicyV2:
                     built[slot] = None
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
+            buy_headroom_usd = budget_headroom_usd
+            if side == "BUY" and effect == "helpful" and risk.soft_mode == "unwind":
+                buy_headroom_usd = max(0.0, free_usdc)
             if side == "BUY":
-                nominal_quote_clip_usd = min(clip_usd, budget_headroom_usd) * size_mult
+                nominal_quote_clip_usd = min(clip_usd, buy_headroom_usd) * size_mult
             elif inventory_backed_sell:
                 nominal_quote_clip_usd = clip_usd * size_mult
             else:
@@ -391,16 +394,17 @@ class QuotePolicyV2:
             floor_allowed = False
             if (
                 effect == "helpful"
-                and risk.soft_mode in {"inventory_skewed", "defensive"}
+                and risk.soft_mode in {"inventory_skewed", "defensive", "unwind"}
                 and risk.inventory_side != "flat"
             ):
+                helpful_headroom_usd = buy_headroom_usd if side == "BUY" else budget_headroom_usd
                 floor_allowed = (
                     (
                         side == "SELL"
                         and inventory_backed_sell
                         and owned_share_cap >= ctx.min_order_size
                     )
-                    or min_viable_clip_usd <= budget_headroom_usd * max(1.0, size_mult)
+                    or min_viable_clip_usd <= helpful_headroom_usd * max(1.0, size_mult)
                 )
             elif (
                 effect == "neutral"

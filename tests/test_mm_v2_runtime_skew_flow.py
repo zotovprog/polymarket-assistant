@@ -13,7 +13,7 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm_v2.config import MMConfigV2
+from mm_v2.config import MMConfigV2, UNWIND_EXIT_CONFIRM_TICKS
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
@@ -547,3 +547,97 @@ def test_mm_regime_degraded_alert_fires_on_unwind_dominance():
     mm._mm_regime_degraded_started_ts = time.time() - 130.0
     mm._update_mm_regime_alert(quoting_ratio_60s=0.10, unwind_ratio_60s=0.80)
     assert "mm_regime_degraded" in mm._alerts
+
+
+def test_hard_cap_entry_then_recovery_exits_unwind_before_expiry():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    sm = StateMachineV2(cfg)
+    snapshot = _snapshot(time_left_sec=600.0)
+    high_excess_inventory = _inventory(
+        dn_shares=11.0,
+        excess_dn_qty=11.0,
+        excess_dn_value_usd=5.8,
+        excess_value_usd=5.8,
+        signed_excess_value_usd=-5.8,
+        total_inventory_value_usd=5.8,
+    )
+    high_risk, _, _ = _risk_and_plan(cfg, snapshot, high_excess_inventory)
+    assert high_risk.target_soft_mode == "unwind"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.30)
+    for _ in range(8):
+        sm.transition(snapshot=snapshot, inventory=high_excess_inventory, risk=high_risk, viability=viability)
+    assert sm.lifecycle == "unwind"
+    sm._unwind_started_at = time.time() - 10.0
+
+    recovered_inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    recovered_risk, _, _ = _risk_and_plan(cfg, snapshot, recovered_inventory)
+    assert recovered_risk.target_soft_mode == "defensive"
+    result = None
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snapshot, inventory=recovered_inventory, risk=recovered_risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "defensive"
+    assert result.effective_soft_mode == "defensive"
+
+
+def test_unwind_target_mismatch_metrics_are_exposed_and_decay_after_exit():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    sec_1 = mm._update_unwind_target_mismatch(effective_soft_mode="unwind", target_soft_mode="defensive")
+    assert mm._unwind_target_mismatch_ticks == 1
+    sec_2 = mm._update_unwind_target_mismatch(effective_soft_mode="unwind", target_soft_mode="inventory_skewed")
+    assert mm._unwind_target_mismatch_ticks == 2
+    assert sec_2 >= sec_1
+
+    mm._last_analytics = AnalyticsState(
+        unwind_target_mismatch_ticks=mm._unwind_target_mismatch_ticks,
+        unwind_target_mismatch_sec=sec_2,
+        unwind_exit_armed=True,
+    )
+    snap = mm.snapshot()
+    assert snap["analytics"]["unwind_target_mismatch_ticks"] == 2
+    assert snap["analytics"]["unwind_target_mismatch_sec"] >= 0.0
+    assert snap["analytics"]["unwind_exit_armed"] is True
+
+    sec_3 = mm._update_unwind_target_mismatch(effective_soft_mode="defensive", target_soft_mode="defensive")
+    assert sec_3 == 0.0
+    assert mm._unwind_target_mismatch_ticks == 0
+
+
+def test_sellability_lag_with_lower_target_does_not_stick_unwind_indefinitely():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
+    snapshot = _snapshot(time_left_sec=600.0)
+    inventory = _inventory(
+        up_shares=6.0,
+        excess_up_qty=6.0,
+        excess_up_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(sellability_lag_active=True),
+    )
+    assert risk.hard_mode == "none"
+    assert risk.target_soft_mode == "defensive"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.30)
+    result = None
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "defensive"

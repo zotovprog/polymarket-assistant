@@ -267,3 +267,88 @@ def test_live_like_low_free_usdc_does_not_collapse_to_none_below_hard_cap():
     assert risk.hard_mode == "none"
     assert plan.quote_balance_state != "none"
     assert plan.quote_viability_reason != "all_quotes_below_min_size"
+
+
+def test_unwind_while_target_lower_ratio_is_bounded_outside_expiry():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    sm = StateMachineV2(cfg)
+    snapshot = _snapshot(time_left_sec=600.0)
+    high_inventory = _inventory(
+        dn_shares=11.0,
+        excess_dn_qty=11.0,
+        excess_dn_value_usd=5.8,
+        excess_value_usd=5.8,
+        signed_excess_value_usd=-5.8,
+        total_inventory_value_usd=5.8,
+    )
+    low_inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    high_risk, _ = _evaluate(cfg, snapshot, high_inventory)
+    low_risk, _ = _evaluate(cfg, snapshot, low_inventory)
+    assert high_risk.target_soft_mode == "unwind"
+    assert low_risk.target_soft_mode == "defensive"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.30)
+
+    samples: list[tuple[str, str, float]] = []
+    for _ in range(8):
+        result = sm.transition(snapshot=snapshot, inventory=high_inventory, risk=high_risk, viability=viability)
+        samples.append((result.effective_soft_mode, result.target_soft_mode, snapshot.time_left_sec))
+    sm._unwind_started_at = time.time() - 10.0
+    for _ in range(20):
+        result = sm.transition(snapshot=snapshot, inventory=low_inventory, risk=low_risk, viability=viability)
+        samples.append((result.effective_soft_mode, result.target_soft_mode, snapshot.time_left_sec))
+
+    eligible = [entry for entry in samples if entry[2] > cfg.unwind_window_sec]
+    mismatch = [entry for entry in eligible if entry[0] == "unwind" and entry[1] != "unwind"]
+    ratio = (len(mismatch) / len(eligible)) if eligible else 0.0
+    assert ratio < 0.25
+
+
+def test_non_expiry_quote_balance_none_not_more_than_three_consecutive():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        time_left_sec=600.0,
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=12.0,
+    )
+    risk, _ = _evaluate(cfg, snapshot, inventory, min_order_size=5.0)
+    if risk.soft_mode != "unwind":
+        risk.soft_mode = "unwind"
+        risk.target_soft_mode = "defensive"
+    policy = QuotePolicyV2(cfg)
+    max_none_streak = 0
+    current_none_streak = 0
+    for _ in range(12):
+        plan = policy.generate(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+        )
+        if snapshot.time_left_sec > cfg.unwind_window_sec and plan.quote_balance_state == "none":
+            current_none_streak += 1
+            max_none_streak = max(max_none_streak, current_none_streak)
+        else:
+            current_none_streak = 0
+    assert max_none_streak <= 3

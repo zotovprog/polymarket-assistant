@@ -271,6 +271,176 @@ def test_unwind_mode_disables_only_pair_expanding_intents():
     assert plan.up_bid is not None
 
 
+def test_unwind_helpful_floor_applies_for_helpful_buy_intents():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=6.0,
+        excess_value_usd=6.0,
+        signed_excess_value_usd=-6.0,
+        total_inventory_value_usd=6.0,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "unwind"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_bid is not None
+    assert plan.up_bid.inventory_effect == "helpful"
+    assert plan.up_bid.size >= 5.0
+    assert plan.quote_viability_reason in {"helpful_floor_applied", "balanced", "helpful_only", "reduced"}
+
+
+def test_unwind_helpful_buy_uses_full_free_usdc_headroom_not_20pct_cap():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=6.0,
+        excess_value_usd=6.0,
+        signed_excess_value_usd=-6.0,
+        total_inventory_value_usd=6.0,
+        free_usdc=12.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "unwind"
+    min_viable_clip = 5.0 * max(snapshot.fv_up, snapshot.fv_dn, 0.5)
+    assert min_viable_clip > (inventory.free_usdc * 0.20)
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_bid is not None
+    assert plan.up_bid.inventory_effect == "helpful"
+    assert plan.up_bid.size >= 5.0
+
+
+def test_unwind_does_not_enable_harmful_intents():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=6.0,
+        excess_value_usd=6.0,
+        signed_excess_value_usd=-6.0,
+        total_inventory_value_usd=6.0,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "unwind"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    harmful_active = [
+        intent
+        for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+        if intent and intent.inventory_effect == "harmful"
+    ]
+    assert not harmful_active
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+
+
+def test_unwind_below_hard_cap_avoids_none_when_helpful_liquidity_exists():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        fv_dn=0.02,
+        pm_mid_up=0.98,
+        pm_mid_dn=0.02,
+        up_best_bid=0.97,
+        up_best_ask=0.98,
+        dn_best_bid=0.02,
+        dn_best_ask=0.03,
+    )
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=9.4,
+        excess_value_usd=9.4,
+        signed_excess_value_usd=-9.4,
+        total_inventory_value_usd=9.4,
+        free_usdc=12.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode in {"inventory_skewed", "defensive"}
+    risk.soft_mode = "unwind"
+    risk.target_soft_mode = "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.quote_balance_state != "none"
+    helpful_count = sum(
+        1
+        for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
+        if intent and intent.inventory_effect == "helpful"
+    )
+    assert helpful_count >= 1
+
+
 def test_pair_complementarity_survives_inventory_skew_adjustment():
     _, plan = _plan_for(
         _inventory(excess_up_value_usd=2.5, excess_value_usd=2.5, signed_excess_value_usd=2.5),

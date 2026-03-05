@@ -80,6 +80,8 @@ class MarketMakerV2:
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
         self._mm_regime_degraded_started_ts = 0.0
+        self._unwind_target_mismatch_ticks = 0
+        self._unwind_target_mismatch_started_ts = 0.0
         self._last_snapshot: PairMarketSnapshot | None = None
         self._last_inventory = PairInventoryState(
             up_shares=0.0,
@@ -262,6 +264,8 @@ class MarketMakerV2:
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
         self._mm_regime_degraded_started_ts = 0.0
+        self._unwind_target_mismatch_ticks = 0
+        self._unwind_target_mismatch_started_ts = 0.0
         self._lifecycle_history.clear()
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
@@ -638,6 +642,24 @@ class MarketMakerV2:
         self._mm_regime_degraded_started_ts = 0.0
         self.clear_alert("mm_regime_degraded")
 
+    def _update_unwind_target_mismatch(
+        self,
+        *,
+        effective_soft_mode: str,
+        target_soft_mode: str,
+    ) -> float:
+        now = time.time()
+        if effective_soft_mode == "unwind" and target_soft_mode != "unwind":
+            if self._unwind_target_mismatch_started_ts <= 0.0:
+                self._unwind_target_mismatch_started_ts = now
+                self._unwind_target_mismatch_ticks = 1
+            else:
+                self._unwind_target_mismatch_ticks += 1
+            return max(0.0, now - self._unwind_target_mismatch_started_ts)
+        self._unwind_target_mismatch_ticks = 0
+        self._unwind_target_mismatch_started_ts = 0.0
+        return 0.0
+
     async def _tick(self) -> None:
         if not self.market:
             return
@@ -788,6 +810,10 @@ class MarketMakerV2:
             reason=transition.reason or risk.reason,
         )
         lifecycle = transition.lifecycle
+        unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
+            effective_soft_mode=effective_risk.soft_mode,
+            target_soft_mode=effective_risk.target_soft_mode,
+        )
         if lifecycle in {"halted", "expired"}:
             await self.gateway.cancel_all()
             plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
@@ -870,6 +896,9 @@ class MarketMakerV2:
             unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
             emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
             four_quote_ratio_60s=float(four_quote_ratio_60s),
+            unwind_target_mismatch_ticks=int(self._unwind_target_mismatch_ticks),
+            unwind_target_mismatch_sec=float(unwind_target_mismatch_sec),
+            unwind_exit_armed=bool(transition.unwind_exit_armed),
             recent_fills=[
                 {
                     "ts": f.ts,

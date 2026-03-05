@@ -8,6 +8,9 @@ from .config import (
     FOUR_QUOTE_MIN_RATIO_FOR_MM,
     MMConfigV2,
     NO_HELPFUL_TICKS_FOR_UNWIND,
+    UNWIND_EXIT_CONFIRM_TICKS,
+    UNWIND_MIN_HOLD_SEC,
+    UNWIND_REENTRY_COOLDOWN_SEC,
     UNWIND_MIN_PROGRESS_RATIO,
     UNWIND_STUCK_WINDOW_SEC,
 )
@@ -34,6 +37,8 @@ class StateMachineV2:
         self._excess_baseline_value_usd = 0.0
         self._excess_baseline_ts = 0.0
         self._no_helpful_ticks = 0
+        self._unwind_exit_ticks = 0
+        self._unwind_last_exit_ts = 0.0
 
     def seconds_in_mode(self) -> float:
         return max(0.0, time.time() - self._entered_at)
@@ -60,12 +65,17 @@ class StateMachineV2:
     def _set_lifecycle(self, next_state: str) -> None:
         if next_state == self.lifecycle:
             return
+        previous = self.lifecycle
         self.lifecycle = next_state
-        self._entered_at = time.time()
+        now = time.time()
+        self._entered_at = now
         if next_state == "unwind":
-            self._unwind_started_at = time.time()
+            self._unwind_started_at = now
+        elif previous == "unwind":
+            self._unwind_last_exit_ts = now
+            self._unwind_exit_ticks = 0
         if next_state == "emergency_unwind":
-            self._emergency_started_at = time.time()
+            self._emergency_started_at = now
         if next_state in {"quoting", "inventory_skewed", "defensive"}:
             self._healthy_ticks = 0
 
@@ -98,6 +108,7 @@ class StateMachineV2:
         progress_ratio = 0.0
         no_progress = False
         reason = ""
+        unwind_exit_armed = False
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
         if snapshot is None:
             self._set_lifecycle("bootstrapping")
@@ -152,30 +163,57 @@ class StateMachineV2:
                         next_state = name
                         break
         elif target_level < current_level:
-            baseline = self._excess_baseline_value_usd if self._excess_baseline_ts > 0 else float(inventory.excess_value_usd)
-            # Unwind should be able to de-escalate when soft target is already lower.
-            # Quality pressure may remain high in defensive markets, but if target mode
-            # dropped below unwind and excess is not worsening, do not pin lifecycle.
-            quality_allows_exit = (
-                float(risk.quality_pressure) < 1.0
-                or self.lifecycle == "unwind"
-            )
-            is_healthy = (
-                target_level < current_level
-                and float(inventory.excess_value_usd) <= max(0.0, baseline * 1.02)
-                and quality_allows_exit
-            )
-            if is_healthy:
-                self._healthy_ticks += 1
-            else:
+            if self.lifecycle == "unwind":
+                unwind_hold_elapsed = (
+                    now - self._unwind_started_at
+                    if self._unwind_started_at > 0.0
+                    else 0.0
+                )
+                reentry_cooldown_elapsed = (
+                    now - self._unwind_last_exit_ts
+                    if self._unwind_last_exit_ts > 0.0
+                    else float("inf")
+                )
+                unwind_exit_armed = (
+                    risk.hard_mode == "none"
+                    and float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
+                    and target_soft_mode in {"normal", "inventory_skewed", "defensive"}
+                    and viability.any_quote
+                    and unwind_hold_elapsed >= float(UNWIND_MIN_HOLD_SEC)
+                    and reentry_cooldown_elapsed >= float(UNWIND_REENTRY_COOLDOWN_SEC)
+                )
+                if unwind_exit_armed:
+                    self._unwind_exit_ticks += 1
+                else:
+                    self._unwind_exit_ticks = 0
                 self._healthy_ticks = 0
-            if self._healthy_ticks >= EXIT_CONFIRM_TICKS:
-                for name, level in self._SOFT_ORDER.items():
-                    if level == current_level - 1:
-                        next_state = name
-                        break
+                if self._unwind_exit_ticks >= UNWIND_EXIT_CONFIRM_TICKS:
+                    next_state = "defensive"
+                    self._unwind_exit_ticks = 0
+            else:
+                baseline = (
+                    self._excess_baseline_value_usd
+                    if self._excess_baseline_ts > 0
+                    else float(inventory.excess_value_usd)
+                )
+                quality_allows_exit = float(risk.quality_pressure) < 1.0
+                is_healthy = (
+                    target_level < current_level
+                    and float(inventory.excess_value_usd) <= max(0.0, baseline * 1.02)
+                    and quality_allows_exit
+                )
+                if is_healthy:
+                    self._healthy_ticks += 1
+                else:
+                    self._healthy_ticks = 0
+                if self._healthy_ticks >= EXIT_CONFIRM_TICKS:
+                    for name, level in self._SOFT_ORDER.items():
+                        if level == current_level - 1:
+                            next_state = name
+                            break
         else:
             self._healthy_ticks = 0
+            self._unwind_exit_ticks = 0
 
         if next_state in {"inventory_skewed", "defensive", "unwind"}:
             if self._excess_baseline_ts <= 0:
@@ -230,4 +268,5 @@ class StateMachineV2:
             progress_ratio=progress_ratio,
             no_progress=no_progress,
             reason=reason or risk.reason,
+            unwind_exit_armed=bool(unwind_exit_armed),
         )

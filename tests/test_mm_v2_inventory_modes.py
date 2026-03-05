@@ -12,7 +12,7 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm_v2.config import EXIT_CONFIRM_TICKS, MMConfigV2
+from mm_v2.config import MMConfigV2, UNWIND_EXIT_CONFIRM_TICKS
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
 from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
@@ -348,6 +348,7 @@ def test_unwind_deescalates_when_target_mode_drops_even_if_quality_is_poor():
     cfg = MMConfigV2(session_budget_usd=15.0)
     sm = StateMachineV2(cfg)
     sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
     inventory = _inventory(
         up_shares=4.88,
         dn_shares=1.35,
@@ -373,20 +374,162 @@ def test_unwind_deescalates_when_target_mode_drops_even_if_quality_is_poor():
     assert risk.target_soft_mode == "defensive"
     assert risk.quality_pressure >= 1.0
     viability = QuoteViabilitySummary(
-        any_quote=False,
+        any_quote=True,
         four_quotes=False,
-        helpful_count=0,
+        helpful_count=1,
         harmful_count=0,
-        helpful_only=False,
+        helpful_only=True,
         harmful_only=False,
-        four_quote_presence_ratio=0.0,
+        four_quote_presence_ratio=0.30,
     )
     result = None
-    for _ in range(EXIT_CONFIRM_TICKS):
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS):
         result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
     assert result is not None
     assert result.lifecycle == "defensive"
     assert result.effective_soft_mode == "defensive"
+
+
+def test_unwind_deescalates_to_defensive_after_confirmed_lower_target():
+    cfg = MMConfigV2(session_budget_usd=50.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
+    inventory = _inventory(
+        up_shares=5.0,
+        excess_up_qty=5.0,
+        excess_up_value_usd=2.4,
+        excess_value_usd=2.4,
+        signed_excess_value_usd=2.4,
+        total_inventory_value_usd=2.4,
+    )
+    snap = _snapshot(
+        market_tradeable=False,
+        market_quality_score=0.20,
+        divergence_up=0.14,
+        divergence_dn=0.14,
+        time_left_sec=600.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "defensive"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.25)
+    result = None
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "defensive"
+    assert result.effective_soft_mode == "defensive"
+
+
+def test_unwind_does_not_deescalate_near_expiry_window():
+    cfg = MMConfigV2(session_budget_usd=50.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
+    inventory = _inventory(
+        up_shares=5.0,
+        excess_up_qty=5.0,
+        excess_up_value_usd=2.4,
+        excess_value_usd=2.4,
+        signed_excess_value_usd=2.4,
+        total_inventory_value_usd=2.4,
+    )
+    snap = _snapshot(
+        market_tradeable=False,
+        market_quality_score=0.20,
+        divergence_up=0.14,
+        divergence_dn=0.14,
+        time_left_sec=30.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "unwind"
+    risk.target_soft_mode = "defensive"
+    risk.soft_mode = "defensive"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.25)
+    result = None
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS + 1):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "unwind"
+    assert result.effective_soft_mode == "unwind"
+
+
+def test_unwind_does_not_deescalate_when_hard_mode_active():
+    cfg = MMConfigV2(session_budget_usd=50.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
+    inventory = _inventory(
+        up_shares=5.0,
+        excess_up_qty=5.0,
+        excess_up_value_usd=2.4,
+        excess_value_usd=2.4,
+        signed_excess_value_usd=2.4,
+        total_inventory_value_usd=2.4,
+    )
+    snap = _snapshot(time_left_sec=600.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(true_drift=True, true_drift_no_progress_sec=5.0),
+    )
+    assert risk.hard_mode == "emergency_unwind"
+    result = sm.transition(
+        snapshot=snap,
+        inventory=inventory,
+        risk=risk,
+        viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.25),
+    )
+    assert result.lifecycle == "emergency_unwind"
+
+
+def test_unwind_exit_does_not_require_excess_baseline_streak():
+    cfg = MMConfigV2(session_budget_usd=50.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("unwind")
+    sm._unwind_started_at = time.time() - 10.0
+    # Deliberately stale/worse baseline: unwind exit should not depend on it.
+    sm._excess_baseline_ts = time.time() - 60.0
+    sm._excess_baseline_value_usd = 0.1
+    inventory = _inventory(
+        up_shares=5.0,
+        excess_up_qty=5.0,
+        excess_up_value_usd=2.4,
+        excess_value_usd=2.4,
+        signed_excess_value_usd=2.4,
+        total_inventory_value_usd=2.4,
+    )
+    snap = _snapshot(
+        market_tradeable=False,
+        market_quality_score=0.20,
+        divergence_up=0.14,
+        divergence_dn=0.14,
+        time_left_sec=600.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "defensive"
+    viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.25)
+    result = None
+    for _ in range(UNWIND_EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "defensive"
 
 
 def test_flat_defensive_no_progress_does_not_escalate_to_unwind():

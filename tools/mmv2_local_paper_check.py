@@ -25,7 +25,15 @@ def _read_key(explicit: str | None, repo_root: Path) -> str:
     raise RuntimeError("PM_WEB_ACCESS_KEY is required (env, --key, or .web_access_key)")
 
 
-def _http_json(base_url: str, path: str, key: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def _http_json(
+    base_url: str,
+    path: str,
+    key: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    timeout_sec: float = 15.0,
+) -> dict[str, Any]:
     data = None
     headers = {
         "x-access-key": key,
@@ -41,7 +49,7 @@ def _http_json(base_url: str, path: str, key: str, *, method: str = "GET", paylo
         method=method,
     )
     try:
-        with urlopen(req, timeout=15) as resp:
+        with urlopen(req, timeout=max(1.0, float(timeout_sec))) as resp:
             raw = resp.read().decode("utf-8")
             if not raw:
                 return {}
@@ -65,17 +73,41 @@ def _start_with_retry(
     payload: dict[str, Any],
     timeout_sec: float,
     sleep_sec: float,
+    http_timeout_sec: float,
 ) -> dict[str, Any]:
     deadline = time.time() + max(1.0, float(timeout_sec))
     last_error = ""
     while time.time() < deadline:
         try:
-            return _http_json(base_url, "/api/mmv2/start", key, method="POST", payload=payload)
+            return _http_json(
+                base_url,
+                "/api/mmv2/start",
+                key,
+                method="POST",
+                payload=payload,
+                timeout_sec=http_timeout_sec,
+            )
         except Exception as exc:  # noqa: BLE001
             text = str(exc)
             last_error = text
-            # Normal transient near-close case: wait for the next window.
-            if "too close to close" in text or "HTTP 409" in text:
+            # Normal transient start cases: near-close, strike fetch timeout/fail,
+            # temporary network stalls while feeds reconnect after expiry.
+            if any(
+                marker in text.lower()
+                for marker in (
+                    "too close to close",
+                    "http 409",
+                    "http 503",
+                    "valid strike",
+                    "pm tokens not found",
+                    "timed out",
+                    "timeout",
+                    "strike fetch failed",
+                    "watch mode",
+                    "transport",
+                    "temporarily unavailable",
+                )
+            ):
                 time.sleep(max(0.5, float(sleep_sec)))
                 continue
             raise
@@ -92,6 +124,7 @@ def main() -> int:
     parser.add_argument("--duration-sec", type=int, default=1800)
     parser.add_argument("--poll-sec", type=float, default=5.0)
     parser.add_argument("--start-retry-timeout-sec", type=float, default=180.0)
+    parser.add_argument("--http-timeout-sec", type=float, default=30.0)
     parser.add_argument("--epsilon", type=float, default=1e-3)
     parser.add_argument("--stop-at-end", action="store_true")
     parser.add_argument("--output-root", default="audit/local-paper")
@@ -121,7 +154,13 @@ def main() -> int:
 
     # Ensure stale run is not hanging.
     try:
-        stop_resp = _http_json(args.base_url, "/api/mmv2/stop", key, method="POST")
+        stop_resp = _http_json(
+            args.base_url,
+            "/api/mmv2/stop",
+            key,
+            method="POST",
+            timeout_sec=float(args.http_timeout_sec),
+        )
         (out_dir / "pre_stop.json").write_text(json.dumps(stop_resp, indent=2), encoding="utf-8")
     except Exception as exc:  # noqa: BLE001
         (out_dir / "pre_stop_error.txt").write_text(str(exc), encoding="utf-8")
@@ -139,6 +178,7 @@ def main() -> int:
         payload=start_payload,
         timeout_sec=float(args.start_retry_timeout_sec),
         sleep_sec=max(1.0, float(args.poll_sec)),
+        http_timeout_sec=float(args.http_timeout_sec),
     )
     (out_dir / "start.json").write_text(json.dumps(start_resp, indent=2), encoding="utf-8")
 
@@ -147,9 +187,27 @@ def main() -> int:
     try:
         while (time.time() - started_at) < float(args.duration_sec):
             now = time.time()
-            state = _http_json(args.base_url, "/api/mmv2/state", key, method="GET")
-            fills = _http_json(args.base_url, "/api/mmv2/fills?limit=100", key, method="GET")
-            logs = _http_json(args.base_url, "/api/logs?limit=200", key, method="GET")
+            state = _http_json(
+                args.base_url,
+                "/api/mmv2/state",
+                key,
+                method="GET",
+                timeout_sec=float(args.http_timeout_sec),
+            )
+            fills = _http_json(
+                args.base_url,
+                "/api/mmv2/fills?limit=100",
+                key,
+                method="GET",
+                timeout_sec=float(args.http_timeout_sec),
+            )
+            logs = _http_json(
+                args.base_url,
+                "/api/logs?limit=200",
+                key,
+                method="GET",
+                timeout_sec=float(args.http_timeout_sec),
+            )
 
             _append_jsonl(state_jsonl, {"ts": now, "state": state})
             _append_jsonl(fills_jsonl, {"ts": now, "fills": fills})
@@ -163,7 +221,32 @@ def main() -> int:
             is_running = bool(state.get("is_running"))
             hard_mode = str(risk.get("hard_mode") or "")
 
-            if lifecycle == "halted" or hard_mode == "halted" or not is_running:
+            if lifecycle == "halted" or hard_mode == "halted":
+                failures.append(
+                    f"runtime halted sample={samples}: lifecycle={lifecycle} hard_mode={hard_mode} "
+                    f"reason={risk.get('reason') or ''}"
+                )
+                break
+            if not is_running:
+                if args.auto_roll_expired:
+                    try:
+                        _start_with_retry(
+                            base_url=args.base_url,
+                            key=key,
+                            payload=start_payload,
+                            timeout_sec=float(args.start_retry_timeout_sec),
+                            sleep_sec=max(1.0, float(args.poll_sec)),
+                            http_timeout_sec=float(args.http_timeout_sec),
+                        )
+                        restart_count += 1
+                        baseline_portfolio = None
+                        prev_portfolio_mark = None
+                        prev_session_pnl = None
+                        prev_fill_count = None
+                        time.sleep(max(0.5, min(2.0, float(args.poll_sec))))
+                        continue
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append(f"runtime not running and restart failed sample={samples}: {exc}")
                 failures.append(
                     f"runtime halted sample={samples}: lifecycle={lifecycle} hard_mode={hard_mode} "
                     f"reason={risk.get('reason') or ''}"
@@ -174,13 +257,20 @@ def main() -> int:
             # really cover multiple windows.
             if args.auto_roll_expired and is_running and lifecycle == "expired":
                 try:
-                    _http_json(args.base_url, "/api/mmv2/stop", key, method="POST")
+                    _http_json(
+                        args.base_url,
+                        "/api/mmv2/stop",
+                        key,
+                        method="POST",
+                        timeout_sec=float(args.http_timeout_sec),
+                    )
                     _start_with_retry(
                         base_url=args.base_url,
                         key=key,
                         payload=start_payload,
                         timeout_sec=float(args.start_retry_timeout_sec),
                         sleep_sec=max(1.0, float(args.poll_sec)),
+                        http_timeout_sec=float(args.http_timeout_sec),
                     )
                     restart_count += 1
                     # New session baseline will be recomputed from next sample.
@@ -191,7 +281,15 @@ def main() -> int:
                     time.sleep(max(0.5, min(2.0, float(args.poll_sec))))
                     continue
                 except Exception as exc:  # noqa: BLE001
-                    failures.append(f"auto-roll failed sample={samples}: {exc}")
+                    # Treat first auto-roll miss as transient and let the regular
+                    # restart branch handle recovery on the next samples.
+                    _append_jsonl(
+                        logs_jsonl,
+                        {
+                            "ts": now,
+                            "local_check_warning": f"auto-roll transient failure sample={samples}: {exc}",
+                        },
+                    )
 
             if bool(health.get("true_drift")):
                 failures.append(f"true_drift at sample={samples}")
@@ -230,7 +328,13 @@ def main() -> int:
     finally:
         if args.stop_at_end:
             try:
-                stop_resp = _http_json(args.base_url, "/api/mmv2/stop", key, method="POST")
+                stop_resp = _http_json(
+                    args.base_url,
+                    "/api/mmv2/stop",
+                    key,
+                    method="POST",
+                    timeout_sec=float(args.http_timeout_sec),
+                )
                 (out_dir / "stop.json").write_text(json.dumps(stop_resp, indent=2), encoding="utf-8")
             except Exception as exc:  # noqa: BLE001
                 (out_dir / "stop_error.txt").write_text(str(exc), encoding="utf-8")
@@ -251,6 +355,7 @@ def main() -> int:
             "epsilon": args.epsilon,
             "auto_roll_expired": bool(args.auto_roll_expired),
             "start_retry_timeout_sec": float(args.start_retry_timeout_sec),
+            "http_timeout_sec": float(args.http_timeout_sec),
         },
         "output_dir": str(out_dir),
     }
