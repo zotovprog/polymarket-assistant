@@ -289,6 +289,42 @@ def test_runtime_wallet_snapshot_coalesce_uses_expected_balances_for_missing_val
     assert available == pytest.approx(11.0)
 
 
+def test_runtime_on_fill_emits_callbacks_with_token_type():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm.set_market(_market())
+    seen: list[tuple[str, str]] = []
+    mm.on_fill(lambda fill, token_type: seen.append((fill.token_id, token_type)))
+
+    mm._emit_fill_callbacks(
+        Fill(
+            ts=time.time(),
+            side="BUY",
+            token_id=mm.market.up_token_id,
+            price=0.51,
+            size=5.0,
+            fee=0.0,
+            is_maker=True,
+        )
+    )
+    mm._emit_fill_callbacks(
+        Fill(
+            ts=time.time(),
+            side="SELL",
+            token_id=mm.market.dn_token_id,
+            price=0.49,
+            size=5.0,
+            fee=0.0,
+            is_maker=True,
+        )
+    )
+
+    assert seen[0] == (mm.market.up_token_id, "up")
+    assert seen[1] == (mm.market.dn_token_id, "dn")
+
+
 def test_runtime_session_pnl_uses_wallet_total_not_reserved_bookkeeping():
     class _MockClient:
         _orders = {}
@@ -325,6 +361,30 @@ def test_runtime_session_pnl_marks_inventory_with_conservative_bid_when_availabl
     mm._update_session_pnl(inventory, total_usdc=8.0, snapshot=snap)
     assert mm._session_pnl == pytest.approx(-1.4)
     assert mm._session_pnl_equity_usd == pytest.approx(-1.4)
+
+
+def test_runtime_v2_fill_context_includes_coin_timeframe():
+    web_server = importlib.import_module("web_server")
+    runtime = web_server.MMRuntimeV2()
+    runtime._coin = "BTC"
+    runtime._timeframe = "15m"
+    runtime._paper_mode = False
+    runtime.mm_v2 = SimpleNamespace(
+        snapshot=lambda app_version="", app_git_hash="": {
+            "market": {"market_id": "btc-15m"},
+            "inventory": {"up_shares": 1.0},
+            "valuation": {"fv_up": 0.52},
+            "risk": {"soft_mode": "normal"},
+            "analytics": {"session_pnl_equity_usd": 1.2, "session_pnl_operator_usd": 0.8},
+        }
+    )
+
+    ctx = runtime._fill_context_v2()
+    assert ctx["market"]["coin"] == "BTC"
+    assert ctx["market"]["timeframe"] == "15m"
+    assert ctx["paper_mode"] is False
+    assert ctx["engine"] == "v2"
+    assert ctx["pnl"]["session_pnl_equity_usd"] == pytest.approx(1.2)
 
 
 @pytest.mark.asyncio

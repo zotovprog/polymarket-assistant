@@ -20,7 +20,7 @@ import copy
 import threading
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -876,6 +876,47 @@ class MMRuntime:
         alerts = list(self._alerts.values())
         alerts.sort(key=lambda x: x.get("ts", 0.0), reverse=True)
         return alerts
+
+    async def _teardown_mongo_logger(self) -> None:
+        if self._mongo_log_handler:
+            logging.getLogger().removeHandler(self._mongo_log_handler)
+            self._mongo_log_handler = None
+        if self._mongo:
+            try:
+                await self._mongo.stop()
+            except Exception:
+                pass
+            self._mongo = None
+
+    async def _attach_mongo_logger(
+        self,
+        *,
+        register_fill: Callable[[Any], None] | None = None,
+        register_snapshot: Callable[[Any], None] | None = None,
+        runtime_tag: str = "",
+    ) -> None:
+        if not config.MONGO_URI:
+            return
+        await self._teardown_mongo_logger()
+        try:
+            from mm.mongo_logger import MongoLogger, MongoLogHandler
+
+            self._mongo = MongoLogger(config.MONGO_URI, config.MONGO_DB)
+            await self._mongo.start()
+            if register_fill is not None:
+                register_fill(self._mongo)
+            if register_snapshot is not None:
+                register_snapshot(self._mongo)
+            self._mongo_log_handler = MongoLogHandler(self._mongo)
+            self._mongo_log_handler.setLevel(logging.INFO)
+            logging.getLogger().addHandler(self._mongo_log_handler)
+            if runtime_tag:
+                log.info("MongoLogger attached (%s)", runtime_tag)
+            else:
+                log.info("MongoLogger attached")
+        except Exception as e:
+            log.warning(f"MongoLogger init failed (continuing without): {e}")
+            await self._teardown_mongo_logger()
 
     def get_verification_status(self) -> dict[str, Any]:
         return copy.deepcopy(self._verification_status)
@@ -1830,24 +1871,13 @@ class MMRuntime:
             self._start_balance = self._initial_usdc
 
         # MongoDB logger (fills, snapshots, Python logs)
-        if config.MONGO_URI:
-            try:
-                from mm.mongo_logger import MongoLogger, MongoLogHandler
-                self._mongo = MongoLogger(config.MONGO_URI, config.MONGO_DB)
-                await self._mongo.start()
-                # Fill callback
-                self.mm.on_fill(lambda fill, tt: self._mongo.log_fill(
-                    fill, tt, self._fill_context()))
-                # Snapshot callback
-                self.mm.on_snapshot(self._mongo.log_snapshot)
-                # Python log handler
-                self._mongo_log_handler = MongoLogHandler(self._mongo)
-                self._mongo_log_handler.setLevel(logging.INFO)
-                logging.getLogger().addHandler(self._mongo_log_handler)
-                log.info("MongoLogger attached")
-            except Exception as e:
-                log.warning(f"MongoLogger init failed (continuing without): {e}")
-                self._mongo = None
+        await self._attach_mongo_logger(
+            register_fill=lambda mongo: self.mm.on_fill(
+                lambda fill, tt: mongo.log_fill(fill, tt, self._fill_context())
+            ),
+            register_snapshot=lambda mongo: self.mm.on_snapshot(mongo.log_snapshot),
+            runtime_tag="legacy",
+        )
 
         # Monitor for window expiry and handle auto-next-window
         self._ensure_monitor_task()
@@ -2034,15 +2064,7 @@ class MMRuntime:
         await self._stop_feed_tasks()
 
         # Tear down MongoLogger
-        if self._mongo_log_handler:
-            logging.getLogger().removeHandler(self._mongo_log_handler)
-            self._mongo_log_handler = None
-        if self._mongo:
-            try:
-                await self._mongo.stop()
-            except Exception:
-                pass
-            self._mongo = None
+        await self._teardown_mongo_logger()
 
         log.info("MM stopped (liquidate=%s emergency=%s)", liquidate, emergency)
         return self.snapshot()
@@ -2727,6 +2749,38 @@ class MMRuntimeV2(MMRuntime):
             },
         }
 
+    def _fill_context_v2(self) -> dict:
+        mm = self.mm_v2
+        market_context: dict[str, Any] = {
+            "coin": self._coin or "",
+            "timeframe": self._timeframe or "",
+        }
+        if not mm:
+            return {
+                "market": market_context,
+                "paper_mode": self._paper_mode,
+                "engine": "v2",
+            }
+        snap = mm.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+        snapshot_market = snap.get("market") or {}
+        if isinstance(snapshot_market, dict):
+            market_context.update(snapshot_market)
+        analytics = snap.get("analytics") or {}
+        pnl_ctx = {
+            "session_pnl_equity_usd": analytics.get("session_pnl_equity_usd", analytics.get("session_pnl", 0.0)),
+            "session_pnl_operator_usd": analytics.get("session_pnl_operator_usd", 0.0),
+        }
+        return {
+            "market": market_context,
+            "inventory": snap.get("inventory"),
+            "valuation": snap.get("valuation"),
+            "risk": snap.get("risk"),
+            "analytics": analytics,
+            "pnl": pnl_ctx,
+            "paper_mode": self._paper_mode,
+            "engine": "v2",
+        }
+
     async def start(
         self,
         coin: str,
@@ -2847,6 +2901,13 @@ class MMRuntimeV2(MMRuntime):
         self.mm_v2.set_market(market)
         await self.mm_v2.start()
         self._running = True
+        await self._attach_mongo_logger(
+            register_fill=lambda mongo: self.mm_v2.on_fill(
+                lambda fill, tt: mongo.log_fill(fill, tt, self._fill_context_v2())
+            ),
+            register_snapshot=lambda mongo: self.mm_v2.on_snapshot(mongo.log_snapshot),
+            runtime_tag="v2",
+        )
         log.info("MM V2 started: %s/%s paper=%s", self._coin, self._timeframe, paper_mode)
         return self.snapshot()
 
@@ -2859,6 +2920,7 @@ class MMRuntimeV2(MMRuntime):
             stop_liquidation = await self.mm_v2.stop(liquidate=liquidate and not emergency)
             self.mm_v2 = None
         await self._stop_feed_tasks()
+        await self._teardown_mongo_logger()
         snap = self.snapshot()
         if stop_liquidation is not None:
             snap["stop_liquidation"] = stop_liquidation

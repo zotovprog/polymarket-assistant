@@ -63,6 +63,7 @@ class MarketMakerV2:
         self._heartbeat_failed = False
         self._alerts: dict[str, dict[str, Any]] = {}
         self._snapshot_callbacks: list[Any] = []
+        self._fill_callbacks: list[Any] = []
         self._fills: list[Fill] = []
         self._excess_history: list[tuple[float, float]] = []
         self._quote_presence_history: list[tuple[float, tuple[bool, bool]]] = []
@@ -176,6 +177,26 @@ class MarketMakerV2:
 
     def on_snapshot(self, callback) -> None:
         self._snapshot_callbacks.append(callback)
+
+    def on_fill(self, callback) -> None:
+        self._fill_callbacks.append(callback)
+
+    def _fill_token_type(self, fill: Fill) -> str:
+        if not self.market:
+            return ""
+        if fill.token_id == self.market.up_token_id:
+            return "up"
+        if fill.token_id == self.market.dn_token_id:
+            return "dn"
+        return ""
+
+    def _emit_fill_callbacks(self, fill: Fill) -> None:
+        token_type = self._fill_token_type(fill)
+        for callback in self._fill_callbacks:
+            try:
+                callback(fill, token_type)
+            except Exception:
+                pass
 
     async def _on_heartbeat_failure(self) -> None:
         self._heartbeat_failed = True
@@ -624,6 +645,7 @@ class MarketMakerV2:
         for fill in fills:
             self._fills.append(fill)
             self.reconcile.record_fill(fill, self.market)
+            self._emit_fill_callbacks(fill)
         up_book, dn_book = await self.gateway.get_books()
         valuation, snapshot = self.valuation.compute(
             market=self.market,
