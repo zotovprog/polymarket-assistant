@@ -103,9 +103,10 @@
         <div class="pnl-section">
             <div class="pnl-big-cards">
                 <div class="pnl-big-card pnl-main-card">
-                    <div class="pnl-big-label">Session PnL</div>
+                    <div class="pnl-big-label">Operator PnL</div>
                     <div id="pnl-session" class="pnl-big-value">$0.00</div>
                     <div id="pnl-pct" class="pnl-pct">0%</div>
+                    <div id="pnl-risk-equity" class="stat-small">Risk PnL (Equity MTM): $0.00</div>
                 </div>
                 <div class="pnl-big-card">
                     <div class="pnl-big-label">Positions Worth</div>
@@ -117,6 +118,24 @@
                 </div>
             </div>
             <div id="pnl-chart" class="chart-container-small"></div>
+            <div class="stat-grid" style="margin-top:10px">
+                <div class="stat-item">
+                    <div class="stat-label">MM Regime</div>
+                    <div id="mm-regime-status" class="stat-value">—</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Quoting 60s</div>
+                    <div id="mm-quoting-ratio" class="stat-value">0%</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Unwind 60s</div>
+                    <div id="mm-unwind-ratio" class="stat-value">0%</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">4-Quote 60s</div>
+                    <div id="mm-fourq-ratio" class="stat-value">0%</div>
+                </div>
+            </div>
         </div>
 
         <!-- 4. Inventory + Active Orders (side by side) -->

@@ -460,6 +460,7 @@ function updateUI(s) {
 
     // ── PnL (simplified: 3 big numbers, animated) ────
     const sessionPnl = s.session_pnl != null ? s.session_pnl : (s.total_pnl || 0);
+    const riskPnl = s.session_pnl_risk_equity != null ? s.session_pnl_risk_equity : sessionPnl;
     const positionsWorth = (s.position_value_pm != null)
         ? s.position_value_pm
         : ((s.inventory?.up_shares || 0) * (s.pm_prices?.up || 0)
@@ -480,6 +481,7 @@ function updateUI(s) {
         pctEl.textContent = (sessionPnl >= 0 ? '+' : '') + pnlPct + '%';
         pctEl.className = 'pnl-pct ' + (sessionPnl >= 0 ? 'positive' : 'negative');
     }
+    setText('pnl-risk-equity', `Risk PnL (Equity MTM): $${riskPnl.toFixed(4)}`);
 
     // Positions worth
     setNumberAnimated('pnl-positions-worth', positionsWorth, '$', 2);
@@ -523,6 +525,7 @@ function updateUI(s) {
 
     // Market Quality
     updateMarketQuality(s.market_quality);
+    updateMMRegime(s.mm_regime || {});
 
     // Latency panel
     if (s.latency) {
@@ -816,6 +819,17 @@ function updateMarketQuality(mq) {
     setText('quality-spread-bps', (mq.spread_bps || 0).toFixed(0) + ' bps');
     setText('quality-bid-depth', '$' + (mq.bid_depth_usd || 0).toFixed(0));
     setText('quality-ask-depth', '$' + (mq.ask_depth_usd || 0).toFixed(0));
+}
+
+function updateMMRegime(mmRegime) {
+    const quoting = Math.max(0, Math.min(1, mmRegime?.quoting_ratio_60s ?? 0));
+    const unwind = Math.max(0, Math.min(1, mmRegime?.unwind_ratio_60s ?? 0));
+    const fourQuote = Math.max(0, Math.min(1, mmRegime?.four_quote_ratio_60s ?? 0));
+    setText('mm-quoting-ratio', (quoting * 100).toFixed(0) + '%');
+    setText('mm-unwind-ratio', (unwind * 100).toFixed(0) + '%');
+    setText('mm-fourq-ratio', (fourQuote * 100).toFixed(0) + '%');
+    const degraded = unwind > 0.5 || quoting < 0.3;
+    setText('mm-regime-status', degraded ? 'DEGRADED' : 'HEALTHY');
 }
 
 // ── Latency Panel ────────────────────────────────────

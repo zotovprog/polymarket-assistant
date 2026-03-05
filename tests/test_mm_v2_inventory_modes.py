@@ -212,8 +212,8 @@ def test_hard_drawdown_enters_emergency_unwind_not_soft_defensive():
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=_snapshot(),
         inventory=_inventory(up_shares=6.0, excess_up_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=3.0),
-        analytics=AnalyticsState(session_pnl=-4.5),
-        health=HealthState(),
+        analytics=AnalyticsState(session_pnl=-4.5, session_pnl_equity_usd=-4.5),
+        health=HealthState(drawdown_breach_active=True, drawdown_breach_ticks=3, drawdown_breach_age_sec=9.0),
     )
     assert risk.hard_mode == "emergency_unwind"
     assert risk.soft_mode in {"defensive", "inventory_skewed"}

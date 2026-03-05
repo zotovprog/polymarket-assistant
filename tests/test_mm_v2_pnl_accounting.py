@@ -218,6 +218,65 @@ def test_wallet_portfolio_includes_reserved_usdc(monkeypatch):
 def test_state_exposes_pnl_component_fields():
     analytics = MarketMakerV2(SimpleNamespace(), type("_MockClient", (), {"_orders": {}})(), MMConfigV2())._last_analytics
     assert hasattr(analytics, "position_mark_value_usd")
+    assert hasattr(analytics, "position_mark_value_bid_usd")
+    assert hasattr(analytics, "position_mark_value_mid_usd")
     assert hasattr(analytics, "portfolio_mark_value_usd")
     assert hasattr(analytics, "tradeable_portfolio_value_usd")
+    assert hasattr(analytics, "session_pnl_equity_usd")
+    assert hasattr(analytics, "session_pnl_operator_usd")
+    assert hasattr(analytics, "session_pnl_operator_ema_usd")
     assert analytics.pnl_calc_mode == "wallet_total_plus_mark"
+    assert analytics.pnl_mark_basis == "conservative_bid"
+
+
+def test_session_pnl_equity_uses_conservative_bid_mark():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._starting_portfolio = 10.0
+    inv = _inventory(
+        up_shares=2.0,
+        dn_shares=0.0,
+        free_usdc=8.0,
+        reserved_usdc=0.0,
+        wallet_total_usdc=8.0,
+    )
+    snap = _snapshot(
+        pm_mid_up=0.9,
+        pm_mid_dn=0.1,
+        up_best_bid=0.6,
+        up_best_ask=0.92,
+    )
+    mm._update_session_pnl(inv, total_usdc=8.0, snapshot=snap)
+    # Equity MTM must use bid: 8 + 2*0.6 = 9.2 => pnl -0.8
+    assert mm._session_pnl_equity_usd == pytest.approx(-0.8)
+
+
+def test_operator_pnl_is_ema_smoothed():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._starting_portfolio = 10.0
+    inv = _inventory(
+        up_shares=1.0,
+        dn_shares=0.0,
+        free_usdc=9.0,
+        reserved_usdc=0.0,
+        wallet_total_usdc=9.0,
+    )
+    snap_a = _snapshot(pm_mid_up=0.9, up_best_bid=0.8)
+    snap_b = _snapshot(pm_mid_up=0.2, up_best_bid=0.1)
+
+    mm._update_session_pnl(inv, total_usdc=9.0, snapshot=snap_a)
+    first_equity = mm._session_pnl_equity_usd
+    first_operator = mm._session_pnl_operator_usd
+    assert first_operator == pytest.approx(first_equity)
+
+    mm._update_session_pnl(inv, total_usdc=9.0, snapshot=snap_b)
+    second_equity = mm._session_pnl_equity_usd
+    second_operator = mm._session_pnl_operator_usd
+
+    assert second_equity != pytest.approx(second_operator)
+    assert min(first_operator, second_equity) <= second_operator <= max(first_operator, second_equity)

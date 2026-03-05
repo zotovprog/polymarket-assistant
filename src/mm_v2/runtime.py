@@ -9,7 +9,14 @@ from mm.heartbeat import HeartbeatManager
 from mm.runtime_metrics import runtime_metrics
 from mm.types import Fill, MarketInfo
 
-from .config import MMConfigV2
+from .config import (
+    DRAWDOWN_CONFIRM_MIN_AGE_SEC,
+    DRAWDOWN_CONFIRM_TICKS,
+    DRAWDOWN_RESET_HYSTERESIS_USD,
+    MM_REGIME_DEGRADED_CONFIRM_SEC,
+    MM_REGIME_WINDOW_SEC,
+    MMConfigV2,
+)
 from .execution_policy import ExecutionPolicyV2
 from .order_tracker import OrderTrackerV2
 from .pair_valuation import PairValuationEngine
@@ -33,6 +40,8 @@ from .types import (
 
 
 class MarketMakerV2:
+    OPERATOR_PNL_EMA_ALPHA = 0.20
+
     def __init__(self, feed_state: Any, clob_client: Any, config: MMConfigV2):
         self.feed_state = feed_state
         self.config = config
@@ -58,9 +67,18 @@ class MarketMakerV2:
         self._excess_history: list[tuple[float, float]] = []
         self._quote_presence_history: list[tuple[float, tuple[bool, bool]]] = []
         self._mode_history: list[tuple[float, str]] = []
+        self._lifecycle_history: list[tuple[float, str]] = []
         self._starting_portfolio = 0.0
         self._starting_usdc = 0.0
         self._session_pnl = 0.0
+        self._session_pnl_equity_usd = 0.0
+        self._session_pnl_operator_ema_usd = 0.0
+        self._session_pnl_operator_usd = 0.0
+        self._operator_pnl_initialized = False
+        self._drawdown_breach_ticks = 0
+        self._drawdown_breach_started_ts = 0.0
+        self._drawdown_breach_active = False
+        self._mm_regime_degraded_started_ts = 0.0
         self._last_snapshot: PairMarketSnapshot | None = None
         self._last_inventory = PairInventoryState(
             up_shares=0.0,
@@ -214,6 +232,16 @@ class MarketMakerV2:
             raise RuntimeError("market is not set")
         self._running = True
         self._started_at = time.time()
+        self._session_pnl = 0.0
+        self._session_pnl_equity_usd = 0.0
+        self._session_pnl_operator_ema_usd = 0.0
+        self._session_pnl_operator_usd = 0.0
+        self._operator_pnl_initialized = False
+        self._drawdown_breach_ticks = 0
+        self._drawdown_breach_started_ts = 0.0
+        self._drawdown_breach_active = False
+        self._mm_regime_degraded_started_ts = 0.0
+        self._lifecycle_history.clear()
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -333,12 +361,27 @@ class MarketMakerV2:
                 self.set_alert("runtime_v2", f"V2 tick error: {exc}", level="error")
             await asyncio.sleep(float(self.config.tick_interval_sec))
 
-    def _position_mark_value(self, *, snapshot: PairMarketSnapshot, inventory: PairInventoryState) -> float:
-        up_mark = float(snapshot.pm_mid_up) if snapshot.pm_mid_up is not None else float(snapshot.fv_up)
-        dn_mark = float(snapshot.pm_mid_dn) if snapshot.pm_mid_dn is not None else float(snapshot.fv_dn)
-        up_mark = max(0.0, up_mark)
-        dn_mark = max(0.0, dn_mark)
-        return max(0.0, float(inventory.up_shares)) * up_mark + max(0.0, float(inventory.dn_shares)) * dn_mark
+    def _position_mark_values(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        inventory: PairInventoryState,
+    ) -> tuple[float, float]:
+        up_mid = float(snapshot.pm_mid_up) if snapshot.pm_mid_up is not None else float(snapshot.fv_up)
+        dn_mid = float(snapshot.pm_mid_dn) if snapshot.pm_mid_dn is not None else float(snapshot.fv_dn)
+        up_mid = max(0.0, up_mid)
+        dn_mid = max(0.0, dn_mid)
+
+        up_bid = float(snapshot.up_best_bid) if snapshot.up_best_bid is not None else up_mid
+        dn_bid = float(snapshot.dn_best_bid) if snapshot.dn_best_bid is not None else dn_mid
+        up_bid = max(0.0, up_bid)
+        dn_bid = max(0.0, dn_bid)
+
+        up_shares = max(0.0, float(inventory.up_shares))
+        dn_shares = max(0.0, float(inventory.dn_shares))
+        position_mark_bid = up_shares * up_bid + dn_shares * dn_bid
+        position_mark_mid = up_shares * up_mid + dn_shares * dn_mid
+        return position_mark_bid, position_mark_mid
 
     def _portfolio_components(
         self,
@@ -346,11 +389,14 @@ class MarketMakerV2:
         inventory: PairInventoryState,
         total_usdc: float,
         snapshot: PairMarketSnapshot,
-    ) -> tuple[float, float, float]:
-        position_mark_value = self._position_mark_value(snapshot=snapshot, inventory=inventory)
-        portfolio_mark_value = max(0.0, float(total_usdc)) + position_mark_value
-        tradeable_portfolio_value = max(0.0, float(inventory.free_usdc)) + position_mark_value
-        return position_mark_value, portfolio_mark_value, tradeable_portfolio_value
+    ) -> tuple[float, float, float, float]:
+        position_mark_bid, position_mark_mid = self._position_mark_values(
+            snapshot=snapshot,
+            inventory=inventory,
+        )
+        portfolio_mark_value = max(0.0, float(total_usdc)) + position_mark_bid
+        tradeable_portfolio_value = max(0.0, float(inventory.free_usdc)) + position_mark_bid
+        return position_mark_bid, position_mark_mid, portfolio_mark_value, tradeable_portfolio_value
 
     def _update_session_pnl(
         self,
@@ -358,16 +404,29 @@ class MarketMakerV2:
         *,
         total_usdc: float,
         snapshot: PairMarketSnapshot,
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float]:
         # PnL must use wallet-total USDC + marked inventory value.
         # Pending/reserved order bookkeeping must not move session PnL.
-        position_mark_value, current_portfolio, tradeable_portfolio = self._portfolio_components(
+        position_mark_bid, position_mark_mid, current_portfolio, tradeable_portfolio = self._portfolio_components(
             inventory=inventory,
             total_usdc=total_usdc,
             snapshot=snapshot,
         )
-        self._session_pnl = current_portfolio - self._starting_portfolio
-        return position_mark_value, current_portfolio, tradeable_portfolio
+        equity_pnl = current_portfolio - self._starting_portfolio
+        self._session_pnl_equity_usd = float(equity_pnl)
+        # Backward-compatible alias.
+        self._session_pnl = self._session_pnl_equity_usd
+        if not self._operator_pnl_initialized:
+            self._session_pnl_operator_ema_usd = self._session_pnl_equity_usd
+            self._operator_pnl_initialized = True
+        else:
+            alpha = float(self.OPERATOR_PNL_EMA_ALPHA)
+            self._session_pnl_operator_ema_usd = (
+                alpha * self._session_pnl_equity_usd
+                + (1.0 - alpha) * self._session_pnl_operator_ema_usd
+            )
+        self._session_pnl_operator_usd = self._session_pnl_operator_ema_usd
+        return position_mark_bid, position_mark_mid, current_portfolio, tradeable_portfolio
 
     def _build_health(
         self,
@@ -376,6 +435,9 @@ class MarketMakerV2:
         wallet_snapshot_stale: bool = False,
         true_drift_age_sec: float = 0.0,
         true_drift_no_progress_sec: float = 0.0,
+        drawdown_breach_ticks: int = 0,
+        drawdown_breach_age_sec: float = 0.0,
+        drawdown_breach_active: bool = False,
     ) -> HealthState:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
@@ -400,6 +462,9 @@ class MarketMakerV2:
             wallet_snapshot_stale=bool(wallet_snapshot_stale),
             true_drift_age_sec=max(0.0, float(true_drift_age_sec)),
             true_drift_no_progress_sec=max(0.0, float(true_drift_no_progress_sec)),
+            drawdown_breach_ticks=max(0, int(drawdown_breach_ticks)),
+            drawdown_breach_age_sec=max(0.0, float(drawdown_breach_age_sec)),
+            drawdown_breach_active=bool(drawdown_breach_active),
             drift_evidence=self.reconcile.drift_evidence.to_dict(),
         )
 
@@ -431,6 +496,40 @@ class MarketMakerV2:
         no_progress = max(0.0, now - self._true_drift_last_progress_ts)
         return age, no_progress
 
+    def _update_drawdown_breach(self, equity_pnl: float) -> tuple[int, float, bool]:
+        if float(self.config.hard_drawdown_usd) <= 0.0:
+            self._drawdown_breach_ticks = 0
+            self._drawdown_breach_started_ts = 0.0
+            self._drawdown_breach_active = False
+            return 0, 0.0, False
+
+        now = time.time()
+        threshold = -float(self.config.hard_drawdown_usd)
+        reset_level = threshold + float(DRAWDOWN_RESET_HYSTERESIS_USD)
+
+        if equity_pnl <= threshold:
+            if self._drawdown_breach_started_ts <= 0.0:
+                self._drawdown_breach_started_ts = now
+                self._drawdown_breach_ticks = 1
+            else:
+                self._drawdown_breach_ticks += 1
+        elif equity_pnl >= reset_level:
+            self._drawdown_breach_ticks = 0
+            self._drawdown_breach_started_ts = 0.0
+            self._drawdown_breach_active = False
+            return 0, 0.0, False
+
+        age = (
+            max(0.0, now - self._drawdown_breach_started_ts)
+            if self._drawdown_breach_started_ts > 0.0
+            else 0.0
+        )
+        self._drawdown_breach_active = (
+            self._drawdown_breach_ticks >= int(DRAWDOWN_CONFIRM_TICKS)
+            and age >= float(DRAWDOWN_CONFIRM_MIN_AGE_SEC)
+        )
+        return int(self._drawdown_breach_ticks), float(age), bool(self._drawdown_breach_active)
+
     def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
         cutoff = time.time() - max_age_sec
         while entries and entries[0][0] < cutoff:
@@ -458,6 +557,65 @@ class MarketMakerV2:
         any_quote = sum(1 for _, present in history if present[0])
         four_quote = sum(1 for _, present in history if present[1])
         return any_quote / total, four_quote / total
+
+    def _quote_presence_ratio_window(self, *, window_sec: float) -> tuple[float, float]:
+        cutoff = time.time() - max(1.0, float(window_sec))
+        history = [entry for entry in self._quote_presence_history if entry[0] >= cutoff]
+        if not history:
+            return 0.0, 0.0
+        total = len(history)
+        any_quote = sum(1 for _, present in history if present[0])
+        four_quote = sum(1 for _, present in history if present[1])
+        return any_quote / total, four_quote / total
+
+    def _lifecycle_ratios(self, *, window_sec: float) -> dict[str, float]:
+        cutoff = time.time() - max(1.0, float(window_sec))
+        history = [entry for entry in self._lifecycle_history if entry[0] >= cutoff]
+        if not history:
+            return {
+                "quoting_ratio_60s": 0.0,
+                "inventory_skewed_ratio_60s": 0.0,
+                "defensive_ratio_60s": 0.0,
+                "unwind_ratio_60s": 0.0,
+                "emergency_unwind_ratio_60s": 0.0,
+            }
+        total = float(len(history))
+        counts = {
+            "quoting": 0,
+            "inventory_skewed": 0,
+            "defensive": 0,
+            "unwind": 0,
+            "emergency_unwind": 0,
+        }
+        for _, lifecycle in history:
+            if lifecycle in counts:
+                counts[lifecycle] += 1
+        return {
+            "quoting_ratio_60s": counts["quoting"] / total,
+            "inventory_skewed_ratio_60s": counts["inventory_skewed"] / total,
+            "defensive_ratio_60s": counts["defensive"] / total,
+            "unwind_ratio_60s": counts["unwind"] / total,
+            "emergency_unwind_ratio_60s": counts["emergency_unwind"] / total,
+        }
+
+    def _update_mm_regime_alert(self, *, quoting_ratio_60s: float, unwind_ratio_60s: float) -> None:
+        now = time.time()
+        degraded = bool(unwind_ratio_60s > 0.50 or quoting_ratio_60s < 0.30)
+        if degraded:
+            if self._mm_regime_degraded_started_ts <= 0.0:
+                self._mm_regime_degraded_started_ts = now
+            elif now - self._mm_regime_degraded_started_ts >= float(MM_REGIME_DEGRADED_CONFIRM_SEC):
+                self.set_alert(
+                    "mm_regime_degraded",
+                    (
+                        f"MM regime degraded: quoting_ratio_60s={quoting_ratio_60s:.2f}, "
+                        f"unwind_ratio_60s={unwind_ratio_60s:.2f}"
+                    ),
+                    level="warning",
+                )
+            return
+        self._mm_regime_degraded_started_ts = 0.0
+        self.clear_alert("mm_regime_degraded")
 
     async def _tick(self) -> None:
         if not self.market:
@@ -526,10 +684,18 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
-        position_mark_value, portfolio_mark_value, tradeable_portfolio_value = self._update_session_pnl(
+        (
+            position_mark_value_bid,
+            position_mark_value_mid,
+            portfolio_mark_value,
+            tradeable_portfolio_value,
+        ) = self._update_session_pnl(
             inventory,
             total_usdc=total_usdc,
             snapshot=snapshot,
+        )
+        drawdown_breach_ticks, drawdown_breach_age_sec, drawdown_breach_active = self._update_drawdown_breach(
+            self._session_pnl_equity_usd,
         )
         if inventory.free_usdc > (inventory.wallet_total_usdc + 1e-6):
             self.set_alert(
@@ -553,7 +719,10 @@ class MarketMakerV2:
             self.clear_alert("wallet_invariant_v2")
         pre_analytics = AnalyticsState(
             fill_count=len(self._fills),
-            session_pnl=self._session_pnl,
+            session_pnl=self._session_pnl_equity_usd,
+            session_pnl_equity_usd=self._session_pnl_equity_usd,
+            session_pnl_operator_usd=self._session_pnl_operator_usd,
+            session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
         )
         true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
         health = self._build_health(
@@ -561,6 +730,9 @@ class MarketMakerV2:
             wallet_snapshot_stale=stale_wallet,
             true_drift_age_sec=true_drift_age_sec,
             true_drift_no_progress_sec=true_drift_no_progress_sec,
+            drawdown_breach_ticks=drawdown_breach_ticks,
+            drawdown_breach_age_sec=drawdown_breach_age_sec,
+            drawdown_breach_active=drawdown_breach_active,
         )
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
@@ -629,17 +801,31 @@ class MarketMakerV2:
             )
         )
         self._mode_history.append((now, effective_risk.soft_mode))
+        self._lifecycle_history.append((now, str(lifecycle)))
         self._prune_history(self._excess_history)
         self._prune_history(self._quote_presence_history)
         self._prune_history(self._mode_history)
+        self._prune_history(self._lifecycle_history)
         quote_presence_ratio, four_quote_presence_ratio = self._quote_presence_ratio()
+        _, four_quote_ratio_60s = self._quote_presence_ratio_window(window_sec=float(MM_REGIME_WINDOW_SEC))
+        regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC))
+        self._update_mm_regime_alert(
+            quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
+            unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
+        )
         analytics = AnalyticsState(
             fill_count=len(self._fills),
-            session_pnl=self._session_pnl,
-            position_mark_value_usd=float(position_mark_value),
+            session_pnl=self._session_pnl_equity_usd,
+            session_pnl_equity_usd=self._session_pnl_equity_usd,
+            session_pnl_operator_usd=self._session_pnl_operator_usd,
+            session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
+            position_mark_value_usd=float(position_mark_value_bid),
+            position_mark_value_bid_usd=float(position_mark_value_bid),
+            position_mark_value_mid_usd=float(position_mark_value_mid),
             portfolio_mark_value_usd=float(portfolio_mark_value),
             tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
             pnl_calc_mode="wallet_total_plus_mark",
+            pnl_mark_basis="conservative_bid",
             pnl_updated_ts=float(now),
             markout_1s=0.0,
             markout_5s=0.0,
@@ -656,6 +842,12 @@ class MarketMakerV2:
             quote_balance_state=plan.quote_balance_state,
             min_viable_clip_usd=float(QuotePolicyV2(self.config)._min_viable_clip_usd(snapshot, ctx)),
             quote_viability_reason=plan.quote_viability_reason,
+            quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
+            inventory_skewed_ratio_60s=float(regime_ratios["inventory_skewed_ratio_60s"]),
+            defensive_ratio_60s=float(regime_ratios["defensive_ratio_60s"]),
+            unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
+            emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
+            four_quote_ratio_60s=float(four_quote_ratio_60s),
             recent_fills=[
                 {
                     "ts": f.ts,
@@ -747,6 +939,12 @@ class MarketMakerV2:
         snap["runtime"] = {
             "last_terminal_reason": self._last_terminal_reason,
             "last_terminal_ts": self._last_terminal_ts,
+            "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
+            "drawdown_breach_age_sec": (
+                max(0.0, time.time() - self._drawdown_breach_started_ts)
+                if self._drawdown_breach_started_ts > 0.0
+                else 0.0
+            ),
         }
         snap["is_running"] = bool(self._running)
         snap["started_at"] = self._started_at

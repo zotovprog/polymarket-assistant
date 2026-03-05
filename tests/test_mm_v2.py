@@ -300,11 +300,15 @@ def test_runtime_session_pnl_uses_wallet_total_not_reserved_bookkeeping():
         free_usdc=9.0,
         reserved_usdc=8.0,  # stale/local reservation can exceed true wallet lock
     )
-    mm._update_session_pnl(inventory, total_usdc=10.0, snapshot=_snapshot(pm_mid_up=0.5, pm_mid_dn=0.5))
+    mm._update_session_pnl(
+        inventory,
+        total_usdc=10.0,
+        snapshot=_snapshot(pm_mid_up=0.5, pm_mid_dn=0.5, up_best_bid=None, dn_best_bid=None),
+    )
     assert mm._session_pnl == pytest.approx(-4.0)
 
 
-def test_runtime_session_pnl_marks_inventory_with_pm_mid_when_available():
+def test_runtime_session_pnl_marks_inventory_with_conservative_bid_when_available():
     class _MockClient:
         _orders = {}
 
@@ -316,10 +320,11 @@ def test_runtime_session_pnl_marks_inventory_with_pm_mid_when_available():
         free_usdc=8.0,
         reserved_usdc=1.0,
     )
-    # PM mid must drive mark-to-market, not fv fallback.
-    snap = _snapshot(pm_mid_up=0.9, pm_mid_dn=0.1, fv_up=0.2, fv_dn=0.8)
+    # Conservative mark must use best bid first for risk PnL.
+    snap = _snapshot(pm_mid_up=0.9, pm_mid_dn=0.1, up_best_bid=0.6, dn_best_bid=0.2, fv_up=0.2, fv_dn=0.8)
     mm._update_session_pnl(inventory, total_usdc=8.0, snapshot=snap)
-    assert mm._session_pnl == pytest.approx(-1.1)
+    assert mm._session_pnl == pytest.approx(-1.4)
+    assert mm._session_pnl_equity_usd == pytest.approx(-1.4)
 
 
 @pytest.mark.asyncio
@@ -905,19 +910,31 @@ async def test_state_exposes_pnl_component_fields(monkeypatch):
             "lifecycle": "quoting",
             "analytics": {
                 "session_pnl": 0.42,
+                "session_pnl_equity_usd": 0.42,
+                "session_pnl_operator_usd": 0.31,
+                "session_pnl_operator_ema_usd": 0.31,
                 "position_mark_value_usd": 8.15,
+                "position_mark_value_bid_usd": 7.95,
+                "position_mark_value_mid_usd": 8.15,
                 "portfolio_mark_value_usd": 23.15,
                 "tradeable_portfolio_value_usd": 21.0,
                 "pnl_calc_mode": "wallet_total_plus_mark",
+                "pnl_mark_basis": "conservative_bid",
                 "pnl_updated_ts": 123456.0,
             },
         },
     )
     resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["session_pnl_equity_usd"] == pytest.approx(0.42)
+    assert resp["analytics"]["session_pnl_operator_usd"] == pytest.approx(0.31)
+    assert resp["analytics"]["session_pnl_operator_ema_usd"] == pytest.approx(0.31)
     assert resp["analytics"]["position_mark_value_usd"] == pytest.approx(8.15)
+    assert resp["analytics"]["position_mark_value_bid_usd"] == pytest.approx(7.95)
+    assert resp["analytics"]["position_mark_value_mid_usd"] == pytest.approx(8.15)
     assert resp["analytics"]["portfolio_mark_value_usd"] == pytest.approx(23.15)
     assert resp["analytics"]["tradeable_portfolio_value_usd"] == pytest.approx(21.0)
     assert resp["analytics"]["pnl_calc_mode"] == "wallet_total_plus_mark"
+    assert resp["analytics"]["pnl_mark_basis"] == "conservative_bid"
     assert resp["analytics"]["pnl_updated_ts"] == pytest.approx(123456.0)
 
 
@@ -1027,12 +1044,18 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
             "runtime": {
                 "last_terminal_reason": "true inventory drift: no unwind progress",
                 "last_terminal_ts": 123456.0,
+                "live_budget_gate_passed": True,
+                "drawdown_breach_ticks": 4,
+                "drawdown_breach_age_sec": 9.5,
             },
         },
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["runtime"]["last_terminal_reason"] == "true inventory drift: no unwind progress"
     assert resp["runtime"]["last_terminal_ts"] == pytest.approx(123456.0)
+    assert resp["runtime"]["live_budget_gate_passed"] is True
+    assert resp["runtime"]["drawdown_breach_ticks"] == 4
+    assert resp["runtime"]["drawdown_breach_age_sec"] == pytest.approx(9.5)
 
 
 @pytest.mark.asyncio
@@ -1083,7 +1106,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
-    web_server._runtime_v2.mm_config_v2.session_budget_usd = 15.0
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 75.0
     captured = {}
 
     async def _fake_start(coin, timeframe, paper_mode, initial_usdc, dev=False, session_budget_usd=None):
@@ -1105,7 +1128,21 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     assert resp["ok"] is True
     assert captured["paper_mode"] is False
     assert captured["initial_usdc"] == pytest.approx(1000.0)
-    assert captured["session_budget_usd"] == pytest.approx(15.0)
+    assert captured["session_budget_usd"] == pytest.approx(75.0)
+
+
+@pytest.mark.asyncio
+async def test_live_start_rejects_budget_below_50(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 15.0
+
+    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=False, dev=True)
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_start(req=req, request=object())
+    assert exc.value.status_code == 400
+    assert "live_min_budget_50_required" in str(exc.value.detail)
 
 
 def test_runtime_v2_start_accepts_session_budget_kwarg():
@@ -1230,6 +1267,8 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
             "health": {"last_fallback_poll_count": 4},
             "analytics": {
                 "session_pnl": 1.23,
+                "session_pnl_equity_usd": 1.23,
+                "session_pnl_operator_usd": 0.78,
                 "fill_count": 1,
                 "spread_capture_usd": 0.0,
                 "position_mark_value_usd": 3.12,
@@ -1255,6 +1294,8 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["position_value_pm"] == pytest.approx(3.12)
     assert resp["portfolio_value"] == pytest.approx(43.12)
     assert resp["wallet_portfolio_value"] == pytest.approx(48.12)
+    assert resp["session_pnl"] == pytest.approx(0.78)
+    assert resp["session_pnl_risk_equity"] == pytest.approx(1.23)
     assert resp["fill_count"] == 1
 
 

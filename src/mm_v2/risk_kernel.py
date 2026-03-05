@@ -128,6 +128,10 @@ class HardSafetyKernel:
         analytics: AnalyticsState,
         health: HealthState,
     ) -> RiskRegime:
+        equity_pnl = float(getattr(analytics, "session_pnl_equity_usd", 0.0) or 0.0)
+        if abs(equity_pnl) < 1e-12 and abs(float(getattr(analytics, "session_pnl", 0.0) or 0.0)) > 0.0:
+            # Backward-compatible fallback while tests/fixtures migrate.
+            equity_pnl = float(getattr(analytics, "session_pnl", 0.0) or 0.0)
         hard_mode = "none"
         hard_reason = ""
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
@@ -135,7 +139,7 @@ class HardSafetyKernel:
         if self.config.hard_drawdown_usd > 0:
             drawdown_budget = max(
                 0.0,
-                1.0 - max(0.0, -analytics.session_pnl) / float(self.config.hard_drawdown_usd),
+                1.0 - max(0.0, -equity_pnl) / float(self.config.hard_drawdown_usd),
             )
 
         if health.true_drift:
@@ -155,9 +159,9 @@ class HardSafetyKernel:
         elif not health.heartbeat_ok:
             hard_mode = "emergency_unwind" if has_material_position else "halted"
             hard_reason = "heartbeat failure"
-        elif analytics.session_pnl <= -float(self.config.hard_drawdown_usd):
+        elif bool(getattr(health, "drawdown_breach_active", False)):
             hard_mode = "emergency_unwind" if has_material_position else "halted"
-            hard_reason = f"hard drawdown ${analytics.session_pnl:.2f}"
+            hard_reason = f"hard drawdown ${equity_pnl:.2f}"
         elif health.residual_inventory_failure and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):
             hard_mode = "emergency_unwind"
             hard_reason = "residual inventory near expiry"

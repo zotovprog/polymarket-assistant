@@ -140,10 +140,16 @@ class ExecutionState:
 class AnalyticsState:
     fill_count: int = 0
     session_pnl: float = 0.0
+    session_pnl_equity_usd: float = 0.0
+    session_pnl_operator_usd: float = 0.0
+    session_pnl_operator_ema_usd: float = 0.0
     position_mark_value_usd: float = 0.0
+    position_mark_value_bid_usd: float = 0.0
+    position_mark_value_mid_usd: float = 0.0
     portfolio_mark_value_usd: float = 0.0
     tradeable_portfolio_value_usd: float = 0.0
     pnl_calc_mode: str = "wallet_total_plus_mark"
+    pnl_mark_basis: str = "conservative_bid"
     pnl_updated_ts: float = 0.0
     markout_1s: float = 0.0
     markout_5s: float = 0.0
@@ -160,6 +166,12 @@ class AnalyticsState:
     quote_balance_state: str = "none"
     min_viable_clip_usd: float = 0.0
     quote_viability_reason: str = ""
+    quoting_ratio_60s: float = 0.0
+    inventory_skewed_ratio_60s: float = 0.0
+    defensive_ratio_60s: float = 0.0
+    unwind_ratio_60s: float = 0.0
+    emergency_unwind_ratio_60s: float = 0.0
+    four_quote_ratio_60s: float = 0.0
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -206,6 +218,9 @@ class HealthState:
     wallet_snapshot_stale: bool = False
     true_drift_age_sec: float = 0.0
     true_drift_no_progress_sec: float = 0.0
+    drawdown_breach_ticks: int = 0
+    drawdown_breach_age_sec: float = 0.0
+    drawdown_breach_active: bool = False
     drift_evidence: dict[str, Any] = field(default_factory=dict)
 
 

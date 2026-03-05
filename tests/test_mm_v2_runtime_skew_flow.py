@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from types import SimpleNamespace
 
 
 BASE = os.path.dirname(os.path.dirname(__file__))
@@ -16,6 +17,7 @@ from mm_v2.config import MMConfigV2
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
+from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
 from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
 from mm.types import MarketInfo
@@ -483,3 +485,65 @@ def test_cancel_repost_sell_lag_does_not_halt_runtime():
         ),
     )
     assert risk.hard_mode == "none"
+
+
+def test_drawdown_requires_persistence_before_hard_mode():
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0, hard_drawdown_usd=4.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=6.0,
+        excess_up_qty=6.0,
+        excess_up_value_usd=3.24,
+        excess_value_usd=3.24,
+        signed_excess_value_usd=3.24,
+        total_inventory_value_usd=3.24,
+    )
+    analytics = AnalyticsState(session_pnl_equity_usd=-4.8, session_pnl=-4.8)
+
+    risk_pre = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=analytics,
+        health=HealthState(drawdown_breach_active=False, drawdown_breach_ticks=1, drawdown_breach_age_sec=1.0),
+    )
+    assert risk_pre.hard_mode == "none"
+
+    risk_post = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=analytics,
+        health=HealthState(drawdown_breach_active=True, drawdown_breach_ticks=3, drawdown_breach_age_sec=9.0),
+    )
+    assert risk_post.hard_mode == "emergency_unwind"
+
+
+def test_live_like_window_reports_mm_regime_ratios():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = time.time()
+    mm._lifecycle_history = [
+        (now - 50.0, "quoting"),
+        (now - 40.0, "quoting"),
+        (now - 30.0, "inventory_skewed"),
+        (now - 20.0, "defensive"),
+        (now - 10.0, "unwind"),
+        (now - 5.0, "unwind"),
+    ]
+    ratios = mm._lifecycle_ratios(window_sec=60.0)
+    assert ratios["quoting_ratio_60s"] > 0.30
+    assert ratios["unwind_ratio_60s"] > 0.30
+    assert ratios["inventory_skewed_ratio_60s"] > 0.0
+    assert ratios["defensive_ratio_60s"] > 0.0
+
+
+def test_mm_regime_degraded_alert_fires_on_unwind_dominance():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    # Emulate prolonged degraded regime.
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    mm._update_mm_regime_alert(quoting_ratio_60s=0.10, unwind_ratio_60s=0.80)
+    assert "mm_regime_degraded" in mm._alerts

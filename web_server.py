@@ -2585,11 +2585,13 @@ class MMRuntime:
 
 class MMRuntimeV2(MMRuntime):
     """Parallel runtime for the pair-first V2 engine."""
+    LIVE_MIN_BUDGET_USD = 50.0
 
     def __init__(self):
         super().__init__()
         self.mm_v2: Optional[MarketMakerV2] = None
         self.mm_config_v2: MMConfigV2 = MMConfigV2()
+        self._live_budget_gate_passed: bool = False
 
     def _idle_snapshot_v2(self) -> dict[str, Any]:
         return {
@@ -2681,17 +2683,37 @@ class MMRuntimeV2(MMRuntime):
                 "wallet_snapshot_stale": False,
                 "true_drift_age_sec": 0.0,
                 "true_drift_no_progress_sec": 0.0,
+                "drawdown_breach_ticks": 0,
+                "drawdown_breach_age_sec": 0.0,
+                "drawdown_breach_active": False,
                 "drift_evidence": {},
             },
             "analytics": {
                 "fill_count": 0,
                 "session_pnl": 0.0,
+                "session_pnl_equity_usd": 0.0,
+                "session_pnl_operator_usd": 0.0,
+                "session_pnl_operator_ema_usd": 0.0,
+                "position_mark_value_usd": 0.0,
+                "position_mark_value_bid_usd": 0.0,
+                "position_mark_value_mid_usd": 0.0,
+                "portfolio_mark_value_usd": 0.0,
+                "tradeable_portfolio_value_usd": 0.0,
+                "pnl_calc_mode": "wallet_total_plus_mark",
+                "pnl_mark_basis": "conservative_bid",
+                "pnl_updated_ts": 0.0,
                 "markout_1s": 0.0,
                 "markout_5s": 0.0,
                 "spread_capture_usd": 0.0,
                 "fill_rate": 0.0,
                 "quote_presence_ratio": 0.0,
                 "inventory_half_life_sec": 0.0,
+                "quoting_ratio_60s": 0.0,
+                "inventory_skewed_ratio_60s": 0.0,
+                "defensive_ratio_60s": 0.0,
+                "unwind_ratio_60s": 0.0,
+                "emergency_unwind_ratio_60s": 0.0,
+                "four_quote_ratio_60s": 0.0,
                 "recent_fills": [],
             },
             "alerts": self.list_alerts(),
@@ -2699,6 +2721,9 @@ class MMRuntimeV2(MMRuntime):
             "runtime": {
                 "last_terminal_reason": "",
                 "last_terminal_ts": 0.0,
+                "live_budget_gate_passed": bool(self._live_budget_gate_passed),
+                "drawdown_breach_ticks": 0,
+                "drawdown_breach_age_sec": 0.0,
             },
         }
 
@@ -2730,6 +2755,22 @@ class MMRuntimeV2(MMRuntime):
         self._paper_mode = bool(paper_mode)
         self._dev_mode = bool(dev)
         self._initial_usdc = float(initial_usdc)
+        effective_session_budget = (
+            float(session_budget_usd)
+            if session_budget_usd is not None
+            else float(self._initial_usdc)
+        )
+        self._live_budget_gate_passed = bool(
+            self._paper_mode or effective_session_budget >= float(self.LIVE_MIN_BUDGET_USD)
+        )
+        if not self._paper_mode and not self._live_budget_gate_passed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"live_min_budget_50_required: requested={effective_session_budget:.2f} "
+                    f"min={self.LIVE_MIN_BUDGET_USD:.2f}"
+                ),
+            )
 
         if dev:
             _telegram.switch_credentials(
@@ -2801,11 +2842,6 @@ class MMRuntimeV2(MMRuntime):
             paper_mode=paper_mode,
             initial_usdc=self._initial_usdc,
         )
-        effective_session_budget = (
-            float(session_budget_usd)
-            if session_budget_usd is not None
-            else float(self._initial_usdc)
-        )
         self.mm_config_v2.session_budget_usd = effective_session_budget
         self.mm_v2 = MarketMakerV2(self.feed_state, clob, self.mm_config_v2)
         self.mm_v2.set_market(market)
@@ -2843,6 +2879,11 @@ class MMRuntimeV2(MMRuntime):
     def snapshot(self) -> dict:
         if self.mm_v2:
             snap = self.mm_v2.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+            runtime_block = snap.get("runtime")
+            if not isinstance(runtime_block, dict):
+                runtime_block = {}
+            runtime_block["live_budget_gate_passed"] = bool(self._live_budget_gate_passed)
+            snap["runtime"] = runtime_block
             snap["alerts"] = self.list_alerts() + [a for a in snap.get("alerts", []) if a not in self.list_alerts()]
             return snap
         snap = self._idle_snapshot_v2()
@@ -3048,6 +3089,16 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
     position_value = float(analytics.get("position_mark_value_usd") or (up_shares * up_mark + dn_shares * dn_mark))
     portfolio_value = float(analytics.get("tradeable_portfolio_value_usd") or (free_usdc + position_value))
     wallet_portfolio_value = float(analytics.get("portfolio_mark_value_usd") or (wallet_total_usdc + position_value))
+    session_pnl_risk_equity = float(
+        analytics.get("session_pnl_equity_usd")
+        if analytics.get("session_pnl_equity_usd") is not None
+        else analytics.get("session_pnl") or 0.0
+    )
+    session_pnl_operator = float(
+        analytics.get("session_pnl_operator_usd")
+        if analytics.get("session_pnl_operator_usd") is not None
+        else session_pnl_risk_equity
+    )
     feed_mid = float(getattr(_runtime_v2.feed_state, "mid", 0.0) or 0.0) if _runtime_v2.feed_state else 0.0
     lifecycle = str(raw.get("lifecycle") or "bootstrapping")
     is_running = bool(raw.get("is_running", False))
@@ -3069,10 +3120,12 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
         "portfolio_value": round(portfolio_value, 4),
         "wallet_portfolio_value": round(wallet_portfolio_value, 4),
         "position_value_pm": round(position_value, 4),
-        "session_pnl": float(analytics.get("session_pnl") or 0.0),
+        "session_pnl": session_pnl_operator,
+        "operator_pnl": session_pnl_operator,
+        "session_pnl_risk_equity": session_pnl_risk_equity,
         "realized_pnl": float(analytics.get("spread_capture_usd") or 0.0),
-        "unrealized_pnl": round(float(analytics.get("session_pnl") or 0.0) - float(analytics.get("spread_capture_usd") or 0.0), 4),
-        "peak_pnl": float(analytics.get("session_pnl") or 0.0),
+        "unrealized_pnl": round(session_pnl_risk_equity - float(analytics.get("spread_capture_usd") or 0.0), 4),
+        "peak_pnl": session_pnl_operator,
         "total_fees": 0.0,
         "total_volume": round(sum(float(f.get("price") or 0.0) * float(f.get("size") or 0.0) for f in recent_fills), 4),
         "fill_count": int(analytics.get("fill_count") or fills_page.get("total") or 0),
@@ -3107,6 +3160,14 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
         "recent_fills": recent_fills,
         "active_orders_detail": _v2_active_orders_detail(),
         "market_quality": market_quality,
+        "mm_regime": {
+            "quoting_ratio_60s": float(analytics.get("quoting_ratio_60s") or 0.0),
+            "inventory_skewed_ratio_60s": float(analytics.get("inventory_skewed_ratio_60s") or 0.0),
+            "defensive_ratio_60s": float(analytics.get("defensive_ratio_60s") or 0.0),
+            "unwind_ratio_60s": float(analytics.get("unwind_ratio_60s") or 0.0),
+            "emergency_unwind_ratio_60s": float(analytics.get("emergency_unwind_ratio_60s") or 0.0),
+            "four_quote_ratio_60s": float(analytics.get("four_quote_ratio_60s") or 0.0),
+        },
         "latency": None,
         "market": {
             "coin": _runtime_v2._coin or "BTC",
@@ -3409,6 +3470,14 @@ async def mmv2_start(req: StartRequest, request: Request):
         session_budget_usd = float(req.initial_usdc)
     else:
         session_budget_usd = float(_runtime_v2.mm_config_v2.session_budget_usd)
+    if not req.paper_mode and session_budget_usd < float(MMRuntimeV2.LIVE_MIN_BUDGET_USD):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"live_min_budget_50_required: requested={session_budget_usd:.2f} "
+                f"min={MMRuntimeV2.LIVE_MIN_BUDGET_USD:.2f}"
+            ),
+        )
     result = await _runtime_v2.start(
         req.coin,
         req.timeframe,
