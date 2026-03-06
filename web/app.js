@@ -525,7 +525,7 @@ function updateUI(s) {
 
     // Market Quality
     updateMarketQuality(s.market_quality);
-    updateMMRegime(s.mm_regime || {});
+    updateMMRegime(s.mm_regime || {}, s);
 
     // Latency panel
     if (s.latency) {
@@ -821,15 +821,110 @@ function updateMarketQuality(mq) {
     setText('quality-ask-depth', '$' + (mq.ask_depth_usd || 0).toFixed(0));
 }
 
-function updateMMRegime(mmRegime) {
-    const quoting = Math.max(0, Math.min(1, mmRegime?.quoting_ratio_60s ?? 0));
-    const unwind = Math.max(0, Math.min(1, mmRegime?.unwind_ratio_60s ?? 0));
-    const fourQuote = Math.max(0, Math.min(1, mmRegime?.four_quote_ratio_60s ?? 0));
+function updateMMRegime(mmRegime, state) {
+    const clampRatio = (v) => Math.max(0, Math.min(1, Number(v ?? 0)));
+    const formatMode = (mode) => {
+        const m = String(mode || '').toLowerCase();
+        const map = {
+            normal: 'NORMAL',
+            inventory_skewed: 'INVENTORY_SKEWED',
+            defensive: 'DEFENSIVE',
+            unwind: 'UNWIND',
+            emergency_unwind: 'EMERGENCY_UNWIND',
+            halted: 'HALTED',
+            bootstrapping: 'BOOTSTRAPPING',
+            quoting: 'QUOTING',
+            expired: 'EXPIRED',
+        };
+        return map[m] || (m ? m.toUpperCase() : '—');
+    };
+
+    const quoting = clampRatio(mmRegime?.quoting_ratio_60s);
+    const inventorySkewed = clampRatio(mmRegime?.inventory_skewed_ratio_60s);
+    const defensive = clampRatio(mmRegime?.defensive_ratio_60s);
+    const unwind = clampRatio(mmRegime?.unwind_ratio_60s);
+    const fourQuote = clampRatio(mmRegime?.four_quote_ratio_60s);
+    const mmEffectiveRaw = mmRegime?.mm_effective_ratio_60s;
+    const mmEffective = clampRatio(mmEffectiveRaw != null ? mmEffectiveRaw : (quoting + inventorySkewed + defensive));
+
+    setText('mm-effective-ratio', (mmEffective * 100).toFixed(0) + '%');
     setText('mm-quoting-ratio', (quoting * 100).toFixed(0) + '%');
     setText('mm-unwind-ratio', (unwind * 100).toFixed(0) + '%');
     setText('mm-fourq-ratio', (fourQuote * 100).toFixed(0) + '%');
-    const degraded = unwind > 0.5 || quoting < 0.3;
-    setText('mm-regime-status', degraded ? 'DEGRADED' : 'HEALTHY');
+
+    const lifecycle = String(mmRegime?.lifecycle || state?.lifecycle || '').toLowerCase();
+    const currentMode = String(mmRegime?.current_mode || state?.mode || lifecycle || '').toLowerCase();
+    const targetMode = String(mmRegime?.target_mode || state?.target_mode || currentMode || '').toLowerCase();
+    setText('mm-regime-current', formatMode(currentMode || lifecycle));
+    setText('mm-regime-target', formatMode(targetMode));
+
+    const quoteBalance = String(mmRegime?.quote_balance_state || '').toLowerCase();
+    const helpfulCount = Number(mmRegime?.helpful_quote_count ?? 0);
+    const harmfulCount = Number(mmRegime?.harmful_quote_count ?? 0);
+    const regimeReason = String(mmRegime?.reason || state?.pause_reason || '').trim();
+
+    let status = 'HEALTHY';
+    let statusClass = 'mm-status-badge mm-status-healthy';
+    if (currentMode === 'halted' || lifecycle === 'halted' || currentMode === 'emergency_unwind') {
+        status = 'CRITICAL';
+        statusClass = 'mm-status-badge mm-status-degraded';
+    } else if (mmEffective < 0.45 || unwind > 0.5 || quoteBalance === 'none') {
+        status = 'DEGRADED';
+        statusClass = 'mm-status-badge mm-status-degraded';
+    } else if (mmEffective < 0.65 || fourQuote < 0.2 || currentMode === 'defensive' || currentMode === 'unwind') {
+        status = 'WATCH';
+        statusClass = 'mm-status-badge mm-status-watch';
+    }
+    const statusEl = document.getElementById('mm-regime-status');
+    if (statusEl) {
+        statusEl.textContent = status;
+        statusEl.className = statusClass;
+    }
+
+    const modeExplain = {
+        normal: 'Базовый MM: двусторонние котировки вокруг fair value.',
+        inventory_skewed: 'Режим перекоса: котировки смещены для разгрузки инвентаря.',
+        defensive: 'Защитный MM: вредные intents подавлены, оставлены разгружающие.',
+        unwind: 'Контролируемая разгрузка: минимизируем расширение риска.',
+        emergency_unwind: 'Аварийная разгрузка позиции из hard safety.',
+        halted: 'Торговля остановлена hard safety.',
+    };
+    let why = modeExplain[currentMode] || modeExplain[lifecycle] || 'Режим не определен.';
+    if (regimeReason) {
+        why += ` Причина: ${regimeReason}.`;
+    } else if (quoteBalance === 'helpful_only') {
+        why += ' Сейчас доступны только helpful-котировки (safe side).';
+    } else if (quoteBalance === 'none') {
+        why += ' Сейчас нет жизнеспособных котировок после risk/min-size фильтров.';
+    } else if (quoteBalance === 'harmful_only_blocked') {
+        why += ' Harmful-only сценарий заблокирован политикой безопасности.';
+    }
+    if (helpfulCount || harmfulCount) {
+        why += ` Helpful/Harmful: ${helpfulCount}/${harmfulCount}.`;
+    }
+    setText('mm-regime-why', why);
+
+    const modeCardMap = {
+        normal: 'mm-mode-normal',
+        inventory_skewed: 'mm-mode-inventory-skewed',
+        defensive: 'mm-mode-defensive',
+        unwind: 'mm-mode-unwind',
+        emergency_unwind: 'mm-mode-emergency-unwind',
+        halted: 'mm-mode-halted',
+    };
+    [
+        'mm-mode-normal',
+        'mm-mode-inventory-skewed',
+        'mm-mode-defensive',
+        'mm-mode-unwind',
+        'mm-mode-emergency-unwind',
+        'mm-mode-halted',
+    ].forEach((id) => {
+        const el = document.getElementById(id);
+        if (el) el.classList.remove('active');
+    });
+    const currentCard = document.getElementById(modeCardMap[currentMode] || modeCardMap[lifecycle]);
+    if (currentCard) currentCard.classList.add('active');
 }
 
 // ── Latency Panel ────────────────────────────────────

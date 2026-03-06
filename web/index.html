@@ -118,22 +118,62 @@
                 </div>
             </div>
             <div id="pnl-chart" class="chart-container-small"></div>
-            <div class="stat-grid" style="margin-top:10px">
-                <div class="stat-item">
-                    <div class="stat-label">MM Regime</div>
-                    <div id="mm-regime-status" class="stat-value">—</div>
+            <div class="mm-regime-panel">
+                <div class="mm-regime-top">
+                    <div class="mm-regime-main">
+                        <div class="stat-label">MM Regime Health</div>
+                        <div class="mm-regime-line">
+                            <span id="mm-regime-status" class="mm-status-badge mm-status-neutral">—</span>
+                            <span id="mm-regime-current" class="mm-mode-current">—</span>
+                            <span class="mm-mode-arrow">→</span>
+                            <span id="mm-regime-target" class="mm-mode-target">—</span>
+                        </div>
+                        <div id="mm-regime-why" class="mm-regime-why">—</div>
+                    </div>
+                    <div class="mm-regime-metrics-grid">
+                        <div class="mm-metric">
+                            <div class="mm-metric-label">MM-Effective 60s</div>
+                            <div id="mm-effective-ratio" class="mm-metric-value">0%</div>
+                        </div>
+                        <div class="mm-metric">
+                            <div class="mm-metric-label">Quoting 60s</div>
+                            <div id="mm-quoting-ratio" class="mm-metric-value">0%</div>
+                        </div>
+                        <div class="mm-metric">
+                            <div class="mm-metric-label">Unwind 60s</div>
+                            <div id="mm-unwind-ratio" class="mm-metric-value">0%</div>
+                        </div>
+                        <div class="mm-metric">
+                            <div class="mm-metric-label">4-Quote 60s</div>
+                            <div id="mm-fourq-ratio" class="mm-metric-value">0%</div>
+                        </div>
+                    </div>
                 </div>
-                <div class="stat-item">
-                    <div class="stat-label">Quoting 60s</div>
-                    <div id="mm-quoting-ratio" class="stat-value">0%</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-label">Unwind 60s</div>
-                    <div id="mm-unwind-ratio" class="stat-value">0%</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-label">4-Quote 60s</div>
-                    <div id="mm-fourq-ratio" class="stat-value">0%</div>
+                <div class="mm-mode-legend">
+                    <div id="mm-mode-normal" class="mm-mode-card">
+                        <div class="mm-mode-title">Normal</div>
+                        <div class="mm-mode-desc">Базовый MM: двусторонние котировки вокруг fair value.</div>
+                    </div>
+                    <div id="mm-mode-inventory-skewed" class="mm-mode-card">
+                        <div class="mm-mode-title">Inventory Skewed</div>
+                        <div class="mm-mode-desc">Перекос инвентаря: асимметрия в пользу разгрузки позиции.</div>
+                    </div>
+                    <div id="mm-mode-defensive" class="mm-mode-card">
+                        <div class="mm-mode-title">Defensive</div>
+                        <div class="mm-mode-desc">Защитный MM: harmful-направления подавлены, полезные остаются.</div>
+                    </div>
+                    <div id="mm-mode-unwind" class="mm-mode-card">
+                        <div class="mm-mode-title">Unwind</div>
+                        <div class="mm-mode-desc">Контролируемый выход: приоритет снизить перекос, не расширять риск.</div>
+                    </div>
+                    <div id="mm-mode-emergency-unwind" class="mm-mode-card">
+                        <div class="mm-mode-title">Emergency Unwind</div>
+                        <div class="mm-mode-desc">Аварийная разгрузка: риск важнее спреда и симметрии.</div>
+                    </div>
+                    <div id="mm-mode-halted" class="mm-mode-card">
+                        <div class="mm-mode-title">Halted</div>
+                        <div class="mm-mode-desc">Hard safety: торговля остановлена до ручного решения.</div>
+                    </div>
                 </div>
             </div>
         </div>
