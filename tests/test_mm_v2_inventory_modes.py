@@ -12,7 +12,7 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm_v2.config import MMConfigV2, UNWIND_EXIT_CONFIRM_TICKS
+from mm_v2.config import EXIT_CONFIRM_TICKS, MMConfigV2, UNWIND_EXIT_CONFIRM_TICKS
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
 from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
@@ -530,6 +530,47 @@ def test_unwind_exit_does_not_require_excess_baseline_streak():
         result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
     assert result is not None
     assert result.lifecycle == "defensive"
+
+
+def test_defensive_deescalates_when_target_normal_and_quotes_viable_despite_stale_baseline():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("defensive")
+    # Stale low baseline should not block defensive de-escalation anymore.
+    sm._excess_baseline_ts = time.time() - 60.0
+    sm._excess_baseline_value_usd = 0.1
+    inventory = _inventory(
+        up_shares=5.0,
+        excess_up_qty=5.0,
+        excess_up_value_usd=1.4,
+        excess_value_usd=1.4,
+        signed_excess_value_usd=1.4,
+        total_inventory_value_usd=1.4,
+    )
+    snap = _snapshot(time_left_sec=600.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "normal"
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=1,
+        harmful_count=0,
+        helpful_only=True,
+        harmful_only=False,
+        quote_balance_state="helpful_only",
+        four_quote_presence_ratio=0.2,
+    )
+    result = None
+    for _ in range(EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "quoting"
+    assert result.effective_soft_mode == "normal"
 
 
 def test_flat_defensive_no_progress_does_not_escalate_to_unwind():

@@ -192,6 +192,24 @@ class StateMachineV2:
                     next_state = "defensive"
                     self._unwind_exit_ticks = 0
                     reason = "unwind exit confirmed"
+            elif self.lifecycle == "defensive":
+                # Defensive must not latch when risk target already normalized.
+                # Use quote viability + confirm ticks instead of excess baseline.
+                defensive_exit_armed = (
+                    risk.hard_mode == "none"
+                    and float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
+                    and target_soft_mode in {"normal", "inventory_skewed"}
+                    and viability.any_quote
+                    and viability.quote_balance_state != "none"
+                )
+                if defensive_exit_armed:
+                    self._healthy_ticks += 1
+                else:
+                    self._healthy_ticks = 0
+                if self._healthy_ticks >= EXIT_CONFIRM_TICKS:
+                    next_state = target_lifecycle
+                    reason = f"defensive exit confirmed: defensive->{target_lifecycle}"
+                    self._healthy_ticks = 0
             else:
                 baseline = (
                     self._excess_baseline_value_usd
