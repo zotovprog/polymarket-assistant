@@ -84,6 +84,7 @@ class MarketMakerV2:
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
         self._mm_regime_degraded_started_ts = 0.0
+        self._mm_regime_degraded_reason = ""
         self._unwind_target_mismatch_ticks = 0
         self._unwind_target_mismatch_started_ts = 0.0
         self._last_snapshot: PairMarketSnapshot | None = None
@@ -269,6 +270,7 @@ class MarketMakerV2:
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
         self._mm_regime_degraded_started_ts = 0.0
+        self._mm_regime_degraded_reason = ""
         self._unwind_target_mismatch_ticks = 0
         self._unwind_target_mismatch_started_ts = 0.0
         self._lifecycle_history.clear()
@@ -472,6 +474,7 @@ class MarketMakerV2:
         drawdown_breach_ticks: int = 0,
         drawdown_breach_age_sec: float = 0.0,
         drawdown_breach_active: bool = False,
+        drawdown_threshold_usd_effective: float = 0.0,
     ) -> HealthState:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
@@ -499,6 +502,7 @@ class MarketMakerV2:
             drawdown_breach_ticks=max(0, int(drawdown_breach_ticks)),
             drawdown_breach_age_sec=max(0.0, float(drawdown_breach_age_sec)),
             drawdown_breach_active=bool(drawdown_breach_active),
+            drawdown_threshold_usd_effective=max(0.0, float(drawdown_threshold_usd_effective)),
             drift_evidence=self.reconcile.drift_evidence.to_dict(),
         )
 
@@ -531,14 +535,15 @@ class MarketMakerV2:
         return age, no_progress
 
     def _update_drawdown_breach(self, equity_pnl: float) -> tuple[int, float, bool]:
-        if float(self.config.hard_drawdown_usd) <= 0.0:
+        effective_drawdown_usd = float(self.config.effective_hard_drawdown_usd())
+        if effective_drawdown_usd <= 0.0:
             self._drawdown_breach_ticks = 0
             self._drawdown_breach_started_ts = 0.0
             self._drawdown_breach_active = False
             return 0, 0.0, False
 
         now = time.time()
-        threshold = -float(self.config.hard_drawdown_usd)
+        threshold = -effective_drawdown_usd
         reset_level = threshold + float(DRAWDOWN_RESET_HYSTERESIS_USD)
 
         if equity_pnl <= threshold:
@@ -666,12 +671,24 @@ class MarketMakerV2:
         inventory_skewed_ratio_60s: float,
         defensive_ratio_60s: float,
         unwind_ratio_60s: float,
+        emergency_unwind_ratio_60s: float,
+        quote_balance_state: str,
     ) -> None:
         now = time.time()
         mm_active_ratio_60s = float(
             quoting_ratio_60s + inventory_skewed_ratio_60s + defensive_ratio_60s
         )
-        degraded = bool(unwind_ratio_60s > 0.50 or mm_active_ratio_60s < 0.30)
+        reason = ""
+        if unwind_ratio_60s > 0.50:
+            reason = "high_unwind_ratio"
+        elif emergency_unwind_ratio_60s > 0.20:
+            reason = "high_emergency_ratio"
+        elif mm_active_ratio_60s < 0.30:
+            reason = "low_mm_effective"
+        elif str(quote_balance_state or "").lower() == "none":
+            reason = "quote_none_sustained"
+        degraded = bool(reason)
+        self._mm_regime_degraded_reason = reason
         if degraded:
             if self._mm_regime_degraded_started_ts <= 0.0:
                 self._mm_regime_degraded_started_ts = now
@@ -679,14 +696,17 @@ class MarketMakerV2:
                 self.set_alert(
                     "mm_regime_degraded",
                     (
-                        f"MM regime degraded: mm_active_ratio_60s={mm_active_ratio_60s:.2f}, "
+                        f"MM regime degraded: reason={reason}, "
+                        f"mm_effective_ratio_60s={mm_active_ratio_60s:.2f}, "
                         f"quoting_ratio_60s={quoting_ratio_60s:.2f}, "
-                        f"unwind_ratio_60s={unwind_ratio_60s:.2f}"
+                        f"unwind_ratio_60s={unwind_ratio_60s:.2f}, "
+                        f"emergency_unwind_ratio_60s={emergency_unwind_ratio_60s:.2f}"
                     ),
                     level="warning",
                 )
             return
         self._mm_regime_degraded_started_ts = 0.0
+        self._mm_regime_degraded_reason = ""
         self.clear_alert("mm_regime_degraded")
 
     def _update_unwind_target_mismatch(
@@ -788,6 +808,7 @@ class MarketMakerV2:
         drawdown_breach_ticks, drawdown_breach_age_sec, drawdown_breach_active = self._update_drawdown_breach(
             self._session_pnl_equity_usd,
         )
+        drawdown_threshold_usd_effective = float(self.config.effective_hard_drawdown_usd())
         if inventory.free_usdc > (inventory.wallet_total_usdc + 1e-6):
             self.set_alert(
                 "wallet_invariant_v2",
@@ -824,6 +845,7 @@ class MarketMakerV2:
             drawdown_breach_ticks=drawdown_breach_ticks,
             drawdown_breach_age_sec=drawdown_breach_age_sec,
             drawdown_breach_active=drawdown_breach_active,
+            drawdown_threshold_usd_effective=drawdown_threshold_usd_effective,
         )
         risk = self.risk_kernel.evaluate(
             snapshot=snapshot,
@@ -893,7 +915,9 @@ class MarketMakerV2:
             for reason in plan.suppressed_reasons.values()
             if str(reason).startswith("harmful_suppressed_")
         )
-        target_ratio_breach_tick = 1 if float(inventory.pair_value_over_target_usd) > 0.0 else 0
+        target_ratio_cap_hits_tick = sum(
+            1 for reason in plan.suppressed_reasons.values() if str(reason) == "target_pair_ratio_cap"
+        )
         current_active_order_ids = set(self.gateway.active_order_ids())
         removed_orders_tick = len(self._prev_active_order_ids - current_active_order_ids)
         self._prev_active_order_ids = current_active_order_ids
@@ -910,7 +934,7 @@ class MarketMakerV2:
         self._mode_history.append((now, effective_risk.soft_mode))
         self._lifecycle_history.append((now, str(lifecycle)))
         self._harmful_suppressed_history.append((now, int(harmful_suppressed_count_tick)))
-        self._target_ratio_breach_history.append((now, int(target_ratio_breach_tick)))
+        self._target_ratio_breach_history.append((now, int(target_ratio_cap_hits_tick)))
         self._order_removal_history.append((now, int(removed_orders_tick)))
         self._prune_history(self._excess_history)
         self._prune_history(self._quote_presence_history)
@@ -946,7 +970,11 @@ class MarketMakerV2:
             inventory_skewed_ratio_60s=float(regime_ratios["inventory_skewed_ratio_60s"]),
             defensive_ratio_60s=float(regime_ratios["defensive_ratio_60s"]),
             unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
+            emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
+            quote_balance_state=str(plan.quote_balance_state),
         )
+        target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
+        target_ratio_cap_active = bool(target_ratio_cap_hits_tick > 0)
         analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl_equity_usd,
@@ -970,6 +998,9 @@ class MarketMakerV2:
             target_pair_value_usd=float(inventory.target_pair_value_usd),
             pair_value_ratio=float(inventory.pair_value_ratio),
             pair_value_over_target_usd=float(inventory.pair_value_over_target_usd),
+            target_ratio_activation_usd_effective=float(target_ratio_activation_usd_effective),
+            target_ratio_cap_active=bool(target_ratio_cap_active),
+            target_ratio_cap_hits_60s=int(target_ratio_breaches_60s),
             target_ratio_pressure=float(effective_risk.target_ratio_pressure),
             inventory_pressure_abs=float(risk.inventory_pressure_abs),
             inventory_pressure_signed=float(risk.inventory_pressure_signed),
@@ -991,9 +1022,11 @@ class MarketMakerV2:
             target_ratio_breaches_60s=int(target_ratio_breaches_60s),
             defensive_to_unwind_count_window=int(defensive_to_unwind_count_window),
             quote_cancel_to_fill_ratio_60s=float(quote_cancel_to_fill_ratio_60s),
+            mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),
             unwind_target_mismatch_ticks=int(self._unwind_target_mismatch_ticks),
             unwind_target_mismatch_sec=float(unwind_target_mismatch_sec),
             unwind_exit_armed=bool(transition.unwind_exit_armed),
+            emergency_exit_armed=bool(transition.emergency_exit_armed),
             recent_fills=[
                 {
                     "ts": f.ts,

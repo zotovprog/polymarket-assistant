@@ -305,6 +305,7 @@ class QuotePolicyV2:
         free_usdc = max(0.0, float(inventory.free_usdc))
         budget_headroom_usd = max(1.0, free_usdc * 0.20)
         min_viable_clip_usd = self._min_viable_clip_usd(snapshot, ctx)
+        harmful_buy_guard_usd = float(self.config.effective_harmful_buy_suppress_usd())
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
         mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
         pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
@@ -335,6 +336,15 @@ class QuotePolicyV2:
                 up_token_id=snapshot.up_token_id,
                 dn_token_id=snapshot.dn_token_id,
             )
+            if (
+                risk.soft_mode == "inventory_skewed"
+                and side == "BUY"
+                and effect == "harmful"
+                and float(inventory.excess_value_usd) >= harmful_buy_guard_usd
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "harmful_buy_blocked_high_skew"
+                continue
             if risk.soft_mode in {"defensive", "unwind"} and effect == "harmful":
                 built[slot] = None
                 suppressed_reasons[slot] = (
@@ -390,7 +400,11 @@ class QuotePolicyV2:
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
             expands_gross_inventory = side == "BUY" or (side == "SELL" and not inventory_backed_sell)
-            if inventory.pair_value_over_target_usd > 0.0 and expands_gross_inventory:
+            if (
+                risk.soft_mode in {"defensive", "unwind"}
+                and inventory.pair_value_over_target_usd > 0.0
+                and expands_gross_inventory
+            ):
                 built[slot] = None
                 suppressed_reasons[slot] = "target_pair_ratio_cap"
                 continue

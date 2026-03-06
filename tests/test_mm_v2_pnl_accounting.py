@@ -280,3 +280,20 @@ def test_operator_pnl_is_ema_smoothed():
 
     assert second_equity != pytest.approx(second_operator)
     assert min(first_operator, second_equity) <= second_operator <= max(first_operator, second_equity)
+
+
+def test_drawdown_breach_uses_effective_threshold_not_raw_static_value():
+    class _MockClient:
+        _orders = {}
+
+    cfg = MMConfigV2(session_budget_usd=50.0, hard_drawdown_usd=4.0, hard_drawdown_budget_ratio=0.30)
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), cfg)
+
+    # Raw threshold would breach at -6, but effective threshold is -15.
+    ticks_1, age_1, active_1 = mm._update_drawdown_breach(-6.0)
+    assert ticks_1 == 0
+    assert age_1 == pytest.approx(0.0)
+    assert active_1 is False
+
+    ticks_2, _, _ = mm._update_drawdown_breach(-16.0)
+    assert ticks_2 >= 1

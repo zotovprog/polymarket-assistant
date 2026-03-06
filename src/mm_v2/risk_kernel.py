@@ -59,6 +59,7 @@ class SoftRiskKernel:
         target_pair_value_usd = max(0.01, float(inventory.target_pair_value_usd))
         pair_over_target_usd = max(0.0, float(inventory.pair_value_over_target_usd))
         target_ratio_pressure = self._clamp(pair_over_target_usd / target_pair_value_usd, 0.0, 1.0)
+        target_ratio_activation_usd = float(self.config.effective_target_ratio_activation_usd())
 
         max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
         min_quality = float(self.config.min_market_quality_score)
@@ -112,9 +113,12 @@ class SoftRiskKernel:
         if target_soft_mode == "normal" and excess_value_usd >= soft_cap:
             target_soft_mode = "inventory_skewed"
             soft_reason = f"soft excess ${excess_value_usd:.2f}"
-        if target_soft_mode == "normal" and pair_over_target_usd > 0.0:
+        if target_soft_mode == "normal" and pair_over_target_usd >= target_ratio_activation_usd:
             target_soft_mode = "inventory_skewed"
-            soft_reason = f"target pair ratio exceeded by ${pair_over_target_usd:.2f}"
+            soft_reason = (
+                f"target pair ratio exceeded by ${pair_over_target_usd:.2f} "
+                f"(>=${target_ratio_activation_usd:.2f})"
+            )
 
         return SoftRiskAssessment(
             target_soft_mode=target_soft_mode,
@@ -173,7 +177,10 @@ class HardSafetyKernel:
             hard_reason = "heartbeat failure"
         elif bool(getattr(health, "drawdown_breach_active", False)):
             hard_mode = "emergency_unwind" if has_material_position else "halted"
-            hard_reason = f"hard drawdown ${equity_pnl:.2f}"
+            hard_reason = (
+                f"hard drawdown ${equity_pnl:.2f} "
+                f"(thr ${float(self.config.effective_hard_drawdown_usd()):.2f})"
+            )
         elif health.residual_inventory_failure and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):
             hard_mode = "emergency_unwind"
             hard_reason = "residual inventory near expiry"

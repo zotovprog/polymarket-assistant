@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 
 from .config import (
+    EMERGENCY_EXIT_CONFIRM_TICKS,
+    EMERGENCY_EXIT_MIN_HOLD_SEC,
     ENTER_CONFIRM_TICKS,
     EXIT_CONFIRM_TICKS,
     FOUR_QUOTE_MIN_RATIO_FOR_MM,
@@ -39,6 +41,7 @@ class StateMachineV2:
         self._no_helpful_ticks = 0
         self._unwind_exit_ticks = 0
         self._unwind_last_exit_ts = 0.0
+        self._emergency_exit_ticks = 0
 
     def seconds_in_mode(self) -> float:
         return max(0.0, time.time() - self._entered_at)
@@ -76,6 +79,8 @@ class StateMachineV2:
             self._unwind_exit_ticks = 0
         if next_state == "emergency_unwind":
             self._emergency_started_at = now
+        elif previous == "emergency_unwind":
+            self._emergency_exit_ticks = 0
         if next_state in {"quoting", "inventory_skewed", "defensive"}:
             self._healthy_ticks = 0
 
@@ -109,6 +114,7 @@ class StateMachineV2:
         no_progress = False
         reason = ""
         unwind_exit_armed = False
+        emergency_exit_armed = False
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
         if snapshot is None:
             self._set_lifecycle("bootstrapping")
@@ -142,6 +148,46 @@ class StateMachineV2:
             )
 
         target_soft_mode = getattr(risk, "target_soft_mode", risk.soft_mode)
+        if self.lifecycle == "emergency_unwind":
+            emergency_hold_elapsed = (
+                now - self._emergency_started_at
+                if self._emergency_started_at > 0.0
+                else 0.0
+            )
+            desired_exit = ""
+            if not has_material_position:
+                desired_exit = "quoting"
+            elif target_soft_mode == "unwind":
+                desired_exit = "unwind"
+            elif target_soft_mode in {"normal", "inventory_skewed", "defensive"} and viability.any_quote:
+                desired_exit = "defensive"
+            emergency_exit_armed = bool(
+                risk.hard_mode == "none"
+                and emergency_hold_elapsed >= float(EMERGENCY_EXIT_MIN_HOLD_SEC)
+                and desired_exit
+            )
+            if emergency_exit_armed:
+                self._emergency_exit_ticks += 1
+            else:
+                self._emergency_exit_ticks = 0
+            if self._emergency_exit_ticks >= int(EMERGENCY_EXIT_CONFIRM_TICKS):
+                next_state = desired_exit or "quoting"
+                self._emergency_exit_ticks = 0
+                if next_state == "defensive":
+                    reason = "emergency exit confirmed: emergency_unwind->defensive"
+                elif next_state == "unwind":
+                    reason = "emergency exit confirmed: emergency_unwind->unwind"
+                else:
+                    reason = "emergency exit confirmed: emergency_unwind->quoting"
+                self._set_lifecycle(next_state)
+            return SoftTransitionResult(
+                lifecycle=self.lifecycle,  # type: ignore[arg-type]
+                effective_soft_mode=self._effective_soft_mode(self.lifecycle),  # type: ignore[arg-type]
+                target_soft_mode=target_soft_mode,  # type: ignore[arg-type]
+                reason=reason or risk.reason,
+                emergency_exit_armed=bool(emergency_exit_armed),
+            )
+
         target_lifecycle = self._target_lifecycle(target_soft_mode)
         if target_lifecycle != self._target_soft_mode:
             self._target_soft_mode = target_lifecycle
@@ -308,4 +354,5 @@ class StateMachineV2:
             no_progress=no_progress,
             reason=reason or risk.reason,
             unwind_exit_armed=bool(unwind_exit_armed),
+            emergency_exit_armed=bool(emergency_exit_armed),
         )

@@ -496,12 +496,32 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert cfg.base_half_spread_bps == pytest.approx(100.0)
     assert cfg.defensive_spread_mult == pytest.approx(1.5)
     assert cfg.defensive_size_mult == pytest.approx(0.4)
+    assert cfg.soft_excess_value_ratio == pytest.approx(0.20)
+    assert cfg.defensive_excess_value_ratio == pytest.approx(0.35)
+    assert cfg.hard_excess_value_ratio == pytest.approx(0.45)
     soft_cap = cfg.session_budget_usd * cfg.soft_excess_value_ratio
     def_cap = cfg.session_budget_usd * cfg.defensive_excess_value_ratio
     hard_cap = cfg.session_budget_usd * cfg.hard_excess_value_ratio
-    assert soft_cap == pytest.approx(3.0)
-    assert def_cap == pytest.approx(5.4)
-    assert hard_cap == pytest.approx(7.5)
+    assert soft_cap == pytest.approx(6.0)
+    assert def_cap == pytest.approx(10.5)
+    assert hard_cap == pytest.approx(13.5)
+
+
+def test_config_excess_profile_defaults_are_020_035_045():
+    cfg = MMConfigV2()
+    assert cfg.soft_excess_value_ratio == pytest.approx(0.20)
+    assert cfg.defensive_excess_value_ratio == pytest.approx(0.35)
+    assert cfg.hard_excess_value_ratio == pytest.approx(0.45)
+
+
+def test_effective_hard_drawdown_usd_uses_budget_ratio_floor():
+    cfg = MMConfigV2(session_budget_usd=50.0, hard_drawdown_usd=4.0, hard_drawdown_budget_ratio=0.30)
+    assert cfg.effective_hard_drawdown_usd() == pytest.approx(15.0)
+
+
+def test_effective_harmful_buy_suppress_usd_uses_budget_ratio():
+    cfg = MMConfigV2(session_budget_usd=50.0, harmful_buy_suppress_ratio=0.30)
+    assert cfg.effective_harmful_buy_suppress_usd() == pytest.approx(15.0)
 
 
 def test_quote_policy_preserves_pair_shape_and_two_sided_bids():
@@ -1130,6 +1150,28 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
     assert resp["runtime"]["live_budget_gate_passed"] is True
     assert resp["runtime"]["drawdown_breach_ticks"] == 4
     assert resp["runtime"]["drawdown_breach_age_sec"] == pytest.approx(9.5)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "defensive",
+            "analytics": {
+                "mm_regime_degraded_reason": "high_emergency_ratio",
+            },
+            "health": {
+                "drawdown_threshold_usd_effective": 15.0,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
+    assert resp["health"]["drawdown_threshold_usd_effective"] == pytest.approx(15.0)
 
 
 @pytest.mark.asyncio

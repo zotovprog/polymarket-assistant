@@ -8,6 +8,8 @@ from mm_shared.mm_config import MMConfig
 
 ENTER_CONFIRM_TICKS = 2
 EXIT_CONFIRM_TICKS = 5
+EMERGENCY_EXIT_CONFIRM_TICKS = 2
+EMERGENCY_EXIT_MIN_HOLD_SEC = 6.0
 UNWIND_EXIT_CONFIRM_TICKS = 3
 UNWIND_MIN_HOLD_SEC = 6.0
 UNWIND_REENTRY_COOLDOWN_SEC = 8.0
@@ -29,6 +31,7 @@ LOW_BUDGET_HARD_EXCESS_MIN_RATIO = 0.35
 DRAWDOWN_CONFIRM_TICKS = 3
 DRAWDOWN_CONFIRM_MIN_AGE_SEC = 8.0
 DRAWDOWN_RESET_HYSTERESIS_USD = 0.25
+TARGET_RATIO_ACTIVATION_MIN_USD = 2.0
 MM_REGIME_WINDOW_SEC = 60.0
 MM_REGIME_DEGRADED_CONFIRM_SEC = 120.0
 
@@ -47,6 +50,7 @@ class MMConfigV2:
         "soft_excess_value_ratio": (0.05, 0.60),
         "defensive_excess_value_ratio": (0.10, 0.80),
         "hard_excess_value_ratio": (0.10, 0.90),
+        "harmful_buy_suppress_ratio": (0.10, 0.90),
         "base_half_spread_bps": (5.0, 5000.0),
         "max_half_spread_bps": (25.0, 10000.0),
         "inventory_skew_strength": (0.1, 10.0),
@@ -56,6 +60,7 @@ class MMConfigV2:
         "emergency_unwind_timeout_sec": (1.0, 120.0),
         "emergency_taker_start_sec": (5.0, 120.0),
         "hard_drawdown_usd": (1.0, 1000.0),
+        "hard_drawdown_budget_ratio": (0.05, 0.80),
         "max_transport_failures": (1.0, 20.0),
         "tick_interval_sec": (0.25, 10.0),
         "min_market_quality_score": (0.0, 1.0),
@@ -71,9 +76,10 @@ class MMConfigV2:
     session_budget_usd: float = 30.0
     base_clip_usd: float = 6.0
     target_pair_value_ratio: float = 0.70
-    soft_excess_value_ratio: float = 0.10
-    defensive_excess_value_ratio: float = 0.18
-    hard_excess_value_ratio: float = 0.25
+    soft_excess_value_ratio: float = 0.20
+    defensive_excess_value_ratio: float = 0.35
+    hard_excess_value_ratio: float = 0.45
+    harmful_buy_suppress_ratio: float = 0.30
     base_half_spread_bps: float = 100.0
     max_half_spread_bps: float = 600.0
     inventory_skew_strength: float = 1.0
@@ -83,6 +89,7 @@ class MMConfigV2:
     emergency_unwind_timeout_sec: float = 10.0
     emergency_taker_start_sec: float = 20.0
     hard_drawdown_usd: float = 4.0
+    hard_drawdown_budget_ratio: float = 0.30
     max_transport_failures: int = 5
     market_scope: str = "BTC_15m"
 
@@ -111,6 +118,17 @@ class MMConfigV2:
         if budget <= LOW_BUDGET_PROFILE_THRESHOLD_USD:
             return max(ratio, LOW_BUDGET_HARD_EXCESS_MIN_RATIO)
         return ratio
+
+    def effective_hard_drawdown_usd(self) -> float:
+        dynamic = float(self.hard_drawdown_budget_ratio) * max(0.0, float(self.session_budget_usd))
+        return max(float(self.hard_drawdown_usd), dynamic)
+
+    def effective_target_ratio_activation_usd(self) -> float:
+        return max(float(TARGET_RATIO_ACTIVATION_MIN_USD), 0.05 * max(0.0, float(self.session_budget_usd)))
+
+    def effective_harmful_buy_suppress_usd(self) -> float:
+        budget = max(0.0, float(self.session_budget_usd))
+        return max(2.0, float(self.harmful_buy_suppress_ratio) * budget)
 
     def validate(self) -> None:
         for field_name, (lo, hi) in self.VALIDATION_BOUNDS.items():

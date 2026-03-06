@@ -102,10 +102,10 @@ def test_one_sided_dn_fill_below_hard_cap_keeps_four_quotes():
     inventory = _inventory(
         dn_shares=12.0,
         excess_dn_qty=12.0,
-        excess_dn_value_usd=6.0,
-        excess_value_usd=6.0,
-        signed_excess_value_usd=-6.0,
-        total_inventory_value_usd=6.0,
+        excess_dn_value_usd=12.0,
+        excess_value_usd=12.0,
+        signed_excess_value_usd=-12.0,
+        total_inventory_value_usd=12.0,
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
     assert risk.soft_mode == "inventory_skewed"
@@ -122,10 +122,10 @@ def test_repeated_dn_accumulation_enters_defensive_but_keeps_quotes():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=3.0,
-        excess_value_usd=3.0,
-        signed_excess_value_usd=-3.0,
-        total_inventory_value_usd=3.0,
+        excess_dn_value_usd=5.6,
+        excess_value_usd=5.6,
+        signed_excess_value_usd=-5.6,
+        total_inventory_value_usd=5.6,
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
     assert risk.soft_mode == "defensive"
@@ -147,10 +147,10 @@ def test_excess_beyond_hard_cap_moves_into_unwind_without_halt():
     inventory = _inventory(
         dn_shares=11.0,
         excess_dn_qty=11.0,
-        excess_dn_value_usd=5.8,
-        excess_value_usd=5.8,
-        signed_excess_value_usd=-5.8,
-        total_inventory_value_usd=5.8,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
     transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1))
@@ -281,18 +281,18 @@ def test_unwind_while_target_lower_ratio_is_bounded_outside_expiry():
     high_inventory = _inventory(
         dn_shares=11.0,
         excess_dn_qty=11.0,
-        excess_dn_value_usd=5.8,
-        excess_value_usd=5.8,
-        signed_excess_value_usd=-5.8,
-        total_inventory_value_usd=5.8,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
     )
     low_inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=3.0,
-        excess_value_usd=3.0,
-        signed_excess_value_usd=-3.0,
-        total_inventory_value_usd=3.0,
+        excess_dn_value_usd=5.6,
+        excess_value_usd=5.6,
+        signed_excess_value_usd=-5.6,
+        total_inventory_value_usd=5.6,
     )
     high_risk, _ = _evaluate(cfg, snapshot, high_inventory)
     low_risk, _ = _evaluate(cfg, snapshot, low_inventory)
@@ -365,10 +365,10 @@ def test_skewed_protective_modes_suppress_harmful_intents():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=3.0,
-        excess_value_usd=3.0,
-        signed_excess_value_usd=-3.0,
-        total_inventory_value_usd=3.0,
+        excess_dn_value_usd=5.6,
+        excess_value_usd=5.6,
+        signed_excess_value_usd=-5.6,
+        total_inventory_value_usd=5.6,
     )
     risk, _ = _evaluate(cfg, snapshot, inventory, min_order_size=5.0)
     assert risk.soft_mode == "defensive"

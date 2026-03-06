@@ -164,6 +164,9 @@ class AnalyticsState:
     target_pair_value_usd: float = 0.0
     pair_value_ratio: float = 0.0
     pair_value_over_target_usd: float = 0.0
+    target_ratio_activation_usd_effective: float = 0.0
+    target_ratio_cap_active: bool = False
+    target_ratio_cap_hits_60s: int = 0
     target_ratio_pressure: float = 0.0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
@@ -185,9 +188,11 @@ class AnalyticsState:
     target_ratio_breaches_60s: int = 0
     defensive_to_unwind_count_window: int = 0
     quote_cancel_to_fill_ratio_60s: float = 0.0
+    mm_regime_degraded_reason: str = ""
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
     unwind_exit_armed: bool = False
+    emergency_exit_armed: bool = False
     recent_fills: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -221,6 +226,7 @@ class SoftTransitionResult:
     no_progress: bool = False
     reason: str = ""
     unwind_exit_armed: bool = False
+    emergency_exit_armed: bool = False
 
 
 @dataclass
@@ -239,6 +245,7 @@ class HealthState:
     drawdown_breach_ticks: int = 0
     drawdown_breach_age_sec: float = 0.0
     drawdown_breach_active: bool = False
+    drawdown_threshold_usd_effective: float = 0.0
     drift_evidence: dict[str, Any] = field(default_factory=dict)
 
 

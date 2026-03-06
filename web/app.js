@@ -843,6 +843,7 @@ function updateMMRegime(mmRegime, state) {
     const inventorySkewed = clampRatio(mmRegime?.inventory_skewed_ratio_60s);
     const defensive = clampRatio(mmRegime?.defensive_ratio_60s);
     const unwind = clampRatio(mmRegime?.unwind_ratio_60s);
+    const emergencyUnwind = clampRatio(mmRegime?.emergency_unwind_ratio_60s);
     const fourQuote = clampRatio(mmRegime?.four_quote_ratio_60s);
     const mmEffectiveRaw = mmRegime?.mm_effective_ratio_60s;
     const mmEffective = clampRatio(mmEffectiveRaw != null ? mmEffectiveRaw : (quoting + inventorySkewed + defensive));
@@ -862,13 +863,14 @@ function updateMMRegime(mmRegime, state) {
     const helpfulCount = Number(mmRegime?.helpful_quote_count ?? 0);
     const harmfulCount = Number(mmRegime?.harmful_quote_count ?? 0);
     const regimeReason = String(mmRegime?.reason || state?.pause_reason || '').trim();
+    const degradedReason = String(mmRegime?.mm_regime_degraded_reason || '').trim();
 
     let status = 'HEALTHY';
     let statusClass = 'mm-status-badge mm-status-healthy';
     if (currentMode === 'halted' || lifecycle === 'halted' || currentMode === 'emergency_unwind') {
         status = 'CRITICAL';
         statusClass = 'mm-status-badge mm-status-degraded';
-    } else if (mmEffective < 0.45 || unwind > 0.5 || quoteBalance === 'none') {
+    } else if (mmEffective < 0.30 || unwind > 0.5 || emergencyUnwind > 0.20 || quoteBalance === 'none') {
         status = 'DEGRADED';
         statusClass = 'mm-status-badge mm-status-degraded';
     } else if (mmEffective < 0.65 || fourQuote < 0.2 || currentMode === 'defensive' || currentMode === 'unwind') {
@@ -892,6 +894,9 @@ function updateMMRegime(mmRegime, state) {
     let why = modeExplain[currentMode] || modeExplain[lifecycle] || 'Режим не определен.';
     if (regimeReason) {
         why += ` Причина: ${regimeReason}.`;
+    }
+    if (degradedReason) {
+        why += ` Regime alert reason: ${degradedReason}.`;
     } else if (quoteBalance === 'helpful_only') {
         why += ' Сейчас доступны только helpful-котировки (safe side).';
     } else if (quoteBalance === 'none') {

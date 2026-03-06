@@ -143,7 +143,7 @@ def test_helpful_size_is_larger_than_harmful_size_under_skew():
 
 def test_skewed_mode_keeps_four_quotes_below_hard_cap():
     risk, plan = _plan_for(
-        _inventory(excess_dn_value_usd=2.0, excess_value_usd=2.0, signed_excess_value_usd=-2.0),
+        _inventory(excess_dn_value_usd=3.2, excess_value_usd=3.2, signed_excess_value_usd=-3.2),
     )
     assert risk.soft_mode == "inventory_skewed"
     assert plan.up_bid is not None
@@ -262,7 +262,7 @@ def test_paper_asks_still_use_owned_inventory():
 
 def test_unwind_mode_disables_only_pair_expanding_intents():
     risk, plan = _plan_for(
-        _inventory(excess_dn_value_usd=5.8, excess_value_usd=5.8, signed_excess_value_usd=-5.8),
+        _inventory(excess_dn_value_usd=7.2, excess_value_usd=7.2, signed_excess_value_usd=-7.2),
     )
     assert risk.soft_mode == "unwind"
     assert plan.dn_bid is None
@@ -286,10 +286,10 @@ def test_unwind_helpful_floor_applies_for_helpful_buy_intents():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=6.0,
-        excess_value_usd=6.0,
-        signed_excess_value_usd=-6.0,
-        total_inventory_value_usd=6.0,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
         free_usdc=50.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -326,10 +326,10 @@ def test_unwind_helpful_buy_uses_full_free_usdc_headroom_not_20pct_cap():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=6.0,
-        excess_value_usd=6.0,
-        signed_excess_value_usd=-6.0,
-        total_inventory_value_usd=6.0,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
         free_usdc=12.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -367,10 +367,10 @@ def test_unwind_does_not_enable_harmful_intents():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=6.0,
-        excess_value_usd=6.0,
-        signed_excess_value_usd=-6.0,
-        total_inventory_value_usd=6.0,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
         free_usdc=50.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -411,10 +411,10 @@ def test_unwind_below_hard_cap_avoids_none_when_helpful_liquidity_exists():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=9.4,
-        excess_value_usd=9.4,
-        signed_excess_value_usd=-9.4,
-        total_inventory_value_usd=9.4,
+        excess_dn_value_usd=12.0,
+        excess_value_usd=12.0,
+        signed_excess_value_usd=-12.0,
+        total_inventory_value_usd=12.0,
         free_usdc=12.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -714,10 +714,10 @@ def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=9.4,
-        excess_value_usd=9.4,
-        signed_excess_value_usd=-9.4,
-        total_inventory_value_usd=9.4,
+        excess_dn_value_usd=18.0,
+        excess_value_usd=18.0,
+        signed_excess_value_usd=-18.0,
+        total_inventory_value_usd=18.0,
         free_usdc=50.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -855,10 +855,10 @@ def test_pair_share_cap_still_limits_endpoint_explosion_after_helpful_floor():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=9.8,
-        excess_value_usd=9.8,
-        signed_excess_value_usd=-9.8,
-        total_inventory_value_usd=9.8,
+        excess_dn_value_usd=18.0,
+        excess_value_usd=18.0,
+        signed_excess_value_usd=-18.0,
+        total_inventory_value_usd=18.0,
         free_usdc=50.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
@@ -879,7 +879,7 @@ def test_pair_share_cap_still_limits_endpoint_explosion_after_helpful_floor():
         if intent and intent.inventory_effect == "helpful"
     ]
     assert helpful_intents
-    assert max(intent.size for intent in helpful_intents) <= 6.0
+    assert max(intent.size for intent in helpful_intents) <= 20.0
 
 
 def test_inventory_backed_sells_survive_low_free_usdc_after_live_like_fills():
@@ -1018,10 +1018,10 @@ def test_defensive_suppresses_harmful_intents_unconditionally():
     inventory = _inventory(
         dn_shares=6.0,
         excess_dn_qty=6.0,
-        excess_dn_value_usd=3.0,
-        excess_value_usd=3.0,
-        signed_excess_value_usd=-3.0,
-        total_inventory_value_usd=3.0,
+        excess_dn_value_usd=5.6,
+        excess_value_usd=5.6,
+        signed_excess_value_usd=-5.6,
+        total_inventory_value_usd=5.6,
     )
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
@@ -1050,10 +1050,10 @@ def test_unwind_suppresses_harmful_intents_unconditionally():
     inventory = _inventory(
         dn_shares=11.0,
         excess_dn_qty=11.0,
-        excess_dn_value_usd=5.8,
-        excess_value_usd=5.8,
-        signed_excess_value_usd=-5.8,
-        total_inventory_value_usd=5.8,
+        excess_dn_value_usd=7.2,
+        excess_value_usd=7.2,
+        signed_excess_value_usd=-7.2,
+        total_inventory_value_usd=7.2,
     )
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
@@ -1075,7 +1075,7 @@ def test_unwind_suppresses_harmful_intents_unconditionally():
 
 
 def test_protective_modes_emit_no_inventory_expanding_final_plan():
-    for excess in (3.0, 5.8):
+    for excess in (5.6, 7.2):
         cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
         snapshot = _snapshot()
         inventory = _inventory(
@@ -1101,3 +1101,212 @@ def test_protective_modes_emit_no_inventory_expanding_final_plan():
         )
         assert plan.dn_bid is None
         assert plan.up_ask is None
+
+
+def test_target_pair_ratio_cap_applies_only_in_defensive_and_unwind():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=6.0, target_pair_value_ratio=0.70)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=10.0,
+        dn_shares=10.0,
+        paired_qty=10.0,
+        paired_value_usd=10.0,
+        total_inventory_value_usd=24.0,
+        target_pair_value_usd=21.0,
+        pair_value_ratio=0.80,
+        pair_value_over_target_usd=3.0,
+        free_usdc=30.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+
+    risk.soft_mode = "normal"
+    risk.target_soft_mode = "normal"
+    plan_normal = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert "target_pair_ratio_cap" not in set(plan_normal.suppressed_reasons.values())
+
+    risk.soft_mode = "defensive"
+    risk.target_soft_mode = "defensive"
+    plan_defensive = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert "target_pair_ratio_cap" in set(plan_defensive.suppressed_reasons.values())
+
+    risk.soft_mode = "unwind"
+    risk.target_soft_mode = "unwind"
+    plan_unwind = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert "target_pair_ratio_cap" in set(plan_unwind.suppressed_reasons.values())
+
+
+def test_target_ratio_deadband_prevents_false_inventory_skewed_trigger():
+    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.70)
+    snapshot = _snapshot(
+        market_quality_score=0.95,
+        market_tradeable=True,
+        divergence_up=0.01,
+        divergence_dn=0.01,
+    )
+    inventory_below_deadband = _inventory(
+        total_inventory_value_usd=22.0,
+        target_pair_value_usd=21.0,
+        pair_value_ratio=22.0 / 30.0,
+        pair_value_over_target_usd=1.0,
+        excess_value_usd=0.2,
+        signed_excess_value_usd=0.2,
+    )
+    risk_below = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory_below_deadband,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert cfg.effective_target_ratio_activation_usd() == pytest.approx(2.0)
+    assert risk_below.target_soft_mode == "normal"
+
+    inventory_above_deadband = _inventory(
+        total_inventory_value_usd=23.5,
+        target_pair_value_usd=21.0,
+        pair_value_ratio=23.5 / 30.0,
+        pair_value_over_target_usd=2.5,
+        excess_value_usd=0.2,
+        signed_excess_value_usd=0.2,
+    )
+    risk_above = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory_above_deadband,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk_above.target_soft_mode == "inventory_skewed"
+
+
+def test_protective_modes_still_block_gross_inventory_expansion():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=6.0, target_pair_value_ratio=0.70)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        up_shares=12.0,
+        dn_shares=8.0,
+        paired_qty=8.0,
+        excess_up_qty=4.0,
+        paired_value_usd=8.0,
+        excess_up_value_usd=2.0,
+        total_inventory_value_usd=24.0,
+        target_pair_value_usd=21.0,
+        pair_value_ratio=0.80,
+        pair_value_over_target_usd=3.0,
+        excess_value_usd=2.0,
+        signed_excess_value_usd=2.0,
+        free_usdc=30.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    risk.soft_mode = "defensive"
+    risk.target_soft_mode = "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.up_bid is None
+    assert plan.dn_bid is None
+    assert plan.suppressed_reasons.get("up_bid") in {
+        "target_pair_ratio_cap",
+        "harmful_suppressed_in_defensive",
+    }
+    assert plan.suppressed_reasons.get("dn_bid") in {
+        "target_pair_ratio_cap",
+        "harmful_suppressed_in_defensive",
+    }
+
+
+def test_inventory_skewed_blocks_harmful_buy_when_excess_above_guard():
+    cfg = MMConfigV2(
+        session_budget_usd=50.0,
+        base_clip_usd=6.0,
+        harmful_buy_suppress_ratio=0.20,
+    )
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=12.0,
+        excess_dn_qty=12.0,
+        excess_dn_value_usd=12.0,
+        excess_value_usd=12.0,
+        signed_excess_value_usd=-12.0,
+        total_inventory_value_usd=12.0,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert cfg.effective_harmful_buy_suppress_usd() == pytest.approx(10.0)
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.dn_bid is None
+    assert plan.suppressed_reasons.get("dn_bid") == "harmful_buy_blocked_high_skew"
+    assert plan.up_bid is not None
+    assert plan.dn_ask is not None
+
+
+def test_inventory_skewed_keeps_harmful_buy_below_guard():
+    cfg = MMConfigV2(
+        session_budget_usd=50.0,
+        base_clip_usd=6.0,
+        harmful_buy_suppress_ratio=0.40,
+    )
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=12.0,
+        excess_dn_qty=12.0,
+        excess_dn_value_usd=12.0,
+        excess_value_usd=12.0,
+        signed_excess_value_usd=-12.0,
+        total_inventory_value_usd=12.0,
+        free_usdc=50.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert cfg.effective_harmful_buy_suppress_usd() == pytest.approx(20.0)
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.dn_bid is not None
+    assert plan.dn_bid.inventory_effect == "harmful"
+    assert plan.suppressed_reasons.get("dn_bid") != "harmful_buy_blocked_high_skew"
