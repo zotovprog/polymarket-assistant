@@ -11,11 +11,19 @@ node_modules/
 dist/
 build/
 data/
+data/raw/
+data/normalized/
+data/replay/
+orderFilled_complete.csv.xz
+data/**/*.parquet
+data/**/*.xz
+audit/local-paper/
 workspace/
 backtest/report.html
 backtest/report.json
 backtest/sweep_results*.json
 .venv/
+.venv311/
 .DS_Store
 .pytest_cache/
 
