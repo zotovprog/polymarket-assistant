@@ -2802,6 +2802,15 @@ class MMRuntimeV2(MMRuntime):
         dev: bool = False,
         session_budget_usd: Optional[float] = None,
     ) -> dict:
+        if self._running and self.mm_v2:
+            try:
+                live_snap = self.mm_v2.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+            except Exception:
+                live_snap = {}
+            lifecycle = str(live_snap.get("lifecycle") or "")
+            is_running = bool(live_snap.get("is_running", False))
+            if not is_running or lifecycle in {"expired", "halted"}:
+                self._running = False
         if self._running:
             raise HTTPException(status_code=400, detail="V2 already running")
         if str(coin).upper() != "BTC" or str(timeframe) not in {"15m", "1h"}:

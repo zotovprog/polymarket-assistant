@@ -866,6 +866,9 @@ class MarketMakerV2:
             plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
             terminal_reason = risk.reason if lifecycle == "halted" else "expired"
             self._set_terminal_reason(terminal_reason or lifecycle)
+            # Expired/halted must terminate the loop so the outer runtime can
+            # start the next window without manual recovery.
+            self._running = False
         else:
             plan = QuotePolicyV2(self.config).generate(
                 snapshot=snapshot,

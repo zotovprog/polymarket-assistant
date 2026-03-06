@@ -8,6 +8,8 @@ from .types import AnalyticsState, HealthState, PairInventoryState, PairMarketSn
 INVENTORY_SIDE_DEADBAND_USD = 0.50
 FLAT_BOOTSTRAP_DIVERGENCE_DEFENSIVE = 0.20
 FLAT_BOOTSTRAP_QUALITY_MULT = 0.50
+DIVERGENCE_PRESSURE_SCALE = 0.30
+DIVERGENCE_DEFENSIVE_THRESHOLD = 0.30
 
 
 @dataclass
@@ -71,7 +73,9 @@ class SoftRiskKernel:
                 min_quality - float(snapshot.market_quality_score),
             ) / min_quality
             quality_pressure = max(quality_pressure, self._clamp(quality_deficit, 0.0, 1.0))
-        divergence_pressure = max_divergence / 0.12
+        # Divergence is noisy around endpoint liquidity regimes; do not
+        # saturate quality pressure too early or MM gets stuck in defensive.
+        divergence_pressure = max_divergence / DIVERGENCE_PRESSURE_SCALE
         quality_pressure = max(quality_pressure, self._clamp(divergence_pressure, 0.0, 1.0))
 
         target_soft_mode = "normal"
@@ -87,7 +91,7 @@ class SoftRiskKernel:
             soft_reason = "defensive excess regime"
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
-            divergence_bad = max_divergence > 0.12
+            divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
             if not snapshot.market_tradeable:
                 target_soft_mode = "defensive"
                 soft_reason = "defensive market regime (untradeable)"
