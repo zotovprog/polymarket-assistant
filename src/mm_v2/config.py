@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import math
 from typing import Any, ClassVar
 
-from mm.mm_config import MMConfig
+from mm_shared.mm_config import MMConfig
 
 ENTER_CONFIRM_TICKS = 2
 EXIT_CONFIRM_TICKS = 5
@@ -68,17 +68,17 @@ class MMConfigV2:
         "fallback_poll_cap": (1.0, 30.0),
     }
 
-    session_budget_usd: float = 15.0
+    session_budget_usd: float = 30.0
     base_clip_usd: float = 6.0
     target_pair_value_ratio: float = 0.70
     soft_excess_value_ratio: float = 0.10
     defensive_excess_value_ratio: float = 0.18
     hard_excess_value_ratio: float = 0.25
-    base_half_spread_bps: float = 150.0
+    base_half_spread_bps: float = 100.0
     max_half_spread_bps: float = 600.0
     inventory_skew_strength: float = 1.0
-    defensive_spread_mult: float = 1.8
-    defensive_size_mult: float = 0.5
+    defensive_spread_mult: float = 1.5
+    defensive_size_mult: float = 0.4
     unwind_window_sec: float = 90.0
     emergency_unwind_timeout_sec: float = 10.0
     emergency_taker_start_sec: float = 20.0

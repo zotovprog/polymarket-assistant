@@ -5,9 +5,9 @@ import time
 from types import SimpleNamespace
 from typing import Any
 
-from mm.fair_value import FairValueEngine
-from mm.market_quality import MarketQualityAnalyzer
-from mm.types import MarketInfo
+from mm_shared.fair_value import FairValueEngine
+from mm_shared.market_quality import MarketQualityAnalyzer
+from mm_shared.types import MarketInfo
 
 from .config import MMConfigV2
 from .types import PairMarketSnapshot

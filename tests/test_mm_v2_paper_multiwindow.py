@@ -129,9 +129,14 @@ def test_repeated_dn_accumulation_enters_defensive_but_keeps_quotes():
     )
     risk, plan = _evaluate(cfg, snapshot, inventory)
     assert risk.soft_mode == "defensive"
-    assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
-    assert plan.quote_balance_state == "balanced"
-    assert plan.up_bid.size_mult > plan.dn_bid.size_mult
+    assert plan.up_bid is not None
+    assert plan.dn_ask is not None
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons.get("dn_bid") == "harmful_suppressed_in_defensive"
+    assert plan.suppressed_reasons.get("up_ask") == "harmful_suppressed_in_defensive"
+    assert plan.up_bid.inventory_effect == "helpful"
+    assert plan.dn_ask.inventory_effect == "helpful"
     assert plan.quote_balance_state != "none"
 
 
@@ -352,3 +357,28 @@ def test_non_expiry_quote_balance_none_not_more_than_three_consecutive():
         else:
             current_none_streak = 0
     assert max_none_streak <= 3
+
+
+def test_skewed_protective_modes_suppress_harmful_intents():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot(time_left_sec=600.0)
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk, _ = _evaluate(cfg, snapshot, inventory, min_order_size=5.0)
+    assert risk.soft_mode == "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons.get("dn_bid") == "harmful_suppressed_in_defensive"
+    assert plan.suppressed_reasons.get("up_ask") == "harmful_suppressed_in_defensive"

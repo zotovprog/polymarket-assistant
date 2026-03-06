@@ -13,7 +13,7 @@ import logging
 import time
 from typing import Any, Callable
 
-from mm.runtime_metrics import runtime_metrics
+from mm_shared.runtime_metrics import runtime_metrics
 from telegram_notifier import TelegramAPIError
 
 log = logging.getLogger("tg.bot")

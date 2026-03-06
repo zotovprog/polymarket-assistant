@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from mm.types import Quote
+from mm_shared.types import Quote
 
 from .types import ExecutionState, QuoteIntent
 

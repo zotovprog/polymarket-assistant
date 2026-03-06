@@ -18,9 +18,9 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm.types import Fill, MarketInfo, Quote
-from mm.mm_config import MMConfig
-from mm.order_manager import OrderManager
+from mm_shared.types import Fill, MarketInfo, Quote
+from mm_shared.mm_config import MMConfig
+from mm_shared.order_manager import OrderManager
 from mm_v2.config import MMConfigV2
 from mm_v2.pair_inventory import build_pair_inventory
 from mm_v2.pm_gateway import PMGateway
@@ -488,6 +488,20 @@ def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
     assert state.reserved_usdc == pytest.approx(2.25)
     assert state.paired_value_usd == pytest.approx(7.0)
     assert state.excess_up_value_usd == pytest.approx(3.0)
+
+
+def test_mmv2_balanced_default_profile_and_caps():
+    cfg = MMConfigV2()
+    assert cfg.session_budget_usd == pytest.approx(30.0)
+    assert cfg.base_half_spread_bps == pytest.approx(100.0)
+    assert cfg.defensive_spread_mult == pytest.approx(1.5)
+    assert cfg.defensive_size_mult == pytest.approx(0.4)
+    soft_cap = cfg.session_budget_usd * cfg.soft_excess_value_ratio
+    def_cap = cfg.session_budget_usd * cfg.defensive_excess_value_ratio
+    hard_cap = cfg.session_budget_usd * cfg.hard_excess_value_ratio
+    assert soft_cap == pytest.approx(3.0)
+    assert def_cap == pytest.approx(5.4)
+    assert hard_cap == pytest.approx(7.5)
 
 
 def test_quote_policy_preserves_pair_shape_and_two_sided_bids():
@@ -1340,10 +1354,7 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
         },
     )
     web_server._runtime_v2.feed_state = SimpleNamespace(mid=99999.0)
-    req = SimpleNamespace(query_params={})
-    resp = await web_server.mm_state(request=req)
-    assert resp["legacy_alias"] is True
-    assert "deprecated" in resp["legacy_warning"].lower()
+    resp = web_server._dashboard_snapshot("v2")
     assert resp["dashboard_engine"] == "v2"
     assert resp["market"]["coin"] == "BTC"
     assert resp["market"]["timeframe"] == "15m"
@@ -1360,15 +1371,14 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_legacy_alias_sets_deprecation_headers(monkeypatch):
+async def test_legacy_alias_routes_removed(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
-    monkeypatch.setattr(web_server, "_dashboard_snapshot", lambda preferred=None: {"dashboard_engine": "v2"})
-    response = Response()
-    payload = await web_server.mm_state(request=SimpleNamespace(query_params={}), response=response)
-    assert payload["legacy_alias"] is True
-    assert response.headers.get("Deprecation") == "true"
-    assert response.headers.get("Sunset")
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mm_state(request=SimpleNamespace(query_params={}), response=Response())
+    assert exc.value.status_code == 410
+    detail = exc.value.detail or {}
+    assert detail.get("error") == "legacy_v1_removed_use_mmv2"
 
 
 @pytest.mark.asyncio

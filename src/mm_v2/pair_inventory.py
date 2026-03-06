@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mm.types import Quote
+from mm_shared.types import Quote
 
 from .types import PairInventoryState
 
@@ -48,6 +48,8 @@ def build_pair_inventory(
     fv_dn: float,
     up_token_id: str,
     dn_token_id: str,
+    session_budget_usd: float = 0.0,
+    target_pair_value_ratio: float = 0.70,
 ) -> PairInventoryState:
     pending = pending_reservations(
         active_orders,
@@ -63,6 +65,14 @@ def build_pair_inventory(
     excess_value_usd = excess_up_value_usd + excess_dn_value_usd
     signed_excess_value_usd = excess_up_value_usd - excess_dn_value_usd
     total_inventory_value_usd = max(0.0, up_shares) * max(0.0, fv_up) + max(0.0, dn_shares) * max(0.0, fv_dn)
+    raw_budget = float(session_budget_usd or 0.0)
+    if raw_budget <= 0.0:
+        raw_budget = max(1.0, float(total_usdc) + total_inventory_value_usd)
+    session_budget = max(0.01, raw_budget)
+    target_ratio = max(0.0, min(1.0, float(target_pair_value_ratio or 0.0)))
+    target_pair_value_usd = session_budget * target_ratio
+    pair_value_ratio = max(0.0, total_inventory_value_usd) / session_budget
+    pair_value_over_target_usd = max(0.0, total_inventory_value_usd - target_pair_value_usd)
     wallet_total_usdc = max(0.0, float(total_usdc))
     if available_usdc is None:
         wallet_free_usdc = max(0.0, wallet_total_usdc - pending["pending_buy_reserved_usdc"])
@@ -90,4 +100,7 @@ def build_pair_inventory(
         pending_buy_reserved_usdc=pending["pending_buy_reserved_usdc"],
         excess_value_usd=excess_value_usd,
         signed_excess_value_usd=signed_excess_value_usd,
+        target_pair_value_usd=target_pair_value_usd,
+        pair_value_ratio=pair_value_ratio,
+        pair_value_over_target_usd=pair_value_over_target_usd,
     )

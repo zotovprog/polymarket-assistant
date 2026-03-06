@@ -76,7 +76,7 @@ def _inventory(**overrides) -> PairInventoryState:
 
 
 def _plan_for(inventory: PairInventoryState):
-    cfg = MMConfigV2(base_clip_usd=6.0)
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
     snapshot = _snapshot()
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
@@ -513,7 +513,7 @@ def test_helpful_intent_is_promoted_to_min_order_size_when_safe():
 
 
 def test_harmful_intents_are_blocked_when_no_helpful_intents_survive(monkeypatch):
-    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     policy = QuotePolicyV2(cfg)
     snapshot = _snapshot(
         fv_up=0.99,
@@ -525,7 +525,7 @@ def test_harmful_intents_are_blocked_when_no_helpful_intents_survive(monkeypatch
         dn_best_bid=0.01,
         dn_best_ask=0.02,
     )
-    inventory = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0, free_usdc=50.0)
+    inventory = _inventory(excess_dn_value_usd=6.0, excess_value_usd=6.0, signed_excess_value_usd=-6.0, free_usdc=50.0)
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
         inventory=inventory,
@@ -575,7 +575,7 @@ def test_effective_soft_mode_drives_quote_generation_not_target_mode():
 
 
 def test_quote_state_includes_suppressed_reason_for_blocked_harmful_intents(monkeypatch):
-    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     policy = QuotePolicyV2(cfg)
     snapshot = _snapshot(
         fv_up=0.99,
@@ -587,7 +587,7 @@ def test_quote_state_includes_suppressed_reason_for_blocked_harmful_intents(monk
         dn_best_bid=0.01,
         dn_best_ask=0.02,
     )
-    inventory = _inventory(excess_dn_value_usd=3.0, excess_value_usd=3.0, signed_excess_value_usd=-3.0, free_usdc=50.0)
+    inventory = _inventory(excess_dn_value_usd=6.0, excess_value_usd=6.0, signed_excess_value_usd=-6.0, free_usdc=50.0)
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
         inventory=inventory,
@@ -782,7 +782,10 @@ def test_harmful_quotes_do_not_receive_min_viable_floor():
         assert plan.dn_bid.inventory_effect == "harmful"
         assert plan.up_bid.size >= plan.dn_bid.size
     else:
-        assert plan.suppressed_reasons["dn_bid"] == "below_min_order_size"
+        assert plan.suppressed_reasons["dn_bid"] in {
+            "below_min_order_size",
+            "harmful_suppressed_in_defensive",
+        }
 
 
 def test_no_viable_quotes_reason_is_explicit_when_all_quotes_below_min_size():
@@ -1007,3 +1010,94 @@ def test_emergency_unwind_post_only_sell_is_priced_above_best_bid():
     assert plan.up_ask is not None
     assert plan.up_ask.post_only is True
     assert plan.up_ask.price > float(snapshot.up_best_bid)
+
+
+def test_defensive_suppresses_harmful_intents_unconditionally():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons.get("dn_bid") == "harmful_suppressed_in_defensive"
+    assert plan.suppressed_reasons.get("up_ask") == "harmful_suppressed_in_defensive"
+    assert plan.up_bid is not None
+    assert plan.dn_ask is not None
+
+
+def test_unwind_suppresses_harmful_intents_unconditionally():
+    cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        dn_shares=11.0,
+        excess_dn_qty=11.0,
+        excess_dn_value_usd=5.8,
+        excess_value_usd=5.8,
+        signed_excess_value_usd=-5.8,
+        total_inventory_value_usd=5.8,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "unwind"
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.dn_bid is None
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons.get("dn_bid") == "harmful_suppressed_in_unwind"
+    assert plan.suppressed_reasons.get("up_ask") == "harmful_suppressed_in_unwind"
+
+
+def test_protective_modes_emit_no_inventory_expanding_final_plan():
+    for excess in (3.0, 5.8):
+        cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
+        snapshot = _snapshot()
+        inventory = _inventory(
+            dn_shares=11.0 if excess > 4.0 else 6.0,
+            excess_dn_qty=11.0 if excess > 4.0 else 6.0,
+            excess_dn_value_usd=excess,
+            excess_value_usd=excess,
+            signed_excess_value_usd=-excess,
+            total_inventory_value_usd=excess,
+        )
+        risk = HardSafetyKernel(cfg).evaluate(
+            snapshot=snapshot,
+            inventory=inventory,
+            analytics=AnalyticsState(),
+            health=HealthState(),
+        )
+        assert risk.soft_mode in {"defensive", "unwind"}
+        plan = QuotePolicyV2(cfg).generate(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+        )
+        assert plan.dn_bid is None
+        assert plan.up_ask is None

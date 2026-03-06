@@ -11,7 +11,7 @@ import websockets
 from datetime import datetime, timezone, timedelta
 
 import config
-from mm.runtime_metrics import runtime_metrics
+from mm_shared.runtime_metrics import runtime_metrics
 
 
 class State:

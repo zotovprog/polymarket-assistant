@@ -5,9 +5,9 @@ from dataclasses import replace
 import time
 from typing import Any
 
-from mm.heartbeat import HeartbeatManager
-from mm.runtime_metrics import runtime_metrics
-from mm.types import Fill, MarketInfo
+from mm_shared.heartbeat import HeartbeatManager
+from mm_shared.runtime_metrics import runtime_metrics
+from mm_shared.types import Fill, MarketInfo
 
 from .config import (
     DRAWDOWN_CONFIRM_MIN_AGE_SEC,
@@ -69,6 +69,10 @@ class MarketMakerV2:
         self._quote_presence_history: list[tuple[float, tuple[bool, bool]]] = []
         self._mode_history: list[tuple[float, str]] = []
         self._lifecycle_history: list[tuple[float, str]] = []
+        self._harmful_suppressed_history: list[tuple[float, int]] = []
+        self._target_ratio_breach_history: list[tuple[float, int]] = []
+        self._order_removal_history: list[tuple[float, int]] = []
+        self._prev_active_order_ids: set[str] = set()
         self._starting_portfolio = 0.0
         self._starting_usdc = 0.0
         self._session_pnl = 0.0
@@ -160,6 +164,7 @@ class MarketMakerV2:
             helpful_only=helpful > 0 and harmful == 0,
             harmful_only=harmful > 0 and helpful == 0,
             four_quote_presence_ratio=rolling_four_quote_presence,
+            quote_balance_state=str(getattr(plan, "quote_balance_state", "none") or "none"),
         )
 
     def set_market(self, market: MarketInfo) -> None:
@@ -267,6 +272,9 @@ class MarketMakerV2:
         self._unwind_target_mismatch_ticks = 0
         self._unwind_target_mismatch_started_ts = 0.0
         self._lifecycle_history.clear()
+        self._harmful_suppressed_history.clear()
+        self._target_ratio_breach_history.clear()
+        self._order_removal_history.clear()
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -291,6 +299,7 @@ class MarketMakerV2:
         fv_dn = float(getattr(self.feed_state, "pm_dn", 0.5) or max(0.01, 1.0 - fv_up))
         self._starting_portfolio = float(total_usdc) + up * fv_up + dn * fv_dn
         self.heartbeat.start()
+        self._prev_active_order_ids = set(self.gateway.active_order_ids())
         self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self, *, liquidate: bool = True) -> dict[str, Any]:
@@ -623,6 +632,33 @@ class MarketMakerV2:
             "emergency_unwind_ratio_60s": counts["emergency_unwind"] / total,
         }
 
+    @staticmethod
+    def _window_sum(history: list[tuple[float, int]], *, window_sec: float) -> int:
+        cutoff = time.time() - max(1.0, float(window_sec))
+        return int(sum(int(value or 0) for ts, value in history if ts >= cutoff))
+
+    def _fills_count_window(self, *, window_sec: float) -> int:
+        cutoff = time.time() - max(1.0, float(window_sec))
+        return int(sum(1 for fill in self._fills if float(getattr(fill, "ts", 0.0) or 0.0) >= cutoff))
+
+    def _quote_cancel_to_fill_ratio(self, *, window_sec: float) -> float:
+        removals = self._window_sum(self._order_removal_history, window_sec=window_sec)
+        fills = self._fills_count_window(window_sec=window_sec)
+        return float(removals / max(1, fills))
+
+    def _defensive_to_unwind_count(self, *, window_sec: float) -> int:
+        cutoff = time.time() - max(1.0, float(window_sec))
+        history = [entry for entry in self._lifecycle_history if entry[0] >= cutoff]
+        if len(history) < 2:
+            return 0
+        transitions = 0
+        prev = history[0][1]
+        for _, lifecycle in history[1:]:
+            if prev == "defensive" and lifecycle == "unwind":
+                transitions += 1
+            prev = lifecycle
+        return transitions
+
     def _update_mm_regime_alert(
         self,
         *,
@@ -849,6 +885,15 @@ class MarketMakerV2:
             if intent and intent.inventory_effect == "harmful"
         )
         now = time.time()
+        harmful_suppressed_count_tick = sum(
+            1
+            for reason in plan.suppressed_reasons.values()
+            if str(reason).startswith("harmful_suppressed_")
+        )
+        target_ratio_breach_tick = 1 if float(inventory.pair_value_over_target_usd) > 0.0 else 0
+        current_active_order_ids = set(self.gateway.active_order_ids())
+        removed_orders_tick = len(self._prev_active_order_ids - current_active_order_ids)
+        self._prev_active_order_ids = current_active_order_ids
         self._excess_history.append((now, float(inventory.excess_value_usd)))
         self._quote_presence_history.append(
             (
@@ -861,13 +906,38 @@ class MarketMakerV2:
         )
         self._mode_history.append((now, effective_risk.soft_mode))
         self._lifecycle_history.append((now, str(lifecycle)))
+        self._harmful_suppressed_history.append((now, int(harmful_suppressed_count_tick)))
+        self._target_ratio_breach_history.append((now, int(target_ratio_breach_tick)))
+        self._order_removal_history.append((now, int(removed_orders_tick)))
         self._prune_history(self._excess_history)
         self._prune_history(self._quote_presence_history)
         self._prune_history(self._mode_history)
         self._prune_history(self._lifecycle_history)
+        self._prune_history(self._harmful_suppressed_history)
+        self._prune_history(self._target_ratio_breach_history)
+        self._prune_history(self._order_removal_history)
         quote_presence_ratio, four_quote_presence_ratio = self._quote_presence_ratio()
         _, four_quote_ratio_60s = self._quote_presence_ratio_window(window_sec=float(MM_REGIME_WINDOW_SEC))
         regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC))
+        mm_effective_ratio_60s = float(
+            regime_ratios["quoting_ratio_60s"]
+            + regime_ratios["inventory_skewed_ratio_60s"]
+            + regime_ratios["defensive_ratio_60s"]
+        )
+        harmful_suppressed_count_60s = self._window_sum(
+            self._harmful_suppressed_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        target_ratio_breaches_60s = self._window_sum(
+            self._target_ratio_breach_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        defensive_to_unwind_count_window = self._defensive_to_unwind_count(
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        quote_cancel_to_fill_ratio_60s = self._quote_cancel_to_fill_ratio(
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
         self._update_mm_regime_alert(
             quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
             inventory_skewed_ratio_60s=float(regime_ratios["inventory_skewed_ratio_60s"]),
@@ -894,6 +964,10 @@ class MarketMakerV2:
             fill_rate=0.0,
             quote_presence_ratio=quote_presence_ratio,
             excess_value_usd=float(inventory.excess_value_usd),
+            target_pair_value_usd=float(inventory.target_pair_value_usd),
+            pair_value_ratio=float(inventory.pair_value_ratio),
+            pair_value_over_target_usd=float(inventory.pair_value_over_target_usd),
+            target_ratio_pressure=float(effective_risk.target_ratio_pressure),
             inventory_pressure_abs=float(risk.inventory_pressure_abs),
             inventory_pressure_signed=float(risk.inventory_pressure_signed),
             inventory_half_life_sec=self._estimate_inventory_half_life(),
@@ -909,6 +983,11 @@ class MarketMakerV2:
             unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
             emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
             four_quote_ratio_60s=float(four_quote_ratio_60s),
+            mm_effective_ratio_60s=float(mm_effective_ratio_60s),
+            harmful_suppressed_count_60s=int(harmful_suppressed_count_60s),
+            target_ratio_breaches_60s=int(target_ratio_breaches_60s),
+            defensive_to_unwind_count_window=int(defensive_to_unwind_count_window),
+            quote_cancel_to_fill_ratio_60s=float(quote_cancel_to_fill_ratio_60s),
             unwind_target_mismatch_ticks=int(self._unwind_target_mismatch_ticks),
             unwind_target_mismatch_sec=float(unwind_target_mismatch_sec),
             unwind_exit_armed=bool(transition.unwind_exit_armed),

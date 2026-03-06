@@ -17,6 +17,7 @@ class SoftRiskAssessment:
     pressure_abs: float
     pressure_signed: float
     quality_pressure: float
+    target_ratio_pressure: float
     soft_reason: str
 
 
@@ -53,6 +54,9 @@ class SoftRiskKernel:
 
         pressure_abs = self._clamp(excess_value_usd / hard_cap, 0.0, 1.0)
         pressure_signed = self._clamp(signed_excess_value_usd / hard_cap, -1.0, 1.0)
+        target_pair_value_usd = max(0.01, float(inventory.target_pair_value_usd))
+        pair_over_target_usd = max(0.0, float(inventory.pair_value_over_target_usd))
+        target_ratio_pressure = self._clamp(pair_over_target_usd / target_pair_value_usd, 0.0, 1.0)
 
         max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
         min_quality = float(self.config.min_market_quality_score)
@@ -104,6 +108,9 @@ class SoftRiskKernel:
         if target_soft_mode == "normal" and excess_value_usd >= soft_cap:
             target_soft_mode = "inventory_skewed"
             soft_reason = f"soft excess ${excess_value_usd:.2f}"
+        if target_soft_mode == "normal" and pair_over_target_usd > 0.0:
+            target_soft_mode = "inventory_skewed"
+            soft_reason = f"target pair ratio exceeded by ${pair_over_target_usd:.2f}"
 
         return SoftRiskAssessment(
             target_soft_mode=target_soft_mode,
@@ -111,6 +118,7 @@ class SoftRiskKernel:
             pressure_abs=pressure_abs,
             pressure_signed=pressure_signed,
             quality_pressure=quality_pressure,
+            target_ratio_pressure=target_ratio_pressure,
             soft_reason=soft_reason,
         )
 
@@ -184,4 +192,5 @@ class HardSafetyKernel:
             inventory_pressure_abs=soft.pressure_abs,
             inventory_pressure_signed=soft.pressure_signed,
             quality_pressure=soft.quality_pressure,
+            target_ratio_pressure=soft.target_ratio_pressure,
         )

@@ -918,6 +918,32 @@ def test_close_only_blocks_all_new_buys():
     assert quotes["dn"][1] is None
 
 
+def test_local_place_skips_do_not_count_toward_lockout():
+    mm = _make_mm(live=True)
+
+    counted = mm._counted_place_failures_for_lockout(
+        place_failed=1,
+        place_total=2,
+        placement_errors_before=0,
+        placement_errors_after=0,
+    )
+
+    assert counted == 0
+
+
+def test_real_place_api_errors_count_toward_lockout():
+    mm = _make_mm(live=True)
+
+    counted = mm._counted_place_failures_for_lockout(
+        place_failed=1,
+        place_total=2,
+        placement_errors_before=3,
+        placement_errors_after=4,
+    )
+
+    assert counted == 1
+
+
 def test_net_delta_buy_cap_trims_bid_to_remaining_headroom():
     mm = _make_mm(live=True)
     mm.config.max_net_delta_shares = 12.0

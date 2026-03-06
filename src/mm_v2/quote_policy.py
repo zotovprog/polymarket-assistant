@@ -335,6 +335,14 @@ class QuotePolicyV2:
                 up_token_id=snapshot.up_token_id,
                 dn_token_id=snapshot.dn_token_id,
             )
+            if risk.soft_mode in {"defensive", "unwind"} and effect == "harmful":
+                built[slot] = None
+                suppressed_reasons[slot] = (
+                    "harmful_suppressed_in_defensive"
+                    if risk.soft_mode == "defensive"
+                    else "harmful_suppressed_in_unwind"
+                )
+                continue
             if risk.soft_mode == "unwind" and self._would_expand_excess(
                 token=token,
                 side=side,
@@ -381,6 +389,11 @@ class QuotePolicyV2:
                     built[slot] = None
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
+            expands_gross_inventory = side == "BUY" or (side == "SELL" and not inventory_backed_sell)
+            if inventory.pair_value_over_target_usd > 0.0 and expands_gross_inventory:
+                built[slot] = None
+                suppressed_reasons[slot] = "target_pair_ratio_cap"
+                continue
             buy_headroom_usd = budget_headroom_usd
             if side == "BUY" and effect == "helpful" and risk.soft_mode == "unwind":
                 buy_headroom_usd = max(0.0, free_usdc)

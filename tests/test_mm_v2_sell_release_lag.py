@@ -12,9 +12,9 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm.mm_config import MMConfig
-from mm.order_manager import OrderManager
-from mm.types import Quote
+from mm_shared.mm_config import MMConfig
+from mm_shared.order_manager import OrderManager
+from mm_shared.types import Quote
 
 
 class _CancelOnlyClient:

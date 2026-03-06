@@ -161,6 +161,7 @@ class StateMachineV2:
                 for name, level in self._SOFT_ORDER.items():
                     if level == current_level + 1:
                         next_state = name
+                        reason = f"escalation: {self.lifecycle}->{name}"
                         break
         elif target_level < current_level:
             if self.lifecycle == "unwind":
@@ -190,6 +191,7 @@ class StateMachineV2:
                 if self._unwind_exit_ticks >= UNWIND_EXIT_CONFIRM_TICKS:
                     next_state = "defensive"
                     self._unwind_exit_ticks = 0
+                    reason = "unwind exit confirmed"
             else:
                 baseline = (
                     self._excess_baseline_value_usd
@@ -210,6 +212,7 @@ class StateMachineV2:
                     for name, level in self._SOFT_ORDER.items():
                         if level == current_level - 1:
                             next_state = name
+                            reason = f"deescalation: {self.lifecycle}->{name}"
                             break
         else:
             self._healthy_ticks = 0
@@ -237,11 +240,12 @@ class StateMachineV2:
                     risk.inventory_side != "flat"
                     and viability.helpful_count == 0
                 )
+                quote_balance_degraded = viability.quote_balance_state in {"none", "reduced"}
                 if missing_helpful_actionable:
                     self._no_helpful_ticks += 1
                 else:
                     self._no_helpful_ticks = 0
-                if no_progress and (
+                if no_progress and quote_balance_degraded and (
                     self._no_helpful_ticks >= NO_HELPFUL_TICKS_FOR_UNWIND
                     or (
                         missing_helpful_actionable
@@ -253,7 +257,7 @@ class StateMachineV2:
                     self._target_soft_mode_ticks = ENTER_CONFIRM_TICKS
                     self._healthy_ticks = 0
                     self._refresh_progress_baseline(inventory)
-                    reason = "no progress in defensive mode"
+                    reason = "no progress in defensive mode with degraded viability"
 
         if not has_material_position and next_state in {"unwind", "emergency_unwind"}:
             next_state = "quoting"

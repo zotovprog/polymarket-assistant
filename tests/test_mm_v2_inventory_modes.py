@@ -574,3 +574,41 @@ def test_flat_defensive_no_progress_does_not_escalate_to_unwind():
     result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=low_viability)
     assert result.no_progress is True
     assert result.lifecycle == "defensive"
+
+
+def test_defensive_no_progress_requires_degraded_quote_balance_for_unwind():
+    cfg = MMConfigV2(session_budget_usd=15.0)
+    sm = StateMachineV2(cfg)
+    inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    snap = _snapshot()
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "defensive"
+    sm._set_lifecycle("defensive")
+    sm._excess_baseline_ts = time.time() - 31.0
+    sm._excess_baseline_value_usd = 3.0
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=True,
+        helpful_count=0,
+        harmful_count=2,
+        helpful_only=False,
+        harmful_only=True,
+        four_quote_presence_ratio=0.9,
+        quote_balance_state="balanced",
+    )
+    for _ in range(3):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result.no_progress is True
+    assert result.lifecycle == "defensive"

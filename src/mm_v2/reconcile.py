@@ -4,7 +4,7 @@ from dataclasses import asdict
 import time
 from dataclasses import dataclass
 
-from mm.types import Fill, MarketInfo, Quote
+from mm_shared.types import Fill, MarketInfo, Quote
 
 from .config import MMConfigV2
 from .pair_inventory import build_pair_inventory
@@ -272,4 +272,6 @@ class ReconcileV2:
             fv_dn=float(fv_dn),
             up_token_id=market.up_token_id,
             dn_token_id=market.dn_token_id,
+            session_budget_usd=float(self.config.session_budget_usd),
+            target_pair_value_ratio=float(self.config.target_pair_value_ratio),
         )

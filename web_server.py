@@ -35,11 +35,9 @@ if str(SRC_DIR) not in sys.path:
 
 import config
 import feeds
-from mm.types import MarketInfo, Inventory
-from mm.mm_config import MMConfig
-from mm.market_maker import MarketMaker
-from mm.market_selector import MarketSelector
-from mm.runtime_metrics import runtime_metrics
+from mm_shared.types import MarketInfo
+from mm_shared.mm_config import MMConfig
+from mm_shared.runtime_metrics import runtime_metrics
 from mm_v2 import MMConfigV2, MarketMakerV2
 from telegram_notifier import TelegramNotifier
 from telegram_bot import TelegramBotManager
@@ -777,7 +775,7 @@ class MMRuntime:
 
     def __init__(self):
         self.feed_state: Optional[feeds.State] = None
-        self.mm: Optional[MarketMaker] = None
+        self.mm: Optional[Any] = None
         self.mm_config: MMConfig = MMConfig()
         self._feed_tasks: list[asyncio.Task] = []
         self._monitor_task: asyncio.Task | None = None
@@ -906,7 +904,7 @@ class MMRuntime:
             return
         await self._teardown_mongo_logger()
         try:
-            from mm.mongo_logger import MongoLogger, MongoLogHandler
+            from mm_shared.mongo_logger import MongoLogger, MongoLogHandler
 
             self._mongo = MongoLogger(config.MONGO_URI, config.MONGO_DB)
             await self._mongo.start()
@@ -1402,7 +1400,8 @@ class MMRuntime:
         }
 
     async def _auto_select_market(self, coin: str, timeframe: str) -> tuple[str, str]:
-        """Resolve AUTO coin/timeframe using MarketSelector ranking."""
+        """Legacy V1 auto-selection removed."""
+        return str(coin), str(timeframe)
         coin_auto = coin.strip().lower() == "auto"
         tf_auto = timeframe.strip().lower() == "auto"
         if not coin_auto and not tf_auto:
@@ -1427,6 +1426,7 @@ class MMRuntime:
             )
             return fallback_coin, fallback_tf
 
+        from mm.market_selector import MarketSelector
         selector = MarketSelector()
         selector.MIN_RECOMMEND_SCORE = float(
             getattr(self.mm_config, "market_selector_min_score", selector.MIN_RECOMMEND_SCORE)
@@ -1654,7 +1654,11 @@ class MMRuntime:
         dev: bool = False,
         session_budget_usd: Optional[float] = None,
     ) -> dict:
-        """Start feeds and market maker."""
+        """Legacy V1 runtime start removed."""
+        raise HTTPException(
+            status_code=410,
+            detail="legacy_v1_runtime_removed_use_mmv2",
+        )
         if self._running:
             raise HTTPException(status_code=400, detail="Already running")
 
@@ -1715,7 +1719,7 @@ class MMRuntime:
             log.info("Credentials validated OK")
             # One-time on-chain approvals for SELL orders (neg-risk markets)
             log.info("Checking on-chain approvals for neg-risk trading...")
-            from mm.approvals import _do_approvals
+            from mm_shared.approvals import _do_approvals
             raw_approval_result: Any
             try:
                 raw_approval_result = await asyncio.to_thread(_do_approvals, PM_PRIVATE_KEY)
@@ -1831,6 +1835,7 @@ class MMRuntime:
             raise HTTPException(status_code=409, detail=startup_block_reason)
 
         # Create and start market maker
+        from mm.market_maker import MarketMaker
         self.mm = MarketMaker(self.feed_state, clob, self.mm_config)
         # Always set session budget limit for USDC cap enforcement
         self.mm.inventory.initial_usdc = initial_usdc
@@ -2014,8 +2019,8 @@ class MMRuntime:
                         max_skip = 3
                         while skip_count < max_skip:
                             try:
-                                from mm.market_quality import MarketQualityAnalyzer
-                                from mm.order_manager import OrderManager
+                                from mm_shared.market_quality import MarketQualityAnalyzer
+                                from mm_shared.order_manager import OrderManager
                                 analyzer = MarketQualityAnalyzer(self.mm_config)
                                 temp_clob = _create_clob_client(
                                     paper_mode=self._paper_mode,
@@ -2847,7 +2852,7 @@ class MMRuntimeV2(MMRuntime):
 
         if not paper_mode:
             await self.validate_live_credentials()
-            from mm.approvals import _do_approvals
+            from mm_shared.approvals import _do_approvals
 
             approval_result = await asyncio.to_thread(_do_approvals, PM_PRIVATE_KEY)
             if not isinstance(approval_result, dict) or approval_result.get("error") or not approval_result.get("all_ok", False):
@@ -3069,8 +3074,10 @@ class MMRuntimeV2(MMRuntime):
         return self.get_verification_status()
 
 # ── Singleton runtime ───────────────────────────────────────────
-_runtime = MMRuntime()
+# Legacy V1 runtime path is removed. Keep `_runtime` as compatibility alias
+# to the V2 singleton for internal helpers that still reference this name.
 _runtime_v2 = MMRuntimeV2()
+_runtime = _runtime_v2
 
 
 def _dashboard_engine(preferred: str | None = None) -> str:
@@ -3364,170 +3371,101 @@ async def logout(response: Response):
 
 
 # ── MM Control ──────────────────────────────────────────────────
-LEGACY_MM_SUNSET = "Wed, 30 Apr 2026 00:00:00 GMT"
-
-
-def _legacy_alias_headers() -> dict[str, str]:
-    return {
-        "Deprecation": "true",
-        "Sunset": LEGACY_MM_SUNSET,
-    }
-
-
-def _legacy_alias_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    data = dict(payload or {})
-    data.setdefault("legacy_alias", True)
-    data.setdefault(
-        "legacy_warning",
-        "Legacy /api/mm/* alias is deprecated; switch to /api/mmv2/* before sunset.",
+def _legacy_v1_removed() -> None:
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "error": "legacy_v1_removed_use_mmv2",
+            "message": "Legacy /api/mm/* endpoints were removed. Use /api/mmv2/*.",
+        },
     )
-    return data
-
-
-def _legacy_alias_response_payload(
-    payload: dict[str, Any],
-    *,
-    response: Response = None,
-) -> dict[str, Any]:
-    if response is not None:
-        for key, value in _legacy_alias_headers().items():
-            response.headers[key] = value
-    return _legacy_alias_payload(payload)
 
 
 @app.post("/api/mm/start")
 async def mm_start(req: StartRequest, request: Request, response: Response = None):
-    """Legacy alias: routes to V2 start."""
+    """Legacy V1 endpoint removed."""
+    del req, response
     _require_auth(request)
-    if req.paper_mode:
-        session_budget_usd = float(req.initial_usdc)
-    elif "initial_usdc" in req.model_fields_set:
-        session_budget_usd = float(req.initial_usdc)
-    else:
-        session_budget_usd = float(_runtime_v2.mm_config_v2.session_budget_usd)
-    result = await _runtime_v2.start(
-        req.coin,
-        req.timeframe,
-        req.paper_mode,
-        req.initial_usdc,
-        dev=req.dev,
-        session_budget_usd=session_budget_usd,
-    )
-    return _legacy_alias_response_payload({"ok": True, "state": result}, response=response)
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/stop")
 async def mm_stop(request: Request, response: Response = None):
-    """Legacy alias: routes to V2 stop."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    result = await _runtime_v2.stop()
-    return _legacy_alias_response_payload({"ok": True, "state": result}, response=response)
+    _legacy_v1_removed()
 
 
 @app.get("/api/mm/state")
 async def mm_state(request: Request, response: Response = None):
-    """Legacy alias: routes to V2 dashboard snapshot."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    return _legacy_alias_response_payload(_dashboard_snapshot("v2"), response=response)
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/config")
 async def mm_config_update(req: ConfigUpdateRequest, request: Request, response: Response = None):
-    """Legacy alias: maps safe subset to V2 config."""
+    """Legacy V1 endpoint removed."""
+    del req, response
     _require_auth(request)
-    updates: dict[str, Any] = {}
-    if req.session_limit is not None:
-        if req.session_limit < 5:
-            return JSONResponse(
-                _legacy_alias_payload({"error": "session_limit must be >= 5"}),
-                status_code=400,
-                headers=_legacy_alias_headers(),
-            )
-        updates["session_budget_usd"] = float(req.session_limit)
-    if req.order_size_usd is not None:
-        updates["base_clip_usd"] = float(req.order_size_usd)
-    if req.max_drawdown_usd is not None:
-        updates["hard_drawdown_usd"] = float(req.max_drawdown_usd)
-    if req.requote_threshold_bps is not None:
-        updates["requote_threshold_bps"] = float(req.requote_threshold_bps)
-    if req.fallback_poll_cap is not None:
-        updates["fallback_poll_cap"] = int(req.fallback_poll_cap)
-    if req.fill_settlement_grace_sec is not None:
-        updates["fill_settlement_grace_sec"] = float(req.fill_settlement_grace_sec)
-    if req.critical_reconcile_drift_shares is not None:
-        updates["reconcile_drift_threshold_shares"] = float(req.critical_reconcile_drift_shares)
-    new_config = _runtime_v2.update_config(**updates)
-    return _legacy_alias_response_payload({"ok": True, "config": new_config, "legacy": True}, response=response)
+    _legacy_v1_removed()
 
 
 @app.get("/api/mm/config")
 async def mm_config_get(request: Request, response: Response = None):
-    """Legacy alias: returns V2 config."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    cfg = dict(_runtime_v2.mm_config_v2.to_dict())
-    cfg["session_limit"] = cfg.get("session_budget_usd", 0.0)
-    return _legacy_alias_response_payload({"config": cfg, "legacy": True}, response=response)
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/emergency")
 async def mm_emergency(request: Request, response: Response = None):
-    """Legacy alias: routes to V2 emergency stop."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    snap = await _runtime_v2.stop(liquidate=False, emergency=True)
-    cancelled_estimate = int((snap.get("execution") or {}).get("open_orders") or 0)
-    return _legacy_alias_response_payload(
-        {"ok": True, "cancelled": cancelled_estimate, "state": snap},
-        response=response,
-    )
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/kill")
 async def mm_kill(request: Request, response: Response = None):
-    """Legacy alias: routes to V2 stop+liquidate."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    snap = await _runtime_v2.stop()
-    return _legacy_alias_response_payload({"ok": True, "state": snap}, response=response)
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/watch")
 async def mm_watch(request: Request, body: dict):
-    """Legacy watch mode is removed in V2-only runtime."""
+    """Legacy V1 endpoint removed."""
     del body
     _require_auth(request)
-    raise HTTPException(
-        status_code=410,
-        detail=_legacy_alias_payload({"error": "legacy watch mode removed; use /api/mmv2/start"}),
-        headers=_legacy_alias_headers(),
-    )
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/watch/stop")
 async def mm_watch_stop(request: Request):
-    """Legacy watch mode is removed in V2-only runtime."""
+    """Legacy V1 endpoint removed."""
     _require_auth(request)
-    raise HTTPException(
-        status_code=410,
-        detail=_legacy_alias_payload({"error": "legacy watch mode removed"}),
-        headers=_legacy_alias_headers(),
-    )
+    _legacy_v1_removed()
 
 
 @app.post("/api/mm/validate-credentials")
 async def mm_validate_credentials(request: Request, response: Response = None):
-    """Legacy alias: validate credentials through V2 runtime."""
+    """Legacy V1 endpoint removed."""
+    del response
     _require_auth(request)
-    try:
-        result = await _runtime_v2.validate_live_credentials()
-        return _legacy_alias_response_payload({"valid": True, **result}, response=response)
-    except HTTPException as e:
-        return _legacy_alias_response_payload({"valid": False, "detail": e.detail}, response=response)
+    _legacy_v1_removed()
 
 
 @app.get("/api/mm/fills")
 async def mm_fills(request: Request, limit: int = 50, offset: int = 0, response: Response = None):
-    """Legacy alias: routes to V2 fills."""
+    """Legacy V1 endpoint removed."""
+    del limit, offset, response
     _require_auth(request)
-    return _legacy_alias_response_payload(_runtime_v2.fills_page(limit=limit, offset=offset), response=response)
+    _legacy_v1_removed()
 
 
 @app.post("/api/mmv2/start")

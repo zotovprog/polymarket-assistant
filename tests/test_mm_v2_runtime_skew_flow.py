@@ -20,7 +20,7 @@ from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
 from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary
-from mm.types import MarketInfo
+from mm_shared.types import MarketInfo
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -661,3 +661,57 @@ def test_sellability_lag_with_lower_target_does_not_stick_unwind_indefinitely():
         result = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=viability)
     assert result is not None
     assert result.lifecycle == "defensive"
+
+
+def test_balanced_profile_avoids_early_unwind_after_first_fill():
+    snapshot = _snapshot()
+    first_fill_inventory = _inventory(
+        dn_shares=6.0,
+        excess_dn_qty=6.0,
+        excess_dn_value_usd=3.0,
+        excess_value_usd=3.0,
+        signed_excess_value_usd=-3.0,
+        total_inventory_value_usd=3.0,
+    )
+    legacy_cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0, defensive_spread_mult=1.8, defensive_size_mult=0.5)
+    balanced_cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=6.0, defensive_spread_mult=1.5, defensive_size_mult=0.4)
+    legacy_risk, _, _ = _risk_and_plan(legacy_cfg, snapshot, first_fill_inventory)
+    balanced_risk, _, balanced_viability = _risk_and_plan(balanced_cfg, snapshot, first_fill_inventory)
+    assert legacy_risk.target_soft_mode == "defensive"
+    assert balanced_risk.target_soft_mode == "inventory_skewed"
+
+    sm = StateMachineV2(balanced_cfg)
+    sm.transition(snapshot=snapshot, inventory=first_fill_inventory, risk=balanced_risk, viability=balanced_viability)
+    sm.transition(snapshot=snapshot, inventory=first_fill_inventory, risk=balanced_risk, viability=balanced_viability)
+    result = sm.transition(snapshot=snapshot, inventory=first_fill_inventory, risk=balanced_risk, viability=balanced_viability)
+    assert result.lifecycle in {"inventory_skewed", "defensive"}
+    assert result.lifecycle != "unwind"
+
+
+def test_mode_ratios_improve_vs_report_baseline():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = time.time()
+    mm._lifecycle_history = [
+        (now - 55.0, "quoting"),
+        (now - 50.0, "quoting"),
+        (now - 45.0, "inventory_skewed"),
+        (now - 40.0, "defensive"),
+        (now - 35.0, "quoting"),
+        (now - 30.0, "inventory_skewed"),
+        (now - 25.0, "defensive"),
+        (now - 20.0, "quoting"),
+        (now - 15.0, "unwind"),
+        (now - 10.0, "inventory_skewed"),
+        (now - 5.0, "defensive"),
+    ]
+    ratios = mm._lifecycle_ratios(window_sec=60.0)
+    mm_effective_ratio = (
+        ratios["quoting_ratio_60s"]
+        + ratios["inventory_skewed_ratio_60s"]
+        + ratios["defensive_ratio_60s"]
+    )
+    assert mm_effective_ratio >= 0.60
+    assert ratios["unwind_ratio_60s"] <= 0.35

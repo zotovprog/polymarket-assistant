@@ -55,6 +55,9 @@ class PairInventoryState:
     pending_buy_reserved_usdc: float = 0.0
     excess_value_usd: float = 0.0
     signed_excess_value_usd: float = 0.0
+    target_pair_value_usd: float = 0.0
+    pair_value_ratio: float = 0.0
+    pair_value_over_target_usd: float = 0.0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
     sellable_up_shares: float = 0.0
@@ -113,6 +116,7 @@ class RiskRegime:
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
     quality_pressure: float = 0.0
+    target_ratio_pressure: float = 0.0
 
 
 @dataclass
@@ -157,6 +161,10 @@ class AnalyticsState:
     fill_rate: float = 0.0
     quote_presence_ratio: float = 0.0
     excess_value_usd: float = 0.0
+    target_pair_value_usd: float = 0.0
+    pair_value_ratio: float = 0.0
+    pair_value_over_target_usd: float = 0.0
+    target_ratio_pressure: float = 0.0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
     inventory_half_life_sec: float = 0.0
@@ -172,6 +180,11 @@ class AnalyticsState:
     unwind_ratio_60s: float = 0.0
     emergency_unwind_ratio_60s: float = 0.0
     four_quote_ratio_60s: float = 0.0
+    mm_effective_ratio_60s: float = 0.0
+    harmful_suppressed_count_60s: int = 0
+    target_ratio_breaches_60s: int = 0
+    defensive_to_unwind_count_window: int = 0
+    quote_cancel_to_fill_ratio_60s: float = 0.0
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
     unwind_exit_armed: bool = False
@@ -187,6 +200,7 @@ class QuoteViabilitySummary:
     helpful_only: bool = False
     harmful_only: bool = False
     four_quote_presence_ratio: float = 0.0
+    quote_balance_state: str = "none"
 
 
 @dataclass

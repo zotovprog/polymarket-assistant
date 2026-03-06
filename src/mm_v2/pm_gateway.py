@@ -5,8 +5,8 @@ import logging
 import math
 from typing import Any
 
-from mm.order_manager import OrderManager
-from mm.types import MarketInfo, Quote, Fill
+from mm_shared.order_manager import OrderManager
+from mm_shared.types import MarketInfo, Quote, Fill
 
 from .config import MMConfigV2
 from .types import QuoteIntent
