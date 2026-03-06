@@ -192,6 +192,23 @@ class StateMachineV2:
                     next_state = "defensive"
                     self._unwind_exit_ticks = 0
                     reason = "unwind exit confirmed"
+            elif self.lifecycle == "inventory_skewed":
+                # Inventory-skewed must not latch once target mode is normal.
+                # Use confirm ticks on viable quoting instead of excess baseline.
+                skew_exit_armed = (
+                    risk.hard_mode == "none"
+                    and target_soft_mode == "normal"
+                    and viability.any_quote
+                    and viability.quote_balance_state != "none"
+                )
+                if skew_exit_armed:
+                    self._healthy_ticks += 1
+                else:
+                    self._healthy_ticks = 0
+                if self._healthy_ticks >= EXIT_CONFIRM_TICKS:
+                    next_state = "quoting"
+                    reason = "inventory_skewed exit confirmed"
+                    self._healthy_ticks = 0
             elif self.lifecycle == "defensive":
                 # Defensive must not latch when risk target already normalized.
                 # Use quote viability + confirm ticks instead of excess baseline.

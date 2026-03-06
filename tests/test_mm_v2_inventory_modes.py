@@ -344,6 +344,53 @@ def test_effective_soft_mode_matches_lifecycle_mapping():
     assert result.effective_soft_mode == "inventory_skewed"
 
 
+def test_inventory_skewed_deescalates_to_quoting_after_confirmed_normal_target():
+    cfg = MMConfigV2(session_budget_usd=50.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("inventory_skewed")
+    inventory = _inventory(
+        up_shares=4.0,
+        excess_up_qty=4.0,
+        excess_up_value_usd=1.8,
+        excess_value_usd=1.8,
+        signed_excess_value_usd=1.8,
+        total_inventory_value_usd=1.8,
+    )
+    snap = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.95,
+        divergence_up=0.03,
+        divergence_dn=0.03,
+        time_left_sec=700.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    # Drive target below inventory_skewed to arm de-escalation.
+    risk.target_soft_mode = "normal"
+    risk.soft_mode = "normal"
+    risk.reason = "normal quoting"
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=True,
+        helpful_count=2,
+        harmful_count=2,
+        helpful_only=False,
+        harmful_only=False,
+        four_quote_presence_ratio=0.9,
+        quote_balance_state="balanced",
+    )
+    result = None
+    for _ in range(EXIT_CONFIRM_TICKS):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.lifecycle == "quoting"
+    assert result.effective_soft_mode == "normal"
+
+
 def test_unwind_deescalates_when_target_mode_drops_even_if_quality_is_poor():
     cfg = MMConfigV2(session_budget_usd=15.0)
     sm = StateMachineV2(cfg)
