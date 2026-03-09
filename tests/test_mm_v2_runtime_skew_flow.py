@@ -398,6 +398,99 @@ def test_wallet_stale_does_not_trigger_true_drift():
     assert reconcile.drift_evidence.classification == "wallet_stale"
 
 
+def test_reconcile_balance_fetch_error_sets_wallet_stale_and_blocks_true_drift():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.align(0.0, 0.0)
+
+    reconcile.reconcile(
+        market=market,
+        real_up=8.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=True,
+    )
+
+    assert reconcile.status == "wallet_stale"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.classification == "wallet_stale"
+
+
+def test_wallet_stale_rearm_requires_two_clean_ticks_before_drift_candidate():
+    cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
+    reconcile = ReconcileV2(cfg)
+    market = _market()
+    reconcile.align(0.0, 0.0)
+
+    # Tick 1: stale snapshot arms rearm.
+    reconcile.reconcile(
+        market=market,
+        real_up=8.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=True,
+    )
+    assert reconcile.status == "wallet_stale"
+    assert reconcile.true_drift is False
+
+    # Tick 2: first clean tick with mismatch -> still recovering.
+    reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=False,
+    )
+    assert reconcile.status == "wallet_recovering"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.candidate_count == 0
+
+    # Tick 3: second clean tick with mismatch -> still recovering.
+    reconcile.reconcile(
+        market=market,
+        real_up=8.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=False,
+    )
+    assert reconcile.status == "wallet_recovering"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.candidate_count == 0
+
+    # Tick 4: rearm is complete, mismatch can become drift candidate.
+    reconcile.reconcile(
+        market=market,
+        real_up=0.0,
+        real_dn=0.0,
+        total_usdc=15.0,
+        available_usdc=15.0,
+        active_orders={},
+        fv_up=0.54,
+        fv_dn=0.46,
+        wallet_snapshot_stale=False,
+    )
+    assert reconcile.status == "drift_pending"
+    assert reconcile.true_drift is False
+    assert reconcile.drift_evidence.candidate_count == 1
+
+
 def test_sellability_lag_does_not_trigger_true_drift():
     cfg = MMConfigV2(reconcile_drift_threshold_shares=1.5)
     reconcile = ReconcileV2(cfg)

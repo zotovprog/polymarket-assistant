@@ -1102,6 +1102,30 @@ async def test_health_exposes_sellability_lag_active(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_health_exposes_last_api_error_raw_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "health": {
+                "last_api_error": "request exception",
+                "last_api_error_op": "get_token_balance",
+                "last_api_error_status_code": 503,
+                "last_api_error_raw": "{\"status\":503,\"error\":\"Request exception\"}",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["health"]["last_api_error"] == "request exception"
+    assert resp["health"]["last_api_error_op"] == "get_token_balance"
+    assert resp["health"]["last_api_error_status_code"] == 503
+    assert "Request exception" in resp["health"]["last_api_error_raw"]
+
+
+@pytest.mark.asyncio
 async def test_state_exposes_drift_evidence(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
@@ -1139,6 +1163,7 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
                 "last_terminal_reason": "true inventory drift: no unwind progress",
                 "last_terminal_ts": 123456.0,
                 "live_budget_gate_passed": True,
+                "paper_budget_gate_passed": False,
                 "drawdown_breach_ticks": 4,
                 "drawdown_breach_age_sec": 9.5,
             },
@@ -1148,6 +1173,7 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
     assert resp["runtime"]["last_terminal_reason"] == "true inventory drift: no unwind progress"
     assert resp["runtime"]["last_terminal_ts"] == pytest.approx(123456.0)
     assert resp["runtime"]["live_budget_gate_passed"] is True
+    assert resp["runtime"]["paper_budget_gate_passed"] is False
     assert resp["runtime"]["drawdown_breach_ticks"] == 4
     assert resp["runtime"]["drawdown_breach_age_sec"] == pytest.approx(9.5)
 
@@ -1209,12 +1235,12 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr(web_server._runtime_v2, "start", _fake_start)
-    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=15.0, dev=True)
+    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=30.0, dev=True)
     resp = await web_server.mmv2_start(req=req, request=object())
     assert resp["ok"] is True
     assert captured["coin"] == "BTC"
     assert captured["timeframe"] == "15m"
-    assert captured["session_budget_usd"] == pytest.approx(15.0)
+    assert captured["session_budget_usd"] == pytest.approx(30.0)
 
 
 @pytest.mark.asyncio
@@ -1248,7 +1274,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
 
 
 @pytest.mark.asyncio
-async def test_live_start_rejects_budget_below_50(monkeypatch):
+async def test_live_start_rejects_budget_below_30(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
@@ -1258,7 +1284,20 @@ async def test_live_start_rejects_budget_below_50(monkeypatch):
     with pytest.raises(web_server.HTTPException) as exc:
         await web_server.mmv2_start(req=req, request=object())
     assert exc.value.status_code == 400
-    assert "live_min_budget_50_required" in str(exc.value.detail)
+    assert "live_min_budget_30_required" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_paper_start_rejects_budget_below_30(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+
+    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=20.0, dev=True)
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_start(req=req, request=object())
+    assert exc.value.status_code == 400
+    assert "paper_min_budget_30_required" in str(exc.value.detail)
 
 
 def test_runtime_v2_start_accepts_session_budget_kwarg():

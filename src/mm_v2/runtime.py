@@ -479,8 +479,21 @@ class MarketMakerV2:
         api_stats = self.gateway.api_error_stats()
         recent = api_stats.get("recent") or []
         last_message = ""
+        last_api_error_op = ""
+        last_api_error_status_code = 0
+        last_api_error_raw = ""
         if recent:
-            last_message = str(recent[-1].get("message") or "")
+            last_event = recent[-1] if isinstance(recent[-1], dict) else {}
+            last_message = str(last_event.get("message") or "")
+            last_api_error_op = str(last_event.get("op") or "")
+            status_raw = last_event.get("status_code")
+            try:
+                last_api_error_status_code = int(status_raw) if status_raw is not None else 0
+            except (TypeError, ValueError):
+                last_api_error_status_code = 0
+            details = last_event.get("details") if isinstance(last_event, dict) else {}
+            if isinstance(details, dict):
+                last_api_error_raw = str(details.get("raw_error") or "")
         transport_totals = api_stats.get("transport_total_by_op")
         if not isinstance(transport_totals, dict):
             transport_totals = {}
@@ -492,6 +505,9 @@ class MarketMakerV2:
             heartbeat_ok=not self._heartbeat_failed,
             transport_ok=transport_ok,
             last_api_error=last_message,
+            last_api_error_op=last_api_error_op,
+            last_api_error_status_code=last_api_error_status_code,
+            last_api_error_raw=last_api_error_raw,
             last_fallback_poll_count=last_fallback,
             true_drift=self.reconcile.true_drift,
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
@@ -767,14 +783,22 @@ class MarketMakerV2:
             total_usdc=total_usdc_raw,
             available_usdc=available_usdc_raw,
         )
+        balance_fetch_health = self.gateway.balance_fetch_health_state()
+        reconcile_balance_error_active = bool(
+            (balance_fetch_health or {}).get("reconcile_balance_error_active")
+        )
+        effective_wallet_stale = bool(stale_wallet or reconcile_balance_error_active)
         sellable_up, sellable_dn = await self.gateway.get_sellable_balances(
             reference_balances=(float(up), float(dn)),
         )
         sell_release_lag = self.gateway.sell_release_lag_state()
-        if stale_wallet:
+        if effective_wallet_stale:
+            stale_reason = "PM wallet snapshot partial/unavailable"
+            if not stale_wallet and reconcile_balance_error_active:
+                stale_reason = "PM reconcile balance fetch errors active; drift guard armed"
             self.set_alert(
                 "wallet_snapshot_stale_v2",
-                "PM wallet snapshot partial/unavailable; using local fallback balances",
+                stale_reason,
                 level="warning",
             )
         else:
@@ -791,7 +815,7 @@ class MarketMakerV2:
             fv_up=valuation.fv_up,
             fv_dn=valuation.fv_dn,
             sellability_lag_active=bool(sell_release_lag.get("active")),
-            wallet_snapshot_stale=stale_wallet,
+            wallet_snapshot_stale=effective_wallet_stale,
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
@@ -839,7 +863,7 @@ class MarketMakerV2:
         true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
         health = self._build_health(
             sellability_lag_active=bool(sell_release_lag.get("active")),
-            wallet_snapshot_stale=stale_wallet,
+            wallet_snapshot_stale=effective_wallet_stale,
             true_drift_age_sec=true_drift_age_sec,
             true_drift_no_progress_sec=true_drift_no_progress_sec,
             drawdown_breach_ticks=drawdown_breach_ticks,

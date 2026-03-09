@@ -2619,13 +2619,15 @@ class MMRuntime:
 
 class MMRuntimeV2(MMRuntime):
     """Parallel runtime for the pair-first V2 engine."""
-    LIVE_MIN_BUDGET_USD = 50.0
+    LIVE_MIN_BUDGET_USD = 30.0
+    PAPER_MIN_BUDGET_USD = 30.0
 
     def __init__(self):
         super().__init__()
         self.mm_v2: Optional[MarketMakerV2] = None
         self.mm_config_v2: MMConfigV2 = MMConfigV2()
         self._live_budget_gate_passed: bool = False
+        self._paper_budget_gate_passed: bool = False
 
     def _idle_snapshot_v2(self) -> dict[str, Any]:
         return {
@@ -2710,6 +2712,9 @@ class MMRuntimeV2(MMRuntime):
                 "heartbeat_ok": True,
                 "transport_ok": True,
                 "last_api_error": "",
+                "last_api_error_op": "",
+                "last_api_error_status_code": 0,
+                "last_api_error_raw": "",
                 "last_fallback_poll_count": 0,
                 "true_drift": False,
                 "residual_inventory_failure": False,
@@ -2762,6 +2767,7 @@ class MMRuntimeV2(MMRuntime):
                 "last_terminal_reason": "",
                 "last_terminal_ts": 0.0,
                 "live_budget_gate_passed": bool(self._live_budget_gate_passed),
+                "paper_budget_gate_passed": bool(self._paper_budget_gate_passed),
                 "drawdown_breach_ticks": 0,
                 "drawdown_breach_age_sec": 0.0,
             },
@@ -2841,14 +2847,25 @@ class MMRuntimeV2(MMRuntime):
             if session_budget_usd is not None
             else float(self._initial_usdc)
         )
+        self._paper_budget_gate_passed = bool(
+            (not self._paper_mode) or effective_session_budget >= float(self.PAPER_MIN_BUDGET_USD)
+        )
         self._live_budget_gate_passed = bool(
             self._paper_mode or effective_session_budget >= float(self.LIVE_MIN_BUDGET_USD)
         )
+        if self._paper_mode and not self._paper_budget_gate_passed:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"paper_min_budget_30_required: requested={effective_session_budget:.2f} "
+                    f"min={self.PAPER_MIN_BUDGET_USD:.2f}"
+                ),
+            )
         if not self._paper_mode and not self._live_budget_gate_passed:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"live_min_budget_50_required: requested={effective_session_budget:.2f} "
+                    f"live_min_budget_30_required: requested={effective_session_budget:.2f} "
                     f"min={self.LIVE_MIN_BUDGET_USD:.2f}"
                 ),
             )
@@ -2972,6 +2989,7 @@ class MMRuntimeV2(MMRuntime):
             if not isinstance(runtime_block, dict):
                 runtime_block = {}
             runtime_block["live_budget_gate_passed"] = bool(self._live_budget_gate_passed)
+            runtime_block["paper_budget_gate_passed"] = bool(self._paper_budget_gate_passed)
             snap["runtime"] = runtime_block
             snap["alerts"] = self.list_alerts() + [a for a in snap.get("alerts", []) if a not in self.list_alerts()]
             return snap
@@ -3505,11 +3523,19 @@ async def mmv2_start(req: StartRequest, request: Request):
         session_budget_usd = float(req.initial_usdc)
     else:
         session_budget_usd = float(_runtime_v2.mm_config_v2.session_budget_usd)
+    if req.paper_mode and session_budget_usd < float(MMRuntimeV2.PAPER_MIN_BUDGET_USD):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"paper_min_budget_30_required: requested={session_budget_usd:.2f} "
+                f"min={MMRuntimeV2.PAPER_MIN_BUDGET_USD:.2f}"
+            ),
+        )
     if not req.paper_mode and session_budget_usd < float(MMRuntimeV2.LIVE_MIN_BUDGET_USD):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"live_min_budget_50_required: requested={session_budget_usd:.2f} "
+                f"live_min_budget_30_required: requested={session_budget_usd:.2f} "
                 f"min={MMRuntimeV2.LIVE_MIN_BUDGET_USD:.2f}"
             ),
         )

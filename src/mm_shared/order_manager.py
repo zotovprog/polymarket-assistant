@@ -214,6 +214,9 @@ class OrderManager:
         self._last_api_error_ts: float = 0.0
         self._recent_cancelled_sell_reserves: dict[str, RecentCancelledSellReserve] = {}
         self._last_sellability_lag_reason: str = ""
+        self._last_known_token_balance_by_token: dict[str, float] = {}
+        self._last_reconcile_balance_error_ts: float = 0.0
+        self._last_reconcile_balance_error: str = ""
         if hasattr(clob_client, "_mock_token_balances") and isinstance(
             getattr(clob_client, "_mock_token_balances", None),
             dict,
@@ -599,6 +602,50 @@ class OrderManager:
                     continue
         return None
 
+    def _extract_error_context(self, exc: Exception) -> dict[str, Any]:
+        status_code = self._extract_status_code(exc)
+        error_msg = self._safe_str(
+            getattr(exc, "error_message", None)
+            or getattr(exc, "message", None)
+            or str(exc)
+        ) or "unknown error"
+        raw_payload: Any = None
+        for attr in ("error", "error_msg", "response"):
+            candidate = getattr(exc, attr, None)
+            if candidate is not None:
+                raw_payload = candidate
+                break
+        if raw_payload is None:
+            args = getattr(exc, "args", None)
+            if args:
+                raw_payload = list(args)
+        if raw_payload is None:
+            raw_payload = {
+                "exception_type": type(exc).__name__,
+                "message": error_msg,
+                "status_code": status_code,
+            }
+        return {
+            "exception_type": type(exc).__name__,
+            "status_code": status_code,
+            "error_msg": error_msg,
+            "raw_error": self._compact_raw(raw_payload, max_len=900),
+        }
+
+    def _balance_error_ttl_sec(self) -> float:
+        return max(
+            2.0,
+            float(getattr(self.config, "fill_settlement_grace_sec", 6.0) or 6.0),
+        )
+
+    async def _get_token_balance_with_source(self, token_id: str, source: str) -> Optional[float]:
+        """Call get_token_balance with source, tolerating legacy monkeypatched signatures."""
+        getter = self.get_token_balance
+        try:
+            return await getter(token_id, source=source)  # type: ignore[misc]
+        except TypeError:
+            return await getter(token_id)  # type: ignore[misc]
+
     def _record_api_error(
         self,
         *,
@@ -612,8 +659,23 @@ class OrderManager:
     ) -> None:
         safe_message = self._safe_str(message) or "unknown api error"
         safe_details = dict(details or {})
+        safe_details.setdefault("source", op)
+        safe_details.setdefault("op_context", op)
+        if status_code is not None:
+            safe_details.setdefault("status_code", int(status_code))
         if transient:
             safe_details["transient"] = True
+        else:
+            safe_details.setdefault("transient", False)
+        raw_error = self._safe_str(safe_details.get("raw_error"))
+        if not raw_error:
+            safe_details["raw_error"] = self._compact_raw(
+                {
+                    "message": safe_message,
+                    "status_code": status_code,
+                },
+                max_len=900,
+            )
         event = APIErrorEvent(
             ts=time.time(),
             op=op,
@@ -820,7 +882,10 @@ class OrderManager:
         SELL cancel. We therefore keep recently cancelled SELL reserve separate
         from wallet truth and expose a conservative sellable balance to V2 asks.
         """
-        raw_balance = await self.get_token_balance(token_id)
+        raw_balance = await self._get_token_balance_with_source(
+            token_id,
+            source="sellable_balance",
+        )
         if raw_balance is None:
             return None
         if hasattr(self.client, "_orders"):
@@ -893,6 +958,28 @@ class OrderManager:
             "dn_cooldown_sec": round(float(dn_cooldown), 3),
             "active_reason": active_reason,
             "reason": self._last_sellability_lag_reason or active_reason,
+        }
+
+    def get_balance_fetch_health_snapshot(self) -> dict[str, Any]:
+        now = time.time()
+        ttl = self._balance_error_ttl_sec()
+        age_sec = (
+            max(0.0, now - self._last_reconcile_balance_error_ts)
+            if self._last_reconcile_balance_error_ts > 0.0
+            else 0.0
+        )
+        active = bool(
+            self._last_reconcile_balance_error_ts > 0.0
+            and age_sec <= ttl
+        )
+        return {
+            "reconcile_balance_error_active": active,
+            "last_reconcile_balance_error_ts": (
+                round(float(self._last_reconcile_balance_error_ts), 3)
+                if self._last_reconcile_balance_error_ts > 0.0
+                else 0.0
+            ),
+            "last_reconcile_balance_error": str(self._last_reconcile_balance_error or ""),
         }
 
     def _prune_recent_orders(
@@ -1445,17 +1532,34 @@ class OrderManager:
         if bool(getattr(self.config, "allow_short_sells", False)):
             return True
 
-        token_bal = await self.get_token_balance(quote.token_id)
+        token_bal = await self._get_token_balance_with_source(
+            quote.token_id,
+            source="close_only_sell",
+        )
         if token_bal is None:
-            self._throttled_warn(
-                "sell_close_only_balance_unavailable",
-                (
-                    f"SELL blocked (close-only): failed to fetch token balance for "
-                    f"{quote.token_id[:12]}..."
-                ),
-                cooldown=10.0,
-            )
-            return False
+            cached_bal = self._last_known_token_balance_by_token.get(quote.token_id)
+            if cached_bal is not None:
+                fallback_buffer = 0.50
+                token_bal = max(0.0, float(cached_bal) - fallback_buffer)
+                self._reconcile_requested = True
+                self._throttled_warn(
+                    "sell_close_only_balance_unavailable_transient",
+                    (
+                        f"SELL close-only uses cached balance for {quote.token_id[:12]}... "
+                        f"(cached={float(cached_bal):.2f}, fallback={token_bal:.2f})"
+                    ),
+                    cooldown=5.0,
+                )
+            else:
+                self._throttled_warn(
+                    "sell_close_only_balance_unavailable",
+                    (
+                        f"SELL blocked (close-only): failed to fetch token balance for "
+                        f"{quote.token_id[:12]}..."
+                    ),
+                    cooldown=10.0,
+                )
+                return False
 
         active_sell_exposure = self._active_sell_inventory(quote.token_id)
         recent_cancelled_exposure = 0.0
@@ -1873,7 +1977,10 @@ class OrderManager:
             # - Inventory-backed close: require enough free tokens, skip USDC collateral check.
             # - True short SELL: only short remainder requires USDC collateral.
             free_inventory = 0.0
-            token_bal = await self.get_token_balance(quote.token_id)
+            token_bal = await self._get_token_balance_with_source(
+                quote.token_id,
+                source="sell_precheck",
+            )
             active_sell_exposure = self._active_sell_inventory(quote.token_id)
             recent_cancelled_exposure = self._recent_cancelled_sell_inventory(quote.token_id)
             local_inventory = quote.size + active_sell_exposure + recent_cancelled_exposure
@@ -2458,18 +2565,30 @@ class OrderManager:
                 "num_bids": len(bids), "num_asks": len(asks),
             }
         except Exception as e:
+            error_ctx = self._extract_error_context(e)
             self._record_api_error(
                 op="get_full_book",
                 token_id=token_id,
-                message=str(e),
-                status_code=self._extract_status_code(e),
-                details={"token_id": token_id[:12]},
+                message=error_ctx["error_msg"],
+                status_code=error_ctx["status_code"],
+                details={
+                    "token_id": token_id[:12],
+                    "source": "get_full_book",
+                    "op_context": "get_full_book",
+                    "exception_type": error_ctx["exception_type"],
+                    "raw_error": error_ctx["raw_error"],
+                },
                 transient=True,
             )
-            log.debug(f"Failed to get full book for {token_id[:12]}...: {e}")
+            log.debug(
+                "Failed to get full book for %s...: %s raw=%s",
+                token_id[:12],
+                error_ctx["error_msg"],
+                error_ctx["raw_error"],
+            )
             return empty
 
-    async def get_token_balance(self, token_id: str) -> Optional[float]:
+    async def get_token_balance(self, token_id: str, source: str = "") -> Optional[float]:
         """Fetch free/tradable PM token balance in shares for a conditional token.
 
         For live CONDITIONAL balances, PM may report only currently available
@@ -2477,9 +2596,15 @@ class OrderManager:
         therefore suitable for pre-trade close-only checks, but not for
         reconcile/startup wallet-truth inventory snapshots.
         """
+        source_name = self._safe_str(source) or "unspecified"
         try:
             if hasattr(self.client, "_orders"):
-                return float(self._mock_token_balances.get(token_id, 0.0))
+                balance = float(self._mock_token_balances.get(token_id, 0.0))
+                self._last_known_token_balance_by_token[token_id] = max(0.0, balance)
+                if source_name == "reconcile_balance":
+                    self._last_reconcile_balance_error_ts = 0.0
+                    self._last_reconcile_balance_error = ""
+                return balance
 
             if not _HAS_CLOB_TYPES:
                 raise ImportError("py_clob_client not installed for live trading")
@@ -2491,17 +2616,38 @@ class OrderManager:
                     token_id=token_id,
                 )
             )
-            return float(result["balance"]) / 1e6
+            balance = float(result["balance"]) / 1e6
+            self._last_known_token_balance_by_token[token_id] = max(0.0, balance)
+            if source_name == "reconcile_balance":
+                self._last_reconcile_balance_error_ts = 0.0
+                self._last_reconcile_balance_error = ""
+            return balance
         except Exception as e:
+            error_ctx = self._extract_error_context(e)
             self._record_api_error(
                 op="get_token_balance",
                 token_id=token_id,
-                message=str(e),
-                status_code=self._extract_status_code(e),
-                details={"token_id": token_id[:12]},
+                message=error_ctx["error_msg"],
+                status_code=error_ctx["status_code"],
+                details={
+                    "token_id": token_id[:12],
+                    "source": source_name,
+                    "op_context": "get_token_balance",
+                    "exception_type": error_ctx["exception_type"],
+                    "raw_error": error_ctx["raw_error"],
+                },
                 transient=True,
             )
-            log.warning(f"Failed to fetch token balance for {token_id[:12]}...: {e}")
+            if source_name == "reconcile_balance":
+                self._last_reconcile_balance_error_ts = time.time()
+                self._last_reconcile_balance_error = error_ctx["error_msg"]
+            log.warning(
+                "Failed to fetch token balance for %s... source=%s: %s raw=%s",
+                token_id[:12],
+                source_name,
+                error_ctx["error_msg"],
+                error_ctx["raw_error"],
+            )
             return None
 
     def _remaining_active_sell_size(self, order_id: str, quote: Quote) -> float:
@@ -2545,7 +2691,10 @@ class OrderManager:
         candidate closer to that expected total. This prevents both under-counts
         and double-counts during live reconcile.
         """
-        free_balance = await self.get_token_balance(token_id)
+        free_balance = await self._get_token_balance_with_source(
+            token_id,
+            source="reconcile_balance",
+        )
         if free_balance is None:
             return None
 
@@ -2617,13 +2766,24 @@ class OrderManager:
             self._usdc_balance_cache_ts = now
             return total, available
         except Exception as e:
+            error_ctx = self._extract_error_context(e)
             self._record_api_error(
                 op="get_usdc_balances",
-                message=str(e),
-                status_code=self._extract_status_code(e),
+                message=error_ctx["error_msg"],
+                status_code=error_ctx["status_code"],
+                details={
+                    "source": "get_usdc_balances",
+                    "op_context": "get_usdc_balances",
+                    "exception_type": error_ctx["exception_type"],
+                    "raw_error": error_ctx["raw_error"],
+                },
                 transient=True,
             )
-            log.warning(f"Failed to fetch USDC balance: {e}")
+            log.warning(
+                "Failed to fetch USDC balance: %s raw=%s",
+                error_ctx["error_msg"],
+                error_ctx["raw_error"],
+            )
             return None, None
 
     async def get_usdc_balance(self, *, force_refresh: bool = False) -> Optional[float]:
@@ -2730,6 +2890,9 @@ class OrderManager:
         self._pending_cancels.clear()
         self._recent_cancelled_sell_reserves.clear()
         self._last_sellability_lag_reason = ""
+        self._last_known_token_balance_by_token.clear()
+        self._last_reconcile_balance_error_ts = 0.0
+        self._last_reconcile_balance_error = ""
         self._reconcile_requested = False
         self._sell_reject_cooldown_until.clear()
         self._cancel_repost_cooldown_until.clear()

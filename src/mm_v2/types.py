@@ -235,6 +235,9 @@ class HealthState:
     heartbeat_ok: bool = True
     transport_ok: bool = True
     last_api_error: str = ""
+    last_api_error_op: str = ""
+    last_api_error_status_code: int = 0
+    last_api_error_raw: str = ""
     last_fallback_poll_count: int = 0
     true_drift: bool = False
     residual_inventory_failure: bool = False

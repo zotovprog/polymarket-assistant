@@ -90,6 +90,9 @@ class PMGateway:
             dn_token_id=self.market.dn_token_id,
         )
 
+    def balance_fetch_health_state(self) -> dict[str, Any]:
+        return self.order_mgr.get_balance_fetch_health_snapshot()
+
     async def get_balances(self) -> tuple[float | None, float | None, float | None, float | None]:
         """Backward-compatible alias for wallet balances."""
         return await self.get_wallet_balances()

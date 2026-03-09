@@ -40,6 +40,7 @@ class ReconcileV2:
     DRIFT_CONFIRM_TICKS = 3
     DRIFT_CONFIRM_WINDOW_SEC = 20.0
     DRIFT_CONFIRM_MIN_AGE_SEC = 8.0
+    WALLET_STALE_REARM_TICKS = 2
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -51,6 +52,7 @@ class ReconcileV2:
         self._startup_realign_count: int = 0
         self._drift_candidate_count: int = 0
         self._drift_candidate_started_ts: float = 0.0
+        self._wallet_stale_rearm_remaining: int = 0
         self.status: str = "bootstrapping"
         self.true_drift: bool = False
         self.drift_evidence: DriftEvidence = DriftEvidence()
@@ -62,6 +64,7 @@ class ReconcileV2:
         self.true_drift = False
         self._drift_candidate_count = 0
         self._drift_candidate_started_ts = 0.0
+        self._wallet_stale_rearm_remaining = 0
         self.drift_evidence = DriftEvidence(
             up_diff=0.0,
             dn_diff=0.0,
@@ -217,7 +220,17 @@ class ReconcileV2:
             self.true_drift = False
             self._drift_candidate_count = 0
             self._drift_candidate_started_ts = 0.0
+            self._wallet_stale_rearm_remaining = int(self.WALLET_STALE_REARM_TICKS)
             status_reason = "wallet snapshot stale"
+        elif self._wallet_stale_rearm_remaining > 0:
+            self.status = "wallet_recovering"
+            self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
+            self._wallet_stale_rearm_remaining = max(0, self._wallet_stale_rearm_remaining - 1)
+            status_reason = (
+                f"wallet stale rearm ({self._wallet_stale_rearm_remaining} ticks left)"
+            )
         elif sellability_lag_active:
             # PM may briefly report constrained free token balance after SELL
             # cancel/repost. Treat this window as transient execution lag.
@@ -242,7 +255,14 @@ class ReconcileV2:
                 self.status = "drift_pending"
                 self.true_drift = False
                 status_reason = "unexplained drift candidate"
-        if self.status in {"ok", "settlement_lag", "sellability_lag", "startup_realign", "wallet_stale"}:
+        if self.status in {
+            "ok",
+            "settlement_lag",
+            "sellability_lag",
+            "startup_realign",
+            "wallet_stale",
+            "wallet_recovering",
+        }:
             self._expected_up = max(0.0, float(real_up))
             self._expected_dn = max(0.0, float(real_dn))
 

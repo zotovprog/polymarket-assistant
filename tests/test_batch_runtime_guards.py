@@ -397,6 +397,63 @@ async def test_place_order_trims_close_only_sell_to_available_inventory():
 
 
 @pytest.mark.anyio
+async def test_close_only_sell_uses_cached_balance_on_transient_token_balance_error():
+    om = order_manager_mod.OrderManager(object(), MMConfig())
+    om.ensure_sell_allowance = AsyncMock(return_value=True)
+    om.get_token_balance = AsyncMock(return_value=None)
+    om._last_known_token_balance_by_token["dn_tok_123"] = 6.8
+    om._place_order_inner = AsyncMock(return_value="oid-cache")
+
+    quote = Quote(side="SELL", token_id="dn_tok_123", price=0.80, size=8.0)
+    oid = await om.place_order(quote)
+
+    assert oid == "oid-cache"
+    assert quote.size < 8.0
+    assert quote.size >= 5.0
+    assert om.reconcile_requested is True
+    om._place_order_inner.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_pm_api_error_records_raw_context_for_balance_failures(monkeypatch):
+    monkeypatch.setattr(order_manager_mod, "_HAS_CLOB_TYPES", True, raising=False)
+    monkeypatch.setattr(order_manager_mod, "AssetType", _DummyAssetType, raising=False)
+    monkeypatch.setattr(
+        order_manager_mod,
+        "BalanceAllowanceParams",
+        _DummyBalanceAllowanceParams,
+        raising=False,
+    )
+
+    class _BalanceFetchError(Exception):
+        def __init__(self):
+            super().__init__("Request exception!")
+            self.status_code = 503
+            self.error_msg = {"error": "Request exception!"}
+
+    class _BalanceFailClient:
+        def get_balance_allowance(self, _params):
+            raise _BalanceFetchError()
+
+    om = order_manager_mod.OrderManager(_BalanceFailClient(), MMConfig())
+    bal = await om.get_token_balance("dn_tok_123", source="reconcile_balance")
+
+    assert bal is None
+    stats = om.get_api_error_stats()
+    recent = stats["recent"][-1]
+    assert recent["op"] == "get_token_balance"
+    assert recent["status_code"] == 503
+    details = recent["details"]
+    assert details["source"] == "reconcile_balance"
+    assert details["op_context"] == "get_token_balance"
+    assert details["transient"] is True
+    assert "Request exception" in details["raw_error"]
+    health = om.get_balance_fetch_health_snapshot()
+    assert health["reconcile_balance_error_active"] is True
+    assert "Request exception" in health["last_reconcile_balance_error"]
+
+
+@pytest.mark.anyio
 async def test_place_order_buy_balance_retry_skips_when_below_pm_min():
     om = order_manager_mod.OrderManager(object(), MMConfig())
     om.get_usdc_available_balance = AsyncMock(side_effect=[100.0, 2.4])
