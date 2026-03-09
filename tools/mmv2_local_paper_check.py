@@ -121,11 +121,16 @@ def main() -> int:
     parser.add_argument("--coin", default="BTC")
     parser.add_argument("--timeframe", default="15m")
     parser.add_argument("--budget", type=float, default=50.0)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--paper-mode", dest="paper_mode", action="store_true", default=True)
+    mode.add_argument("--live-mode", dest="paper_mode", action="store_false")
     parser.add_argument("--duration-sec", type=int, default=1800)
     parser.add_argument("--poll-sec", type=float, default=5.0)
     parser.add_argument("--start-retry-timeout-sec", type=float, default=180.0)
     parser.add_argument("--http-timeout-sec", type=float, default=30.0)
     parser.add_argument("--epsilon", type=float, default=1e-3)
+    parser.add_argument("--paper-max-loss-usd", type=float, default=1.0)
+    parser.add_argument("--live-max-loss-usd", type=float, default=3.0)
     parser.add_argument("--stop-at-end", action="store_true")
     parser.add_argument("--output-root", default="audit/local-paper")
     parser.add_argument("--auto-roll-expired", action="store_true", default=True)
@@ -144,6 +149,7 @@ def main() -> int:
     logs_jsonl = out_dir / "logs.jsonl"
 
     failures: list[str] = []
+    failed_criteria: list[str] = []
     samples = 0
     max_fill_count = 0
     restart_count = 0
@@ -151,6 +157,17 @@ def main() -> int:
     prev_portfolio_mark = None
     prev_session_pnl = None
     prev_fill_count = None
+    terminal_expected = False
+
+    # Gate metrics
+    outside_near_expiry_samples = 0
+    min_mm_effective_ratio_60s_outside = float("inf")
+    max_unwind_ratio_60s_outside = 0.0
+    max_emergency_unwind_ratio_60s_outside = 0.0
+    max_quote_none_streak_outside = 0
+    quote_none_streak_outside = 0
+    final_pnl_usd = 0.0
+    window_final_pnls_by_start: dict[float, float] = {}
 
     # Ensure stale run is not hanging.
     try:
@@ -168,7 +185,7 @@ def main() -> int:
     start_payload = {
         "coin": args.coin,
         "timeframe": args.timeframe,
-        "paper_mode": True,
+        "paper_mode": bool(args.paper_mode),
         "initial_usdc": float(args.budget),
         "dev": True,
     }
@@ -183,6 +200,13 @@ def main() -> int:
     (out_dir / "start.json").write_text(json.dumps(start_resp, indent=2), encoding="utf-8")
 
     started_at = time.time()
+    target_loss_floor = -abs(float(args.paper_max_loss_usd if args.paper_mode else args.live_max_loss_usd))
+
+    def _ratio(value: Any) -> float:
+        try:
+            return max(0.0, min(1.0, float(value or 0.0)))
+        except Exception:
+            return 0.0
 
     try:
         while (time.time() - started_at) < float(args.duration_sec):
@@ -220,6 +244,11 @@ def main() -> int:
             lifecycle = str(state.get("lifecycle") or "")
             is_running = bool(state.get("is_running"))
             hard_mode = str(risk.get("hard_mode") or "")
+            market = state.get("market") or {}
+            cfg = state.get("config") or {}
+            time_left_sec = float(market.get("time_left_sec") or 0.0)
+            unwind_window_sec = float(cfg.get("unwind_window_sec") or 90.0)
+            outside_near_expiry = time_left_sec > unwind_window_sec
 
             if lifecycle == "halted" or hard_mode == "halted":
                 failures.append(
@@ -228,6 +257,10 @@ def main() -> int:
                 )
                 break
             if not is_running:
+                # Graceful end-of-window terminal in paper/live checks.
+                if lifecycle == "expired" and hard_mode == "none":
+                    terminal_expected = True
+                    break
                 if args.auto_roll_expired:
                     try:
                         _start_with_retry(
@@ -290,12 +323,25 @@ def main() -> int:
                             "local_check_warning": f"auto-roll transient failure sample={samples}: {exc}",
                         },
                     )
+            elif lifecycle == "expired" and hard_mode == "none" and not args.auto_roll_expired:
+                terminal_expected = True
+                break
 
             if bool(health.get("true_drift")):
                 failures.append(f"true_drift at sample={samples}")
+            if hard_mode == "halted":
+                failures.append(f"hard_mode_halted at sample={samples}")
 
             fill_count = int(analytics.get("fill_count") or 0)
-            session_pnl = float(analytics.get("session_pnl") or 0.0)
+            session_pnl = float(
+                analytics.get("session_pnl_equity_usd")
+                if analytics.get("session_pnl_equity_usd") is not None
+                else (analytics.get("session_pnl") or 0.0)
+            )
+            final_pnl_usd = session_pnl
+            started_key = float(state.get("started_at") or 0.0)
+            if started_key > 0.0:
+                window_final_pnls_by_start[started_key] = session_pnl
             portfolio_mark = analytics.get("portfolio_mark_value_usd")
             if portfolio_mark is not None:
                 portfolio_mark = float(portfolio_mark)
@@ -320,6 +366,24 @@ def main() -> int:
                             f"delta_pnl={delta_pnl:.6f} delta_portfolio={delta_portfolio:.6f}"
                         )
 
+            if outside_near_expiry:
+                outside_near_expiry_samples += 1
+                mm_effective_ratio_60s = _ratio(analytics.get("mm_effective_ratio_60s"))
+                unwind_ratio_60s = _ratio(analytics.get("unwind_ratio_60s"))
+                emergency_unwind_ratio_60s = _ratio(analytics.get("emergency_unwind_ratio_60s"))
+                min_mm_effective_ratio_60s_outside = min(min_mm_effective_ratio_60s_outside, mm_effective_ratio_60s)
+                max_unwind_ratio_60s_outside = max(max_unwind_ratio_60s_outside, unwind_ratio_60s)
+                max_emergency_unwind_ratio_60s_outside = max(
+                    max_emergency_unwind_ratio_60s_outside,
+                    emergency_unwind_ratio_60s,
+                )
+                quote_balance_state = str(analytics.get("quote_balance_state") or state.get("quote_balance_state") or "")
+                if quote_balance_state == "none":
+                    quote_none_streak_outside += 1
+                    max_quote_none_streak_outside = max(max_quote_none_streak_outside, quote_none_streak_outside)
+                else:
+                    quote_none_streak_outside = 0
+
             prev_portfolio_mark = portfolio_mark
             prev_session_pnl = session_pnl
             prev_fill_count = fill_count
@@ -339,20 +403,70 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 (out_dir / "stop_error.txt").write_text(str(exc), encoding="utf-8")
 
+    window_final_pnls = [
+        float(window_final_pnls_by_start[k]) for k in sorted(window_final_pnls_by_start.keys())
+    ]
+    if not window_final_pnls:
+        window_final_pnls = [float(final_pnl_usd)]
+
+    if any(float(pnl) < target_loss_floor for pnl in window_final_pnls):
+        failed_criteria.append(
+            f"window_final_pnl_below_floor (floor={target_loss_floor:.2f}, values={window_final_pnls})"
+        )
+    if failures:
+        failed_criteria.append("runtime_failures_present")
+    if outside_near_expiry_samples <= 0:
+        failed_criteria.append("no_samples_outside_near_expiry")
+    else:
+        if min_mm_effective_ratio_60s_outside < 0.65:
+            failed_criteria.append(
+                f"mm_effective_ratio_60s_below_0.65 (min={min_mm_effective_ratio_60s_outside:.4f})"
+            )
+        if max_unwind_ratio_60s_outside > 0.35:
+            failed_criteria.append(
+                f"unwind_ratio_60s_above_0.35 (max={max_unwind_ratio_60s_outside:.4f})"
+            )
+        if max_emergency_unwind_ratio_60s_outside > 0.10:
+            failed_criteria.append(
+                f"emergency_unwind_ratio_60s_above_0.10 (max={max_emergency_unwind_ratio_60s_outside:.4f})"
+            )
+        if max_quote_none_streak_outside > 3:
+            failed_criteria.append(
+                f"quote_balance_none_streak_above_3 (max={max_quote_none_streak_outside})"
+            )
+
+    gate_verdict = "go" if not failed_criteria else "no_go"
     summary = {
-        "ok": len(failures) == 0,
+        "ok": gate_verdict == "go",
+        "gate_verdict": gate_verdict,
+        "failed_criteria": failed_criteria,
+        "terminal_expected": bool(terminal_expected),
         "samples": samples,
         "max_fill_count": max_fill_count,
         "restart_count": restart_count,
+        "final_pnl_usd": float(final_pnl_usd),
+        "window_final_pnls": window_final_pnls,
+        "outside_near_expiry": {
+            "samples": int(outside_near_expiry_samples),
+            "min_mm_effective_ratio_60s": (
+                0.0 if min_mm_effective_ratio_60s_outside == float("inf") else float(min_mm_effective_ratio_60s_outside)
+            ),
+            "max_unwind_ratio_60s": float(max_unwind_ratio_60s_outside),
+            "max_emergency_unwind_ratio_60s": float(max_emergency_unwind_ratio_60s_outside),
+            "max_quote_balance_none_streak": int(max_quote_none_streak_outside),
+        },
         "failures": failures,
         "params": {
             "base_url": args.base_url,
             "coin": args.coin,
             "timeframe": args.timeframe,
             "budget": args.budget,
+            "paper_mode": bool(args.paper_mode),
             "duration_sec": args.duration_sec,
             "poll_sec": args.poll_sec,
             "epsilon": args.epsilon,
+            "paper_max_loss_usd": float(args.paper_max_loss_usd),
+            "live_max_loss_usd": float(args.live_max_loss_usd),
             "auto_roll_expired": bool(args.auto_roll_expired),
             "start_retry_timeout_sec": float(args.start_retry_timeout_sec),
             "http_timeout_sec": float(args.http_timeout_sec),

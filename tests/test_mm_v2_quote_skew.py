@@ -612,7 +612,7 @@ def test_quote_state_includes_suppressed_reason_for_blocked_harmful_intents(monk
     assert plan.suppressed_reasons["dn_bid"] == "harmful blocked without helpful viability"
 
 
-def test_default_clip_6_produces_flat_start_quotes_at_pm_min_size():
+def test_default_clip_4_produces_flat_start_quotes_at_pm_min_size():
     cfg = MMConfigV2()
     snapshot = _snapshot()
     inventory = _inventory(free_usdc=50.0)
@@ -628,7 +628,7 @@ def test_default_clip_6_produces_flat_start_quotes_at_pm_min_size():
         risk=risk,
         ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
     )
-    assert cfg.base_clip_usd == pytest.approx(6.0)
+    assert cfg.base_clip_usd == pytest.approx(4.0)
     assert plan.quote_balance_state != "none"
     assert all([plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask])
 
@@ -1156,7 +1156,7 @@ def test_target_pair_ratio_cap_applies_only_in_defensive_and_unwind():
 
 
 def test_target_ratio_deadband_prevents_false_inventory_skewed_trigger():
-    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.70)
+    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.50)
     snapshot = _snapshot(
         market_quality_score=0.95,
         market_tradeable=True,
@@ -1164,10 +1164,10 @@ def test_target_ratio_deadband_prevents_false_inventory_skewed_trigger():
         divergence_dn=0.01,
     )
     inventory_below_deadband = _inventory(
-        total_inventory_value_usd=22.0,
-        target_pair_value_usd=21.0,
-        pair_value_ratio=22.0 / 30.0,
-        pair_value_over_target_usd=1.0,
+        total_inventory_value_usd=18.0,
+        target_pair_value_usd=15.0,
+        pair_value_ratio=18.0 / 30.0,
+        pair_value_over_target_usd=3.0,
         excess_value_usd=0.2,
         signed_excess_value_usd=0.2,
     )
@@ -1177,14 +1177,14 @@ def test_target_ratio_deadband_prevents_false_inventory_skewed_trigger():
         analytics=AnalyticsState(),
         health=HealthState(),
     )
-    assert cfg.effective_target_ratio_activation_usd() == pytest.approx(2.0)
+    assert cfg.effective_target_ratio_activation_usd() == pytest.approx(4.0)
     assert risk_below.target_soft_mode == "normal"
 
     inventory_above_deadband = _inventory(
-        total_inventory_value_usd=23.5,
-        target_pair_value_usd=21.0,
-        pair_value_ratio=23.5 / 30.0,
-        pair_value_over_target_usd=2.5,
+        total_inventory_value_usd=19.5,
+        target_pair_value_usd=15.0,
+        pair_value_ratio=19.5 / 30.0,
+        pair_value_over_target_usd=4.5,
         excess_value_usd=0.2,
         signed_excess_value_usd=0.2,
     )
@@ -1195,6 +1195,35 @@ def test_target_ratio_deadband_prevents_false_inventory_skewed_trigger():
         health=HealthState(),
     )
     assert risk_above.target_soft_mode == "inventory_skewed"
+
+
+def test_final_maker_cross_guard_suppresses_unplaceable_endpoint_sell():
+    cfg = MMConfigV2(base_clip_usd=4.0)
+    snapshot = _snapshot(
+        fv_up=0.98,
+        pm_mid_up=0.98,
+        up_best_bid=0.99,
+        up_best_ask=0.99,
+        fv_dn=0.02,
+        pm_mid_dn=0.02,
+        dn_best_bid=0.01,
+        dn_best_ask=0.02,
+    )
+    inventory = _inventory(up_shares=10.0, free_usdc=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.up_ask is None
+    assert plan.suppressed_reasons.get("up_ask") == "maker_cross_guard"
 
 
 def test_protective_modes_still_block_gross_inventory_expansion():

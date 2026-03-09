@@ -35,6 +35,16 @@ def _floor_price(price: float, tick_size: float) -> float:
     return round(max(min_price, min(max_price, floored)), 10)
 
 
+def _ceil_price(price: float, tick_size: float) -> float:
+    tick = max(1e-9, float(tick_size))
+    ceiled = math.ceil((float(price) - 1e-9) / tick) * tick
+    min_price = max(tick_size, 0.01)
+    max_price = min(0.99, 1.0 - tick_size)
+    if max_price < min_price:
+        max_price = min_price
+    return round(max(min_price, min(max_price, ceiled)), 10)
+
+
 @dataclass
 class QuoteContext:
     tick_size: float
@@ -468,6 +478,33 @@ class QuotePolicyV2:
                 price_adjust_ticks=ticks,
                 inventory_backed_sell=inventory_backed_sell,
             )
+            if intent is not None:
+                # Final maker guard after rounding. This prevents any residual
+                # crossed-book post-only prices in endpoint/tick edge cases.
+                if side == "BUY" and best_ask is not None:
+                    max_maker_buy = _floor_price(float(best_ask) - ctx.tick_size, ctx.tick_size)
+                    if (
+                        max_maker_buy < 0.01
+                        or max_maker_buy >= float(best_ask) - 1e-9
+                        or intent.price > max_maker_buy + 1e-9
+                    ):
+                        if max_maker_buy >= 0.01 and max_maker_buy < float(best_ask) - 1e-9:
+                            intent.price = max_maker_buy
+                        else:
+                            intent = None
+                            suppressed = "maker_cross_guard"
+                elif side == "SELL" and best_bid is not None:
+                    min_maker_sell = _ceil_price(float(best_bid) + ctx.tick_size, ctx.tick_size)
+                    if (
+                        min_maker_sell > 0.99
+                        or min_maker_sell <= float(best_bid) + 1e-9
+                        or intent.price < min_maker_sell - 1e-9
+                    ):
+                        if min_maker_sell <= 0.99 and min_maker_sell > float(best_bid) + 1e-9:
+                            intent.price = min_maker_sell
+                        else:
+                            intent = None
+                            suppressed = "maker_cross_guard"
             built[slot] = intent
             if suppressed:
                 suppressed_reasons[slot] = suppressed

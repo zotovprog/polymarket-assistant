@@ -7,6 +7,8 @@ from .config import (
     EMERGENCY_EXIT_MIN_HOLD_SEC,
     ENTER_CONFIRM_TICKS,
     EXIT_CONFIRM_TICKS,
+    FORCED_UNWIND_CONFIRM_TICKS,
+    FORCED_UNWIND_EXCESS_MULT,
     FOUR_QUOTE_MIN_RATIO_FOR_MM,
     MMConfigV2,
     NO_HELPFUL_TICKS_FOR_UNWIND,
@@ -42,6 +44,7 @@ class StateMachineV2:
         self._unwind_exit_ticks = 0
         self._unwind_last_exit_ts = 0.0
         self._emergency_exit_ticks = 0
+        self._forced_unwind_ticks = 0
 
     def seconds_in_mode(self) -> float:
         return max(0.0, time.time() - self._entered_at)
@@ -115,6 +118,8 @@ class StateMachineV2:
         reason = ""
         unwind_exit_armed = False
         emergency_exit_armed = False
+        unwind_deferred = False
+        forced_unwind_extreme_excess = False
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
         if snapshot is None:
             self._set_lifecycle("bootstrapping")
@@ -197,6 +202,29 @@ class StateMachineV2:
 
         current_level = self._soft_level(self.lifecycle)
         target_level = self._soft_level(target_lifecycle)
+        budget = max(0.01, float(self.config.session_budget_usd))
+        defensive_cap = max(
+            float(self.config.soft_excess_value_ratio) * budget,
+            float(self.config.defensive_excess_value_ratio) * budget,
+        )
+        hard_cap = max(
+            defensive_cap,
+            float(self.config.effective_hard_excess_value_ratio()) * budget,
+        )
+        forced_unwind_threshold = float(FORCED_UNWIND_EXCESS_MULT) * float(hard_cap)
+        extreme_excess = float(inventory.excess_value_usd) >= forced_unwind_threshold
+        viable_unwind_quote_balance = viability.quote_balance_state in {"helpful_only", "reduced", "balanced"}
+        defer_unwind_with_viable_quotes = (
+            target_soft_mode == "unwind"
+            and risk.hard_mode == "none"
+            and float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
+            and viability.any_quote
+            and viable_unwind_quote_balance
+        )
+        if target_soft_mode == "unwind" and extreme_excess:
+            self._forced_unwind_ticks += 1
+        else:
+            self._forced_unwind_ticks = 0
 
         if self.lifecycle == "bootstrapping":
             next_state = "quoting"
@@ -206,8 +234,18 @@ class StateMachineV2:
             if self._target_soft_mode_ticks >= ENTER_CONFIRM_TICKS:
                 for name, level in self._SOFT_ORDER.items():
                     if level == current_level + 1:
-                        next_state = name
-                        reason = f"escalation: {self.lifecycle}->{name}"
+                        if name == "unwind" and defer_unwind_with_viable_quotes:
+                            if self._forced_unwind_ticks >= int(FORCED_UNWIND_CONFIRM_TICKS):
+                                next_state = "unwind"
+                                forced_unwind_extreme_excess = True
+                                reason = "forced_unwind_extreme_excess"
+                            else:
+                                next_state = self.lifecycle
+                                unwind_deferred = True
+                                reason = "unwind_deferred_viable_quotes"
+                        else:
+                            next_state = name
+                            reason = f"escalation: {self.lifecycle}->{name}"
                         break
         elif target_level < current_level:
             if self.lifecycle == "unwind":
@@ -355,4 +393,6 @@ class StateMachineV2:
             reason=reason or risk.reason,
             unwind_exit_armed=bool(unwind_exit_armed),
             emergency_exit_armed=bool(emergency_exit_armed),
+            unwind_deferred=bool(unwind_deferred),
+            forced_unwind_extreme_excess=bool(forced_unwind_extreme_excess),
         )

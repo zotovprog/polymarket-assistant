@@ -16,6 +16,8 @@ from mm_v2.config import (
     EMERGENCY_EXIT_CONFIRM_TICKS,
     EMERGENCY_EXIT_MIN_HOLD_SEC,
     EXIT_CONFIRM_TICKS,
+    FORCED_UNWIND_CONFIRM_TICKS,
+    FORCED_UNWIND_EXCESS_MULT,
     MMConfigV2,
     UNWIND_EXIT_CONFIRM_TICKS,
 )
@@ -812,3 +814,82 @@ def test_defensive_no_progress_requires_degraded_quote_balance_for_unwind():
         result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
     assert result.no_progress is True
     assert result.lifecycle == "defensive"
+
+
+def test_unwind_deferred_when_viable_quotes_and_not_near_expiry():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("defensive")
+    snap = _snapshot(time_left_sec=600.0)
+    inventory = _inventory(
+        dn_shares=20.0,
+        excess_dn_qty=20.0,
+        excess_dn_value_usd=14.0,
+        excess_value_usd=14.0,
+        signed_excess_value_usd=-14.0,
+        total_inventory_value_usd=14.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "unwind"
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=1,
+        harmful_count=0,
+        helpful_only=True,
+        harmful_only=False,
+        quote_balance_state="helpful_only",
+    )
+    result = None
+    for _ in range(2):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.unwind_deferred is True
+    assert result.forced_unwind_extreme_excess is False
+    assert result.lifecycle == "defensive"
+    assert result.reason == "unwind_deferred_viable_quotes"
+
+
+def test_forced_unwind_extreme_excess_overrides_viable_quote_defer():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("defensive")
+    snap = _snapshot(time_left_sec=600.0)
+    hard_cap = cfg.effective_hard_excess_value_ratio() * cfg.session_budget_usd
+    extreme_excess = (FORCED_UNWIND_EXCESS_MULT * hard_cap) + 0.5
+    inventory = _inventory(
+        up_shares=40.0,
+        excess_up_qty=40.0,
+        excess_up_value_usd=extreme_excess,
+        excess_value_usd=extreme_excess,
+        signed_excess_value_usd=extreme_excess,
+        total_inventory_value_usd=extreme_excess,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "unwind"
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=1,
+        harmful_count=0,
+        helpful_only=True,
+        harmful_only=False,
+        quote_balance_state="helpful_only",
+    )
+    result = None
+    for _ in range(max(3, int(FORCED_UNWIND_CONFIRM_TICKS))):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.forced_unwind_extreme_excess is True
+    assert result.lifecycle == "unwind"
+    assert result.reason == "forced_unwind_extreme_excess"

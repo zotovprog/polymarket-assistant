@@ -493,6 +493,8 @@ def test_pair_inventory_decomposition_tracks_pair_and_pending_orders():
 def test_mmv2_balanced_default_profile_and_caps():
     cfg = MMConfigV2()
     assert cfg.session_budget_usd == pytest.approx(30.0)
+    assert cfg.base_clip_usd == pytest.approx(4.0)
+    assert cfg.target_pair_value_ratio == pytest.approx(0.50)
     assert cfg.base_half_spread_bps == pytest.approx(100.0)
     assert cfg.defensive_spread_mult == pytest.approx(1.5)
     assert cfg.defensive_size_mult == pytest.approx(0.4)
@@ -505,6 +507,13 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert soft_cap == pytest.approx(6.0)
     assert def_cap == pytest.approx(10.5)
     assert hard_cap == pytest.approx(13.5)
+
+
+def test_effective_target_ratio_activation_usd_uses_new_budget_ratio_formula():
+    cfg_small = MMConfigV2(session_budget_usd=30.0)
+    cfg_large = MMConfigV2(session_budget_usd=100.0)
+    assert cfg_small.effective_target_ratio_activation_usd() == pytest.approx(4.0)
+    assert cfg_large.effective_target_ratio_activation_usd() == pytest.approx(12.0)
 
 
 def test_config_excess_profile_defaults_are_020_035_045():
@@ -1189,6 +1198,9 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
             "lifecycle": "defensive",
             "analytics": {
                 "mm_regime_degraded_reason": "high_emergency_ratio",
+                "maker_cross_guard_hits_60s": 4,
+                "unwind_deferred_hits_60s": 2,
+                "forced_unwind_extreme_excess_hits_60s": 1,
             },
             "health": {
                 "drawdown_threshold_usd_effective": 15.0,
@@ -1197,6 +1209,9 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
+    assert resp["analytics"]["maker_cross_guard_hits_60s"] == 4
+    assert resp["analytics"]["unwind_deferred_hits_60s"] == 2
+    assert resp["analytics"]["forced_unwind_extreme_excess_hits_60s"] == 1
     assert resp["health"]["drawdown_threshold_usd_effective"] == pytest.approx(15.0)
 
 
@@ -1429,6 +1444,9 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "position_mark_value_usd": 3.12,
                 "tradeable_portfolio_value_usd": 43.12,
                 "portfolio_mark_value_usd": 48.12,
+                "maker_cross_guard_hits_60s": 3,
+                "unwind_deferred_hits_60s": 2,
+                "forced_unwind_extreme_excess_hits_60s": 1,
             },
             "alerts": [],
             "config": {"session_budget_usd": 50.0},
@@ -1449,6 +1467,9 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["session_pnl"] == pytest.approx(0.78)
     assert resp["session_pnl_risk_equity"] == pytest.approx(1.23)
     assert resp["fill_count"] == 1
+    assert resp["mm_regime"]["maker_cross_guard_hits_60s"] == 3
+    assert resp["mm_regime"]["unwind_deferred_hits_60s"] == 2
+    assert resp["mm_regime"]["forced_unwind_extreme_excess_hits_60s"] == 1
 
 
 @pytest.mark.asyncio

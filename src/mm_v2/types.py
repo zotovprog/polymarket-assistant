@@ -188,6 +188,9 @@ class AnalyticsState:
     target_ratio_breaches_60s: int = 0
     defensive_to_unwind_count_window: int = 0
     quote_cancel_to_fill_ratio_60s: float = 0.0
+    maker_cross_guard_hits_60s: int = 0
+    unwind_deferred_hits_60s: int = 0
+    forced_unwind_extreme_excess_hits_60s: int = 0
     mm_regime_degraded_reason: str = ""
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
@@ -227,6 +230,8 @@ class SoftTransitionResult:
     reason: str = ""
     unwind_exit_armed: bool = False
     emergency_exit_armed: bool = False
+    unwind_deferred: bool = False
+    forced_unwind_extreme_excess: bool = False
 
 
 @dataclass

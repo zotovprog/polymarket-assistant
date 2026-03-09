@@ -72,6 +72,9 @@ class MarketMakerV2:
         self._harmful_suppressed_history: list[tuple[float, int]] = []
         self._target_ratio_breach_history: list[tuple[float, int]] = []
         self._order_removal_history: list[tuple[float, int]] = []
+        self._maker_cross_guard_history: list[tuple[float, int]] = []
+        self._unwind_deferred_history: list[tuple[float, int]] = []
+        self._forced_unwind_extreme_excess_history: list[tuple[float, int]] = []
         self._prev_active_order_ids: set[str] = set()
         self._starting_portfolio = 0.0
         self._starting_usdc = 0.0
@@ -277,6 +280,9 @@ class MarketMakerV2:
         self._harmful_suppressed_history.clear()
         self._target_ratio_breach_history.clear()
         self._order_removal_history.clear()
+        self._maker_cross_guard_history.clear()
+        self._unwind_deferred_history.clear()
+        self._forced_unwind_extreme_excess_history.clear()
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -939,9 +945,14 @@ class MarketMakerV2:
             for reason in plan.suppressed_reasons.values()
             if str(reason).startswith("harmful_suppressed_")
         )
+        maker_cross_guard_hits_tick = sum(
+            1 for reason in plan.suppressed_reasons.values() if str(reason) == "maker_cross_guard"
+        )
         target_ratio_cap_hits_tick = sum(
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "target_pair_ratio_cap"
         )
+        unwind_deferred_hits_tick = 1 if transition.unwind_deferred else 0
+        forced_unwind_extreme_excess_hits_tick = 1 if transition.forced_unwind_extreme_excess else 0
         current_active_order_ids = set(self.gateway.active_order_ids())
         removed_orders_tick = len(self._prev_active_order_ids - current_active_order_ids)
         self._prev_active_order_ids = current_active_order_ids
@@ -960,6 +971,9 @@ class MarketMakerV2:
         self._harmful_suppressed_history.append((now, int(harmful_suppressed_count_tick)))
         self._target_ratio_breach_history.append((now, int(target_ratio_cap_hits_tick)))
         self._order_removal_history.append((now, int(removed_orders_tick)))
+        self._maker_cross_guard_history.append((now, int(maker_cross_guard_hits_tick)))
+        self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
+        self._forced_unwind_extreme_excess_history.append((now, int(forced_unwind_extreme_excess_hits_tick)))
         self._prune_history(self._excess_history)
         self._prune_history(self._quote_presence_history)
         self._prune_history(self._mode_history)
@@ -967,6 +981,9 @@ class MarketMakerV2:
         self._prune_history(self._harmful_suppressed_history)
         self._prune_history(self._target_ratio_breach_history)
         self._prune_history(self._order_removal_history)
+        self._prune_history(self._maker_cross_guard_history)
+        self._prune_history(self._unwind_deferred_history)
+        self._prune_history(self._forced_unwind_extreme_excess_history)
         quote_presence_ratio, four_quote_presence_ratio = self._quote_presence_ratio()
         _, four_quote_ratio_60s = self._quote_presence_ratio_window(window_sec=float(MM_REGIME_WINDOW_SEC))
         regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC))
@@ -981,6 +998,18 @@ class MarketMakerV2:
         )
         target_ratio_breaches_60s = self._window_sum(
             self._target_ratio_breach_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        maker_cross_guard_hits_60s = self._window_sum(
+            self._maker_cross_guard_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        unwind_deferred_hits_60s = self._window_sum(
+            self._unwind_deferred_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+        )
+        forced_unwind_extreme_excess_hits_60s = self._window_sum(
+            self._forced_unwind_extreme_excess_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
         )
         defensive_to_unwind_count_window = self._defensive_to_unwind_count(
@@ -1046,6 +1075,9 @@ class MarketMakerV2:
             target_ratio_breaches_60s=int(target_ratio_breaches_60s),
             defensive_to_unwind_count_window=int(defensive_to_unwind_count_window),
             quote_cancel_to_fill_ratio_60s=float(quote_cancel_to_fill_ratio_60s),
+            maker_cross_guard_hits_60s=int(maker_cross_guard_hits_60s),
+            unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
+            forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),
             unwind_target_mismatch_ticks=int(self._unwind_target_mismatch_ticks),
             unwind_target_mismatch_sec=float(unwind_target_mismatch_sec),

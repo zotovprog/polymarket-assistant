@@ -49,7 +49,7 @@ def build_pair_inventory(
     up_token_id: str,
     dn_token_id: str,
     session_budget_usd: float = 0.0,
-    target_pair_value_ratio: float = 0.70,
+    target_pair_value_ratio: float = 0.50,
 ) -> PairInventoryState:
     pending = pending_reservations(
         active_orders,

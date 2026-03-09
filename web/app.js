@@ -864,6 +864,9 @@ function updateMMRegime(mmRegime, state) {
     const harmfulCount = Number(mmRegime?.harmful_quote_count ?? 0);
     const regimeReason = String(mmRegime?.reason || state?.pause_reason || '').trim();
     const degradedReason = String(mmRegime?.mm_regime_degraded_reason || '').trim();
+    const makerGuardHits = Number(mmRegime?.maker_cross_guard_hits_60s ?? 0);
+    const unwindDeferredHits = Number(mmRegime?.unwind_deferred_hits_60s ?? 0);
+    const forcedUnwindHits = Number(mmRegime?.forced_unwind_extreme_excess_hits_60s ?? 0);
 
     let status = 'HEALTHY';
     let statusClass = 'mm-status-badge mm-status-healthy';
@@ -908,6 +911,12 @@ function updateMMRegime(mmRegime, state) {
         why += ` Helpful/Harmful: ${helpfulCount}/${harmfulCount}.`;
     }
     setText('mm-regime-why', why);
+    const signalHints = [];
+    if (makerGuardHits > 0) signalHints.push(`maker_guard=${makerGuardHits}`);
+    if (unwindDeferredHits > 0) signalHints.push(`unwind_deferred=${unwindDeferredHits}`);
+    if (forcedUnwindHits > 0) signalHints.push(`forced_unwind=${forcedUnwindHits}`);
+    if (!signalHints.length) signalHints.push('no protective signal hits in 60s');
+    setText('mm-regime-signals', `Signals: ${signalHints.join(', ')}`);
 
     const modeCardMap = {
         normal: 'mm-mode-normal',

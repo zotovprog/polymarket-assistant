@@ -31,9 +31,12 @@ LOW_BUDGET_HARD_EXCESS_MIN_RATIO = 0.35
 DRAWDOWN_CONFIRM_TICKS = 3
 DRAWDOWN_CONFIRM_MIN_AGE_SEC = 8.0
 DRAWDOWN_RESET_HYSTERESIS_USD = 0.25
-TARGET_RATIO_ACTIVATION_MIN_USD = 2.0
+TARGET_RATIO_ACTIVATION_MIN_USD = 4.0
+TARGET_RATIO_ACTIVATION_BUDGET_RATIO = 0.12
 MM_REGIME_WINDOW_SEC = 60.0
 MM_REGIME_DEGRADED_CONFIRM_SEC = 120.0
+FORCED_UNWIND_EXCESS_MULT = 1.35
+FORCED_UNWIND_CONFIRM_TICKS = 3
 
 
 @dataclass
@@ -74,8 +77,8 @@ class MMConfigV2:
     }
 
     session_budget_usd: float = 30.0
-    base_clip_usd: float = 6.0
-    target_pair_value_ratio: float = 0.70
+    base_clip_usd: float = 4.0
+    target_pair_value_ratio: float = 0.50
     soft_excess_value_ratio: float = 0.20
     defensive_excess_value_ratio: float = 0.35
     hard_excess_value_ratio: float = 0.45
@@ -124,7 +127,10 @@ class MMConfigV2:
         return max(float(self.hard_drawdown_usd), dynamic)
 
     def effective_target_ratio_activation_usd(self) -> float:
-        return max(float(TARGET_RATIO_ACTIVATION_MIN_USD), 0.05 * max(0.0, float(self.session_budget_usd)))
+        return max(
+            float(TARGET_RATIO_ACTIVATION_MIN_USD),
+            float(TARGET_RATIO_ACTIVATION_BUDGET_RATIO) * max(0.0, float(self.session_budget_usd)),
+        )
 
     def effective_harmful_buy_suppress_usd(self) -> float:
         budget = max(0.0, float(self.session_budget_usd))

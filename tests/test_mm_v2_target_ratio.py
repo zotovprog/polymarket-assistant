@@ -78,7 +78,7 @@ def _inventory(**overrides) -> PairInventoryState:
 
 
 def test_target_pair_ratio_overflow_suppresses_inventory_expanding_intents():
-    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.70)
+    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.50)
     snapshot = _snapshot()
     inventory = _inventory(
         up_shares=12.0,
@@ -87,7 +87,8 @@ def test_target_pair_ratio_overflow_suppresses_inventory_expanding_intents():
         paired_value_usd=12.0,
         total_inventory_value_usd=24.0,
         pair_value_ratio=0.80,
-        pair_value_over_target_usd=3.0,
+        target_pair_value_usd=15.0,
+        pair_value_over_target_usd=9.0,
     )
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
@@ -95,6 +96,8 @@ def test_target_pair_ratio_overflow_suppresses_inventory_expanding_intents():
         analytics=AnalyticsState(),
         health=HealthState(),
     )
+    risk.soft_mode = "defensive"
+    risk.target_soft_mode = "defensive"
     plan = QuotePolicyV2(cfg).generate(
         snapshot=snapshot,
         inventory=inventory,
@@ -108,7 +111,7 @@ def test_target_pair_ratio_overflow_suppresses_inventory_expanding_intents():
 
 
 def test_target_pair_ratio_metrics_exposed_in_state():
-    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.70)
+    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.50)
     snapshot = _snapshot()
     inventory = _inventory()
     risk = HardSafetyKernel(cfg).evaluate(
@@ -145,13 +148,14 @@ def test_target_pair_ratio_metrics_exposed_in_state():
 
 
 def test_target_ratio_does_not_trigger_hard_mode_by_itself():
-    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.70)
+    cfg = MMConfigV2(session_budget_usd=30.0, target_pair_value_ratio=0.50)
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=_snapshot(),
         inventory=_inventory(
-            total_inventory_value_usd=24.0,
-            pair_value_ratio=0.80,
-            pair_value_over_target_usd=3.0,
+            total_inventory_value_usd=20.0,
+            target_pair_value_usd=15.0,
+            pair_value_ratio=20.0 / 30.0,
+            pair_value_over_target_usd=5.0,
             excess_value_usd=0.0,
             signed_excess_value_usd=0.0,
         ),

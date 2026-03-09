@@ -3282,6 +3282,11 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
             "four_quote_ratio_60s": float(analytics.get("four_quote_ratio_60s") or 0.0),
             "mm_effective_ratio_60s": float(analytics.get("mm_effective_ratio_60s") or 0.0),
             "mm_regime_degraded_reason": str(analytics.get("mm_regime_degraded_reason") or ""),
+            "maker_cross_guard_hits_60s": int(analytics.get("maker_cross_guard_hits_60s") or 0),
+            "unwind_deferred_hits_60s": int(analytics.get("unwind_deferred_hits_60s") or 0),
+            "forced_unwind_extreme_excess_hits_60s": int(
+                analytics.get("forced_unwind_extreme_excess_hits_60s") or 0
+            ),
             "current_mode": str(risk.get("soft_mode") or "normal"),
             "target_mode": str(risk.get("target_soft_mode") or risk.get("soft_mode") or "normal"),
             "lifecycle": lifecycle,
