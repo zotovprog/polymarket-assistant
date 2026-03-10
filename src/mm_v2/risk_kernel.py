@@ -13,6 +13,7 @@ DIVERGENCE_DEFENSIVE_THRESHOLD = 0.30
 UNTRADEABLE_QUALITY_MULT = 0.75
 UNTRADEABLE_DIVERGENCE_MULT = 1.50
 UNTRADEABLE_BASE_QUALITY_PRESSURE = 0.60
+UNTRADEABLE_MATERIAL_INVENTORY_DIVERGENCE = 0.06
 
 
 @dataclass
@@ -63,6 +64,8 @@ class SoftRiskKernel:
         pair_over_target_usd = max(0.0, float(inventory.pair_value_over_target_usd))
         target_ratio_pressure = self._clamp(pair_over_target_usd / target_pair_value_usd, 0.0, 1.0)
         target_ratio_activation_usd = float(self.config.effective_target_ratio_activation_usd())
+        gross_brake_activation_usd = max(1.5, 0.05 * budget)
+        material_inventory_usd = max(6.0, 0.20 * budget)
 
         max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
         min_quality = float(self.config.min_market_quality_score)
@@ -76,6 +79,13 @@ class SoftRiskKernel:
         )
         severe_untradeable = bool(
             is_untradeable and (severe_untradeable_quality or severe_untradeable_divergence)
+        )
+        material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
+        untradeable_inventory_divergence_bad = bool(
+            max_divergence >= UNTRADEABLE_MATERIAL_INVENTORY_DIVERGENCE
+        )
+        untradeable_inventory_quality_bad = bool(
+            float(snapshot.market_quality_score) < min_quality
         )
 
         quality_pressure = 0.0
@@ -108,7 +118,17 @@ class SoftRiskKernel:
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
-            if is_untradeable and severe_untradeable:
+            if is_untradeable and material_inventory and (
+                untradeable_inventory_divergence_bad or untradeable_inventory_quality_bad
+            ):
+                target_soft_mode = "defensive"
+                soft_reason = "defensive untradeable inventory regime"
+            elif is_untradeable and pair_over_target_usd >= gross_brake_activation_usd:
+                target_soft_mode = "inventory_skewed"
+                soft_reason = (
+                    f"untradeable pair inventory over target by ${pair_over_target_usd:.2f}"
+                )
+            elif is_untradeable and severe_untradeable:
                 target_soft_mode = "defensive"
                 if severe_untradeable_quality:
                     soft_reason = "defensive market regime (untradeable severe quality)"
@@ -171,12 +191,14 @@ class HardSafetyKernel:
         hard_mode = "none"
         hard_reason = ""
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
+        effective_drawdown_usd = max(0.01, float(self.config.effective_hard_drawdown_usd()))
         drawdown_budget = 1.0
         if self.config.hard_drawdown_usd > 0:
             drawdown_budget = max(
                 0.0,
-                1.0 - max(0.0, -equity_pnl) / float(self.config.hard_drawdown_usd),
+                1.0 - max(0.0, -equity_pnl) / effective_drawdown_usd,
             )
+        early_drawdown_pressure = max(0.0, -equity_pnl / effective_drawdown_usd)
 
         if health.true_drift:
             if has_material_position:
@@ -199,7 +221,7 @@ class HardSafetyKernel:
             hard_mode = "emergency_unwind" if has_material_position else "halted"
             hard_reason = (
                 f"hard drawdown ${equity_pnl:.2f} "
-                f"(thr ${float(self.config.effective_hard_drawdown_usd()):.2f})"
+                f"(thr ${effective_drawdown_usd:.2f})"
             )
         elif health.residual_inventory_failure and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):
             hard_mode = "emergency_unwind"
@@ -224,4 +246,5 @@ class HardSafetyKernel:
             inventory_pressure_signed=soft.pressure_signed,
             quality_pressure=soft.quality_pressure,
             target_ratio_pressure=soft.target_ratio_pressure,
+            early_drawdown_pressure=early_drawdown_pressure,
         )

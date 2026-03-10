@@ -53,6 +53,13 @@ class QuoteContext:
 
 
 class QuotePolicyV2:
+    MIDPOINT_FIRST_SHIFT_CAP_ABS = 0.02
+    MIDPOINT_FIRST_SHIFT_SPREAD_FRACTION = 0.35
+    MIDPOINT_FIRST_DIVERGENCE_BRAKE_START = 0.03
+    MIDPOINT_FIRST_DIVERGENCE_BRAKE_FULL = 0.10
+    TOXIC_SIDE_SPREAD_TICKS_MAX = 3
+    TOXIC_SIDE_SIZE_BRAKE_MIN = 0.35
+
     def __init__(self, config: MMConfigV2):
         self.config = config
 
@@ -69,6 +76,103 @@ class QuotePolicyV2:
         if risk.soft_mode == "unwind":
             return max(1.0, base * 0.5)
         return base
+
+    @staticmethod
+    def _clamp(value: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, value))
+
+    @staticmethod
+    def _token_side(token: str, snapshot: PairMarketSnapshot) -> Literal["up", "dn"]:
+        return "up" if token == snapshot.up_token_id else "dn"
+
+    def _midpoint_anchor(self, snapshot: PairMarketSnapshot, token_side: Literal["up", "dn"]) -> float:
+        if token_side == "up":
+            return max(
+                0.01,
+                min(
+                    0.99,
+                    float(
+                        snapshot.midpoint_anchor_up
+                        if snapshot.midpoint_anchor_up is not None
+                        else snapshot.pm_mid_up
+                        if snapshot.pm_mid_up is not None
+                        else snapshot.fv_up
+                    ),
+                ),
+            )
+        return max(
+            0.01,
+            min(
+                0.99,
+                float(
+                    snapshot.midpoint_anchor_dn
+                    if snapshot.midpoint_anchor_dn is not None
+                    else snapshot.pm_mid_dn
+                    if snapshot.pm_mid_dn is not None
+                    else snapshot.fv_dn
+                ),
+            ),
+        )
+
+    def _model_anchor(self, snapshot: PairMarketSnapshot, token_side: Literal["up", "dn"]) -> float:
+        if token_side == "up":
+            return max(
+                0.01,
+                min(
+                    0.99,
+                    float(
+                        snapshot.model_anchor_up
+                        if snapshot.model_anchor_up is not None
+                        else snapshot.fv_up
+                    ),
+                ),
+            )
+        return max(
+            0.01,
+            min(
+                0.99,
+                float(
+                    snapshot.model_anchor_dn
+                    if snapshot.model_anchor_dn is not None
+                    else snapshot.fv_dn
+                ),
+            ),
+        )
+
+    def _token_toxic_state(
+        self,
+        *,
+        token: str,
+        snapshot: PairMarketSnapshot,
+        risk: RiskRegime,
+    ) -> tuple[int, float, bool]:
+        token_side = self._token_side(token, snapshot)
+        if token_side == "up":
+            return (
+                int(getattr(risk, "toxic_fill_streak_up", 0) or 0),
+                max(0.0, float(getattr(risk, "side_hard_block_up_sec", 0.0) or 0.0)),
+                bool(getattr(risk, "side_soft_brake_up_active", False)),
+            )
+        return (
+            int(getattr(risk, "toxic_fill_streak_dn", 0) or 0),
+            max(0.0, float(getattr(risk, "side_hard_block_dn_sec", 0.0) or 0.0)),
+            bool(getattr(risk, "side_soft_brake_dn_active", False)),
+        )
+
+    def _midpoint_divergence_pressure(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        token_side: Literal["up", "dn"],
+    ) -> float:
+        divergence = float(
+            snapshot.anchor_divergence_up if token_side == "up" else snapshot.anchor_divergence_dn
+        )
+        start = float(self.MIDPOINT_FIRST_DIVERGENCE_BRAKE_START)
+        full = float(self.MIDPOINT_FIRST_DIVERGENCE_BRAKE_FULL)
+        if divergence <= start + 1e-9:
+            return 0.0
+        return self._clamp((divergence - start) / max(1e-9, full - start), 0.0, 1.0)
 
     def _harmful_buy_brake_mult(
         self,
@@ -347,7 +451,10 @@ class QuotePolicyV2:
         risk: RiskRegime,
         ctx: QuoteContext,
     ) -> QuotePlan:
-        base_mid = max(0.01, min(0.99, float(snapshot.fv_up)))
+        midpoint_anchor_up = self._midpoint_anchor(snapshot, "up")
+        midpoint_anchor_dn = self._midpoint_anchor(snapshot, "dn")
+        model_anchor_up = self._model_anchor(snapshot, "up")
+        model_anchor_dn = self._model_anchor(snapshot, "dn")
         spread = self._spread(risk)
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
@@ -356,6 +463,9 @@ class QuotePolicyV2:
         min_viable_clip_usd = self._min_viable_clip_usd(snapshot, ctx)
         harmful_buy_guard_usd = float(self.config.effective_harmful_buy_suppress_usd())
         budget_usd = max(0.01, float(self.config.session_budget_usd))
+        pair_over_target_usd = max(0.0, float(inventory.pair_value_over_target_usd))
+        gross_brake_activation_usd = max(1.5, 0.05 * budget_usd)
+        gross_buy_block_usd = max(3.0, 0.10 * budget_usd)
         soft_cap_usd = max(0.01, float(self.config.soft_excess_value_ratio) * budget_usd)
         defensive_cap_usd = max(0.01, float(self.config.defensive_excess_value_ratio) * budget_usd)
         hard_cap_usd = max(
@@ -368,14 +478,37 @@ class QuotePolicyV2:
             0.80 * defensive_cap_usd,
         )
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
+        market_anchor_mid = max(0.01, min(0.99, float(midpoint_anchor_up)))
+        model_shift_cap = max(
+            float(ctx.tick_size),
+            min(float(self.MIDPOINT_FIRST_SHIFT_CAP_ABS), float(spread) * float(self.MIDPOINT_FIRST_SHIFT_SPREAD_FRACTION)),
+        )
+        up_anchor_divergence_pressure = self._midpoint_divergence_pressure(
+            snapshot=snapshot,
+            token_side="up",
+        )
+        dn_anchor_divergence_pressure = self._midpoint_divergence_pressure(
+            snapshot=snapshot,
+            token_side="dn",
+        )
+        up_model_shift = self._clamp(
+            float(model_anchor_up) - float(market_anchor_mid),
+            -model_shift_cap,
+            model_shift_cap,
+        ) * max(0.0, 1.0 - up_anchor_divergence_pressure)
+        dn_model_shift = self._clamp(
+            float(model_anchor_dn) - float(midpoint_anchor_dn),
+            -model_shift_cap,
+            model_shift_cap,
+        ) * max(0.0, 1.0 - dn_anchor_divergence_pressure)
         mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
-        pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
+        up_mid = max(0.01, min(0.99, market_anchor_mid + up_model_shift - mid_shift))
+        dn_mid = max(0.01, min(0.99, float(midpoint_anchor_dn) + dn_model_shift + mid_shift))
         pair_reference_price = self._pair_reference_price(snapshot)
         outside_near_expiry = float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
 
-        up_bid_price = pair_mid - spread
-        up_ask_price = pair_mid + spread
-        dn_mid = 1.0 - pair_mid
+        up_bid_price = up_mid - spread
+        up_ask_price = up_mid + spread
         dn_bid_price = dn_mid - spread
         dn_ask_price = dn_mid + spread
 
@@ -391,6 +524,30 @@ class QuotePolicyV2:
         helpful_floor_applied = False
         neutral_floor_applied = False
         harmful_buy_brake_hits = 0
+        gross_inventory_brake_hits = 0
+        pair_over_target_buy_blocks = 0
+        dual_bid_guard_inventory_budget_hits = 0
+        midpoint_first_brake_hits = 0
+        simultaneous_bid_block_prevented = 0
+        gross_inventory_brake_active_tick = False
+        side_soft_brake_active_tick = False
+        drawdown_brake_active = (
+            risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed"}
+            and float(getattr(risk, "early_drawdown_pressure", 0.0) or 0.0) >= 0.50
+        )
+        harmful_drawdown_block_active = (
+            risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed"}
+            and float(getattr(risk, "early_drawdown_pressure", 0.0) or 0.0) >= 0.75
+        )
+        if (
+            abs(float(model_anchor_up) - float(market_anchor_mid)) > model_shift_cap + 1e-9
+            or abs(float(model_anchor_dn) - float(midpoint_anchor_dn)) > model_shift_cap + 1e-9
+            or up_anchor_divergence_pressure > 0.0
+            or dn_anchor_divergence_pressure > 0.0
+        ):
+            midpoint_first_brake_hits += 1
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
             effect = self._classify_inventory_effect(
@@ -400,6 +557,52 @@ class QuotePolicyV2:
                 up_token_id=snapshot.up_token_id,
                 dn_token_id=snapshot.dn_token_id,
             )
+            token_side = self._token_side(token, snapshot)
+            token_toxic_streak, token_hard_block_sec, token_soft_brake_active = self._token_toxic_state(
+                token=token,
+                snapshot=snapshot,
+                risk=risk,
+            )
+            if (
+                side == "BUY"
+                and token_soft_brake_active
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                side_soft_brake_active_tick = True
+            token_divergence_pressure = self._midpoint_divergence_pressure(
+                snapshot=snapshot,
+                token_side=token_side,
+            )
+            token_spread_extra_ticks = min(
+                int(self.TOXIC_SIDE_SPREAD_TICKS_MAX),
+                max(
+                    token_toxic_streak,
+                    int(math.ceil(token_divergence_pressure * self.TOXIC_SIDE_SPREAD_TICKS_MAX)),
+                ),
+            )
+            token_buy_size_brake_mult = 1.0
+            if side == "BUY" and risk.hard_mode == "none" and risk.soft_mode in {"normal", "inventory_skewed"}:
+                if token_toxic_streak > 0:
+                    token_buy_size_brake_mult = min(
+                        token_buy_size_brake_mult,
+                        max(self.TOXIC_SIDE_SIZE_BRAKE_MIN, 1.0 - 0.25 * float(token_toxic_streak)),
+                    )
+                if token_divergence_pressure > 0.0:
+                    token_buy_size_brake_mult = min(
+                        token_buy_size_brake_mult,
+                        max(self.TOXIC_SIDE_SIZE_BRAKE_MIN, 1.0 - 0.50 * float(token_divergence_pressure)),
+                    )
+            if (
+                side == "BUY"
+                and token_hard_block_sec > 0.0
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "side_reentry_cooldown"
+                midpoint_first_brake_hits += 1
+                continue
             if (
                 risk.soft_mode in {"normal", "inventory_skewed"}
                 and risk.target_soft_mode in {"defensive", "unwind"}
@@ -414,11 +617,7 @@ class QuotePolicyV2:
                 risk.soft_mode in {"normal", "inventory_skewed"}
                 and side == "BUY"
                 and effect == "harmful"
-                and float(risk.drawdown_pct_budget) <= 0.25
-                and (
-                    risk.target_soft_mode in {"defensive", "unwind"}
-                    or float(inventory.excess_value_usd) >= pre_protective_harmful_buy_guard_usd
-                )
+                and harmful_drawdown_block_active
             ):
                 built[slot] = None
                 suppressed_reasons[slot] = "harmful_buy_blocked_drawdown"
@@ -456,6 +655,17 @@ class QuotePolicyV2:
                 adjusted_price += ctx.tick_size * ticks if side == "BUY" else -(ctx.tick_size * ticks)
             elif effect == "harmful":
                 adjusted_price += -(ctx.tick_size * ticks) if side == "BUY" else (ctx.tick_size * ticks)
+            if (
+                token_spread_extra_ticks > 0
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                adjusted_price += (
+                    -(ctx.tick_size * token_spread_extra_ticks)
+                    if side == "BUY"
+                    else (ctx.tick_size * token_spread_extra_ticks)
+                )
+                midpoint_first_brake_hits += 1
             adjusted_price = self._maker_clamp(
                 side=side,
                 price=adjusted_price,
@@ -470,7 +680,7 @@ class QuotePolicyV2:
                     "best_ask": best_ask,
                     "role": role,
                     "effect": effect,
-                    "size_mult": float(self._size_multiplier(effect, pressure)),
+                    "size_mult": float(self._size_multiplier(effect, pressure) * token_buy_size_brake_mult),
                     "ticks": int(ticks),
                     "adjusted_price": float(adjusted_price),
                 }
@@ -506,10 +716,44 @@ class QuotePolicyV2:
                 built[slot] = None
                 suppressed_reasons[slot] = "target_pair_ratio_cap"
                 continue
+            if (
+                side == "BUY"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+                and pair_over_target_usd >= gross_buy_block_usd
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "pair_over_target_buy_block"
+                pair_over_target_buy_blocks += 1
+                continue
             buy_headroom_usd = budget_headroom_usd
             if side == "BUY" and effect == "helpful" and risk.soft_mode == "unwind":
                 buy_headroom_usd = max(0.0, free_usdc)
             harmful_buy_brake_mult = 1.0
+            gross_inventory_brake_mult = 1.0
+            if (
+                side == "BUY"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                if pair_over_target_usd > gross_brake_activation_usd + 1e-9:
+                    if gross_buy_block_usd <= gross_brake_activation_usd + 1e-9:
+                        gross_inventory_brake_mult = 0.35
+                    else:
+                        gross_progress = (pair_over_target_usd - gross_brake_activation_usd) / max(
+                            1e-9,
+                            gross_buy_block_usd - gross_brake_activation_usd,
+                        )
+                        gross_progress = max(0.0, min(1.0, gross_progress))
+                        gross_inventory_brake_mult = max(0.35, 1.0 - 0.65 * gross_progress)
+                early_drawdown_pressure = float(getattr(risk, "early_drawdown_pressure", 0.0) or 0.0)
+                if early_drawdown_pressure >= 0.50:
+                    drawdown_progress = max(0.0, min(1.0, (early_drawdown_pressure - 0.50) / 0.50))
+                    drawdown_brake_mult = max(0.20, 1.0 - 0.80 * drawdown_progress)
+                    gross_inventory_brake_mult = min(gross_inventory_brake_mult, drawdown_brake_mult)
+                if gross_inventory_brake_mult < 0.999:
+                    gross_inventory_brake_active_tick = True
+                    gross_inventory_brake_hits += 1
             if side == "BUY" and effect == "harmful":
                 harmful_buy_brake_mult = self._harmful_buy_brake_mult(
                     inventory=inventory,
@@ -547,8 +791,14 @@ class QuotePolicyV2:
                     harmful_buy_brake_hits += 1
             if side == "BUY":
                 nominal_quote_clip_usd = (
-                    min(clip_usd, buy_headroom_usd) * size_mult * harmful_buy_brake_mult
+                    min(clip_usd, buy_headroom_usd)
+                    * size_mult
+                    * token_buy_size_brake_mult
+                    * harmful_buy_brake_mult
+                    * gross_inventory_brake_mult
                 )
+                if token_buy_size_brake_mult < 0.999:
+                    midpoint_first_brake_hits += 1
             elif inventory_backed_sell:
                 nominal_quote_clip_usd = clip_usd * size_mult
             else:
@@ -603,7 +853,14 @@ class QuotePolicyV2:
                         and harmful_buy_brake_mult < 0.999
                         and float(inventory.excess_value_usd) >= harmful_side_floor_block_usd
                     )
-                    if (not harmful_brake_floor_blocked) and side_min_clip_usd <= side_floor_headroom_usd + 1e-9:
+                    gross_brake_floor_blocked = (
+                        gross_inventory_brake_mult < 0.999 and pair_over_target_usd > gross_brake_activation_usd
+                    )
+                    if (
+                        (not harmful_brake_floor_blocked)
+                        and (not gross_brake_floor_blocked)
+                        and side_min_clip_usd <= side_floor_headroom_usd + 1e-9
+                    ):
                         effective_clip_usd = max(effective_clip_usd, side_min_clip_usd)
             if inventory_backed_sell:
                 share_cap = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
@@ -661,6 +918,111 @@ class QuotePolicyV2:
         if built["dn_bid"] and built["up_ask"] and built["dn_bid"].price + built["up_ask"].price > pair_ceiling:
             built["dn_bid"].price = _floor_price(pair_ceiling - built["up_ask"].price, ctx.tick_size)
 
+        if (
+            outside_near_expiry
+            and risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed"}
+            and bool(snapshot.market_tradeable)
+            and built["up_bid"] is None
+            and built["dn_bid"] is None
+        ):
+            blocked_bid_slots = [
+                slot
+                for slot in ("up_bid", "dn_bid")
+                if suppressed_reasons.get(slot) == "side_reentry_cooldown"
+            ]
+            if len(blocked_bid_slots) == 2:
+                def _coordination_score(slot_name: str) -> tuple[float, float, float]:
+                    if slot_name == "up_bid":
+                        return (
+                            float(getattr(risk, "side_hard_block_up_sec", 0.0) or 0.0),
+                            float(getattr(risk, "toxic_fill_streak_up", 0) or 0),
+                            float(getattr(risk, "negative_spread_capture_streak_up", 0) or 0),
+                        )
+                    return (
+                        float(getattr(risk, "side_hard_block_dn_sec", 0.0) or 0.0),
+                        float(getattr(risk, "toxic_fill_streak_dn", 0) or 0),
+                        float(getattr(risk, "negative_spread_capture_streak_dn", 0) or 0),
+                    )
+
+                keep_slot = min(blocked_bid_slots, key=_coordination_score)
+                meta = bid_slot_meta.get(keep_slot)
+                if not meta:
+                    fallback_quote = raw_quotes.get(keep_slot)
+                    if fallback_quote:
+                        (
+                            _fallback_side,
+                            fallback_token,
+                            fallback_base_price,
+                            fallback_best_bid,
+                            fallback_best_ask,
+                            fallback_role,
+                        ) = fallback_quote
+                        fallback_effect = self._classify_inventory_effect(
+                            token=fallback_token,
+                            side="BUY",
+                            inventory_side=risk.inventory_side,
+                            up_token_id=snapshot.up_token_id,
+                            dn_token_id=snapshot.dn_token_id,
+                        )
+                        fallback_ticks = self._price_adjust_ticks(fallback_effect, pressure)
+                        fallback_adjusted = float(fallback_base_price)
+                        if fallback_effect == "helpful":
+                            fallback_adjusted += ctx.tick_size * fallback_ticks
+                        elif fallback_effect == "harmful":
+                            fallback_adjusted -= ctx.tick_size * fallback_ticks
+                        fallback_adjusted = self._maker_clamp(
+                            side="BUY",
+                            price=fallback_adjusted,
+                            best_bid=fallback_best_bid,
+                            best_ask=fallback_best_ask,
+                            tick_size=ctx.tick_size,
+                        )
+                        meta = {
+                            "token": fallback_token,
+                            "best_bid": fallback_best_bid,
+                            "best_ask": fallback_best_ask,
+                            "role": fallback_role,
+                            "effect": fallback_effect,
+                            "size_mult": float(self._size_multiplier(fallback_effect, pressure)),
+                            "ticks": int(fallback_ticks),
+                            "adjusted_price": float(fallback_adjusted),
+                        }
+                if meta:
+                    maker_safe_bid_price = self._maker_safe_bid_price(
+                        best_ask=meta.get("best_ask"),
+                        tick_size=ctx.tick_size,
+                    )
+                    if maker_safe_bid_price is not None:
+                        side_min_clip_usd = float(ctx.min_order_size) * float(maker_safe_bid_price)
+                        side_floor_headroom_usd = dual_bid_guard_headroom_usd * max(
+                            1.0,
+                            float(meta.get("size_mult") or 1.0),
+                        )
+                        if side_min_clip_usd <= side_floor_headroom_usd + 1e-9:
+                            intent, suppressed = self._make_intent(
+                                token=str(meta.get("token")),
+                                side="BUY",
+                                price=min(float(meta.get("adjusted_price") or maker_safe_bid_price), float(maker_safe_bid_price)),
+                                clip_usd=side_min_clip_usd,
+                                share_cap=max(
+                                    float(ctx.min_order_size),
+                                    float(side_min_clip_usd) / max(0.01, pair_reference_price),
+                                ),
+                                ctx=ctx,
+                                role=str(meta.get("role") or "base_bid"),
+                                post_only=True,
+                                inventory_effect=str(meta.get("effect") or "neutral"),  # type: ignore[arg-type]
+                                size_mult=float(meta.get("size_mult") or 1.0),
+                                price_adjust_ticks=int(meta.get("ticks") or 0),
+                            )
+                            if intent is not None:
+                                built[keep_slot] = intent
+                                suppressed_reasons[keep_slot] = "dual_bid_cooldown_coordination"
+                                simultaneous_bid_block_prevented = 1
+                            elif suppressed:
+                                suppressed_reasons[keep_slot] = suppressed
+
         # Dual-bid core guard: outside near-expiry in normal/skewed mode we should
         # avoid sustained one-sided BUY quoting when the opposite bid is recoverable.
         if (
@@ -681,7 +1043,9 @@ class QuotePolicyV2:
                     "harmful_suppressed_in_defensive",
                     "harmful_suppressed_in_unwind",
                     "target_pair_ratio_cap",
+                    "pair_over_target_buy_block",
                     "maker_cross_guard",
+                    "side_reentry_cooldown",
                     "live_requires_inventory_backed_sell",
                     "harmful_buy_blocked_drawdown",
                 }:
@@ -732,14 +1096,25 @@ class QuotePolicyV2:
                     if (
                         meta
                         and str(meta.get("effect") or "") == "harmful"
-                        and risk.soft_mode in {"normal", "inventory_skewed"}
-                        and risk.target_soft_mode in {"defensive", "unwind"}
-                        and float(inventory.excess_value_usd) >= pre_protective_harmful_buy_guard_usd
+                        and pair_over_target_usd >= gross_buy_block_usd - 1e-9
                     ):
-                        suppressed_reasons[missing_slot] = prior_reason or "dual_bid_guard_viability"
+                        suppressed_reasons[missing_slot] = "dual_bid_guard_inventory_budget"
+                        dual_bid_guard_inventory_budget_hits += 1
+                        meta = None
+                    if (
+                        meta
+                        and str(meta.get("effect") or "") == "harmful"
+                        and gross_inventory_brake_active_tick
+                        and pair_over_target_usd >= gross_buy_block_usd - 1e-9
+                    ):
+                        suppressed_reasons[missing_slot] = "dual_bid_guard_inventory_budget"
+                        dual_bid_guard_inventory_budget_hits += 1
                         meta = None
                     if not meta:
-                        if prior_reason:
+                        current_reason = str(suppressed_reasons.get(missing_slot) or "")
+                        if current_reason.startswith("dual_bid_guard_"):
+                            pass
+                        elif prior_reason:
                             suppressed_reasons[missing_slot] = prior_reason
                         else:
                             suppressed_reasons[missing_slot] = "dual_bid_guard_viability"
@@ -942,6 +1317,8 @@ class QuotePolicyV2:
             quote_viability_reason = "helpful_floor_applied"
         elif neutral_floor_applied:
             quote_viability_reason = "min_viable_floor_applied"
+        elif side_soft_brake_active_tick:
+            quote_viability_reason = "side_reentry_soft_brake"
         elif quote_balance_state == "reduced":
             quote_viability_reason = "reduced"
         elif quote_balance_state == "none":
@@ -959,4 +1336,11 @@ class QuotePolicyV2:
             suppressed_reasons=suppressed_reasons,
             harmful_buy_brake_active=bool(harmful_buy_brake_hits > 0),
             harmful_buy_brake_hits=int(harmful_buy_brake_hits),
+            gross_inventory_brake_active=bool(gross_inventory_brake_active_tick),
+            gross_inventory_brake_hits=int(gross_inventory_brake_hits),
+            pair_over_target_buy_blocks=int(pair_over_target_buy_blocks),
+            dual_bid_guard_inventory_budget_hits=int(dual_bid_guard_inventory_budget_hits),
+            midpoint_first_brake_hits=int(midpoint_first_brake_hits),
+            simultaneous_bid_block_prevented=int(simultaneous_bid_block_prevented),
+            quote_anchor_mode="midpoint_first",
         )

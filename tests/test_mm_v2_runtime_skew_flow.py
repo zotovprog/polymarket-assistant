@@ -157,7 +157,7 @@ def test_dn_excess_near_endpoint_below_hard_cap_keeps_safe_plan():
     assert not (plan.quote_balance_state == "harmful_only_blocked" and plan.up_bid is None and plan.dn_ask is None)
 
 
-def test_untradeable_tolerated_market_keeps_dual_bids_in_inventory_skewed():
+def test_untradeable_material_inventory_enters_defensive_but_keeps_helpful_bid():
     cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
     snapshot = _snapshot(
         market_tradeable=False,
@@ -179,11 +179,11 @@ def test_untradeable_tolerated_market_keeps_dual_bids_in_inventory_skewed():
         free_usdc=30.0,
     )
     risk, plan, _ = _risk_and_plan(cfg, snapshot, inventory)
-    assert risk.soft_mode == "inventory_skewed"
+    assert risk.soft_mode == "defensive"
     assert risk.hard_mode == "none"
     assert plan.up_bid is not None
-    assert plan.dn_bid is not None
-    assert plan.quote_balance_state in {"balanced", "reduced", "helpful_only"}
+    assert plan.dn_bid is None
+    assert plan.quote_balance_state == "helpful_only"
 
 
 def test_helpful_quotes_can_be_restored_by_promotion():
@@ -857,6 +857,34 @@ def test_dual_bid_ratio_ignores_no_bid_ticks():
         quote_balance_state="reduced",
     )
     assert mm._mm_regime_degraded_reason != "low_dual_bid_ratio"
+
+
+def test_two_weak_negative_markouts_only_arm_soft_brake_not_hard_block():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = time.time()
+    mm._apply_side_markout_result(token_side="up", markout=-0.01, tick_size=0.01, now=now)
+    mm._apply_side_markout_result(token_side="up", markout=-0.01, tick_size=0.01, now=now + 1.0)
+    assert mm._negative_spread_capture_streak_up == 2
+    assert mm._toxic_fill_streak_up == 0
+    assert mm._side_soft_brake_active("up") is True
+    assert mm._side_reentry_cooldown_sec("up", now=now + 1.0) == pytest.approx(0.0)
+
+
+def test_hard_block_requires_stronger_toxic_confirmation():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = time.time()
+    mm._apply_side_markout_result(token_side="dn", markout=-0.04, tick_size=0.01, now=now)
+    assert mm._side_reentry_cooldown_sec("dn", now=now) == pytest.approx(0.0)
+    mm._apply_side_markout_result(token_side="dn", markout=-0.04, tick_size=0.01, now=now + 1.0)
+    assert mm._toxic_fill_streak_dn >= 2
+    assert mm._side_soft_brake_active("dn") is True
+    assert mm._side_reentry_cooldown_sec("dn", now=now + 1.0) > 0.0
 
 
 def test_hard_cap_entry_then_recovery_exits_unwind_before_expiry():

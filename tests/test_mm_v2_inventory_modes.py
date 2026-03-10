@@ -247,6 +247,53 @@ def test_non_severe_untradeable_market_keeps_inventory_skewed_on_soft_excess():
     assert risk.reason.startswith("soft excess")
 
 
+def test_untradeable_material_inventory_enters_defensive_before_hard_mode():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=False,
+            market_quality_score=0.30,
+            divergence_up=0.07,
+            divergence_dn=0.07,
+        ),
+        inventory=_inventory(
+            total_inventory_value_usd=7.0,
+            excess_value_usd=0.4,
+            signed_excess_value_usd=0.4,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    assert risk.hard_mode == "none"
+    assert risk.reason == "defensive untradeable inventory regime"
+
+
+def test_untradeable_over_target_inventory_enters_inventory_skewed_before_soft_excess():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=False,
+            market_quality_score=0.62,
+            divergence_up=0.02,
+            divergence_dn=0.02,
+        ),
+        inventory=_inventory(
+            total_inventory_value_usd=16.5,
+            pair_value_over_target_usd=2.0,
+            target_pair_value_usd=15.0,
+            pair_value_ratio=0.55,
+            excess_value_usd=0.2,
+            signed_excess_value_usd=0.2,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert risk.hard_mode == "none"
+    assert risk.reason.startswith("untradeable pair inventory over target")
+
+
 def test_hard_safety_true_drift_bypasses_soft_modes():
     cfg = MMConfigV2(session_budget_usd=15.0)
     risk = HardSafetyKernel(cfg).evaluate(

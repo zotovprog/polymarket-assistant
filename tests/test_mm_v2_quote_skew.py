@@ -1616,6 +1616,91 @@ def test_dual_bid_guard_emits_explicit_reason_when_not_recoverable(monkeypatch):
     assert plan.suppressed_reasons.get("dn_bid") != "dual_bid_guard_applied"
 
 
+def test_side_soft_brake_keeps_dual_bids_without_hard_block():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(time_left_sec=600.0, market_tradeable=True)
+    inventory = _inventory(free_usdc=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    risk = replace(
+        risk,
+        soft_mode="normal",
+        target_soft_mode="normal",
+        toxic_fill_streak_up=1,
+        toxic_fill_streak_dn=1,
+        negative_spread_capture_streak_up=1,
+        negative_spread_capture_streak_dn=1,
+        side_soft_brake_up_active=True,
+        side_soft_brake_dn_active=True,
+        side_reentry_cooldown_up_sec=0.0,
+        side_reentry_cooldown_dn_sec=0.0,
+        side_hard_block_up_sec=0.0,
+        side_hard_block_dn_sec=0.0,
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.quote_viability_reason == "side_reentry_soft_brake"
+    assert plan.suppressed_reasons.get("up_bid") is None
+    assert plan.suppressed_reasons.get("dn_bid") is None
+
+
+def test_simultaneous_hard_block_keeps_less_toxic_bid_midpoint_safe():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        time_left_sec=600.0,
+        market_tradeable=True,
+        up_best_bid=0.52,
+        up_best_ask=0.54,
+        dn_best_bid=0.46,
+        dn_best_ask=0.48,
+    )
+    inventory = _inventory(free_usdc=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    risk = replace(
+        risk,
+        soft_mode="normal",
+        target_soft_mode="normal",
+        toxic_fill_streak_up=1,
+        toxic_fill_streak_dn=2,
+        negative_spread_capture_streak_up=2,
+        negative_spread_capture_streak_dn=3,
+        side_soft_brake_up_active=True,
+        side_soft_brake_dn_active=True,
+        side_reentry_cooldown_up_sec=6.0,
+        side_reentry_cooldown_dn_sec=12.0,
+        side_hard_block_up_sec=6.0,
+        side_hard_block_dn_sec=12.0,
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.simultaneous_bid_block_prevented == 1
+    assert (plan.up_bid is not None) ^ (plan.dn_bid is not None)
+    assert plan.up_bid is not None
+    assert plan.up_bid.post_only is True
+    assert plan.up_bid.price < snapshot.up_best_ask
+    assert plan.suppressed_reasons.get("up_bid") == "dual_bid_cooldown_coordination"
+    assert plan.suppressed_reasons.get("dn_bid") == "side_reentry_cooldown"
+
+
 def test_harmful_buy_brake_reduces_clip_as_excess_grows():
     cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0, harmful_buy_suppress_ratio=0.50)
     snapshot = _snapshot()
@@ -1735,11 +1820,11 @@ def test_harmful_buy_blocked_on_deep_drawdown_in_skewed_mode():
     risk = HardSafetyKernel(cfg).evaluate(
         snapshot=snapshot,
         inventory=inventory,
-        analytics=AnalyticsState(session_pnl_equity_usd=-5.0, session_pnl=-5.0),
+        analytics=AnalyticsState(session_pnl_equity_usd=-7.0, session_pnl=-7.0),
         health=HealthState(),
     )
     assert risk.soft_mode == "inventory_skewed"
-    assert risk.drawdown_pct_budget <= 0.25
+    assert risk.early_drawdown_pressure >= 0.75
     plan = QuotePolicyV2(cfg).generate(
         snapshot=snapshot,
         inventory=inventory,
@@ -1749,6 +1834,252 @@ def test_harmful_buy_blocked_on_deep_drawdown_in_skewed_mode():
     assert plan.up_bid is not None and plan.up_bid.inventory_effect == "helpful"
     assert plan.dn_bid is None
     assert plan.suppressed_reasons.get("dn_bid") == "harmful_buy_blocked_drawdown"
+
+
+def test_gross_inventory_brake_reduces_buy_clip_before_block_threshold():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot()
+    base_inventory = _inventory(
+        free_usdc=20.0,
+        dn_shares=8.0,
+        excess_dn_qty=8.0,
+        excess_dn_value_usd=6.5,
+        excess_value_usd=6.5,
+        signed_excess_value_usd=-6.5,
+        total_inventory_value_usd=8.0,
+        target_pair_value_usd=15.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=base_inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    unbraked = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=base_inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    braked_inventory = replace(
+        base_inventory,
+        pair_value_over_target_usd=2.0,
+        pair_value_ratio=0.57,
+        total_inventory_value_usd=17.0,
+    )
+    braked = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=braked_inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert unbraked.up_bid is not None and braked.up_bid is not None
+    assert braked.gross_inventory_brake_active is True
+    assert braked.up_bid.size < unbraked.up_bid.size
+
+
+def test_pair_over_target_buy_block_blocks_pair_expanding_buys():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        free_usdc=18.0,
+        dn_shares=8.0,
+        excess_dn_qty=8.0,
+        excess_dn_value_usd=6.5,
+        excess_value_usd=6.5,
+        signed_excess_value_usd=-6.5,
+        total_inventory_value_usd=18.5,
+        target_pair_value_usd=15.0,
+        pair_value_over_target_usd=3.5,
+        pair_value_ratio=0.62,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert plan.up_bid is None
+    assert plan.dn_bid is None
+    assert plan.pair_over_target_buy_blocks == 2
+    assert plan.suppressed_reasons["up_bid"] == "pair_over_target_buy_block"
+    assert plan.suppressed_reasons["dn_bid"] == "pair_over_target_buy_block"
+
+
+def test_dual_bid_guard_preserves_harmful_bid_during_progressive_gross_brake():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        free_usdc=20.0,
+        dn_shares=14.0,
+        excess_dn_qty=14.0,
+        excess_dn_value_usd=9.2,
+        excess_value_usd=9.2,
+        signed_excess_value_usd=-9.2,
+        total_inventory_value_usd=18.0,
+        target_pair_value_usd=15.0,
+        pair_value_over_target_usd=2.0,
+        pair_value_ratio=0.60,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert plan.up_bid is not None and plan.up_bid.inventory_effect == "helpful"
+    assert plan.dn_bid is not None
+    assert plan.dn_bid.inventory_effect == "harmful"
+    assert plan.suppressed_reasons.get("dn_bid") in {None, "dual_bid_guard_applied"}
+    assert plan.dual_bid_guard_inventory_budget_hits == 0
+
+
+def test_dual_bid_guard_preserves_harmful_bid_during_pre_emergency_drawdown(monkeypatch):
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        time_left_sec=600.0,
+        pm_mid_up=0.78,
+        pm_mid_dn=0.22,
+        up_best_bid=0.67,
+        up_best_ask=0.69,
+        dn_best_bid=0.31,
+        dn_best_ask=0.33,
+        market_tradeable=True,
+        market_quality_score=0.95,
+    )
+    inventory = _inventory(
+        free_usdc=18.0,
+        up_shares=3.88,
+        dn_shares=9.56,
+        sellable_up_shares=3.88,
+        sellable_dn_shares=9.56,
+        excess_dn_qty=1.7929905037459941 / 0.31566734220880166,
+        excess_dn_value_usd=1.7929905037459941,
+        excess_value_usd=1.7929905037459941,
+        signed_excess_value_usd=-1.7929905037459941,
+        total_inventory_value_usd=5.0,
+        target_pair_value_usd=15.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(session_pnl_equity_usd=-6.66, session_pnl=-6.66),
+        health=HealthState(),
+    )
+    assert 0.50 <= risk.early_drawdown_pressure < 0.75
+    assert risk.soft_mode == "normal"
+
+    policy = QuotePolicyV2(cfg)
+    original_make_intent = policy._make_intent
+    dn_bid_calls = {"count": 0}
+
+    def _patched_make_intent(*args, **kwargs):
+        token = kwargs.get("token")
+        side = kwargs.get("side")
+        if token == snapshot.dn_token_id and side == "BUY":
+            dn_bid_calls["count"] += 1
+            if dn_bid_calls["count"] == 1:
+                return None, "below_min_order_size"
+        return original_make_intent(*args, **kwargs)
+
+    monkeypatch.setattr(policy, "_make_intent", _patched_make_intent)
+    plan = policy.generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert dn_bid_calls["count"] >= 2
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.dn_bid.inventory_effect == "harmful"
+    assert plan.suppressed_reasons.get("dn_bid") == "dual_bid_guard_applied"
+
+
+def test_dual_bid_guard_allows_harmful_bid_when_only_micro_over_target():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        free_usdc=20.0,
+        dn_shares=10.2,
+        excess_dn_qty=10.2,
+        excess_dn_value_usd=6.4,
+        excess_value_usd=6.4,
+        signed_excess_value_usd=-6.4,
+        total_inventory_value_usd=15.8,
+        target_pair_value_usd=15.0,
+        pair_value_over_target_usd=0.8,
+        pair_value_ratio=15.8 / 30.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert plan.up_bid is not None and plan.up_bid.inventory_effect == "helpful"
+    assert plan.dn_bid is not None
+    assert plan.dn_bid.inventory_effect == "harmful"
+    assert plan.suppressed_reasons.get("dn_bid") is None
+    assert plan.dual_bid_guard_inventory_budget_hits == 0
+
+
+def test_dual_bid_guard_does_not_rearm_harmful_bid_after_gross_buy_block_threshold():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot()
+    inventory = _inventory(
+        free_usdc=20.0,
+        dn_shares=14.0,
+        excess_dn_qty=14.0,
+        excess_dn_value_usd=9.2,
+        excess_value_usd=9.2,
+        signed_excess_value_usd=-9.2,
+        total_inventory_value_usd=18.5,
+        target_pair_value_usd=15.0,
+        pair_value_over_target_usd=3.5,
+        pair_value_ratio=18.5 / 30.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert plan.up_bid is None
+    assert plan.dn_bid is None
+    assert plan.suppressed_reasons["dn_bid"] in {
+        "pair_over_target_buy_block",
+        "harmful_buy_blocked_high_skew",
+    }
+    assert plan.dual_bid_guard_inventory_budget_hits == 0
 
 
 def test_emergency_taker_forced_disables_post_only_for_emergency_sells():

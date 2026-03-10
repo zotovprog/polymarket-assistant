@@ -2628,6 +2628,14 @@ class MMRuntimeV2(MMRuntime):
         self.mm_config_v2: MMConfigV2 = MMConfigV2()
         self._live_budget_gate_passed: bool = False
         self._paper_budget_gate_passed: bool = False
+        self._last_terminal_runtime_v2: dict[str, Any] = {
+            "last_terminal_reason": "",
+            "last_terminal_ts": 0.0,
+            "last_terminal_wallet_total_usdc": 0.0,
+            "last_terminal_up_shares": 0.0,
+            "last_terminal_dn_shares": 0.0,
+            "last_terminal_pnl_equity_usd": 0.0,
+        }
 
     def _idle_snapshot_v2(self) -> dict[str, Any]:
         return {
@@ -2646,10 +2654,13 @@ class MMRuntimeV2(MMRuntime):
                 "divergence_dn": 0.0,
             },
             "inventory": {
-                "up_shares": 0.0,
-                "dn_shares": 0.0,
-                "free_usdc": 0.0,
+                "up_shares": float(self._last_terminal_runtime_v2.get("last_terminal_up_shares") or 0.0),
+                "dn_shares": float(self._last_terminal_runtime_v2.get("last_terminal_dn_shares") or 0.0),
+                "free_usdc": float(self._last_terminal_runtime_v2.get("last_terminal_wallet_total_usdc") or 0.0),
                 "reserved_usdc": 0.0,
+                "wallet_total_usdc": float(self._last_terminal_runtime_v2.get("last_terminal_wallet_total_usdc") or 0.0),
+                "wallet_reserved_usdc": 0.0,
+                "pending_buy_reserved_usdc": 0.0,
                 "pending_buy_up": 0.0,
                 "pending_buy_dn": 0.0,
                 "pending_sell_up": 0.0,
@@ -2661,6 +2672,9 @@ class MMRuntimeV2(MMRuntime):
                 "excess_up_value_usd": 0.0,
                 "excess_dn_value_usd": 0.0,
                 "total_inventory_value_usd": 0.0,
+                "target_pair_value_usd": 0.0,
+                "pair_value_ratio": 0.0,
+                "pair_value_over_target_usd": 0.0,
                 "sellable_up_shares": 0.0,
                 "sellable_dn_shares": 0.0,
             },
@@ -2706,6 +2720,19 @@ class MMRuntimeV2(MMRuntime):
                 "inventory_pressure": 0.0,
                 "edge_score": 0.0,
                 "drawdown_pct_budget": 1.0,
+                "early_drawdown_pressure": 0.0,
+                "post_fill_markout_5s_up": 0.0,
+                "post_fill_markout_5s_dn": 0.0,
+                "negative_spread_capture_streak_up": 0,
+                "negative_spread_capture_streak_dn": 0,
+                "toxic_fill_streak_up": 0,
+                "toxic_fill_streak_dn": 0,
+                "side_soft_brake_up_active": False,
+                "side_soft_brake_dn_active": False,
+                "side_reentry_cooldown_up_sec": 0.0,
+                "side_reentry_cooldown_dn_sec": 0.0,
+                "side_hard_block_up_sec": 0.0,
+                "side_hard_block_dn_sec": 0.0,
             },
             "health": {
                 "reconcile_status": "bootstrapping",
@@ -2730,15 +2757,39 @@ class MMRuntimeV2(MMRuntime):
             },
             "analytics": {
                 "fill_count": 0,
-                "session_pnl": 0.0,
-                "session_pnl_equity_usd": 0.0,
-                "session_pnl_operator_usd": 0.0,
-                "session_pnl_operator_ema_usd": 0.0,
+                "session_pnl": float(self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0),
+                "session_pnl_equity_usd": float(
+                    self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0
+                ),
+                "session_pnl_operator_usd": float(
+                    self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0
+                ),
+                "session_pnl_operator_ema_usd": float(
+                    self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0
+                ),
                 "position_mark_value_usd": 0.0,
                 "position_mark_value_bid_usd": 0.0,
                 "position_mark_value_mid_usd": 0.0,
                 "portfolio_mark_value_usd": 0.0,
                 "tradeable_portfolio_value_usd": 0.0,
+                "anchor_divergence_up": 0.0,
+                "anchor_divergence_dn": 0.0,
+                "quote_shift_from_mid_up": 0.0,
+                "quote_shift_from_mid_dn": 0.0,
+                "post_fill_markout_5s_up": 0.0,
+                "post_fill_markout_5s_dn": 0.0,
+                "toxic_fill_streak_up": 0,
+                "toxic_fill_streak_dn": 0,
+                "side_soft_brake_up_active": False,
+                "side_soft_brake_dn_active": False,
+                "negative_spread_capture_streak_up": 0,
+                "negative_spread_capture_streak_dn": 0,
+                "side_reentry_cooldown_up_sec": 0.0,
+                "side_reentry_cooldown_dn_sec": 0.0,
+                "side_hard_block_up_sec": 0.0,
+                "side_hard_block_dn_sec": 0.0,
+                "quote_anchor_mode": "midpoint_first",
+                "midpoint_reference_mode": "midpoint_first",
                 "pnl_calc_mode": "wallet_total_plus_mark",
                 "pnl_mark_basis": "conservative_bid",
                 "pnl_updated_ts": 0.0,
@@ -2751,6 +2802,10 @@ class MMRuntimeV2(MMRuntime):
                 "target_ratio_activation_usd_effective": 0.0,
                 "target_ratio_cap_active": False,
                 "target_ratio_cap_hits_60s": 0,
+                "gross_inventory_brake_active": False,
+                "gross_inventory_brake_hits_60s": 0,
+                "pair_over_target_buy_blocks_60s": 0,
+                "dual_bid_guard_inventory_budget_hits_60s": 0,
                 "harmful_buy_brake_active": False,
                 "harmful_buy_brake_hits_60s": 0,
                 "emergency_taker_forced": False,
@@ -2767,6 +2822,8 @@ class MMRuntimeV2(MMRuntime):
                 "maker_cross_guard_hits_60s": 0,
                 "dual_bid_guard_hits_60s": 0,
                 "dual_bid_guard_fail_hits_60s": 0,
+                "midpoint_first_brake_hits_60s": 0,
+                "simultaneous_bid_block_prevented_hits_60s": 0,
                 "unwind_deferred_hits_60s": 0,
                 "forced_unwind_extreme_excess_hits_60s": 0,
                 "mm_regime_degraded_reason": "",
@@ -2776,8 +2833,16 @@ class MMRuntimeV2(MMRuntime):
             "alerts": self.list_alerts(),
             "config": self.mm_config_v2.to_dict(),
             "runtime": {
-                "last_terminal_reason": "",
-                "last_terminal_ts": 0.0,
+                "last_terminal_reason": str(self._last_terminal_runtime_v2.get("last_terminal_reason") or ""),
+                "last_terminal_ts": float(self._last_terminal_runtime_v2.get("last_terminal_ts") or 0.0),
+                "last_terminal_wallet_total_usdc": float(
+                    self._last_terminal_runtime_v2.get("last_terminal_wallet_total_usdc") or 0.0
+                ),
+                "last_terminal_up_shares": float(self._last_terminal_runtime_v2.get("last_terminal_up_shares") or 0.0),
+                "last_terminal_dn_shares": float(self._last_terminal_runtime_v2.get("last_terminal_dn_shares") or 0.0),
+                "last_terminal_pnl_equity_usd": float(
+                    self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0
+                ),
                 "live_budget_gate_passed": bool(self._live_budget_gate_passed),
                 "paper_budget_gate_passed": bool(self._paper_budget_gate_passed),
                 "drawdown_breach_ticks": 0,
@@ -2973,8 +3038,33 @@ class MMRuntimeV2(MMRuntime):
         await self._cancel_strike_retry_task()
         stop_liquidation: dict[str, Any] | None = None
         if self.mm_v2:
+            if hasattr(self.mm_v2, "snapshot"):
+                terminal_snap = self.mm_v2.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+                runtime_block = terminal_snap.get("runtime") if isinstance(terminal_snap, dict) else {}
+                if isinstance(runtime_block, dict):
+                    self._last_terminal_runtime_v2.update(
+                        {
+                            "last_terminal_reason": str(runtime_block.get("last_terminal_reason") or ""),
+                            "last_terminal_ts": float(runtime_block.get("last_terminal_ts") or 0.0),
+                            "last_terminal_wallet_total_usdc": float(
+                                runtime_block.get("last_terminal_wallet_total_usdc") or 0.0
+                            ),
+                            "last_terminal_up_shares": float(runtime_block.get("last_terminal_up_shares") or 0.0),
+                            "last_terminal_dn_shares": float(runtime_block.get("last_terminal_dn_shares") or 0.0),
+                            "last_terminal_pnl_equity_usd": float(
+                                runtime_block.get("last_terminal_pnl_equity_usd") or 0.0
+                            ),
+                        }
+                    )
             stop_liquidation = await self.mm_v2.stop(liquidate=liquidate and not emergency)
             self.mm_v2 = None
+            if isinstance(stop_liquidation, dict):
+                self._last_terminal_runtime_v2["last_terminal_up_shares"] = float(
+                    stop_liquidation.get("remaining_up") or self._last_terminal_runtime_v2["last_terminal_up_shares"]
+                )
+                self._last_terminal_runtime_v2["last_terminal_dn_shares"] = float(
+                    stop_liquidation.get("remaining_dn") or self._last_terminal_runtime_v2["last_terminal_dn_shares"]
+                )
         await self._stop_feed_tasks()
         await self._teardown_mongo_logger()
         snap = self.snapshot()
@@ -3000,6 +3090,16 @@ class MMRuntimeV2(MMRuntime):
             runtime_block = snap.get("runtime")
             if not isinstance(runtime_block, dict):
                 runtime_block = {}
+            self._last_terminal_runtime_v2.update(
+                {
+                    "last_terminal_reason": str(runtime_block.get("last_terminal_reason") or ""),
+                    "last_terminal_ts": float(runtime_block.get("last_terminal_ts") or 0.0),
+                    "last_terminal_wallet_total_usdc": float(runtime_block.get("last_terminal_wallet_total_usdc") or 0.0),
+                    "last_terminal_up_shares": float(runtime_block.get("last_terminal_up_shares") or 0.0),
+                    "last_terminal_dn_shares": float(runtime_block.get("last_terminal_dn_shares") or 0.0),
+                    "last_terminal_pnl_equity_usd": float(runtime_block.get("last_terminal_pnl_equity_usd") or 0.0),
+                }
+            )
             runtime_block["live_budget_gate_passed"] = bool(self._live_budget_gate_passed)
             runtime_block["paper_budget_gate_passed"] = bool(self._paper_budget_gate_passed)
             snap["runtime"] = runtime_block
@@ -3296,9 +3396,35 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
             "dual_bid_ratio_60s": float(analytics.get("dual_bid_ratio_60s") or 0.0),
             "one_sided_bid_streak_outside": int(analytics.get("one_sided_bid_streak_outside") or 0),
             "mm_regime_degraded_reason": str(analytics.get("mm_regime_degraded_reason") or ""),
+            "quote_anchor_mode": str(analytics.get("quote_anchor_mode") or "midpoint_first"),
+            "midpoint_reference_mode": str(analytics.get("midpoint_reference_mode") or "midpoint_first"),
+            "anchor_divergence_up": float(analytics.get("anchor_divergence_up") or 0.0),
+            "anchor_divergence_dn": float(analytics.get("anchor_divergence_dn") or 0.0),
+            "quote_shift_from_mid_up": float(analytics.get("quote_shift_from_mid_up") or 0.0),
+            "quote_shift_from_mid_dn": float(analytics.get("quote_shift_from_mid_dn") or 0.0),
+            "post_fill_markout_5s_up": float(analytics.get("post_fill_markout_5s_up") or 0.0),
+            "post_fill_markout_5s_dn": float(analytics.get("post_fill_markout_5s_dn") or 0.0),
+            "toxic_fill_streak_up": int(analytics.get("toxic_fill_streak_up") or 0),
+            "toxic_fill_streak_dn": int(analytics.get("toxic_fill_streak_dn") or 0),
+            "side_soft_brake_up_active": bool(analytics.get("side_soft_brake_up_active") or False),
+            "side_soft_brake_dn_active": bool(analytics.get("side_soft_brake_dn_active") or False),
+            "side_reentry_cooldown_up_sec": float(analytics.get("side_reentry_cooldown_up_sec") or 0.0),
+            "side_reentry_cooldown_dn_sec": float(analytics.get("side_reentry_cooldown_dn_sec") or 0.0),
+            "side_hard_block_up_sec": float(analytics.get("side_hard_block_up_sec") or 0.0),
+            "side_hard_block_dn_sec": float(analytics.get("side_hard_block_dn_sec") or 0.0),
             "maker_cross_guard_hits_60s": int(analytics.get("maker_cross_guard_hits_60s") or 0),
             "dual_bid_guard_hits_60s": int(analytics.get("dual_bid_guard_hits_60s") or 0),
             "dual_bid_guard_fail_hits_60s": int(analytics.get("dual_bid_guard_fail_hits_60s") or 0),
+            "midpoint_first_brake_hits_60s": int(analytics.get("midpoint_first_brake_hits_60s") or 0),
+            "simultaneous_bid_block_prevented_hits_60s": int(
+                analytics.get("simultaneous_bid_block_prevented_hits_60s") or 0
+            ),
+            "gross_inventory_brake_active": bool(analytics.get("gross_inventory_brake_active") or False),
+            "gross_inventory_brake_hits_60s": int(analytics.get("gross_inventory_brake_hits_60s") or 0),
+            "pair_over_target_buy_blocks_60s": int(analytics.get("pair_over_target_buy_blocks_60s") or 0),
+            "dual_bid_guard_inventory_budget_hits_60s": int(
+                analytics.get("dual_bid_guard_inventory_budget_hits_60s") or 0
+            ),
             "harmful_buy_brake_active": bool(analytics.get("harmful_buy_brake_active") or False),
             "harmful_buy_brake_hits_60s": int(analytics.get("harmful_buy_brake_hits_60s") or 0),
             "emergency_taker_forced": bool(analytics.get("emergency_taker_forced") or False),

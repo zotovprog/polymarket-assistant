@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
 from typing import Any
 
@@ -39,8 +39,22 @@ from .types import (
 )
 
 
+@dataclass
+class _PendingMarkoutEval:
+    ts: float
+    token_side: str
+    side: str
+    price: float
+
+
 class MarketMakerV2:
     OPERATOR_PNL_EMA_ALPHA = 0.20
+    POST_FILL_MARKOUT_EVAL_SEC = 5.0
+    TOXIC_FILL_MARKOUT_TICKS = 3
+    NEGATIVE_MARKOUT_TICKS = 1
+    HARD_BLOCK_NEGATIVE_STREAK = 3
+    HARD_BLOCK_TOXIC_STREAK = 2
+    SIDE_REENTRY_COOLDOWN_SEC = 12.0
 
     def __init__(self, feed_state: Any, clob_client: Any, config: MMConfigV2):
         self.feed_state = feed_state
@@ -65,12 +79,15 @@ class MarketMakerV2:
         self._snapshot_callbacks: list[Any] = []
         self._fill_callbacks: list[Any] = []
         self._fills: list[Fill] = []
+        self._pending_markout_evals: list[_PendingMarkoutEval] = []
         self._excess_history: list[tuple[float, float]] = []
         self._quote_presence_history: list[tuple[float, tuple[bool, bool]]] = []
         self._mode_history: list[tuple[float, str]] = []
         self._lifecycle_history: list[tuple[float, str]] = []
         self._harmful_suppressed_history: list[tuple[float, int]] = []
         self._harmful_buy_brake_history: list[tuple[float, int]] = []
+        self._gross_inventory_brake_history: list[tuple[float, int]] = []
+        self._pair_over_target_buy_block_history: list[tuple[float, int]] = []
         self._target_ratio_breach_history: list[tuple[float, int]] = []
         self._order_removal_history: list[tuple[float, int]] = []
         self._maker_cross_guard_history: list[tuple[float, int]] = []
@@ -78,6 +95,9 @@ class MarketMakerV2:
         self._dual_bid_outside_success_history: list[tuple[float, int]] = []
         self._dual_bid_guard_hits_history: list[tuple[float, int]] = []
         self._dual_bid_guard_fail_history: list[tuple[float, int]] = []
+        self._dual_bid_guard_inventory_budget_history: list[tuple[float, int]] = []
+        self._midpoint_first_brake_history: list[tuple[float, int]] = []
+        self._simultaneous_bid_block_prevented_history: list[tuple[float, int]] = []
         self._emergency_taker_forced_history: list[tuple[float, int]] = []
         self._one_sided_bid_streak_outside: int = 0
         self._unwind_deferred_history: list[tuple[float, int]] = []
@@ -90,6 +110,15 @@ class MarketMakerV2:
         self._session_pnl_operator_ema_usd = 0.0
         self._session_pnl_operator_usd = 0.0
         self._operator_pnl_initialized = False
+        self._pending_markout_evals.clear()
+        self._post_fill_markout_5s_up = 0.0
+        self._post_fill_markout_5s_dn = 0.0
+        self._negative_spread_capture_streak_up = 0
+        self._negative_spread_capture_streak_dn = 0
+        self._toxic_fill_streak_up = 0
+        self._toxic_fill_streak_dn = 0
+        self._side_reentry_blocked_until_up = 0.0
+        self._side_reentry_blocked_until_dn = 0.0
         self._drawdown_breach_ticks = 0
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
@@ -102,6 +131,14 @@ class MarketMakerV2:
         self._unwind_target_mismatch_ticks = 0
         self._unwind_target_mismatch_started_ts = 0.0
         self._last_snapshot: PairMarketSnapshot | None = None
+        self._post_fill_markout_5s_up = 0.0
+        self._post_fill_markout_5s_dn = 0.0
+        self._negative_spread_capture_streak_up = 0
+        self._negative_spread_capture_streak_dn = 0
+        self._toxic_fill_streak_up = 0
+        self._toxic_fill_streak_dn = 0
+        self._side_reentry_blocked_until_up = 0.0
+        self._side_reentry_blocked_until_dn = 0.0
         self._last_inventory = PairInventoryState(
             up_shares=0.0,
             dn_shares=0.0,
@@ -142,6 +179,10 @@ class MarketMakerV2:
         self._last_health = HealthState()
         self._last_terminal_reason: str = ""
         self._last_terminal_ts: float = 0.0
+        self._last_terminal_wallet_total_usdc: float = 0.0
+        self._last_terminal_up_shares: float = 0.0
+        self._last_terminal_dn_shares: float = 0.0
+        self._last_terminal_pnl_equity_usd: float = 0.0
         self._true_drift_started_ts: float = 0.0
         self._true_drift_last_progress_ts: float = 0.0
         self._true_drift_best_exposure: float = 0.0
@@ -290,6 +331,8 @@ class MarketMakerV2:
         self._lifecycle_history.clear()
         self._harmful_suppressed_history.clear()
         self._harmful_buy_brake_history.clear()
+        self._gross_inventory_brake_history.clear()
+        self._pair_over_target_buy_block_history.clear()
         self._target_ratio_breach_history.clear()
         self._order_removal_history.clear()
         self._maker_cross_guard_history.clear()
@@ -297,6 +340,9 @@ class MarketMakerV2:
         self._dual_bid_outside_success_history.clear()
         self._dual_bid_guard_hits_history.clear()
         self._dual_bid_guard_fail_history.clear()
+        self._dual_bid_guard_inventory_budget_history.clear()
+        self._midpoint_first_brake_history.clear()
+        self._simultaneous_bid_block_prevented_history.clear()
         self._emergency_taker_forced_history.clear()
         self._one_sided_bid_streak_outside = 0
         self._unwind_deferred_history.clear()
@@ -305,6 +351,12 @@ class MarketMakerV2:
         self._emergency_no_progress_started_ts = 0.0
         self._emergency_no_progress_ticks = 0
         self._emergency_taker_forced = False
+        self._last_terminal_reason = ""
+        self._last_terminal_ts = 0.0
+        self._last_terminal_wallet_total_usdc = 0.0
+        self._last_terminal_up_shares = 0.0
+        self._last_terminal_dn_shares = 0.0
+        self._last_terminal_pnl_equity_usd = 0.0
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -383,6 +435,11 @@ class MarketMakerV2:
         await self.heartbeat.stop()
         if not self._last_terminal_reason:
             self._set_terminal_reason("manual_stop")
+        if isinstance(liquidation_result, dict):
+            self._capture_terminal_state(
+                up_shares=float(liquidation_result.get("remaining_up", self._last_inventory.up_shares) or 0.0),
+                dn_shares=float(liquidation_result.get("remaining_dn", self._last_inventory.dn_shares) or 0.0),
+            )
         return liquidation_result
 
     def fills_page(self, *, limit: int = 50, offset: int = 0) -> dict[str, Any]:
@@ -492,6 +549,154 @@ class MarketMakerV2:
         self._session_pnl_operator_usd = self._session_pnl_operator_ema_usd
         return position_mark_bid, position_mark_mid, current_portfolio, tradeable_portfolio
 
+    @staticmethod
+    def _token_side_for_fill(fill: Fill, market: MarketInfo | None) -> str:
+        if not market:
+            return ""
+        if fill.token_id == market.up_token_id:
+            return "up"
+        if fill.token_id == market.dn_token_id:
+            return "dn"
+        return ""
+
+    @staticmethod
+    def _snapshot_anchor_price(snapshot: PairMarketSnapshot, token_side: str) -> float:
+        if token_side == "up":
+            return max(
+                0.01,
+                float(
+                    snapshot.midpoint_anchor_up
+                    if snapshot.midpoint_anchor_up is not None
+                    else snapshot.pm_mid_up
+                    if snapshot.pm_mid_up is not None
+                    else snapshot.fv_up
+                ),
+            )
+        return max(
+            0.01,
+            float(
+                snapshot.midpoint_anchor_dn
+                if snapshot.midpoint_anchor_dn is not None
+                else snapshot.pm_mid_dn
+                if snapshot.pm_mid_dn is not None
+                else snapshot.fv_dn
+            ),
+        )
+
+    def _side_reentry_cooldown_sec(self, token_side: str, *, now: float) -> float:
+        if token_side == "up":
+            return max(0.0, float(self._side_reentry_blocked_until_up - now))
+        return max(0.0, float(self._side_reentry_blocked_until_dn - now))
+
+    def _side_soft_brake_active(self, token_side: str) -> bool:
+        if token_side == "up":
+            return bool(
+                int(self._negative_spread_capture_streak_up) > 0
+                or int(self._toxic_fill_streak_up) > 0
+            )
+        return bool(
+            int(self._negative_spread_capture_streak_dn) > 0
+            or int(self._toxic_fill_streak_dn) > 0
+        )
+
+    def _apply_side_markout_result(
+        self,
+        *,
+        token_side: str,
+        markout: float,
+        tick_size: float,
+        now: float,
+    ) -> None:
+        negative_threshold = -max(float(tick_size) * float(self.NEGATIVE_MARKOUT_TICKS), 0.01)
+        toxic_threshold = -max(float(tick_size), 0.01) * float(self.TOXIC_FILL_MARKOUT_TICKS)
+        is_negative = markout <= negative_threshold
+        is_toxic = markout <= toxic_threshold
+
+        if token_side == "up":
+            self._post_fill_markout_5s_up = float(markout)
+            self._negative_spread_capture_streak_up = (
+                self._negative_spread_capture_streak_up + 1
+                if is_negative
+                else max(0, self._negative_spread_capture_streak_up - 1)
+            )
+            self._toxic_fill_streak_up = (
+                self._toxic_fill_streak_up + 1
+                if is_toxic
+                else max(0, self._toxic_fill_streak_up - 1)
+            )
+            if (
+                self._toxic_fill_streak_up >= int(self.HARD_BLOCK_TOXIC_STREAK)
+                or self._negative_spread_capture_streak_up >= int(self.HARD_BLOCK_NEGATIVE_STREAK)
+            ):
+                self._side_reentry_blocked_until_up = max(
+                    float(self._side_reentry_blocked_until_up),
+                    now + float(self.SIDE_REENTRY_COOLDOWN_SEC),
+                )
+            return
+
+        self._post_fill_markout_5s_dn = float(markout)
+        self._negative_spread_capture_streak_dn = (
+            self._negative_spread_capture_streak_dn + 1
+            if is_negative
+            else max(0, self._negative_spread_capture_streak_dn - 1)
+        )
+        self._toxic_fill_streak_dn = (
+            self._toxic_fill_streak_dn + 1
+            if is_toxic
+            else max(0, self._toxic_fill_streak_dn - 1)
+        )
+        if (
+            self._toxic_fill_streak_dn >= int(self.HARD_BLOCK_TOXIC_STREAK)
+            or self._negative_spread_capture_streak_dn >= int(self.HARD_BLOCK_NEGATIVE_STREAK)
+        ):
+            self._side_reentry_blocked_until_dn = max(
+                float(self._side_reentry_blocked_until_dn),
+                now + float(self.SIDE_REENTRY_COOLDOWN_SEC),
+            )
+
+    def _update_pending_markouts(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        now: float,
+    ) -> None:
+        if not self._pending_markout_evals:
+            return
+        keep: list[_PendingMarkoutEval] = []
+        tick_size = float(self.market.tick_size if self.market else 0.01)
+        for item in self._pending_markout_evals:
+            if now - float(item.ts) < float(self.POST_FILL_MARKOUT_EVAL_SEC):
+                keep.append(item)
+                continue
+            anchor_price = self._snapshot_anchor_price(snapshot, str(item.token_side))
+            if str(item.side).upper() == "BUY":
+                markout = float(anchor_price) - float(item.price)
+            else:
+                markout = float(item.price) - float(anchor_price)
+            self._apply_side_markout_result(
+                token_side=str(item.token_side),
+                markout=float(markout),
+                tick_size=tick_size,
+                now=now,
+            )
+        self._pending_markout_evals = keep
+
+    def _quote_shift_from_mid(
+        self,
+        *,
+        plan: QuotePlan,
+        snapshot: PairMarketSnapshot,
+        token_side: str,
+    ) -> float:
+        anchor_price = self._snapshot_anchor_price(snapshot, token_side)
+        quotes = (
+            (plan.up_bid, plan.up_ask)
+            if token_side == "up"
+            else (plan.dn_bid, plan.dn_ask)
+        )
+        shifts = [abs(float(intent.price) - anchor_price) for intent in quotes if intent is not None]
+        return max(shifts) if shifts else 0.0
+
     def _build_health(
         self,
         *,
@@ -560,6 +765,28 @@ class MarketMakerV2:
             return
         self._last_terminal_reason = text
         self._last_terminal_ts = time.time()
+        self._capture_terminal_state()
+
+    def _capture_terminal_state(
+        self,
+        *,
+        wallet_total_usdc: float | None = None,
+        up_shares: float | None = None,
+        dn_shares: float | None = None,
+        pnl_equity_usd: float | None = None,
+    ) -> None:
+        self._last_terminal_wallet_total_usdc = float(
+            self._last_inventory.wallet_total_usdc if wallet_total_usdc is None else wallet_total_usdc
+        )
+        self._last_terminal_up_shares = float(
+            self._last_inventory.up_shares if up_shares is None else up_shares
+        )
+        self._last_terminal_dn_shares = float(
+            self._last_inventory.dn_shares if dn_shares is None else dn_shares
+        )
+        self._last_terminal_pnl_equity_usd = float(
+            self._session_pnl_equity_usd if pnl_equity_usd is None else pnl_equity_usd
+        )
 
     def _update_true_drift_progress(self, inventory: PairInventoryState) -> tuple[float, float]:
         if not self.reconcile.true_drift:
@@ -856,6 +1083,16 @@ class MarketMakerV2:
         for fill in fills:
             self._fills.append(fill)
             self.reconcile.record_fill(fill, self.market)
+            token_side = self._token_side_for_fill(fill, self.market)
+            if token_side:
+                self._pending_markout_evals.append(
+                    _PendingMarkoutEval(
+                        ts=float(getattr(fill, "ts", time.time()) or time.time()),
+                        token_side=str(token_side),
+                        side=str(fill.side),
+                        price=float(fill.price),
+                    )
+                )
             self._emit_fill_callbacks(fill)
         up_book, dn_book = await self.gateway.get_books()
         valuation, snapshot = self.valuation.compute(
@@ -864,6 +1101,8 @@ class MarketMakerV2:
             up_book=up_book,
             dn_book=dn_book,
         )
+        now = time.time()
+        self._update_pending_markouts(snapshot=snapshot, now=now)
         self.gateway.sync_paper_prices(
             fv_up=valuation.fv_up,
             fv_dn=valuation.fv_dn,
@@ -991,6 +1230,21 @@ class MarketMakerV2:
             analytics=pre_analytics,
             health=health,
         )
+        risk = replace(
+            risk,
+            post_fill_markout_5s_up=float(self._post_fill_markout_5s_up),
+            post_fill_markout_5s_dn=float(self._post_fill_markout_5s_dn),
+            negative_spread_capture_streak_up=int(self._negative_spread_capture_streak_up),
+            negative_spread_capture_streak_dn=int(self._negative_spread_capture_streak_dn),
+            toxic_fill_streak_up=int(self._toxic_fill_streak_up),
+            toxic_fill_streak_dn=int(self._toxic_fill_streak_dn),
+            side_soft_brake_up_active=bool(self._side_soft_brake_active("up")),
+            side_soft_brake_dn_active=bool(self._side_soft_brake_active("dn")),
+            side_reentry_cooldown_up_sec=float(self._side_reentry_cooldown_sec("up", now=now)),
+            side_reentry_cooldown_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
+            side_hard_block_up_sec=float(self._side_reentry_cooldown_sec("up", now=now)),
+            side_hard_block_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
+        )
         emergency_taker_forced, emergency_no_progress_sec = self._update_emergency_taker_force(
             hard_mode=str(risk.hard_mode),
             excess_value_usd=float(inventory.excess_value_usd),
@@ -1087,13 +1341,29 @@ class MarketMakerV2:
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "maker_cross_guard"
         )
         harmful_buy_brake_hits_tick = int(getattr(plan, "harmful_buy_brake_hits", 0) or 0)
+        gross_inventory_brake_hits_tick = int(getattr(plan, "gross_inventory_brake_hits", 0) or 0)
+        pair_over_target_buy_blocks_tick = int(getattr(plan, "pair_over_target_buy_blocks", 0) or 0)
         dual_bid_guard_hits_tick = sum(
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "dual_bid_guard_applied"
+        )
+        dual_bid_guard_inventory_budget_hits_tick = int(
+            getattr(plan, "dual_bid_guard_inventory_budget_hits", 0) or 0
+        )
+        midpoint_first_brake_hits_tick = int(getattr(plan, "midpoint_first_brake_hits", 0) or 0)
+        simultaneous_bid_block_prevented_tick = int(
+            getattr(plan, "simultaneous_bid_block_prevented", 0) or 0
         )
         dual_bid_guard_fail_hits_tick = sum(
             1
             for reason in plan.suppressed_reasons.values()
-            if str(reason) in {"dual_bid_guard_headroom", "dual_bid_guard_viability", "dual_bid_guard_market"}
+            if str(reason)
+            in {
+                "dual_bid_guard_headroom",
+                "dual_bid_guard_viability",
+                "dual_bid_guard_market",
+                "dual_bid_guard_inventory_budget",
+                "dual_bid_guard_drawdown_block",
+            }
         )
         target_ratio_cap_hits_tick = sum(
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "target_pair_ratio_cap"
@@ -1117,11 +1387,16 @@ class MarketMakerV2:
         self._lifecycle_history.append((now, str(lifecycle)))
         self._harmful_suppressed_history.append((now, int(harmful_suppressed_count_tick)))
         self._harmful_buy_brake_history.append((now, int(harmful_buy_brake_hits_tick)))
+        self._gross_inventory_brake_history.append((now, int(gross_inventory_brake_hits_tick)))
+        self._pair_over_target_buy_block_history.append((now, int(pair_over_target_buy_blocks_tick)))
         self._target_ratio_breach_history.append((now, int(target_ratio_cap_hits_tick)))
         self._order_removal_history.append((now, int(removed_orders_tick)))
         self._maker_cross_guard_history.append((now, int(maker_cross_guard_hits_tick)))
         self._dual_bid_guard_hits_history.append((now, int(dual_bid_guard_hits_tick)))
         self._dual_bid_guard_fail_history.append((now, int(dual_bid_guard_fail_hits_tick)))
+        self._dual_bid_guard_inventory_budget_history.append((now, int(dual_bid_guard_inventory_budget_hits_tick)))
+        self._midpoint_first_brake_history.append((now, int(midpoint_first_brake_hits_tick)))
+        self._simultaneous_bid_block_prevented_history.append((now, int(simultaneous_bid_block_prevented_tick)))
         self._emergency_taker_forced_history.append((now, 1 if emergency_taker_forced else 0))
         self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
         self._forced_unwind_extreme_excess_history.append((now, int(forced_unwind_extreme_excess_hits_tick)))
@@ -1132,6 +1407,8 @@ class MarketMakerV2:
         self._prune_history(self._lifecycle_history, now=window_now)
         self._prune_history(self._harmful_suppressed_history, now=window_now)
         self._prune_history(self._harmful_buy_brake_history, now=window_now)
+        self._prune_history(self._gross_inventory_brake_history, now=window_now)
+        self._prune_history(self._pair_over_target_buy_block_history, now=window_now)
         self._prune_history(self._target_ratio_breach_history, now=window_now)
         self._prune_history(self._order_removal_history, now=window_now)
         self._prune_history(self._maker_cross_guard_history, now=window_now)
@@ -1139,6 +1416,9 @@ class MarketMakerV2:
         self._prune_history(self._dual_bid_outside_success_history, now=window_now)
         self._prune_history(self._dual_bid_guard_hits_history, now=window_now)
         self._prune_history(self._dual_bid_guard_fail_history, now=window_now)
+        self._prune_history(self._dual_bid_guard_inventory_budget_history, now=window_now)
+        self._prune_history(self._midpoint_first_brake_history, now=window_now)
+        self._prune_history(self._simultaneous_bid_block_prevented_history, now=window_now)
         self._prune_history(self._emergency_taker_forced_history, now=window_now)
         self._prune_history(self._unwind_deferred_history, now=window_now)
         self._prune_history(self._forced_unwind_extreme_excess_history, now=window_now)
@@ -1168,6 +1448,16 @@ class MarketMakerV2:
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
+        gross_inventory_brake_hits_60s = self._window_sum(
+            self._gross_inventory_brake_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        pair_over_target_buy_blocks_60s = self._window_sum(
+            self._pair_over_target_buy_block_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
         maker_cross_guard_hits_60s = self._window_sum(
             self._maker_cross_guard_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
@@ -1180,6 +1470,21 @@ class MarketMakerV2:
         )
         dual_bid_guard_fail_hits_60s = self._window_sum(
             self._dual_bid_guard_fail_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_guard_inventory_budget_hits_60s = self._window_sum(
+            self._dual_bid_guard_inventory_budget_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        midpoint_first_brake_hits_60s = self._window_sum(
+            self._midpoint_first_brake_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        simultaneous_bid_block_prevented_hits_60s = self._window_sum(
+            self._simultaneous_bid_block_prevented_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
@@ -1234,6 +1539,16 @@ class MarketMakerV2:
         )
         target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
         target_ratio_cap_active = bool(target_ratio_cap_hits_tick > 0)
+        quote_shift_from_mid_up = self._quote_shift_from_mid(
+            plan=plan,
+            snapshot=snapshot,
+            token_side="up",
+        )
+        quote_shift_from_mid_dn = self._quote_shift_from_mid(
+            plan=plan,
+            snapshot=snapshot,
+            token_side="dn",
+        )
         analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl_equity_usd,
@@ -1245,6 +1560,24 @@ class MarketMakerV2:
             position_mark_value_mid_usd=float(position_mark_value_mid),
             portfolio_mark_value_usd=float(portfolio_mark_value),
             tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
+            anchor_divergence_up=float(snapshot.anchor_divergence_up),
+            anchor_divergence_dn=float(snapshot.anchor_divergence_dn),
+            quote_shift_from_mid_up=float(quote_shift_from_mid_up),
+            quote_shift_from_mid_dn=float(quote_shift_from_mid_dn),
+            post_fill_markout_5s_up=float(self._post_fill_markout_5s_up),
+            post_fill_markout_5s_dn=float(self._post_fill_markout_5s_dn),
+            toxic_fill_streak_up=int(self._toxic_fill_streak_up),
+            toxic_fill_streak_dn=int(self._toxic_fill_streak_dn),
+            side_soft_brake_up_active=bool(self._side_soft_brake_active("up")),
+            side_soft_brake_dn_active=bool(self._side_soft_brake_active("dn")),
+            negative_spread_capture_streak_up=int(self._negative_spread_capture_streak_up),
+            negative_spread_capture_streak_dn=int(self._negative_spread_capture_streak_dn),
+            side_reentry_cooldown_up_sec=float(self._side_reentry_cooldown_sec("up", now=window_now)),
+            side_reentry_cooldown_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=window_now)),
+            side_hard_block_up_sec=float(self._side_reentry_cooldown_sec("up", now=window_now)),
+            side_hard_block_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=window_now)),
+            quote_anchor_mode=str(getattr(snapshot, "quote_anchor_mode", "midpoint_first") or "midpoint_first"),
+            midpoint_reference_mode=str(getattr(snapshot, "valuation_source", "midpoint_first") or "midpoint_first"),
             pnl_calc_mode="wallet_total_plus_mark",
             pnl_mark_basis="conservative_bid",
             pnl_updated_ts=float(now),
@@ -1261,6 +1594,10 @@ class MarketMakerV2:
             target_ratio_cap_active=bool(target_ratio_cap_active),
             target_ratio_cap_hits_60s=int(target_ratio_breaches_60s),
             target_ratio_pressure=float(effective_risk.target_ratio_pressure),
+            gross_inventory_brake_active=bool(getattr(plan, "gross_inventory_brake_active", False)),
+            gross_inventory_brake_hits_60s=int(gross_inventory_brake_hits_60s),
+            pair_over_target_buy_blocks_60s=int(pair_over_target_buy_blocks_60s),
+            dual_bid_guard_inventory_budget_hits_60s=int(dual_bid_guard_inventory_budget_hits_60s),
             inventory_pressure_abs=float(risk.inventory_pressure_abs),
             inventory_pressure_signed=float(risk.inventory_pressure_signed),
             inventory_half_life_sec=self._estimate_inventory_half_life(),
@@ -1291,6 +1628,8 @@ class MarketMakerV2:
             maker_cross_guard_hits_60s=int(maker_cross_guard_hits_60s),
             dual_bid_guard_hits_60s=int(dual_bid_guard_hits_60s),
             dual_bid_guard_fail_hits_60s=int(dual_bid_guard_fail_hits_60s),
+            midpoint_first_brake_hits_60s=int(midpoint_first_brake_hits_60s),
+            simultaneous_bid_block_prevented_hits_60s=int(simultaneous_bid_block_prevented_hits_60s),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),
@@ -1326,6 +1665,13 @@ class MarketMakerV2:
         self._last_plan = plan
         self._last_analytics = analytics
         self._last_health = health
+        if lifecycle in {"expired", "halted"}:
+            self._capture_terminal_state(
+                wallet_total_usdc=float(inventory.wallet_total_usdc),
+                up_shares=float(inventory.up_shares),
+                dn_shares=float(inventory.dn_shares),
+                pnl_equity_usd=float(self._session_pnl_equity_usd),
+            )
         transport_totals = api_stats.get("transport_total_by_op")
         if not isinstance(transport_totals, dict):
             transport_totals = {}
@@ -1391,6 +1737,10 @@ class MarketMakerV2:
         snap["runtime"] = {
             "last_terminal_reason": self._last_terminal_reason,
             "last_terminal_ts": self._last_terminal_ts,
+            "last_terminal_wallet_total_usdc": float(self._last_terminal_wallet_total_usdc),
+            "last_terminal_up_shares": float(self._last_terminal_up_shares),
+            "last_terminal_dn_shares": float(self._last_terminal_dn_shares),
+            "last_terminal_pnl_equity_usd": float(self._last_terminal_pnl_equity_usd),
             "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
             "drawdown_breach_age_sec": (
                 max(0.0, time.time() - self._drawdown_breach_started_ts)

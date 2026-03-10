@@ -23,6 +23,7 @@ from mm_shared.mm_config import MMConfig
 from mm_shared.order_manager import OrderManager
 from mm_v2.config import MMConfigV2, NO_HELPFUL_TICKS_FOR_UNWIND, UNWIND_STUCK_WINDOW_SEC
 from mm_v2.pair_inventory import build_pair_inventory
+from mm_v2.pair_valuation import PairValuationEngine
 from mm_v2.pm_gateway import PMGateway
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
@@ -103,6 +104,41 @@ def _inventory(**overrides) -> PairInventoryState:
     )
     payload.update(overrides)
     return PairInventoryState(**payload)
+
+
+def test_tradeable_valuation_uses_midpoint_bounded_model_source(monkeypatch):
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    engine = PairValuationEngine(cfg)
+    monkeypatch.setattr(engine.provider, "compute", lambda *args, **kwargs: (0.10, 0.90))
+    market = _market()
+    feed_state = SimpleNamespace(
+        mid=100000.0,
+        klines=[],
+        pm_up=0.25,
+        pm_dn=0.75,
+        pm_last_update_ts=time.time(),
+        bids=[],
+        asks=[],
+        trades=[],
+    )
+    up_book = {"best_bid": 0.24, "best_ask": 0.26, "bid_depth_usd": 250.0, "ask_depth_usd": 250.0}
+    dn_book = {"best_bid": 0.74, "best_ask": 0.76, "bid_depth_usd": 250.0, "ask_depth_usd": 250.0}
+
+    result, snapshot = engine.compute(
+        market=market,
+        feed_state=feed_state,
+        up_book=up_book,
+        dn_book=dn_book,
+    )
+
+    assert snapshot.market_tradeable is True
+    assert snapshot.valuation_source == "midpoint_bounded_model"
+    assert result.source == "midpoint_bounded_model"
+    assert snapshot.model_anchor_up == pytest.approx(0.10)
+    assert snapshot.midpoint_anchor_up == pytest.approx(0.25)
+    assert snapshot.anchor_divergence_up == pytest.approx(0.15)
+    assert 0.23 <= snapshot.fv_up <= 0.26
+    assert 0.74 <= snapshot.fv_dn <= 0.77
 
 
 def test_pmgateway_disables_naked_sells_for_live_client():
@@ -1289,6 +1325,46 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_state_exposes_gross_inventory_brake_and_terminal_snapshot(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "risk": {
+                "early_drawdown_pressure": 0.62,
+            },
+            "analytics": {
+                "gross_inventory_brake_active": True,
+                "gross_inventory_brake_hits_60s": 5,
+                "pair_over_target_buy_blocks_60s": 2,
+                "dual_bid_guard_inventory_budget_hits_60s": 1,
+            },
+            "runtime": {
+                "last_terminal_reason": "manual_stop",
+                "last_terminal_ts": 222.0,
+                "last_terminal_wallet_total_usdc": 18.82,
+                "last_terminal_up_shares": 0.03,
+                "last_terminal_dn_shares": 2.72,
+                "last_terminal_pnl_equity_usd": -16.67,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["risk"]["early_drawdown_pressure"] == pytest.approx(0.62)
+    assert resp["analytics"]["gross_inventory_brake_active"] is True
+    assert resp["analytics"]["gross_inventory_brake_hits_60s"] == 5
+    assert resp["analytics"]["pair_over_target_buy_blocks_60s"] == 2
+    assert resp["analytics"]["dual_bid_guard_inventory_budget_hits_60s"] == 1
+    assert resp["runtime"]["last_terminal_wallet_total_usdc"] == pytest.approx(18.82)
+    assert resp["runtime"]["last_terminal_up_shares"] == pytest.approx(0.03)
+    assert resp["runtime"]["last_terminal_dn_shares"] == pytest.approx(2.72)
+    assert resp["runtime"]["last_terminal_pnl_equity_usd"] == pytest.approx(-16.67)
+
+
+@pytest.mark.asyncio
 async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
@@ -1356,6 +1432,34 @@ async def test_state_exposes_dual_bid_metrics(monkeypatch):
     assert resp["analytics"]["one_sided_bid_streak_outside"] == 3
     assert resp["analytics"]["dual_bid_guard_hits_60s"] == 5
     assert resp["analytics"]["dual_bid_guard_fail_hits_60s"] == 2
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_midpoint_reference_and_side_brake_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "analytics": {
+                "midpoint_reference_mode": "midpoint_bounded_model",
+                "side_soft_brake_up_active": True,
+                "side_soft_brake_dn_active": False,
+                "side_hard_block_up_sec": 6.5,
+                "side_hard_block_dn_sec": 0.0,
+                "simultaneous_bid_block_prevented_hits_60s": 3,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["midpoint_reference_mode"] == "midpoint_bounded_model"
+    assert resp["analytics"]["side_soft_brake_up_active"] is True
+    assert resp["analytics"]["side_soft_brake_dn_active"] is False
+    assert resp["analytics"]["side_hard_block_up_sec"] == pytest.approx(6.5)
+    assert resp["analytics"]["side_hard_block_dn_sec"] == pytest.approx(0.0)
+    assert resp["analytics"]["simultaneous_bid_block_prevented_hits_60s"] == 3
 
 
 @pytest.mark.asyncio
@@ -1592,6 +1696,16 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "maker_cross_guard_hits_60s": 3,
                 "dual_bid_guard_hits_60s": 2,
                 "dual_bid_guard_fail_hits_60s": 1,
+                "midpoint_reference_mode": "midpoint_bounded_model",
+                "side_soft_brake_up_active": True,
+                "side_soft_brake_dn_active": False,
+                "side_hard_block_up_sec": 4.0,
+                "side_hard_block_dn_sec": 0.0,
+                "simultaneous_bid_block_prevented_hits_60s": 2,
+                "gross_inventory_brake_active": True,
+                "gross_inventory_brake_hits_60s": 3,
+                "pair_over_target_buy_blocks_60s": 2,
+                "dual_bid_guard_inventory_budget_hits_60s": 1,
                 "harmful_buy_brake_active": True,
                 "harmful_buy_brake_hits_60s": 4,
                 "emergency_taker_forced": False,
@@ -1624,6 +1738,16 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["maker_cross_guard_hits_60s"] == 3
     assert resp["mm_regime"]["dual_bid_guard_hits_60s"] == 2
     assert resp["mm_regime"]["dual_bid_guard_fail_hits_60s"] == 1
+    assert resp["mm_regime"]["midpoint_reference_mode"] == "midpoint_bounded_model"
+    assert resp["mm_regime"]["side_soft_brake_up_active"] is True
+    assert resp["mm_regime"]["side_soft_brake_dn_active"] is False
+    assert resp["mm_regime"]["side_hard_block_up_sec"] == pytest.approx(4.0)
+    assert resp["mm_regime"]["side_hard_block_dn_sec"] == pytest.approx(0.0)
+    assert resp["mm_regime"]["simultaneous_bid_block_prevented_hits_60s"] == 2
+    assert resp["mm_regime"]["gross_inventory_brake_active"] is True
+    assert resp["mm_regime"]["gross_inventory_brake_hits_60s"] == 3
+    assert resp["mm_regime"]["pair_over_target_buy_blocks_60s"] == 2
+    assert resp["mm_regime"]["dual_bid_guard_inventory_budget_hits_60s"] == 1
     assert resp["mm_regime"]["harmful_buy_brake_active"] is True
     assert resp["mm_regime"]["harmful_buy_brake_hits_60s"] == 4
     assert resp["mm_regime"]["emergency_taker_forced"] is False

@@ -26,9 +26,16 @@ class PairMarketSnapshot:
     dn_ask_depth_usd: float
     market_quality_score: float
     market_tradeable: bool
+    midpoint_anchor_up: float | None = None
+    midpoint_anchor_dn: float | None = None
+    model_anchor_up: float | None = None
+    model_anchor_dn: float | None = None
+    anchor_divergence_up: float = 0.0
+    anchor_divergence_dn: float = 0.0
+    quote_anchor_mode: str = "midpoint_first"
     divergence_up: float = 0.0
     divergence_dn: float = 0.0
-    valuation_source: str = "model"
+    valuation_source: str = "midpoint_first"
     valuation_regime: str = "normal"
     pm_age_sec: float = 999.0
 
@@ -103,6 +110,13 @@ class QuotePlan:
     suppressed_reasons: dict[str, str] = field(default_factory=dict)
     harmful_buy_brake_active: bool = False
     harmful_buy_brake_hits: int = 0
+    gross_inventory_brake_active: bool = False
+    gross_inventory_brake_hits: int = 0
+    pair_over_target_buy_blocks: int = 0
+    dual_bid_guard_inventory_budget_hits: int = 0
+    midpoint_first_brake_hits: int = 0
+    simultaneous_bid_block_prevented: int = 0
+    quote_anchor_mode: str = "midpoint_first"
 
 
 @dataclass
@@ -119,7 +133,20 @@ class RiskRegime:
     inventory_pressure_signed: float = 0.0
     quality_pressure: float = 0.0
     target_ratio_pressure: float = 0.0
+    early_drawdown_pressure: float = 0.0
     emergency_taker_forced: bool = False
+    post_fill_markout_5s_up: float = 0.0
+    post_fill_markout_5s_dn: float = 0.0
+    negative_spread_capture_streak_up: int = 0
+    negative_spread_capture_streak_dn: int = 0
+    toxic_fill_streak_up: int = 0
+    toxic_fill_streak_dn: int = 0
+    side_soft_brake_up_active: bool = False
+    side_soft_brake_dn_active: bool = False
+    side_reentry_cooldown_up_sec: float = 0.0
+    side_reentry_cooldown_dn_sec: float = 0.0
+    side_hard_block_up_sec: float = 0.0
+    side_hard_block_dn_sec: float = 0.0
 
 
 @dataclass
@@ -155,6 +182,24 @@ class AnalyticsState:
     position_mark_value_mid_usd: float = 0.0
     portfolio_mark_value_usd: float = 0.0
     tradeable_portfolio_value_usd: float = 0.0
+    anchor_divergence_up: float = 0.0
+    anchor_divergence_dn: float = 0.0
+    quote_shift_from_mid_up: float = 0.0
+    quote_shift_from_mid_dn: float = 0.0
+    post_fill_markout_5s_up: float = 0.0
+    post_fill_markout_5s_dn: float = 0.0
+    toxic_fill_streak_up: int = 0
+    toxic_fill_streak_dn: int = 0
+    side_soft_brake_up_active: bool = False
+    side_soft_brake_dn_active: bool = False
+    negative_spread_capture_streak_up: int = 0
+    negative_spread_capture_streak_dn: int = 0
+    side_reentry_cooldown_up_sec: float = 0.0
+    side_reentry_cooldown_dn_sec: float = 0.0
+    side_hard_block_up_sec: float = 0.0
+    side_hard_block_dn_sec: float = 0.0
+    quote_anchor_mode: str = "midpoint_first"
+    midpoint_reference_mode: str = "midpoint_first"
     pnl_calc_mode: str = "wallet_total_plus_mark"
     pnl_mark_basis: str = "conservative_bid"
     pnl_updated_ts: float = 0.0
@@ -171,6 +216,10 @@ class AnalyticsState:
     target_ratio_cap_active: bool = False
     target_ratio_cap_hits_60s: int = 0
     target_ratio_pressure: float = 0.0
+    gross_inventory_brake_active: bool = False
+    gross_inventory_brake_hits_60s: int = 0
+    pair_over_target_buy_blocks_60s: int = 0
+    dual_bid_guard_inventory_budget_hits_60s: int = 0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
     inventory_half_life_sec: float = 0.0
@@ -196,6 +245,8 @@ class AnalyticsState:
     maker_cross_guard_hits_60s: int = 0
     dual_bid_guard_hits_60s: int = 0
     dual_bid_guard_fail_hits_60s: int = 0
+    midpoint_first_brake_hits_60s: int = 0
+    simultaneous_bid_block_prevented_hits_60s: int = 0
     harmful_buy_brake_active: bool = False
     harmful_buy_brake_hits_60s: int = 0
     emergency_taker_forced: bool = False
