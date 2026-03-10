@@ -148,6 +148,8 @@ class APIErrorEvent:
 class OrderManager:
     """Manage orders on Polymarket CLOB."""
 
+    _TRANSPORT_WINDOW_SEC = 60.0
+
     def __init__(self, clob_client: Any, config: MMConfig):
         """
         Args:
@@ -699,21 +701,80 @@ class OrderManager:
         details: dict[str, Any] | None,
         status_code: int | None,
     ) -> bool:
-        del status_code
+        if not self._is_write_api_op(op):
+            return False
         payload = details or {}
         if bool(payload.get("transient")):
             return False
         message_l = str(message or "").lower()
-        if "crosses book" in message_l or "invalid post-only order" in message_l:
+        if self._is_order_validation_reject(message_l, status_code=status_code):
             return False
         if self._is_balance_or_allowance_reject(message_l):
             return False
         return True
 
+    @staticmethod
+    def _is_write_api_op(op: str) -> bool:
+        text = str(op or "").strip().lower()
+        if not text:
+            return False
+        if text.startswith(("place_", "cancel_", "sign_", "merge_", "redeem_")):
+            return True
+        return text in {
+            "cancel_all",
+            "ensure_sell_allowance",
+            "approval",
+            "liquidate",
+        }
+
+    @staticmethod
+    def _is_order_validation_reject(message_l: str, *, status_code: int | None) -> bool:
+        text = str(message_l or "").strip().lower()
+        if not text:
+            return False
+        if "crosses book" in text or "invalid post-only order" in text:
+            return True
+        markers = (
+            "invalid amount",
+            "min size",
+            "minimum size",
+            "minimum order",
+            "price outside bounds",
+            "invalid price",
+            "invalid size",
+            "size too small",
+            "tick size",
+            "precision",
+        )
+        if any(marker in text for marker in markers):
+            return True
+        # 4xx order-validation rejects should not be treated as transport corruption.
+        return status_code in {400, 404, 409, 422}
+
     def get_api_error_stats(self) -> dict[str, Any]:
+        now = time.time()
+        window_start = now - float(self._TRANSPORT_WINDOW_SEC)
+        recent_events = [
+            event
+            for event in self._recent_api_errors
+            if float(event.ts) >= window_start
+        ]
+        transport_recent_total = 0
+        transport_recent_by_op: dict[str, int] = {}
+        for event in recent_events:
+            if self._is_transport_error_event(
+                op=event.op,
+                message=event.message,
+                details=event.details,
+                status_code=event.status_code,
+            ):
+                transport_recent_total += 1
+                transport_recent_by_op[event.op] = int(transport_recent_by_op.get(event.op, 0)) + 1
         return {
             "total_by_op": dict(sorted(self._api_error_counts.items())),
             "transport_total_by_op": dict(sorted(self._transport_error_counts.items())),
+            "transport_recent_60s_total": int(transport_recent_total),
+            "transport_recent_60s_by_op": dict(sorted(transport_recent_by_op.items())),
             "recent": [event.to_dict() for event in list(self._recent_api_errors)[-10:]],
             "last_error_ts": round(self._last_api_error_ts, 3) if self._last_api_error_ts > 0 else 0.0,
         }

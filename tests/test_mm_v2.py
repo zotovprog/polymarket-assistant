@@ -243,6 +243,42 @@ def test_order_manager_crosses_book_not_counted_as_transport_failure():
     assert stats["transport_total_by_op"] == {}
 
 
+def test_order_manager_invalid_amount_not_counted_as_transport_failure():
+    class _MockClient:
+        _orders = {}
+
+    mgr = OrderManager(_MockClient(), MMConfig())
+    mgr._record_api_error(
+        op="place_order",
+        token_id="dn-token",
+        status_code=400,
+        message="PolyApiException[status_code=400, error_message={'error': 'invalid amount for a marketable BUY order ($0.05), min size: $1'}]",
+        details={"side": "BUY", "post_only": True},
+    )
+    stats = mgr.get_api_error_stats()
+    assert stats["total_by_op"]["place_order"] == 1
+    assert stats["transport_total_by_op"] == {}
+    assert stats["transport_recent_60s_total"] == 0
+
+
+def test_order_manager_read_op_request_exception_not_counted_as_transport_failure():
+    class _MockClient:
+        _orders = {}
+
+    mgr = OrderManager(_MockClient(), MMConfig())
+    mgr._record_api_error(
+        op="get_full_book",
+        token_id="up-token",
+        status_code=None,
+        message="PolyApiException[status_code=None, error_message=Request exception!]",
+        details={"source": "get_full_book"},
+    )
+    stats = mgr.get_api_error_stats()
+    assert stats["total_by_op"]["get_full_book"] == 1
+    assert stats["transport_total_by_op"] == {}
+    assert stats["transport_recent_60s_total"] == 0
+
+
 def test_mmv2_health_ignores_crosses_book_when_transport_totals_empty(monkeypatch):
     class _MockClient:
         _orders = {}
@@ -265,6 +301,54 @@ def test_mmv2_health_ignores_crosses_book_when_transport_totals_empty(monkeypatc
     health = mm._build_health()
     assert health.transport_ok is True
     assert "crosses book" in health.last_api_error
+
+
+def test_mmv2_health_prefers_recent_transport_window_over_lifetime_totals(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(max_transport_failures=5))
+    monkeypatch.setattr(
+        mm.gateway,
+        "api_error_stats",
+        lambda: {
+            "total_by_op": {"place_order": 99},
+            "transport_total_by_op": {"place_order": 99},
+            "transport_recent_60s_total": 0,
+            "recent": [
+                {
+                    "op": "place_order",
+                    "message": "historic error",
+                }
+            ],
+        },
+    )
+    health = mm._build_health()
+    assert health.transport_ok is True
+
+
+def test_mmv2_health_marks_transport_unhealthy_from_recent_window(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(max_transport_failures=5))
+    monkeypatch.setattr(
+        mm.gateway,
+        "api_error_stats",
+        lambda: {
+            "total_by_op": {"place_order": 2},
+            "transport_total_by_op": {"place_order": 2},
+            "transport_recent_60s_total": 5,
+            "recent": [
+                {
+                    "op": "place_order",
+                    "message": "PolyApiException[status_code=None, error_message=Request exception!]",
+                }
+            ],
+        },
+    )
+    health = mm._build_health()
+    assert health.transport_ok is False
 
 
 def test_runtime_wallet_snapshot_coalesce_uses_expected_balances_for_missing_values():

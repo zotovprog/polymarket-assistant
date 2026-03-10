@@ -495,6 +495,7 @@ class MarketMakerV2:
     def _build_health(
         self,
         *,
+        api_stats: dict[str, Any] | None = None,
         sellability_lag_active: bool = False,
         wallet_snapshot_stale: bool = False,
         true_drift_age_sec: float = 0.0,
@@ -504,7 +505,7 @@ class MarketMakerV2:
         drawdown_breach_active: bool = False,
         drawdown_threshold_usd_effective: float = 0.0,
     ) -> HealthState:
-        api_stats = self.gateway.api_error_stats()
+        api_stats = dict(api_stats or self.gateway.api_error_stats() or {})
         recent = api_stats.get("recent") or []
         last_message = ""
         last_api_error_op = ""
@@ -525,8 +526,11 @@ class MarketMakerV2:
         transport_totals = api_stats.get("transport_total_by_op")
         if not isinstance(transport_totals, dict):
             transport_totals = {}
-        total_failures = int(sum(int(v or 0) for v in transport_totals.values()))
-        transport_ok = total_failures < int(self.config.max_transport_failures)
+        has_recent_transport_window = "transport_recent_60s_total" in api_stats
+        recent_transport_failures = int(api_stats.get("transport_recent_60s_total") or 0)
+        if not has_recent_transport_window:
+            recent_transport_failures = int(sum(int(v or 0) for v in transport_totals.values()))
+        transport_ok = recent_transport_failures < int(self.config.max_transport_failures)
         last_fallback = int(getattr(self.gateway.order_mgr, "_last_fallback_poll_count", 0))
         return HealthState(
             reconcile_status=self.reconcile.status,
@@ -885,11 +889,14 @@ class MarketMakerV2:
             total_usdc=total_usdc_raw,
             available_usdc=available_usdc_raw,
         )
+        api_stats = self.gateway.api_error_stats()
         balance_fetch_health = self.gateway.balance_fetch_health_state()
         reconcile_balance_error_active = bool(
             (balance_fetch_health or {}).get("reconcile_balance_error_active")
         )
-        effective_wallet_stale = bool(stale_wallet or reconcile_balance_error_active)
+        transport_recent_failures = int((api_stats or {}).get("transport_recent_60s_total") or 0)
+        transport_unhealthy_recent = transport_recent_failures >= int(self.config.max_transport_failures)
+        effective_wallet_stale = bool(stale_wallet or reconcile_balance_error_active or transport_unhealthy_recent)
         sellable_up, sellable_dn = await self.gateway.get_sellable_balances(
             reference_balances=(float(up), float(dn)),
         )
@@ -898,6 +905,10 @@ class MarketMakerV2:
             stale_reason = "PM wallet snapshot partial/unavailable"
             if not stale_wallet and reconcile_balance_error_active:
                 stale_reason = "PM reconcile balance fetch errors active; drift guard armed"
+            elif transport_unhealthy_recent:
+                stale_reason = (
+                    f"PM transport errors active ({transport_recent_failures}/60s); drift guard armed"
+                )
             self.set_alert(
                 "wallet_snapshot_stale_v2",
                 stale_reason,
@@ -964,6 +975,7 @@ class MarketMakerV2:
         )
         true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
         health = self._build_health(
+            api_stats=api_stats,
             sellability_lag_active=bool(sell_release_lag.get("active")),
             wallet_snapshot_stale=effective_wallet_stale,
             true_drift_age_sec=true_drift_age_sec,
@@ -1314,11 +1326,13 @@ class MarketMakerV2:
         self._last_plan = plan
         self._last_analytics = analytics
         self._last_health = health
-        api_stats = self.gateway.api_error_stats()
         transport_totals = api_stats.get("transport_total_by_op")
         if not isinstance(transport_totals, dict):
             transport_totals = {}
-        transport_failures = int(sum(int(v or 0) for v in transport_totals.values()))
+        has_recent_transport_window = "transport_recent_60s_total" in api_stats
+        transport_failures = int(api_stats.get("transport_recent_60s_total") or 0)
+        if not has_recent_transport_window:
+            transport_failures = int(sum(int(v or 0) for v in transport_totals.values()))
         execution = self.tracker.execution_state(
             active_orders=self.gateway.active_orders(),
             transport_failures=transport_failures,
