@@ -21,7 +21,7 @@ if BASE not in sys.path:
 from mm_shared.types import Fill, MarketInfo, Quote
 from mm_shared.mm_config import MMConfig
 from mm_shared.order_manager import OrderManager
-from mm_v2.config import MMConfigV2
+from mm_v2.config import MMConfigV2, NO_HELPFUL_TICKS_FOR_UNWIND, UNWIND_STUCK_WINDOW_SEC
 from mm_v2.pair_inventory import build_pair_inventory
 from mm_v2.pm_gateway import PMGateway
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
@@ -804,6 +804,23 @@ def test_hard_excess_transitions_state_machine_to_unwind():
         viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=0, harmful_count=2),
     )
     assert risk.target_soft_mode == "unwind"
+    assert transition.lifecycle == "defensive"
+    sm._excess_baseline_ts = time.time() - (float(UNWIND_STUCK_WINDOW_SEC) + 1.0)
+    sm._excess_baseline_value_usd = float(inventory.excess_value_usd)
+    for _ in range(int(NO_HELPFUL_TICKS_FOR_UNWIND)):
+        transition = sm.transition(
+            snapshot=_snapshot(),
+            inventory=inventory,
+            risk=risk,
+            viability=QuoteViabilitySummary(
+                any_quote=True,
+                four_quotes=False,
+                helpful_count=0,
+                harmful_count=2,
+                quote_balance_state="reduced",
+                four_quote_presence_ratio=0.10,
+            ),
+        )
     assert transition.lifecycle == "unwind"
     assert transition.effective_soft_mode == "unwind"
 
@@ -1199,6 +1216,15 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
             "analytics": {
                 "mm_regime_degraded_reason": "high_emergency_ratio",
                 "maker_cross_guard_hits_60s": 4,
+                "dual_bid_ratio_60s": 0.72,
+                "one_sided_bid_streak_outside": 2,
+                "dual_bid_guard_hits_60s": 6,
+                "dual_bid_guard_fail_hits_60s": 1,
+                "harmful_buy_brake_active": True,
+                "harmful_buy_brake_hits_60s": 7,
+                "emergency_taker_forced": True,
+                "emergency_taker_forced_hits_60s": 3,
+                "emergency_no_progress_sec": 11.5,
                 "unwind_deferred_hits_60s": 2,
                 "forced_unwind_extreme_excess_hits_60s": 1,
             },
@@ -1210,9 +1236,42 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     resp = await web_server.mmv2_state(request=object())
     assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
     assert resp["analytics"]["maker_cross_guard_hits_60s"] == 4
+    assert resp["analytics"]["dual_bid_ratio_60s"] == pytest.approx(0.72)
+    assert resp["analytics"]["one_sided_bid_streak_outside"] == 2
+    assert resp["analytics"]["dual_bid_guard_hits_60s"] == 6
+    assert resp["analytics"]["dual_bid_guard_fail_hits_60s"] == 1
+    assert resp["analytics"]["harmful_buy_brake_active"] is True
+    assert resp["analytics"]["harmful_buy_brake_hits_60s"] == 7
+    assert resp["analytics"]["emergency_taker_forced"] is True
+    assert resp["analytics"]["emergency_taker_forced_hits_60s"] == 3
+    assert resp["analytics"]["emergency_no_progress_sec"] == pytest.approx(11.5)
     assert resp["analytics"]["unwind_deferred_hits_60s"] == 2
     assert resp["analytics"]["forced_unwind_extreme_excess_hits_60s"] == 1
     assert resp["health"]["drawdown_threshold_usd_effective"] == pytest.approx(15.0)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_dual_bid_metrics(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "inventory_skewed",
+            "analytics": {
+                "dual_bid_ratio_60s": 0.81,
+                "one_sided_bid_streak_outside": 3,
+                "dual_bid_guard_hits_60s": 5,
+                "dual_bid_guard_fail_hits_60s": 2,
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["analytics"]["dual_bid_ratio_60s"] == pytest.approx(0.81)
+    assert resp["analytics"]["one_sided_bid_streak_outside"] == 3
+    assert resp["analytics"]["dual_bid_guard_hits_60s"] == 5
+    assert resp["analytics"]["dual_bid_guard_fail_hits_60s"] == 2
 
 
 @pytest.mark.asyncio
@@ -1444,7 +1503,16 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "position_mark_value_usd": 3.12,
                 "tradeable_portfolio_value_usd": 43.12,
                 "portfolio_mark_value_usd": 48.12,
+                "dual_bid_ratio_60s": 0.74,
+                "one_sided_bid_streak_outside": 1,
                 "maker_cross_guard_hits_60s": 3,
+                "dual_bid_guard_hits_60s": 2,
+                "dual_bid_guard_fail_hits_60s": 1,
+                "harmful_buy_brake_active": True,
+                "harmful_buy_brake_hits_60s": 4,
+                "emergency_taker_forced": False,
+                "emergency_taker_forced_hits_60s": 1,
+                "emergency_no_progress_sec": 0.0,
                 "unwind_deferred_hits_60s": 2,
                 "forced_unwind_extreme_excess_hits_60s": 1,
             },
@@ -1467,7 +1535,16 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["session_pnl"] == pytest.approx(0.78)
     assert resp["session_pnl_risk_equity"] == pytest.approx(1.23)
     assert resp["fill_count"] == 1
+    assert resp["mm_regime"]["dual_bid_ratio_60s"] == pytest.approx(0.74)
+    assert resp["mm_regime"]["one_sided_bid_streak_outside"] == 1
     assert resp["mm_regime"]["maker_cross_guard_hits_60s"] == 3
+    assert resp["mm_regime"]["dual_bid_guard_hits_60s"] == 2
+    assert resp["mm_regime"]["dual_bid_guard_fail_hits_60s"] == 1
+    assert resp["mm_regime"]["harmful_buy_brake_active"] is True
+    assert resp["mm_regime"]["harmful_buy_brake_hits_60s"] == 4
+    assert resp["mm_regime"]["emergency_taker_forced"] is False
+    assert resp["mm_regime"]["emergency_taker_forced_hits_60s"] == 1
+    assert resp["mm_regime"]["emergency_no_progress_sec"] == pytest.approx(0.0)
     assert resp["mm_regime"]["unwind_deferred_hits_60s"] == 2
     assert resp["mm_regime"]["forced_unwind_extreme_excess_hits_60s"] == 1
 

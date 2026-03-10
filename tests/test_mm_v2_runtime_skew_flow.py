@@ -5,6 +5,8 @@ import sys
 import time
 from types import SimpleNamespace
 
+import pytest
+
 
 BASE = os.path.dirname(os.path.dirname(__file__))
 SRC = os.path.join(BASE, "src")
@@ -13,7 +15,13 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm_v2.config import EMERGENCY_EXIT_CONFIRM_TICKS, MMConfigV2, UNWIND_EXIT_CONFIRM_TICKS
+from mm_v2.config import (
+    EMERGENCY_EXIT_CONFIRM_TICKS,
+    MMConfigV2,
+    NO_HELPFUL_TICKS_FOR_UNWIND,
+    UNWIND_EXIT_CONFIRM_TICKS,
+    UNWIND_STUCK_WINDOW_SEC,
+)
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
@@ -147,6 +155,35 @@ def test_dn_excess_near_endpoint_below_hard_cap_keeps_safe_plan():
     assert risk.soft_mode in {"inventory_skewed", "defensive"}
     assert plan.quote_balance_state in {"balanced", "helpful_only", "reduced", "harmful_only_blocked"}
     assert not (plan.quote_balance_state == "harmful_only_blocked" and plan.up_bid is None and plan.dn_ask is None)
+
+
+def test_untradeable_tolerated_market_keeps_dual_bids_in_inventory_skewed():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=False,
+        market_quality_score=0.62,
+        divergence_up=0.08,
+        divergence_dn=0.07,
+        up_best_bid=0.01,
+        up_best_ask=0.03,
+        dn_best_bid=0.97,
+        dn_best_ask=0.99,
+    )
+    inventory = _inventory(
+        dn_shares=8.0,
+        excess_dn_qty=8.0,
+        excess_dn_value_usd=6.5,
+        excess_value_usd=6.5,
+        signed_excess_value_usd=-6.5,
+        total_inventory_value_usd=6.5,
+        free_usdc=30.0,
+    )
+    risk, plan, _ = _risk_and_plan(cfg, snapshot, inventory)
+    assert risk.soft_mode == "inventory_skewed"
+    assert risk.hard_mode == "none"
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.quote_balance_state in {"balanced", "reduced", "helpful_only"}
 
 
 def test_helpful_quotes_can_be_restored_by_promotion():
@@ -627,6 +664,61 @@ def test_dynamic_drawdown_threshold_delays_emergency_for_same_pnl():
     assert low_cfg.effective_hard_drawdown_usd() < high_cfg.effective_hard_drawdown_usd()
 
 
+def test_emergency_taker_force_enables_only_after_confirmed_no_progress(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = [1000.0]
+    monkeypatch.setattr("mm_v2.runtime.time.time", lambda: now[0])
+
+    forced, age = mm._update_emergency_taker_force(hard_mode="emergency_unwind", excess_value_usd=10.0)
+    assert forced is False
+    assert age == pytest.approx(0.0)
+
+    now[0] += 3.0
+    forced, age = mm._update_emergency_taker_force(hard_mode="emergency_unwind", excess_value_usd=9.9)
+    assert forced is False
+    assert age >= 3.0
+
+    now[0] += 6.0
+    forced, age = mm._update_emergency_taker_force(hard_mode="emergency_unwind", excess_value_usd=9.8)
+    assert forced is True
+    assert age >= 8.0
+
+
+def test_emergency_taker_force_does_not_enable_when_progress_exists(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = [2000.0]
+    monkeypatch.setattr("mm_v2.runtime.time.time", lambda: now[0])
+
+    forced, _ = mm._update_emergency_taker_force(hard_mode="emergency_unwind", excess_value_usd=10.0)
+    assert forced is False
+    now[0] += 4.0
+    forced, _ = mm._update_emergency_taker_force(hard_mode="emergency_unwind", excess_value_usd=9.4)
+    assert forced is False
+    assert mm._emergency_no_progress_ticks == 0
+    assert mm._emergency_no_progress_started_ts == pytest.approx(0.0)
+
+
+def test_emergency_taker_force_is_disabled_outside_hard_mode(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    now = [3000.0]
+    monkeypatch.setattr("mm_v2.runtime.time.time", lambda: now[0])
+
+    mm._emergency_taker_forced = True
+    forced, age = mm._update_emergency_taker_force(hard_mode="none", excess_value_usd=6.0)
+    assert forced is False
+    assert age == pytest.approx(0.0)
+    assert mm._emergency_taker_forced is False
+
+
 def test_live_like_window_reports_mm_regime_ratios():
     class _MockClient:
         _orders = {}
@@ -703,6 +795,70 @@ def test_mm_regime_degraded_reason_reports_high_emergency_ratio():
     assert "high_emergency_ratio" in alert["message"]
 
 
+def test_mm_regime_degraded_reason_low_dual_bid_ratio():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.45,
+        inventory_skewed_ratio_60s=0.20,
+        defensive_ratio_60s=0.10,
+        unwind_ratio_60s=0.05,
+        emergency_unwind_ratio_60s=0.0,
+        dual_bid_ratio_60s=0.40,
+        one_sided_bid_streak_outside=7,
+        outside_near_expiry=True,
+        quote_balance_state="reduced",
+    )
+    assert mm._mm_regime_degraded_reason == "low_dual_bid_ratio"
+    alert = mm._alerts.get("mm_regime_degraded")
+    assert alert is not None
+    assert "low_dual_bid_ratio" in alert["message"]
+
+
+def test_one_sided_bid_streak_tracks_only_outside_near_expiry():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.45,
+        inventory_skewed_ratio_60s=0.20,
+        defensive_ratio_60s=0.10,
+        unwind_ratio_60s=0.05,
+        emergency_unwind_ratio_60s=0.0,
+        dual_bid_ratio_60s=0.20,
+        one_sided_bid_streak_outside=8,
+        outside_near_expiry=False,
+        quote_balance_state="reduced",
+    )
+    assert mm._mm_regime_degraded_reason != "low_dual_bid_ratio"
+
+
+def test_dual_bid_ratio_ignores_no_bid_ticks():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    # No bids on both sides should not be considered one-sided degradation.
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.40,
+        inventory_skewed_ratio_60s=0.30,
+        defensive_ratio_60s=0.10,
+        unwind_ratio_60s=0.0,
+        emergency_unwind_ratio_60s=0.0,
+        dual_bid_ratio_60s=1.0,
+        one_sided_bid_streak_outside=0,
+        outside_near_expiry=True,
+        quote_balance_state="reduced",
+    )
+    assert mm._mm_regime_degraded_reason != "low_dual_bid_ratio"
+
+
 def test_hard_cap_entry_then_recovery_exits_unwind_before_expiry():
     cfg = MMConfigV2(session_budget_usd=15.0, base_clip_usd=6.0)
     sm = StateMachineV2(cfg)
@@ -720,6 +876,19 @@ def test_hard_cap_entry_then_recovery_exits_unwind_before_expiry():
     viability = QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=1, four_quote_presence_ratio=0.30)
     for _ in range(8):
         sm.transition(snapshot=snapshot, inventory=high_excess_inventory, risk=high_risk, viability=viability)
+    assert sm.lifecycle == "defensive"
+    # Confirmed no-progress + degraded viability should still allow unwind.
+    sm._excess_baseline_value_usd = float(high_excess_inventory.excess_value_usd)
+    sm._excess_baseline_ts = time.time() - (float(UNWIND_STUCK_WINDOW_SEC) + 1.0)
+    degraded = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=0,
+        quote_balance_state="reduced",
+        four_quote_presence_ratio=0.20,
+    )
+    for _ in range(int(NO_HELPFUL_TICKS_FOR_UNWIND)):
+        sm.transition(snapshot=snapshot, inventory=high_excess_inventory, risk=high_risk, viability=degraded)
     assert sm.lifecycle == "unwind"
     sm._unwind_started_at = time.time() - 10.0
 

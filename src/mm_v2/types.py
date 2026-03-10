@@ -101,6 +101,8 @@ class QuotePlan:
     ] = "none"
     quote_viability_reason: str = ""
     suppressed_reasons: dict[str, str] = field(default_factory=dict)
+    harmful_buy_brake_active: bool = False
+    harmful_buy_brake_hits: int = 0
 
 
 @dataclass
@@ -117,6 +119,7 @@ class RiskRegime:
     inventory_pressure_signed: float = 0.0
     quality_pressure: float = 0.0
     target_ratio_pressure: float = 0.0
+    emergency_taker_forced: bool = False
 
 
 @dataclass
@@ -184,11 +187,20 @@ class AnalyticsState:
     emergency_unwind_ratio_60s: float = 0.0
     four_quote_ratio_60s: float = 0.0
     mm_effective_ratio_60s: float = 0.0
+    dual_bid_ratio_60s: float = 0.0
+    one_sided_bid_streak_outside: int = 0
     harmful_suppressed_count_60s: int = 0
     target_ratio_breaches_60s: int = 0
     defensive_to_unwind_count_window: int = 0
     quote_cancel_to_fill_ratio_60s: float = 0.0
     maker_cross_guard_hits_60s: int = 0
+    dual_bid_guard_hits_60s: int = 0
+    dual_bid_guard_fail_hits_60s: int = 0
+    harmful_buy_brake_active: bool = False
+    harmful_buy_brake_hits_60s: int = 0
+    emergency_taker_forced: bool = False
+    emergency_taker_forced_hits_60s: int = 0
+    emergency_no_progress_sec: float = 0.0
     unwind_deferred_hits_60s: int = 0
     forced_unwind_extreme_excess_hits_60s: int = 0
     mm_regime_degraded_reason: str = ""

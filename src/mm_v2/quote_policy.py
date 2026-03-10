@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Literal
+from typing import Any, Literal
 
 from .config import (
     HARMFUL_PRICE_TICKS_MAX,
@@ -69,6 +69,35 @@ class QuotePolicyV2:
         if risk.soft_mode == "unwind":
             return max(1.0, base * 0.5)
         return base
+
+    def _harmful_buy_brake_mult(
+        self,
+        *,
+        inventory: PairInventoryState,
+        risk: RiskRegime,
+    ) -> float:
+        """Throttle harmful BUY sizing as excess approaches hard cap.
+
+        This keeps two-sided maker MM active, but reduces the speed of inventory
+        expansion on the harmful side before we are forced into protective modes.
+        """
+        if risk.soft_mode not in {"normal", "inventory_skewed"}:
+            return 1.0
+        excess_value = max(0.0, float(inventory.excess_value_usd))
+        budget = max(0.01, float(self.config.session_budget_usd))
+        soft_cap = max(0.01, float(self.config.soft_excess_value_ratio) * budget)
+        defensive_cap = max(soft_cap, float(self.config.defensive_excess_value_ratio) * budget)
+        hard_cap = max(defensive_cap, float(self.config.effective_hard_excess_value_ratio()) * budget)
+        # Start throttling around soft-cap so harmful BUY flow does not keep
+        # accelerating excess into hard/unwind territory.
+        brake_start = max(2.0, soft_cap)
+        if excess_value <= brake_start + 1e-9:
+            return 1.0
+        if hard_cap <= brake_start + 1e-9:
+            return 0.20
+        progress = (excess_value - brake_start) / max(1e-9, hard_cap - brake_start)
+        progress = max(0.0, min(1.0, progress))
+        return max(0.20, 1.0 - 0.80 * progress)
 
     def _min_viable_clip_usd(self, snapshot: PairMarketSnapshot, ctx: QuoteContext) -> float:
         return float(ctx.min_order_size) * self._pair_reference_price(snapshot)
@@ -170,6 +199,15 @@ class QuotePolicyV2:
         if side == "SELL" and best_bid is not None:
             price = max(price, float(best_bid) + tick_size)
         return price
+
+    @staticmethod
+    def _maker_safe_bid_price(*, best_ask: float | None, tick_size: float) -> float | None:
+        if best_ask is None:
+            return None
+        safe = _floor_price(float(best_ask) - tick_size, tick_size)
+        if safe < 0.01 or safe >= float(best_ask) - 1e-9:
+            return None
+        return float(safe)
 
     @staticmethod
     def _pair_reference_price(snapshot: PairMarketSnapshot) -> float:
@@ -314,12 +352,26 @@ class QuotePolicyV2:
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
         budget_headroom_usd = max(1.0, free_usdc * 0.20)
+        dual_bid_guard_headroom_usd = max(1.0, free_usdc)
         min_viable_clip_usd = self._min_viable_clip_usd(snapshot, ctx)
         harmful_buy_guard_usd = float(self.config.effective_harmful_buy_suppress_usd())
+        budget_usd = max(0.01, float(self.config.session_budget_usd))
+        soft_cap_usd = max(0.01, float(self.config.soft_excess_value_ratio) * budget_usd)
+        defensive_cap_usd = max(0.01, float(self.config.defensive_excess_value_ratio) * budget_usd)
+        hard_cap_usd = max(
+            defensive_cap_usd,
+            float(self.config.effective_hard_excess_value_ratio()) * budget_usd,
+        )
+        pre_protective_harmful_buy_guard_usd = max(2.0, 0.60 * defensive_cap_usd)
+        harmful_side_floor_block_usd = max(
+            pre_protective_harmful_buy_guard_usd,
+            0.80 * defensive_cap_usd,
+        )
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
         mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
         pair_mid = max(0.01, min(0.99, base_mid - mid_shift))
         pair_reference_price = self._pair_reference_price(snapshot)
+        outside_near_expiry = float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
 
         up_bid_price = pair_mid - spread
         up_ask_price = pair_mid + spread
@@ -335,8 +387,10 @@ class QuotePolicyV2:
         }
         built: dict[str, QuoteIntent | None] = {}
         suppressed_reasons: dict[str, str] = {}
+        bid_slot_meta: dict[str, dict[str, Any]] = {}
         helpful_floor_applied = False
         neutral_floor_applied = False
+        harmful_buy_brake_hits = 0
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
             effect = self._classify_inventory_effect(
@@ -346,6 +400,29 @@ class QuotePolicyV2:
                 up_token_id=snapshot.up_token_id,
                 dn_token_id=snapshot.dn_token_id,
             )
+            if (
+                risk.soft_mode in {"normal", "inventory_skewed"}
+                and risk.target_soft_mode in {"defensive", "unwind"}
+                and side == "BUY"
+                and effect == "harmful"
+                and float(inventory.excess_value_usd) >= pre_protective_harmful_buy_guard_usd
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "harmful_buy_blocked_pre_protective"
+                continue
+            if (
+                risk.soft_mode in {"normal", "inventory_skewed"}
+                and side == "BUY"
+                and effect == "harmful"
+                and float(risk.drawdown_pct_budget) <= 0.25
+                and (
+                    risk.target_soft_mode in {"defensive", "unwind"}
+                    or float(inventory.excess_value_usd) >= pre_protective_harmful_buy_guard_usd
+                )
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "harmful_buy_blocked_drawdown"
+                continue
             if (
                 risk.soft_mode == "inventory_skewed"
                 and side == "BUY"
@@ -386,6 +463,17 @@ class QuotePolicyV2:
                 best_ask=best_ask,
                 tick_size=ctx.tick_size,
             )
+            if side == "BUY":
+                bid_slot_meta[slot] = {
+                    "token": token,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "role": role,
+                    "effect": effect,
+                    "size_mult": float(self._size_multiplier(effect, pressure)),
+                    "ticks": int(ticks),
+                    "adjusted_price": float(adjusted_price),
+                }
             size_mult = self._size_multiplier(effect, pressure)
             owned_share_cap = 0.0
             live_sellable_share_cap = 0.0
@@ -421,8 +509,46 @@ class QuotePolicyV2:
             buy_headroom_usd = budget_headroom_usd
             if side == "BUY" and effect == "helpful" and risk.soft_mode == "unwind":
                 buy_headroom_usd = max(0.0, free_usdc)
+            harmful_buy_brake_mult = 1.0
+            if side == "BUY" and effect == "harmful":
+                harmful_buy_brake_mult = self._harmful_buy_brake_mult(
+                    inventory=inventory,
+                    risk=risk,
+                )
+                side_excess_qty = 0.0
+                side_mark_price = pair_reference_price
+                if token == snapshot.up_token_id:
+                    side_excess_qty = max(0.0, float(inventory.excess_up_qty))
+                    side_mark_price = max(
+                        0.05,
+                        float(snapshot.pm_mid_up or snapshot.fv_up or pair_reference_price),
+                    )
+                elif token == snapshot.dn_token_id:
+                    side_excess_qty = max(0.0, float(inventory.excess_dn_qty))
+                    side_mark_price = max(
+                        0.05,
+                        float(snapshot.pm_mid_dn or snapshot.fv_dn or pair_reference_price),
+                    )
+                soft_cap_qty = soft_cap_usd / max(0.05, side_mark_price)
+                hard_cap_qty = hard_cap_usd / max(0.05, side_mark_price)
+                qty_brake_start = max(float(ctx.min_order_size), 0.70 * soft_cap_qty)
+                if side_excess_qty > qty_brake_start + 1e-9:
+                    if hard_cap_qty <= qty_brake_start + 1e-9:
+                        qty_brake_mult = 0.20
+                    else:
+                        qty_progress = (side_excess_qty - qty_brake_start) / max(
+                            1e-9,
+                            hard_cap_qty - qty_brake_start,
+                        )
+                        qty_progress = max(0.0, min(1.0, qty_progress))
+                        qty_brake_mult = max(0.20, 1.0 - 0.80 * qty_progress)
+                    harmful_buy_brake_mult = min(harmful_buy_brake_mult, float(qty_brake_mult))
+                if harmful_buy_brake_mult < 0.999:
+                    harmful_buy_brake_hits += 1
             if side == "BUY":
-                nominal_quote_clip_usd = min(clip_usd, buy_headroom_usd) * size_mult
+                nominal_quote_clip_usd = (
+                    min(clip_usd, buy_headroom_usd) * size_mult * harmful_buy_brake_mult
+                )
             elif inventory_backed_sell:
                 nominal_quote_clip_usd = clip_usd * size_mult
             else:
@@ -459,6 +585,26 @@ class QuotePolicyV2:
                         helpful_floor_applied = True
                     elif effect == "neutral":
                         neutral_floor_applied = True
+            if (
+                side == "BUY"
+                and outside_near_expiry
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                maker_safe_bid_price = self._maker_safe_bid_price(
+                    best_ask=best_ask,
+                    tick_size=ctx.tick_size,
+                )
+                if maker_safe_bid_price is not None:
+                    side_min_clip_usd = float(ctx.min_order_size) * float(maker_safe_bid_price)
+                    side_floor_headroom_usd = buy_headroom_usd * max(1.0, size_mult)
+                    harmful_brake_floor_blocked = (
+                        effect == "harmful"
+                        and harmful_buy_brake_mult < 0.999
+                        and float(inventory.excess_value_usd) >= harmful_side_floor_block_usd
+                    )
+                    if (not harmful_brake_floor_blocked) and side_min_clip_usd <= side_floor_headroom_usd + 1e-9:
+                        effective_clip_usd = max(effective_clip_usd, side_min_clip_usd)
             if inventory_backed_sell:
                 share_cap = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
             else:
@@ -515,12 +661,184 @@ class QuotePolicyV2:
         if built["dn_bid"] and built["up_ask"] and built["dn_bid"].price + built["up_ask"].price > pair_ceiling:
             built["dn_bid"].price = _floor_price(pair_ceiling - built["up_ask"].price, ctx.tick_size)
 
+        # Dual-bid core guard: outside near-expiry in normal/skewed mode we should
+        # avoid sustained one-sided BUY quoting when the opposite bid is recoverable.
+        if (
+            outside_near_expiry
+            and risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed"}
+        ):
+            up_bid_active = built["up_bid"] is not None
+            dn_bid_active = built["dn_bid"] is not None
+            if int(up_bid_active) + int(dn_bid_active) == 1:
+                missing_slot = "up_bid" if not up_bid_active else "dn_bid"
+                existing_reason = str(suppressed_reasons.get(missing_slot) or "")
+                prior_reason = existing_reason
+                blocked_by_high_skew = existing_reason == "harmful_buy_blocked_high_skew"
+                blocked_by_pre_protective = existing_reason == "harmful_buy_blocked_pre_protective"
+                blocked_by_harmful_skew = blocked_by_high_skew or blocked_by_pre_protective
+                if existing_reason in {
+                    "harmful_suppressed_in_defensive",
+                    "harmful_suppressed_in_unwind",
+                    "target_pair_ratio_cap",
+                    "maker_cross_guard",
+                    "live_requires_inventory_backed_sell",
+                    "harmful_buy_blocked_drawdown",
+                }:
+                    pass
+                else:
+                    meta = bid_slot_meta.get(missing_slot)
+                    if not meta:
+                        fallback_quote = raw_quotes.get(missing_slot)
+                        if fallback_quote:
+                            (
+                                _fallback_side,
+                                fallback_token,
+                                fallback_base_price,
+                                fallback_best_bid,
+                                fallback_best_ask,
+                                fallback_role,
+                            ) = fallback_quote
+                            fallback_effect = self._classify_inventory_effect(
+                                token=fallback_token,
+                                side="BUY",
+                                inventory_side=risk.inventory_side,
+                                up_token_id=snapshot.up_token_id,
+                                dn_token_id=snapshot.dn_token_id,
+                            )
+                            fallback_ticks = self._price_adjust_ticks(fallback_effect, pressure)
+                            fallback_adjusted = float(fallback_base_price)
+                            if fallback_effect == "helpful":
+                                fallback_adjusted += ctx.tick_size * fallback_ticks
+                            elif fallback_effect == "harmful":
+                                fallback_adjusted -= ctx.tick_size * fallback_ticks
+                            fallback_adjusted = self._maker_clamp(
+                                side="BUY",
+                                price=fallback_adjusted,
+                                best_bid=fallback_best_bid,
+                                best_ask=fallback_best_ask,
+                                tick_size=ctx.tick_size,
+                            )
+                            meta = {
+                                "token": fallback_token,
+                                "best_bid": fallback_best_bid,
+                                "best_ask": fallback_best_ask,
+                                "role": fallback_role,
+                                "effect": fallback_effect,
+                                "size_mult": float(self._size_multiplier(fallback_effect, pressure)),
+                                "ticks": int(fallback_ticks),
+                                "adjusted_price": float(fallback_adjusted),
+                            }
+                    if (
+                        meta
+                        and str(meta.get("effect") or "") == "harmful"
+                        and risk.soft_mode in {"normal", "inventory_skewed"}
+                        and risk.target_soft_mode in {"defensive", "unwind"}
+                        and float(inventory.excess_value_usd) >= pre_protective_harmful_buy_guard_usd
+                    ):
+                        suppressed_reasons[missing_slot] = prior_reason or "dual_bid_guard_viability"
+                        meta = None
+                    if not meta:
+                        if prior_reason:
+                            suppressed_reasons[missing_slot] = prior_reason
+                        else:
+                            suppressed_reasons[missing_slot] = "dual_bid_guard_viability"
+                    else:
+                        maker_safe_bid_price = self._maker_safe_bid_price(
+                            best_ask=meta.get("best_ask"),
+                            tick_size=ctx.tick_size,
+                        )
+                        if maker_safe_bid_price is None:
+                            suppressed_reasons[missing_slot] = "dual_bid_guard_market"
+                        else:
+                            side_min_clip_usd = float(ctx.min_order_size) * float(maker_safe_bid_price)
+                            side_floor_headroom_usd = dual_bid_guard_headroom_usd * max(
+                                1.0,
+                                float(meta.get("size_mult") or 1.0),
+                            )
+                            if side_min_clip_usd > side_floor_headroom_usd + 1e-9:
+                                suppressed_reasons[missing_slot] = "dual_bid_guard_headroom"
+                            elif (
+                                risk.soft_mode == "inventory_skewed"
+                                and str(meta.get("effect") or "") == "harmful"
+                                and float(inventory.excess_value_usd) >= harmful_buy_guard_usd
+                                and not blocked_by_harmful_skew
+                            ):
+                                suppressed_reasons[missing_slot] = "dual_bid_guard_viability"
+                            else:
+                                guard_price = min(
+                                    float(meta.get("adjusted_price") or maker_safe_bid_price),
+                                    float(maker_safe_bid_price),
+                                )
+                                guard_clip_usd = side_min_clip_usd
+                                guard_share_cap = max(
+                                    max(0.0, side_min_clip_usd / pair_reference_price),
+                                    # Side-aware cap: recover missing dual-bid on cheap side
+                                    # without opening large endpoint inventory expansion.
+                                    float(ctx.min_order_size) * float(HELPFUL_MIN_PROMOTION_MULT),
+                                )
+                                allow_guard_intent = True
+                                if blocked_by_harmful_skew:
+                                    # Keep recovery passive near the high-skew guard:
+                                    # only re-arm dual-bid with a deeper maker price and
+                                    # minimal economically viable size.
+                                    if blocked_by_pre_protective:
+                                        suppressed_reasons[missing_slot] = prior_reason or "dual_bid_guard_viability"
+                                        allow_guard_intent = False
+                                    recovery_limit = harmful_buy_guard_usd * 1.15
+                                    if allow_guard_intent and float(inventory.excess_value_usd) > recovery_limit:
+                                        suppressed_reasons[missing_slot] = prior_reason or "dual_bid_guard_viability"
+                                        allow_guard_intent = False
+                                    if allow_guard_intent:
+                                        conservative_ticks = max(6, int(meta.get("ticks") or 0) + 4)
+                                        guard_price = max(
+                                            0.01,
+                                            _floor_price(
+                                                float(guard_price) - (float(ctx.tick_size) * conservative_ticks),
+                                                ctx.tick_size,
+                                            ),
+                                        )
+                                        guard_clip_usd = max(
+                                            0.01,
+                                            float(ctx.min_order_size) * float(guard_price) * 1.02,
+                                        )
+                                        guard_share_cap = max(
+                                            float(ctx.min_order_size),
+                                            float(guard_clip_usd) / max(0.01, pair_reference_price),
+                                        )
+                                if allow_guard_intent:
+                                    intent, suppressed = self._make_intent(
+                                        token=str(meta.get("token")),
+                                        side="BUY",
+                                        price=guard_price,
+                                        clip_usd=guard_clip_usd,
+                                        share_cap=guard_share_cap,
+                                        ctx=ctx,
+                                        role=str(meta.get("role") or "base_bid"),
+                                        post_only=True,
+                                        inventory_effect=str(meta.get("effect") or "neutral"),  # type: ignore[arg-type]
+                                        size_mult=float(meta.get("size_mult") or 1.0),
+                                        price_adjust_ticks=int(meta.get("ticks") or 0),
+                                    )
+                                    if intent is None:
+                                        if blocked_by_harmful_skew and prior_reason:
+                                            suppressed_reasons[missing_slot] = prior_reason
+                                        else:
+                                            suppressed_reasons[missing_slot] = "dual_bid_guard_viability"
+                                    else:
+                                        intent.price = min(float(intent.price), float(maker_safe_bid_price))
+                                        built[missing_slot] = intent
+                                        suppressed_reasons[missing_slot] = "dual_bid_guard_applied"
+
         regime = risk.soft_mode
         reason = risk.reason
         if risk.hard_mode == "emergency_unwind":
             regime = "emergency_unwind"
+            emergency_taker_forced = bool(getattr(risk, "emergency_taker_forced", False))
             if inventory.up_shares > 0:
-                up_post_only = bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec)
+                up_post_only = bool(
+                    snapshot.time_left_sec > self.config.emergency_taker_start_sec
+                ) and not emergency_taker_forced
                 up_emergency_price = float(snapshot.up_best_bid or max(0.01, up_ask_price))
                 if up_post_only:
                     up_emergency_price = self._maker_clamp(
@@ -550,7 +868,9 @@ class QuotePolicyV2:
                 built["up_bid"] = None
                 built["up_ask"] = None
             if inventory.dn_shares > 0:
-                dn_post_only = bool(snapshot.time_left_sec > self.config.emergency_taker_start_sec)
+                dn_post_only = bool(
+                    snapshot.time_left_sec > self.config.emergency_taker_start_sec
+                ) and not emergency_taker_forced
                 dn_emergency_price = float(snapshot.dn_best_bid or max(0.01, dn_ask_price))
                 if dn_post_only:
                     dn_emergency_price = self._maker_clamp(
@@ -637,4 +957,6 @@ class QuotePolicyV2:
             quote_balance_state=quote_balance_state,  # type: ignore[arg-type]
             quote_viability_reason=quote_viability_reason,
             suppressed_reasons=suppressed_reasons,
+            harmful_buy_brake_active=bool(harmful_buy_brake_hits > 0),
+            harmful_buy_brake_hits=int(harmful_buy_brake_hits),
         )

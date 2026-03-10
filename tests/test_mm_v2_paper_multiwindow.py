@@ -12,7 +12,7 @@ if SRC not in sys.path:
 if BASE not in sys.path:
     sys.path.insert(0, BASE)
 
-from mm_v2.config import MMConfigV2
+from mm_v2.config import MMConfigV2, NO_HELPFUL_TICKS_FOR_UNWIND, UNWIND_STUCK_WINDOW_SEC
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.state_machine import StateMachineV2
@@ -162,6 +162,24 @@ def test_excess_beyond_hard_cap_moves_into_unwind_without_halt():
     transition = sm.transition(snapshot=snapshot, inventory=inventory, risk=risk, viability=QuoteViabilitySummary(any_quote=True, four_quotes=False, helpful_count=0, harmful_count=2, harmful_only=True, four_quote_presence_ratio=0.10))
     assert risk.hard_mode == "none"
     assert risk.target_soft_mode == "unwind"
+    assert transition.lifecycle == "defensive"
+    sm._excess_baseline_ts = time.time() - (float(UNWIND_STUCK_WINDOW_SEC) + 1.0)
+    sm._excess_baseline_value_usd = float(inventory.excess_value_usd)
+    for _ in range(int(NO_HELPFUL_TICKS_FOR_UNWIND)):
+        transition = sm.transition(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            viability=QuoteViabilitySummary(
+                any_quote=True,
+                four_quotes=False,
+                helpful_count=0,
+                harmful_count=2,
+                harmful_only=True,
+                quote_balance_state="reduced",
+                four_quote_presence_ratio=0.10,
+            ),
+        )
     assert transition.lifecycle == "unwind"
     assert plan.dn_bid is None
     assert plan.up_bid is not None

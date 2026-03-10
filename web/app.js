@@ -845,6 +845,8 @@ function updateMMRegime(mmRegime, state) {
     const unwind = clampRatio(mmRegime?.unwind_ratio_60s);
     const emergencyUnwind = clampRatio(mmRegime?.emergency_unwind_ratio_60s);
     const fourQuote = clampRatio(mmRegime?.four_quote_ratio_60s);
+    const dualBid = clampRatio(mmRegime?.dual_bid_ratio_60s);
+    const oneSidedBidStreak = Number(mmRegime?.one_sided_bid_streak_outside ?? 0);
     const mmEffectiveRaw = mmRegime?.mm_effective_ratio_60s;
     const mmEffective = clampRatio(mmEffectiveRaw != null ? mmEffectiveRaw : (quoting + inventorySkewed + defensive));
 
@@ -852,6 +854,8 @@ function updateMMRegime(mmRegime, state) {
     setText('mm-quoting-ratio', (quoting * 100).toFixed(0) + '%');
     setText('mm-unwind-ratio', (unwind * 100).toFixed(0) + '%');
     setText('mm-fourq-ratio', (fourQuote * 100).toFixed(0) + '%');
+    setText('mm-dual-bid-ratio', (dualBid * 100).toFixed(0) + '%');
+    setText('mm-one-sided-streak', String(Math.max(0, oneSidedBidStreak)));
 
     const lifecycle = String(mmRegime?.lifecycle || state?.lifecycle || '').toLowerCase();
     const currentMode = String(mmRegime?.current_mode || state?.mode || lifecycle || '').toLowerCase();
@@ -865,6 +869,13 @@ function updateMMRegime(mmRegime, state) {
     const regimeReason = String(mmRegime?.reason || state?.pause_reason || '').trim();
     const degradedReason = String(mmRegime?.mm_regime_degraded_reason || '').trim();
     const makerGuardHits = Number(mmRegime?.maker_cross_guard_hits_60s ?? 0);
+    const dualBidGuardHits = Number(mmRegime?.dual_bid_guard_hits_60s ?? 0);
+    const dualBidGuardFailHits = Number(mmRegime?.dual_bid_guard_fail_hits_60s ?? 0);
+    const harmfulBuyBrakeActive = Boolean(mmRegime?.harmful_buy_brake_active ?? false);
+    const harmfulBuyBrakeHits = Number(mmRegime?.harmful_buy_brake_hits_60s ?? 0);
+    const emergencyTakerForced = Boolean(mmRegime?.emergency_taker_forced ?? false);
+    const emergencyTakerForcedHits = Number(mmRegime?.emergency_taker_forced_hits_60s ?? 0);
+    const emergencyNoProgressSec = Number(mmRegime?.emergency_no_progress_sec ?? 0);
     const unwindDeferredHits = Number(mmRegime?.unwind_deferred_hits_60s ?? 0);
     const forcedUnwindHits = Number(mmRegime?.forced_unwind_extreme_excess_hits_60s ?? 0);
 
@@ -873,7 +884,13 @@ function updateMMRegime(mmRegime, state) {
     if (currentMode === 'halted' || lifecycle === 'halted' || currentMode === 'emergency_unwind') {
         status = 'CRITICAL';
         statusClass = 'mm-status-badge mm-status-degraded';
-    } else if (mmEffective < 0.30 || unwind > 0.5 || emergencyUnwind > 0.20 || quoteBalance === 'none') {
+    } else if (
+        mmEffective < 0.30 ||
+        degradedReason === 'low_dual_bid_ratio' ||
+        unwind > 0.5 ||
+        emergencyUnwind > 0.20 ||
+        quoteBalance === 'none'
+    ) {
         status = 'DEGRADED';
         statusClass = 'mm-status-badge mm-status-degraded';
     } else if (mmEffective < 0.65 || fourQuote < 0.2 || currentMode === 'defensive' || currentMode === 'unwind') {
@@ -900,6 +917,15 @@ function updateMMRegime(mmRegime, state) {
     }
     if (degradedReason) {
         why += ` Regime alert reason: ${degradedReason}.`;
+        if (degradedReason === 'low_dual_bid_ratio') {
+            why += ' Dual-Bid core просел: слишком часто активен только один bid вне near-expiry.';
+        }
+    }
+    if (harmfulBuyBrakeActive) {
+        why += ' Harmful BUY brake активен: скорость набора перекоса ограничена.';
+    }
+    if (emergencyTakerForced) {
+        why += ` Emergency taker failover активен (${Math.max(0, emergencyNoProgressSec).toFixed(1)}s без прогресса).`;
     } else if (quoteBalance === 'helpful_only') {
         why += ' Сейчас доступны только helpful-котировки (safe side).';
     } else if (quoteBalance === 'none') {
@@ -913,9 +939,15 @@ function updateMMRegime(mmRegime, state) {
     setText('mm-regime-why', why);
     const signalHints = [];
     if (makerGuardHits > 0) signalHints.push(`maker_guard=${makerGuardHits}`);
+    signalHints.push(`dual_bid_ratio=${(dualBid * 100).toFixed(0)}%`);
+    signalHints.push(`one_sided_streak=${Math.max(0, oneSidedBidStreak)}`);
+    if (dualBidGuardHits > 0) signalHints.push(`dual_bid_guard_hits=${dualBidGuardHits}`);
+    if (dualBidGuardFailHits > 0) signalHints.push(`dual_bid_guard_fail=${dualBidGuardFailHits}`);
+    if (harmfulBuyBrakeHits > 0) signalHints.push(`harmful_buy_brake=${harmfulBuyBrakeHits}`);
+    if (emergencyTakerForced) signalHints.push(`emergency_taker_forced=1`);
+    if (emergencyTakerForcedHits > 0) signalHints.push(`emergency_taker_forced_hits=${emergencyTakerForcedHits}`);
     if (unwindDeferredHits > 0) signalHints.push(`unwind_deferred=${unwindDeferredHits}`);
     if (forcedUnwindHits > 0) signalHints.push(`forced_unwind=${forcedUnwindHits}`);
-    if (!signalHints.length) signalHints.push('no protective signal hits in 60s');
     setText('mm-regime-signals', `Signals: ${signalHints.join(', ')}`);
 
     const modeCardMap = {

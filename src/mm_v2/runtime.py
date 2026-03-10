@@ -70,9 +70,16 @@ class MarketMakerV2:
         self._mode_history: list[tuple[float, str]] = []
         self._lifecycle_history: list[tuple[float, str]] = []
         self._harmful_suppressed_history: list[tuple[float, int]] = []
+        self._harmful_buy_brake_history: list[tuple[float, int]] = []
         self._target_ratio_breach_history: list[tuple[float, int]] = []
         self._order_removal_history: list[tuple[float, int]] = []
         self._maker_cross_guard_history: list[tuple[float, int]] = []
+        self._dual_bid_outside_sample_history: list[tuple[float, int]] = []
+        self._dual_bid_outside_success_history: list[tuple[float, int]] = []
+        self._dual_bid_guard_hits_history: list[tuple[float, int]] = []
+        self._dual_bid_guard_fail_history: list[tuple[float, int]] = []
+        self._emergency_taker_forced_history: list[tuple[float, int]] = []
+        self._one_sided_bid_streak_outside: int = 0
         self._unwind_deferred_history: list[tuple[float, int]] = []
         self._forced_unwind_extreme_excess_history: list[tuple[float, int]] = []
         self._prev_active_order_ids: set[str] = set()
@@ -86,6 +93,10 @@ class MarketMakerV2:
         self._drawdown_breach_ticks = 0
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
+        self._emergency_progress_baseline_excess = 0.0
+        self._emergency_no_progress_started_ts = 0.0
+        self._emergency_no_progress_ticks = 0
+        self._emergency_taker_forced = False
         self._mm_regime_degraded_started_ts = 0.0
         self._mm_regime_degraded_reason = ""
         self._unwind_target_mismatch_ticks = 0
@@ -278,11 +289,22 @@ class MarketMakerV2:
         self._unwind_target_mismatch_started_ts = 0.0
         self._lifecycle_history.clear()
         self._harmful_suppressed_history.clear()
+        self._harmful_buy_brake_history.clear()
         self._target_ratio_breach_history.clear()
         self._order_removal_history.clear()
         self._maker_cross_guard_history.clear()
+        self._dual_bid_outside_sample_history.clear()
+        self._dual_bid_outside_success_history.clear()
+        self._dual_bid_guard_hits_history.clear()
+        self._dual_bid_guard_fail_history.clear()
+        self._emergency_taker_forced_history.clear()
+        self._one_sided_bid_streak_outside = 0
         self._unwind_deferred_history.clear()
         self._forced_unwind_extreme_excess_history.clear()
+        self._emergency_progress_baseline_excess = 0.0
+        self._emergency_no_progress_started_ts = 0.0
+        self._emergency_no_progress_ticks = 0
+        self._emergency_taker_forced = False
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -591,8 +613,55 @@ class MarketMakerV2:
         )
         return int(self._drawdown_breach_ticks), float(age), bool(self._drawdown_breach_active)
 
-    def _prune_history(self, entries: list[tuple[float, Any]], *, max_age_sec: float = 120.0) -> None:
-        cutoff = time.time() - max_age_sec
+    def _update_emergency_taker_force(
+        self,
+        *,
+        hard_mode: str,
+        excess_value_usd: float,
+    ) -> tuple[bool, float]:
+        """Enable taker failover in emergency unwind only after confirmed no-progress."""
+        if hard_mode != "emergency_unwind":
+            self._emergency_progress_baseline_excess = max(0.0, float(excess_value_usd))
+            self._emergency_no_progress_started_ts = 0.0
+            self._emergency_no_progress_ticks = 0
+            self._emergency_taker_forced = False
+            return False, 0.0
+
+        now = time.time()
+        current_excess = max(0.0, float(excess_value_usd))
+        if self._emergency_progress_baseline_excess <= 0.0:
+            self._emergency_progress_baseline_excess = current_excess
+
+        baseline = max(1e-9, float(self._emergency_progress_baseline_excess))
+        progress = current_excess <= (baseline * 0.95)
+        if progress:
+            self._emergency_progress_baseline_excess = current_excess
+            self._emergency_no_progress_started_ts = 0.0
+            self._emergency_no_progress_ticks = 0
+            self._emergency_taker_forced = False
+            return False, 0.0
+
+        if self._emergency_no_progress_started_ts <= 0.0:
+            self._emergency_no_progress_started_ts = now
+            self._emergency_no_progress_ticks = 1
+        else:
+            self._emergency_no_progress_ticks += 1
+        no_progress_sec = max(0.0, now - self._emergency_no_progress_started_ts)
+        self._emergency_taker_forced = bool(
+            self._emergency_no_progress_ticks >= 3
+            and no_progress_sec >= 8.0
+        )
+        return bool(self._emergency_taker_forced), float(no_progress_sec)
+
+    def _prune_history(
+        self,
+        entries: list[tuple[float, Any]],
+        *,
+        max_age_sec: float = 120.0,
+        now: float | None = None,
+    ) -> None:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max_age_sec
         while entries and entries[0][0] < cutoff:
             entries.pop(0)
 
@@ -619,8 +688,14 @@ class MarketMakerV2:
         four_quote = sum(1 for _, present in history if present[1])
         return any_quote / total, four_quote / total
 
-    def _quote_presence_ratio_window(self, *, window_sec: float) -> tuple[float, float]:
-        cutoff = time.time() - max(1.0, float(window_sec))
+    def _quote_presence_ratio_window(
+        self,
+        *,
+        window_sec: float,
+        now: float | None = None,
+    ) -> tuple[float, float]:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
         history = [entry for entry in self._quote_presence_history if entry[0] >= cutoff]
         if not history:
             return 0.0, 0.0
@@ -629,8 +704,14 @@ class MarketMakerV2:
         four_quote = sum(1 for _, present in history if present[1])
         return any_quote / total, four_quote / total
 
-    def _lifecycle_ratios(self, *, window_sec: float) -> dict[str, float]:
-        cutoff = time.time() - max(1.0, float(window_sec))
+    def _lifecycle_ratios(
+        self,
+        *,
+        window_sec: float,
+        now: float | None = None,
+    ) -> dict[str, float]:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
         history = [entry for entry in self._lifecycle_history if entry[0] >= cutoff]
         if not history:
             return {
@@ -660,21 +741,29 @@ class MarketMakerV2:
         }
 
     @staticmethod
-    def _window_sum(history: list[tuple[float, int]], *, window_sec: float) -> int:
-        cutoff = time.time() - max(1.0, float(window_sec))
+    def _window_sum(
+        history: list[tuple[float, int]],
+        *,
+        window_sec: float,
+        now: float | None = None,
+    ) -> int:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
         return int(sum(int(value or 0) for ts, value in history if ts >= cutoff))
 
-    def _fills_count_window(self, *, window_sec: float) -> int:
-        cutoff = time.time() - max(1.0, float(window_sec))
+    def _fills_count_window(self, *, window_sec: float, now: float | None = None) -> int:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
         return int(sum(1 for fill in self._fills if float(getattr(fill, "ts", 0.0) or 0.0) >= cutoff))
 
-    def _quote_cancel_to_fill_ratio(self, *, window_sec: float) -> float:
-        removals = self._window_sum(self._order_removal_history, window_sec=window_sec)
-        fills = self._fills_count_window(window_sec=window_sec)
+    def _quote_cancel_to_fill_ratio(self, *, window_sec: float, now: float | None = None) -> float:
+        removals = self._window_sum(self._order_removal_history, window_sec=window_sec, now=now)
+        fills = self._fills_count_window(window_sec=window_sec, now=now)
         return float(removals / max(1, fills))
 
-    def _defensive_to_unwind_count(self, *, window_sec: float) -> int:
-        cutoff = time.time() - max(1.0, float(window_sec))
+    def _defensive_to_unwind_count(self, *, window_sec: float, now: float | None = None) -> int:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
         history = [entry for entry in self._lifecycle_history if entry[0] >= cutoff]
         if len(history) < 2:
             return 0
@@ -694,7 +783,10 @@ class MarketMakerV2:
         defensive_ratio_60s: float,
         unwind_ratio_60s: float,
         emergency_unwind_ratio_60s: float,
-        quote_balance_state: str,
+        dual_bid_ratio_60s: float = 1.0,
+        one_sided_bid_streak_outside: int = 0,
+        outside_near_expiry: bool = True,
+        quote_balance_state: str = "",
     ) -> None:
         now = time.time()
         mm_active_ratio_60s = float(
@@ -707,6 +799,8 @@ class MarketMakerV2:
             reason = "high_emergency_ratio"
         elif mm_active_ratio_60s < 0.30:
             reason = "low_mm_effective"
+        elif outside_near_expiry and dual_bid_ratio_60s < 0.70:
+            reason = "low_dual_bid_ratio"
         elif str(quote_balance_state or "").lower() == "none":
             reason = "quote_none_sustained"
         degraded = bool(reason)
@@ -721,6 +815,8 @@ class MarketMakerV2:
                         f"MM regime degraded: reason={reason}, "
                         f"mm_effective_ratio_60s={mm_active_ratio_60s:.2f}, "
                         f"quoting_ratio_60s={quoting_ratio_60s:.2f}, "
+                        f"dual_bid_ratio_60s={dual_bid_ratio_60s:.2f}, "
+                        f"one_sided_bid_streak_outside={int(one_sided_bid_streak_outside)}, "
                         f"unwind_ratio_60s={unwind_ratio_60s:.2f}, "
                         f"emergency_unwind_ratio_60s={emergency_unwind_ratio_60s:.2f}"
                     ),
@@ -883,6 +979,15 @@ class MarketMakerV2:
             analytics=pre_analytics,
             health=health,
         )
+        emergency_taker_forced, emergency_no_progress_sec = self._update_emergency_taker_force(
+            hard_mode=str(risk.hard_mode),
+            excess_value_usd=float(inventory.excess_value_usd),
+        )
+        if bool(getattr(risk, "emergency_taker_forced", False)) != emergency_taker_forced:
+            risk = replace(
+                risk,
+                emergency_taker_forced=bool(emergency_taker_forced),
+            )
         inventory.inventory_pressure_abs = risk.inventory_pressure_abs
         inventory.inventory_pressure_signed = risk.inventory_pressure_signed
         ctx = QuoteContext(
@@ -907,12 +1012,14 @@ class MarketMakerV2:
             soft_mode=transition.effective_soft_mode,
             target_soft_mode=transition.target_soft_mode,
             reason=transition.reason or risk.reason,
+            emergency_taker_forced=bool(emergency_taker_forced),
         )
         lifecycle = transition.lifecycle
         unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
             effective_soft_mode=effective_risk.soft_mode,
             target_soft_mode=effective_risk.target_soft_mode,
         )
+        outside_near_expiry = float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
         if lifecycle in {"halted", "expired"}:
             await self.gateway.cancel_all()
             plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
@@ -940,6 +1047,25 @@ class MarketMakerV2:
             if intent and intent.inventory_effect == "harmful"
         )
         now = time.time()
+        up_bid_active = plan.up_bid is not None
+        dn_bid_active = plan.dn_bid is not None
+        dual_bid_active = bool(up_bid_active and dn_bid_active)
+        one_sided_bid_active = bool(up_bid_active) ^ bool(dn_bid_active)
+        dual_bid_mode_eligible = bool(
+            outside_near_expiry
+            and effective_risk.hard_mode == "none"
+            and effective_risk.soft_mode in {"normal", "inventory_skewed"}
+            and (up_bid_active or dn_bid_active)
+        )
+        if dual_bid_mode_eligible:
+            self._dual_bid_outside_sample_history.append((now, 1))
+            self._dual_bid_outside_success_history.append((now, 1 if dual_bid_active else 0))
+            if one_sided_bid_active:
+                self._one_sided_bid_streak_outside += 1
+            else:
+                self._one_sided_bid_streak_outside = 0
+        else:
+            self._one_sided_bid_streak_outside = 0
         harmful_suppressed_count_tick = sum(
             1
             for reason in plan.suppressed_reasons.values()
@@ -947,6 +1073,15 @@ class MarketMakerV2:
         )
         maker_cross_guard_hits_tick = sum(
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "maker_cross_guard"
+        )
+        harmful_buy_brake_hits_tick = int(getattr(plan, "harmful_buy_brake_hits", 0) or 0)
+        dual_bid_guard_hits_tick = sum(
+            1 for reason in plan.suppressed_reasons.values() if str(reason) == "dual_bid_guard_applied"
+        )
+        dual_bid_guard_fail_hits_tick = sum(
+            1
+            for reason in plan.suppressed_reasons.values()
+            if str(reason) in {"dual_bid_guard_headroom", "dual_bid_guard_viability", "dual_bid_guard_market"}
         )
         target_ratio_cap_hits_tick = sum(
             1 for reason in plan.suppressed_reasons.values() if str(reason) == "target_pair_ratio_cap"
@@ -969,24 +1104,38 @@ class MarketMakerV2:
         self._mode_history.append((now, effective_risk.soft_mode))
         self._lifecycle_history.append((now, str(lifecycle)))
         self._harmful_suppressed_history.append((now, int(harmful_suppressed_count_tick)))
+        self._harmful_buy_brake_history.append((now, int(harmful_buy_brake_hits_tick)))
         self._target_ratio_breach_history.append((now, int(target_ratio_cap_hits_tick)))
         self._order_removal_history.append((now, int(removed_orders_tick)))
         self._maker_cross_guard_history.append((now, int(maker_cross_guard_hits_tick)))
+        self._dual_bid_guard_hits_history.append((now, int(dual_bid_guard_hits_tick)))
+        self._dual_bid_guard_fail_history.append((now, int(dual_bid_guard_fail_hits_tick)))
+        self._emergency_taker_forced_history.append((now, 1 if emergency_taker_forced else 0))
         self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
         self._forced_unwind_extreme_excess_history.append((now, int(forced_unwind_extreme_excess_hits_tick)))
-        self._prune_history(self._excess_history)
-        self._prune_history(self._quote_presence_history)
-        self._prune_history(self._mode_history)
-        self._prune_history(self._lifecycle_history)
-        self._prune_history(self._harmful_suppressed_history)
-        self._prune_history(self._target_ratio_breach_history)
-        self._prune_history(self._order_removal_history)
-        self._prune_history(self._maker_cross_guard_history)
-        self._prune_history(self._unwind_deferred_history)
-        self._prune_history(self._forced_unwind_extreme_excess_history)
+        window_now = float(now)
+        self._prune_history(self._excess_history, now=window_now)
+        self._prune_history(self._quote_presence_history, now=window_now)
+        self._prune_history(self._mode_history, now=window_now)
+        self._prune_history(self._lifecycle_history, now=window_now)
+        self._prune_history(self._harmful_suppressed_history, now=window_now)
+        self._prune_history(self._harmful_buy_brake_history, now=window_now)
+        self._prune_history(self._target_ratio_breach_history, now=window_now)
+        self._prune_history(self._order_removal_history, now=window_now)
+        self._prune_history(self._maker_cross_guard_history, now=window_now)
+        self._prune_history(self._dual_bid_outside_sample_history, now=window_now)
+        self._prune_history(self._dual_bid_outside_success_history, now=window_now)
+        self._prune_history(self._dual_bid_guard_hits_history, now=window_now)
+        self._prune_history(self._dual_bid_guard_fail_history, now=window_now)
+        self._prune_history(self._emergency_taker_forced_history, now=window_now)
+        self._prune_history(self._unwind_deferred_history, now=window_now)
+        self._prune_history(self._forced_unwind_extreme_excess_history, now=window_now)
         quote_presence_ratio, four_quote_presence_ratio = self._quote_presence_ratio()
-        _, four_quote_ratio_60s = self._quote_presence_ratio_window(window_sec=float(MM_REGIME_WINDOW_SEC))
-        regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC))
+        _, four_quote_ratio_60s = self._quote_presence_ratio_window(
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        regime_ratios = self._lifecycle_ratios(window_sec=float(MM_REGIME_WINDOW_SEC), now=window_now)
         mm_effective_ratio_60s = float(
             regime_ratios["quoting_ratio_60s"]
             + regime_ratios["inventory_skewed_ratio_60s"]
@@ -995,28 +1144,70 @@ class MarketMakerV2:
         harmful_suppressed_count_60s = self._window_sum(
             self._harmful_suppressed_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         target_ratio_breaches_60s = self._window_sum(
             self._target_ratio_breach_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        harmful_buy_brake_hits_60s = self._window_sum(
+            self._harmful_buy_brake_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         maker_cross_guard_hits_60s = self._window_sum(
             self._maker_cross_guard_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_guard_hits_60s = self._window_sum(
+            self._dual_bid_guard_hits_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_guard_fail_hits_60s = self._window_sum(
+            self._dual_bid_guard_fail_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_outside_samples_60s = self._window_sum(
+            self._dual_bid_outside_sample_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_outside_success_60s = self._window_sum(
+            self._dual_bid_outside_success_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        dual_bid_ratio_60s = (
+            float(dual_bid_outside_success_60s / max(1, dual_bid_outside_samples_60s))
+            if dual_bid_outside_samples_60s > 0
+            else 1.0
         )
         unwind_deferred_hits_60s = self._window_sum(
             self._unwind_deferred_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         forced_unwind_extreme_excess_hits_60s = self._window_sum(
             self._forced_unwind_extreme_excess_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        emergency_taker_forced_hits_60s = self._window_sum(
+            self._emergency_taker_forced_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         defensive_to_unwind_count_window = self._defensive_to_unwind_count(
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         quote_cancel_to_fill_ratio_60s = self._quote_cancel_to_fill_ratio(
             window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
         )
         self._update_mm_regime_alert(
             quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
@@ -1024,6 +1215,9 @@ class MarketMakerV2:
             defensive_ratio_60s=float(regime_ratios["defensive_ratio_60s"]),
             unwind_ratio_60s=float(regime_ratios["unwind_ratio_60s"]),
             emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
+            dual_bid_ratio_60s=float(dual_bid_ratio_60s),
+            one_sided_bid_streak_outside=int(self._one_sided_bid_streak_outside),
+            outside_near_expiry=bool(outside_near_expiry),
             quote_balance_state=str(plan.quote_balance_state),
         )
         target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
@@ -1071,11 +1265,20 @@ class MarketMakerV2:
             emergency_unwind_ratio_60s=float(regime_ratios["emergency_unwind_ratio_60s"]),
             four_quote_ratio_60s=float(four_quote_ratio_60s),
             mm_effective_ratio_60s=float(mm_effective_ratio_60s),
+            dual_bid_ratio_60s=float(dual_bid_ratio_60s),
+            one_sided_bid_streak_outside=int(self._one_sided_bid_streak_outside),
             harmful_suppressed_count_60s=int(harmful_suppressed_count_60s),
             target_ratio_breaches_60s=int(target_ratio_breaches_60s),
+            harmful_buy_brake_active=bool(getattr(plan, "harmful_buy_brake_active", False)),
+            harmful_buy_brake_hits_60s=int(harmful_buy_brake_hits_60s),
+            emergency_taker_forced=bool(emergency_taker_forced),
+            emergency_taker_forced_hits_60s=int(emergency_taker_forced_hits_60s),
+            emergency_no_progress_sec=float(emergency_no_progress_sec),
             defensive_to_unwind_count_window=int(defensive_to_unwind_count_window),
             quote_cancel_to_fill_ratio_60s=float(quote_cancel_to_fill_ratio_60s),
             maker_cross_guard_hits_60s=int(maker_cross_guard_hits_60s),
+            dual_bid_guard_hits_60s=int(dual_bid_guard_hits_60s),
+            dual_bid_guard_fail_hits_60s=int(dual_bid_guard_fail_hits_60s),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),

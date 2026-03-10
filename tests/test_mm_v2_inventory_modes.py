@@ -203,6 +203,50 @@ def test_poor_market_quality_only_enters_defensive_not_hard_mode():
     assert risk.quality_pressure > 0.0
 
 
+def test_non_severe_untradeable_market_is_tolerated_for_mm():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=False,
+            market_quality_score=0.62,
+            divergence_up=0.08,
+            divergence_dn=0.07,
+        ),
+        inventory=_inventory(
+            excess_value_usd=0.10,
+            signed_excess_value_usd=0.10,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "normal"
+    assert risk.hard_mode == "none"
+    assert risk.reason == "normal quoting (untradeable tolerated)"
+    assert 0.0 < risk.quality_pressure < 1.0
+
+
+def test_non_severe_untradeable_market_keeps_inventory_skewed_on_soft_excess():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=False,
+            market_quality_score=0.60,
+            divergence_up=0.07,
+            divergence_dn=0.06,
+        ),
+        inventory=_inventory(
+            excess_dn_value_usd=6.5,
+            excess_value_usd=6.5,
+            signed_excess_value_usd=-6.5,
+        ),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "inventory_skewed"
+    assert risk.hard_mode == "none"
+    assert risk.reason.startswith("soft excess")
+
+
 def test_hard_safety_true_drift_bypasses_soft_modes():
     cfg = MMConfigV2(session_budget_usd=15.0)
     risk = HardSafetyKernel(cfg).evaluate(
@@ -855,7 +899,7 @@ def test_unwind_deferred_when_viable_quotes_and_not_near_expiry():
     assert result.reason == "unwind_deferred_viable_quotes"
 
 
-def test_forced_unwind_extreme_excess_overrides_viable_quote_defer():
+def test_forced_unwind_extreme_excess_does_not_override_viable_helpful_quotes():
     cfg = MMConfigV2(session_budget_usd=30.0)
     sm = StateMachineV2(cfg)
     sm._set_lifecycle("defensive")
@@ -885,6 +929,46 @@ def test_forced_unwind_extreme_excess_overrides_viable_quote_defer():
         helpful_only=True,
         harmful_only=False,
         quote_balance_state="helpful_only",
+    )
+    result = None
+    for _ in range(max(3, int(FORCED_UNWIND_CONFIRM_TICKS))):
+        result = sm.transition(snapshot=snap, inventory=inventory, risk=risk, viability=viability)
+    assert result is not None
+    assert result.forced_unwind_extreme_excess is False
+    assert result.lifecycle == "defensive"
+    assert result.reason == "unwind_deferred_viable_quotes"
+
+
+def test_forced_unwind_extreme_excess_overrides_degraded_viability():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    sm = StateMachineV2(cfg)
+    sm._set_lifecycle("defensive")
+    snap = _snapshot(time_left_sec=600.0)
+    hard_cap = cfg.effective_hard_excess_value_ratio() * cfg.session_budget_usd
+    extreme_excess = (FORCED_UNWIND_EXCESS_MULT * hard_cap) + 0.5
+    inventory = _inventory(
+        up_shares=40.0,
+        excess_up_qty=40.0,
+        excess_up_value_usd=extreme_excess,
+        excess_value_usd=extreme_excess,
+        signed_excess_value_usd=extreme_excess,
+        total_inventory_value_usd=extreme_excess,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    assert risk.target_soft_mode == "unwind"
+    viability = QuoteViabilitySummary(
+        any_quote=True,
+        four_quotes=False,
+        helpful_count=0,
+        harmful_count=1,
+        helpful_only=False,
+        harmful_only=True,
+        quote_balance_state="reduced",
     )
     result = None
     for _ in range(max(3, int(FORCED_UNWIND_CONFIRM_TICKS))):

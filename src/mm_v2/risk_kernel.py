@@ -10,6 +10,9 @@ FLAT_BOOTSTRAP_DIVERGENCE_DEFENSIVE = 0.20
 FLAT_BOOTSTRAP_QUALITY_MULT = 0.50
 DIVERGENCE_PRESSURE_SCALE = 0.30
 DIVERGENCE_DEFENSIVE_THRESHOLD = 0.30
+UNTRADEABLE_QUALITY_MULT = 0.75
+UNTRADEABLE_DIVERGENCE_MULT = 1.50
+UNTRADEABLE_BASE_QUALITY_PRESSURE = 0.60
 
 
 @dataclass
@@ -64,10 +67,20 @@ class SoftRiskKernel:
         max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
         min_quality = float(self.config.min_market_quality_score)
         flat_bootstrap = inventory_side == "flat" and excess_value_usd < max(soft_cap * 0.5, deadband_usd)
+        is_untradeable = not bool(snapshot.market_tradeable)
+        severe_untradeable_quality = bool(
+            float(snapshot.market_quality_score) < (min_quality * UNTRADEABLE_QUALITY_MULT)
+        )
+        severe_untradeable_divergence = bool(
+            max_divergence > (DIVERGENCE_DEFENSIVE_THRESHOLD * UNTRADEABLE_DIVERGENCE_MULT)
+        )
+        severe_untradeable = bool(
+            is_untradeable and (severe_untradeable_quality or severe_untradeable_divergence)
+        )
 
         quality_pressure = 0.0
-        if not snapshot.market_tradeable:
-            quality_pressure = 1.0
+        if is_untradeable:
+            quality_pressure = max(quality_pressure, UNTRADEABLE_BASE_QUALITY_PRESSURE)
         if min_quality > 0:
             quality_deficit = max(
                 0.0,
@@ -78,6 +91,8 @@ class SoftRiskKernel:
         # saturate quality pressure too early or MM gets stuck in defensive.
         divergence_pressure = max_divergence / DIVERGENCE_PRESSURE_SCALE
         quality_pressure = max(quality_pressure, self._clamp(divergence_pressure, 0.0, 1.0))
+        if severe_untradeable:
+            quality_pressure = 1.0
 
         target_soft_mode = "normal"
         soft_reason = "normal quoting"
@@ -93,9 +108,14 @@ class SoftRiskKernel:
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
-            if not snapshot.market_tradeable:
+            if is_untradeable and severe_untradeable:
                 target_soft_mode = "defensive"
-                soft_reason = "defensive market regime (untradeable)"
+                if severe_untradeable_quality:
+                    soft_reason = "defensive market regime (untradeable severe quality)"
+                else:
+                    soft_reason = "defensive market regime (untradeable severe divergence)"
+            elif is_untradeable:
+                soft_reason = "normal quoting (untradeable tolerated)"
             elif flat_bootstrap:
                 # When inventory is effectively flat, avoid overreacting to
                 # mild quality noise. Keep two-sided MM entry possible unless

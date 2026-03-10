@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -162,10 +163,15 @@ def main() -> int:
     # Gate metrics
     outside_near_expiry_samples = 0
     min_mm_effective_ratio_60s_outside = float("inf")
+    min_dual_bid_ratio_60s_outside = float("inf")
+    dual_bid_ratio_60s_outside_samples = 0
     max_unwind_ratio_60s_outside = 0.0
     max_emergency_unwind_ratio_60s_outside = 0.0
     max_quote_none_streak_outside = 0
     quote_none_streak_outside = 0
+    max_one_sided_bid_streak_outside = 0
+    max_low_dual_bid_streak_outside = 0
+    low_dual_bid_streak_outside = 0
     final_pnl_usd = 0.0
     window_final_pnls_by_start: dict[float, float] = {}
 
@@ -201,12 +207,23 @@ def main() -> int:
 
     started_at = time.time()
     target_loss_floor = -abs(float(args.paper_max_loss_usd if args.paper_mode else args.live_max_loss_usd))
+    dual_bid_warmup_sec = 60.0
 
     def _ratio(value: Any) -> float:
         try:
             return max(0.0, min(1.0, float(value or 0.0)))
         except Exception:
             return 0.0
+
+    def _is_expected_terminal(*, lifecycle: str, hard_mode: str, reason: str) -> bool:
+        if lifecycle != "expired":
+            return False
+        if hard_mode == "none":
+            return True
+        normalized_reason = str(reason or "").strip().lower()
+        if hard_mode == "emergency_unwind" and "residual inventory near expiry" in normalized_reason:
+            return True
+        return False
 
     try:
         while (time.time() - started_at) < float(args.duration_sec):
@@ -244,6 +261,7 @@ def main() -> int:
             lifecycle = str(state.get("lifecycle") or "")
             is_running = bool(state.get("is_running"))
             hard_mode = str(risk.get("hard_mode") or "")
+            risk_reason = str(risk.get("reason") or "")
             market = state.get("market") or {}
             cfg = state.get("config") or {}
             time_left_sec = float(market.get("time_left_sec") or 0.0)
@@ -253,12 +271,16 @@ def main() -> int:
             if lifecycle == "halted" or hard_mode == "halted":
                 failures.append(
                     f"runtime halted sample={samples}: lifecycle={lifecycle} hard_mode={hard_mode} "
-                    f"reason={risk.get('reason') or ''}"
+                    f"reason={risk_reason}"
                 )
                 break
             if not is_running:
                 # Graceful end-of-window terminal in paper/live checks.
-                if lifecycle == "expired" and hard_mode == "none":
+                if _is_expected_terminal(
+                    lifecycle=lifecycle,
+                    hard_mode=hard_mode,
+                    reason=risk_reason,
+                ):
                     terminal_expected = True
                     break
                 if args.auto_roll_expired:
@@ -282,7 +304,7 @@ def main() -> int:
                         failures.append(f"runtime not running and restart failed sample={samples}: {exc}")
                 failures.append(
                     f"runtime halted sample={samples}: lifecycle={lifecycle} hard_mode={hard_mode} "
-                    f"reason={risk.get('reason') or ''}"
+                    f"reason={risk_reason}"
                 )
                 break
 
@@ -323,7 +345,14 @@ def main() -> int:
                             "local_check_warning": f"auto-roll transient failure sample={samples}: {exc}",
                         },
                     )
-            elif lifecycle == "expired" and hard_mode == "none" and not args.auto_roll_expired:
+            elif (
+                not args.auto_roll_expired
+                and _is_expected_terminal(
+                    lifecycle=lifecycle,
+                    hard_mode=hard_mode,
+                    reason=risk_reason,
+                )
+            ):
                 terminal_expected = True
                 break
 
@@ -371,11 +400,28 @@ def main() -> int:
                 mm_effective_ratio_60s = _ratio(analytics.get("mm_effective_ratio_60s"))
                 unwind_ratio_60s = _ratio(analytics.get("unwind_ratio_60s"))
                 emergency_unwind_ratio_60s = _ratio(analytics.get("emergency_unwind_ratio_60s"))
+                dual_bid_ratio_60s = _ratio(analytics.get("dual_bid_ratio_60s"))
+                one_sided_bid_streak_outside = int(analytics.get("one_sided_bid_streak_outside") or 0)
                 min_mm_effective_ratio_60s_outside = min(min_mm_effective_ratio_60s_outside, mm_effective_ratio_60s)
+                if (now - started_at) >= dual_bid_warmup_sec:
+                    dual_bid_ratio_60s_outside_samples += 1
+                    min_dual_bid_ratio_60s_outside = min(min_dual_bid_ratio_60s_outside, dual_bid_ratio_60s)
+                    if dual_bid_ratio_60s < 0.70:
+                        low_dual_bid_streak_outside += 1
+                        max_low_dual_bid_streak_outside = max(
+                            max_low_dual_bid_streak_outside,
+                            low_dual_bid_streak_outside,
+                        )
+                    else:
+                        low_dual_bid_streak_outside = 0
                 max_unwind_ratio_60s_outside = max(max_unwind_ratio_60s_outside, unwind_ratio_60s)
                 max_emergency_unwind_ratio_60s_outside = max(
                     max_emergency_unwind_ratio_60s_outside,
                     emergency_unwind_ratio_60s,
+                )
+                max_one_sided_bid_streak_outside = max(
+                    max_one_sided_bid_streak_outside,
+                    max(0, one_sided_bid_streak_outside),
                 )
                 quote_balance_state = str(analytics.get("quote_balance_state") or state.get("quote_balance_state") or "")
                 if quote_balance_state == "none":
@@ -422,6 +468,12 @@ def main() -> int:
             failed_criteria.append(
                 f"mm_effective_ratio_60s_below_0.65 (min={min_mm_effective_ratio_60s_outside:.4f})"
             )
+        low_dual_streak_limit_ticks = int(max(1, math.ceil(120.0 / max(0.1, float(args.poll_sec)))))
+        if max_low_dual_bid_streak_outside > low_dual_streak_limit_ticks:
+            failed_criteria.append(
+                "dual_bid_ratio_60s_low_sustained "
+                f"(max_streak_ticks={max_low_dual_bid_streak_outside}, limit={low_dual_streak_limit_ticks})"
+            )
         if max_unwind_ratio_60s_outside > 0.35:
             failed_criteria.append(
                 f"unwind_ratio_60s_above_0.35 (max={max_unwind_ratio_60s_outside:.4f})"
@@ -433,6 +485,10 @@ def main() -> int:
         if max_quote_none_streak_outside > 3:
             failed_criteria.append(
                 f"quote_balance_none_streak_above_3 (max={max_quote_none_streak_outside})"
+            )
+        if max_one_sided_bid_streak_outside > 6:
+            failed_criteria.append(
+                f"one_sided_bid_streak_outside_above_6 (max={max_one_sided_bid_streak_outside})"
             )
 
     gate_verdict = "go" if not failed_criteria else "no_go"
@@ -451,10 +507,21 @@ def main() -> int:
             "min_mm_effective_ratio_60s": (
                 0.0 if min_mm_effective_ratio_60s_outside == float("inf") else float(min_mm_effective_ratio_60s_outside)
             ),
+            "min_dual_bid_ratio_60s": (
+                1.0 if min_dual_bid_ratio_60s_outside == float("inf") else float(min_dual_bid_ratio_60s_outside)
+            ),
+            "dual_bid_ratio_60s_samples": int(dual_bid_ratio_60s_outside_samples),
             "max_unwind_ratio_60s": float(max_unwind_ratio_60s_outside),
             "max_emergency_unwind_ratio_60s": float(max_emergency_unwind_ratio_60s_outside),
             "max_quote_balance_none_streak": int(max_quote_none_streak_outside),
+            "max_one_sided_bid_streak_outside": int(max_one_sided_bid_streak_outside),
+            "max_low_dual_bid_streak_outside": int(max_low_dual_bid_streak_outside),
         },
+        "dual_bid_ratio_60s_min_outside": (
+            1.0 if min_dual_bid_ratio_60s_outside == float("inf") else float(min_dual_bid_ratio_60s_outside)
+        ),
+        "max_one_sided_bid_streak_outside": int(max_one_sided_bid_streak_outside),
+        "max_low_dual_bid_streak_outside": int(max_low_dual_bid_streak_outside),
         "failures": failures,
         "params": {
             "base_url": args.base_url,

@@ -214,6 +214,13 @@ class StateMachineV2:
         forced_unwind_threshold = float(FORCED_UNWIND_EXCESS_MULT) * float(hard_cap)
         extreme_excess = float(inventory.excess_value_usd) >= forced_unwind_threshold
         viable_unwind_quote_balance = viability.quote_balance_state in {"helpful_only", "reduced", "balanced"}
+        suppress_forced_unwind_on_viable_helpful = (
+            risk.hard_mode == "none"
+            and float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
+            and viability.any_quote
+            and viability.helpful_count > 0
+            and viability.quote_balance_state in {"helpful_only", "balanced"}
+        )
         defer_unwind_with_viable_quotes = (
             target_soft_mode == "unwind"
             and risk.hard_mode == "none"
@@ -221,7 +228,11 @@ class StateMachineV2:
             and viability.any_quote
             and viable_unwind_quote_balance
         )
-        if target_soft_mode == "unwind" and extreme_excess:
+        if (
+            target_soft_mode == "unwind"
+            and extreme_excess
+            and not suppress_forced_unwind_on_viable_helpful
+        ):
             self._forced_unwind_ticks += 1
         else:
             self._forced_unwind_ticks = 0
@@ -234,15 +245,41 @@ class StateMachineV2:
             if self._target_soft_mode_ticks >= ENTER_CONFIRM_TICKS:
                 for name, level in self._SOFT_ORDER.items():
                     if level == current_level + 1:
-                        if name == "unwind" and defer_unwind_with_viable_quotes:
-                            if self._forced_unwind_ticks >= int(FORCED_UNWIND_CONFIRM_TICKS):
-                                next_state = "unwind"
-                                forced_unwind_extreme_excess = True
-                                reason = "forced_unwind_extreme_excess"
+                        if name == "unwind":
+                            # In MM-first flow, defensive -> unwind should not happen
+                            # just because target flips for one/two noisy ticks.
+                            # Outside near-expiry we hold defensive unless:
+                            # 1) stuck/degraded branch confirms no progress (handled below), or
+                            # 2) extreme excess override is confirmed.
+                            hold_defensive_for_stuck_confirmation = (
+                                self.lifecycle == "defensive"
+                                and risk.hard_mode == "none"
+                                and float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
+                            )
+                            if hold_defensive_for_stuck_confirmation:
+                                if self._forced_unwind_ticks >= int(FORCED_UNWIND_CONFIRM_TICKS):
+                                    next_state = "unwind"
+                                    forced_unwind_extreme_excess = True
+                                    reason = "forced_unwind_extreme_excess"
+                                else:
+                                    next_state = self.lifecycle
+                                    unwind_deferred = True
+                                    if defer_unwind_with_viable_quotes:
+                                        reason = "unwind_deferred_viable_quotes"
+                                    else:
+                                        reason = "unwind_deferred_pending_stuck_confirmation"
+                            elif defer_unwind_with_viable_quotes:
+                                if self._forced_unwind_ticks >= int(FORCED_UNWIND_CONFIRM_TICKS):
+                                    next_state = "unwind"
+                                    forced_unwind_extreme_excess = True
+                                    reason = "forced_unwind_extreme_excess"
+                                else:
+                                    next_state = self.lifecycle
+                                    unwind_deferred = True
+                                    reason = "unwind_deferred_viable_quotes"
                             else:
-                                next_state = self.lifecycle
-                                unwind_deferred = True
-                                reason = "unwind_deferred_viable_quotes"
+                                next_state = "unwind"
+                                reason = f"escalation: {self.lifecycle}->unwind"
                         else:
                             next_state = name
                             reason = f"escalation: {self.lifecycle}->{name}"
