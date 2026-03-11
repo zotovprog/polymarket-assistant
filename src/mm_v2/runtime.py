@@ -99,6 +99,9 @@ class MarketMakerV2:
         self._dual_bid_guard_inventory_budget_history: list[tuple[float, int]] = []
         self._midpoint_first_brake_history: list[tuple[float, int]] = []
         self._simultaneous_bid_block_prevented_history: list[tuple[float, int]] = []
+        self._divergence_soft_brake_history: list[tuple[float, int]] = []
+        self._divergence_hard_suppress_history: list[tuple[float, int]] = []
+        self._buy_edge_gap_history: list[tuple[float, float]] = []
         self._emergency_taker_forced_history: list[tuple[float, int]] = []
         self._one_sided_bid_streak_outside: int = 0
         self._unwind_deferred_history: list[tuple[float, int]] = []
@@ -353,6 +356,9 @@ class MarketMakerV2:
         self._dual_bid_guard_inventory_budget_history.clear()
         self._midpoint_first_brake_history.clear()
         self._simultaneous_bid_block_prevented_history.clear()
+        self._divergence_soft_brake_history.clear()
+        self._divergence_hard_suppress_history.clear()
+        self._buy_edge_gap_history.clear()
         self._emergency_taker_forced_history.clear()
         self._one_sided_bid_streak_outside = 0
         self._unwind_deferred_history.clear()
@@ -1024,6 +1030,20 @@ class MarketMakerV2:
         cutoff = ref_now - max(1.0, float(window_sec))
         return int(sum(int(value or 0) for ts, value in history if ts >= cutoff))
 
+    @staticmethod
+    def _window_max(
+        history: list[tuple[float, float]],
+        *,
+        window_sec: float,
+        now: float | None = None,
+    ) -> float:
+        ref_now = float(now if now is not None else time.time())
+        cutoff = ref_now - max(1.0, float(window_sec))
+        values = [float(value or 0.0) for ts, value in history if ts >= cutoff]
+        if not values:
+            return 0.0
+        return float(max(values))
+
     def _fills_count_window(self, *, window_sec: float, now: float | None = None) -> int:
         ref_now = float(now if now is not None else time.time())
         cutoff = ref_now - max(1.0, float(window_sec))
@@ -1060,6 +1080,8 @@ class MarketMakerV2:
         one_sided_bid_streak_outside: int = 0,
         outside_near_expiry: bool = True,
         quote_balance_state: str = "",
+        dual_bid_exception_active: bool = False,
+        dual_bid_exception_reason: str = "",
     ) -> None:
         now = time.time()
         mm_active_ratio_60s = float(
@@ -1072,6 +1094,8 @@ class MarketMakerV2:
             reason = "high_emergency_ratio"
         elif mm_active_ratio_60s < 0.30:
             reason = "low_mm_effective"
+        elif outside_near_expiry and dual_bid_exception_active and dual_bid_exception_reason:
+            reason = str(dual_bid_exception_reason)
         elif outside_near_expiry and dual_bid_ratio_60s < 0.70:
             reason = "low_dual_bid_ratio"
         elif str(quote_balance_state or "").lower() == "none":
@@ -1512,10 +1536,13 @@ class MarketMakerV2:
             and effective_risk.soft_mode in {"normal", "inventory_skewed"}
             and (up_bid_active or dn_bid_active)
         )
+        dual_bid_exception_active = bool(getattr(plan, "dual_bid_exception_active", False))
+        dual_bid_exception_reason = str(getattr(plan, "dual_bid_exception_reason", "") or "")
         if dual_bid_mode_eligible:
             self._dual_bid_outside_sample_history.append((now, 1))
-            self._dual_bid_outside_success_history.append((now, 1 if dual_bid_active else 0))
-            if one_sided_bid_active:
+            dual_bid_success = bool(dual_bid_active or (one_sided_bid_active and dual_bid_exception_active))
+            self._dual_bid_outside_success_history.append((now, 1 if dual_bid_success else 0))
+            if one_sided_bid_active and not dual_bid_exception_active:
                 self._one_sided_bid_streak_outside += 1
             else:
                 self._one_sided_bid_streak_outside = 0
@@ -1541,6 +1568,13 @@ class MarketMakerV2:
         midpoint_first_brake_hits_tick = int(getattr(plan, "midpoint_first_brake_hits", 0) or 0)
         simultaneous_bid_block_prevented_tick = int(
             getattr(plan, "simultaneous_bid_block_prevented", 0) or 0
+        )
+        divergence_soft_brake_hits_tick = int(getattr(plan, "divergence_soft_brake_hits", 0) or 0)
+        divergence_hard_suppress_hits_tick = int(getattr(plan, "divergence_hard_suppress_hits", 0) or 0)
+        buy_edge_gap_tick = max(
+            0.0,
+            float(getattr(snapshot, "buy_edge_gap_up", 0.0) or 0.0),
+            float(getattr(snapshot, "buy_edge_gap_dn", 0.0) or 0.0),
         )
         dual_bid_guard_fail_hits_tick = sum(
             1
@@ -1586,6 +1620,9 @@ class MarketMakerV2:
         self._dual_bid_guard_inventory_budget_history.append((now, int(dual_bid_guard_inventory_budget_hits_tick)))
         self._midpoint_first_brake_history.append((now, int(midpoint_first_brake_hits_tick)))
         self._simultaneous_bid_block_prevented_history.append((now, int(simultaneous_bid_block_prevented_tick)))
+        self._divergence_soft_brake_history.append((now, int(divergence_soft_brake_hits_tick)))
+        self._divergence_hard_suppress_history.append((now, int(divergence_hard_suppress_hits_tick)))
+        self._buy_edge_gap_history.append((now, float(buy_edge_gap_tick)))
         self._emergency_taker_forced_history.append((now, 1 if emergency_taker_forced else 0))
         self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
         self._forced_unwind_extreme_excess_history.append((now, int(forced_unwind_extreme_excess_hits_tick)))
@@ -1608,6 +1645,9 @@ class MarketMakerV2:
         self._prune_history(self._dual_bid_guard_inventory_budget_history, now=window_now)
         self._prune_history(self._midpoint_first_brake_history, now=window_now)
         self._prune_history(self._simultaneous_bid_block_prevented_history, now=window_now)
+        self._prune_history(self._divergence_soft_brake_history, now=window_now)
+        self._prune_history(self._divergence_hard_suppress_history, now=window_now)
+        self._prune_history(self._buy_edge_gap_history, now=window_now)
         self._prune_history(self._emergency_taker_forced_history, now=window_now)
         self._prune_history(self._unwind_deferred_history, now=window_now)
         self._prune_history(self._forced_unwind_extreme_excess_history, now=window_now)
@@ -1677,6 +1717,21 @@ class MarketMakerV2:
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
+        divergence_soft_brake_hits_60s = self._window_sum(
+            self._divergence_soft_brake_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        divergence_hard_suppress_hits_60s = self._window_sum(
+            self._divergence_hard_suppress_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        max_buy_edge_gap_60s = self._window_max(
+            self._buy_edge_gap_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
         dual_bid_outside_samples_60s = self._window_sum(
             self._dual_bid_outside_sample_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
@@ -1725,6 +1780,8 @@ class MarketMakerV2:
             one_sided_bid_streak_outside=int(self._one_sided_bid_streak_outside),
             outside_near_expiry=bool(outside_near_expiry),
             quote_balance_state=str(plan.quote_balance_state),
+            dual_bid_exception_active=bool(dual_bid_exception_active),
+            dual_bid_exception_reason=str(dual_bid_exception_reason),
         )
         target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
         target_ratio_cap_active = bool(target_ratio_cap_hits_tick > 0)
@@ -1751,6 +1808,8 @@ class MarketMakerV2:
             tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
             anchor_divergence_up=float(snapshot.anchor_divergence_up),
             anchor_divergence_dn=float(snapshot.anchor_divergence_dn),
+            buy_edge_gap_up=float(getattr(snapshot, "buy_edge_gap_up", 0.0) or 0.0),
+            buy_edge_gap_dn=float(getattr(snapshot, "buy_edge_gap_dn", 0.0) or 0.0),
             quote_shift_from_mid_up=float(quote_shift_from_mid_up),
             quote_shift_from_mid_dn=float(quote_shift_from_mid_dn),
             post_fill_markout_5s_up=float(self._post_fill_markout_5s_up),
@@ -1819,6 +1878,15 @@ class MarketMakerV2:
             dual_bid_guard_fail_hits_60s=int(dual_bid_guard_fail_hits_60s),
             midpoint_first_brake_hits_60s=int(midpoint_first_brake_hits_60s),
             simultaneous_bid_block_prevented_hits_60s=int(simultaneous_bid_block_prevented_hits_60s),
+            divergence_soft_brake_up_active=bool(getattr(plan, "divergence_soft_brake_up_active", False)),
+            divergence_soft_brake_dn_active=bool(getattr(plan, "divergence_soft_brake_dn_active", False)),
+            divergence_hard_suppress_up_active=bool(getattr(plan, "divergence_hard_suppress_up_active", False)),
+            divergence_hard_suppress_dn_active=bool(getattr(plan, "divergence_hard_suppress_dn_active", False)),
+            divergence_soft_brake_hits_60s=int(divergence_soft_brake_hits_60s),
+            divergence_hard_suppress_hits_60s=int(divergence_hard_suppress_hits_60s),
+            max_buy_edge_gap_60s=float(max_buy_edge_gap_60s),
+            dual_bid_exception_active=bool(dual_bid_exception_active),
+            dual_bid_exception_reason=str(dual_bid_exception_reason),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),

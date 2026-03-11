@@ -57,6 +57,10 @@ class QuotePolicyV2:
     MIDPOINT_FIRST_SHIFT_SPREAD_FRACTION = 0.35
     MIDPOINT_FIRST_DIVERGENCE_BRAKE_START = 0.03
     MIDPOINT_FIRST_DIVERGENCE_BRAKE_FULL = 0.10
+    DIVERGENCE_BUY_SOFT_BRAKE_START = 0.05
+    DIVERGENCE_BUY_HARD_SUPPRESS = 0.18
+    DIVERGENCE_BUY_SPREAD_TICKS_MAX = 6
+    DIVERGENCE_BUY_SIZE_BRAKE_MIN = 0.10
     TOXIC_SIDE_SPREAD_TICKS_MAX = 3
     TOXIC_SIDE_SIZE_BRAKE_MIN = 0.35
 
@@ -173,6 +177,30 @@ class QuotePolicyV2:
         if divergence <= start + 1e-9:
             return 0.0
         return self._clamp((divergence - start) / max(1e-9, full - start), 0.0, 1.0)
+
+    @staticmethod
+    def _buy_edge_gap(
+        *,
+        snapshot: PairMarketSnapshot,
+        token_side: Literal["up", "dn"],
+    ) -> float:
+        gap = float(
+            snapshot.buy_edge_gap_up if token_side == "up" else snapshot.buy_edge_gap_dn
+        )
+        return max(0.0, gap)
+
+    def _divergence_buy_pressure(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        token_side: Literal["up", "dn"],
+    ) -> float:
+        gap = self._buy_edge_gap(snapshot=snapshot, token_side=token_side)
+        start = float(self.DIVERGENCE_BUY_SOFT_BRAKE_START)
+        hard = float(self.DIVERGENCE_BUY_HARD_SUPPRESS)
+        if gap <= start + 1e-9:
+            return 0.0
+        return self._clamp((gap - start) / max(1e-9, hard - start), 0.0, 1.0)
 
     def _harmful_buy_brake_mult(
         self,
@@ -529,6 +557,14 @@ class QuotePolicyV2:
         dual_bid_guard_inventory_budget_hits = 0
         midpoint_first_brake_hits = 0
         simultaneous_bid_block_prevented = 0
+        divergence_soft_brake_up_active = False
+        divergence_soft_brake_dn_active = False
+        divergence_hard_suppress_up_active = False
+        divergence_hard_suppress_dn_active = False
+        divergence_soft_brake_hits = 0
+        divergence_hard_suppress_hits = 0
+        dual_bid_exception_active = False
+        dual_bid_exception_reason = ""
         gross_inventory_brake_active_tick = False
         side_soft_brake_active_tick = False
         drawdown_brake_active = (
@@ -574,6 +610,14 @@ class QuotePolicyV2:
                 snapshot=snapshot,
                 token_side=token_side,
             )
+            buy_edge_gap = self._buy_edge_gap(
+                snapshot=snapshot,
+                token_side=token_side,
+            )
+            divergence_buy_pressure = self._divergence_buy_pressure(
+                snapshot=snapshot,
+                token_side=token_side,
+            )
             token_spread_extra_ticks = min(
                 int(self.TOXIC_SIDE_SPREAD_TICKS_MAX),
                 max(
@@ -593,6 +637,40 @@ class QuotePolicyV2:
                         token_buy_size_brake_mult,
                         max(self.TOXIC_SIDE_SIZE_BRAKE_MIN, 1.0 - 0.50 * float(token_divergence_pressure)),
                     )
+            if (
+                side == "BUY"
+                and bool(snapshot.market_tradeable)
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed"}
+            ):
+                if buy_edge_gap >= float(self.DIVERGENCE_BUY_HARD_SUPPRESS):
+                    built[slot] = None
+                    suppressed_reasons[slot] = "divergence_buy_hard_suppress"
+                    midpoint_first_brake_hits += 1
+                    divergence_hard_suppress_hits += 1
+                    if token_side == "up":
+                        divergence_hard_suppress_up_active = True
+                    else:
+                        divergence_hard_suppress_dn_active = True
+                    continue
+                if divergence_buy_pressure > 0.0:
+                    divergence_extra_ticks = int(
+                        math.ceil(divergence_buy_pressure * float(self.DIVERGENCE_BUY_SPREAD_TICKS_MAX))
+                    )
+                    token_spread_extra_ticks = max(token_spread_extra_ticks, divergence_extra_ticks)
+                    token_buy_size_brake_mult = min(
+                        token_buy_size_brake_mult,
+                        max(
+                            self.DIVERGENCE_BUY_SIZE_BRAKE_MIN,
+                            1.0 - (0.90 * float(divergence_buy_pressure)),
+                        ),
+                    )
+                    divergence_soft_brake_hits += 1
+                    midpoint_first_brake_hits += 1
+                    if token_side == "up":
+                        divergence_soft_brake_up_active = True
+                    else:
+                        divergence_soft_brake_dn_active = True
             if (
                 side == "BUY"
                 and token_hard_block_sec > 0.0
@@ -1040,6 +1118,7 @@ class QuotePolicyV2:
                 blocked_by_pre_protective = existing_reason == "harmful_buy_blocked_pre_protective"
                 blocked_by_harmful_skew = blocked_by_high_skew or blocked_by_pre_protective
                 if existing_reason in {
+                    "divergence_buy_hard_suppress",
                     "harmful_suppressed_in_defensive",
                     "harmful_suppressed_in_unwind",
                     "target_pair_ratio_cap",
@@ -1205,6 +1284,28 @@ class QuotePolicyV2:
                                         built[missing_slot] = intent
                                         suppressed_reasons[missing_slot] = "dual_bid_guard_applied"
 
+        if (
+            outside_near_expiry
+            and risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed"}
+            and bool(snapshot.market_tradeable)
+        ):
+            up_reason = str(suppressed_reasons.get("up_bid") or "")
+            dn_reason = str(suppressed_reasons.get("dn_bid") or "")
+            up_bid_active = built["up_bid"] is not None
+            dn_bid_active = built["dn_bid"] is not None
+            if (
+                up_bid_active
+                and not dn_bid_active
+                and dn_reason == "divergence_buy_hard_suppress"
+            ) or (
+                dn_bid_active
+                and not up_bid_active
+                and up_reason == "divergence_buy_hard_suppress"
+            ):
+                dual_bid_exception_active = True
+                dual_bid_exception_reason = "divergence_buy_hard_suppress"
+
         regime = risk.soft_mode
         reason = risk.reason
         if risk.hard_mode == "emergency_unwind":
@@ -1342,5 +1443,13 @@ class QuotePolicyV2:
             dual_bid_guard_inventory_budget_hits=int(dual_bid_guard_inventory_budget_hits),
             midpoint_first_brake_hits=int(midpoint_first_brake_hits),
             simultaneous_bid_block_prevented=int(simultaneous_bid_block_prevented),
+            divergence_soft_brake_up_active=bool(divergence_soft_brake_up_active),
+            divergence_soft_brake_dn_active=bool(divergence_soft_brake_dn_active),
+            divergence_hard_suppress_up_active=bool(divergence_hard_suppress_up_active),
+            divergence_hard_suppress_dn_active=bool(divergence_hard_suppress_dn_active),
+            divergence_soft_brake_hits=int(divergence_soft_brake_hits),
+            divergence_hard_suppress_hits=int(divergence_hard_suppress_hits),
+            dual_bid_exception_active=bool(dual_bid_exception_active),
+            dual_bid_exception_reason=str(dual_bid_exception_reason or ""),
             quote_anchor_mode="midpoint_first",
         )

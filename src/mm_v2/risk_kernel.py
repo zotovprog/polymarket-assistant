@@ -66,6 +66,47 @@ class SoftRiskKernel:
         target_ratio_activation_usd = float(self.config.effective_target_ratio_activation_usd())
         gross_brake_activation_usd = max(1.5, 0.05 * budget)
         material_inventory_usd = max(6.0, 0.20 * budget)
+        up_inventory_value_usd = max(
+            0.0,
+            float(inventory.up_shares)
+            * max(
+                0.01,
+                float(
+                    snapshot.up_best_bid
+                    if snapshot.up_best_bid is not None
+                    else snapshot.midpoint_anchor_up
+                    if snapshot.midpoint_anchor_up is not None
+                    else snapshot.fv_up
+                ),
+            ),
+        )
+        dn_inventory_value_usd = max(
+            0.0,
+            float(inventory.dn_shares)
+            * max(
+                0.01,
+                float(
+                    snapshot.dn_best_bid
+                    if snapshot.dn_best_bid is not None
+                    else snapshot.midpoint_anchor_dn
+                    if snapshot.midpoint_anchor_dn is not None
+                    else snapshot.fv_dn
+                ),
+            ),
+        )
+        buy_edge_gap_up = float(getattr(snapshot, "buy_edge_gap_up", 0.0) or 0.0)
+        buy_edge_gap_dn = float(getattr(snapshot, "buy_edge_gap_dn", 0.0) or 0.0)
+        toxic_buy_gap_threshold = 0.18
+        toxic_divergence_inventory_up = bool(
+            bool(snapshot.market_tradeable)
+            and buy_edge_gap_up >= toxic_buy_gap_threshold
+            and up_inventory_value_usd >= material_inventory_usd
+        )
+        toxic_divergence_inventory_dn = bool(
+            bool(snapshot.market_tradeable)
+            and buy_edge_gap_dn >= toxic_buy_gap_threshold
+            and dn_inventory_value_usd >= material_inventory_usd
+        )
 
         max_divergence = max(float(snapshot.divergence_up), float(snapshot.divergence_dn))
         min_quality = float(self.config.min_market_quality_score)
@@ -115,6 +156,14 @@ class SoftRiskKernel:
         elif excess_value_usd >= defensive_cap:
             target_soft_mode = "defensive"
             soft_reason = "defensive excess regime"
+        elif toxic_divergence_inventory_up or toxic_divergence_inventory_dn:
+            target_soft_mode = "defensive"
+            if toxic_divergence_inventory_up and toxic_divergence_inventory_dn:
+                soft_reason = "defensive toxic divergence inventory"
+            elif toxic_divergence_inventory_up:
+                soft_reason = "defensive toxic divergence inventory (up)"
+            else:
+                soft_reason = "defensive toxic divergence inventory (dn)"
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD

@@ -136,9 +136,75 @@ def test_tradeable_valuation_uses_midpoint_bounded_model_source(monkeypatch):
     assert result.source == "midpoint_bounded_model"
     assert snapshot.model_anchor_up == pytest.approx(0.10)
     assert snapshot.midpoint_anchor_up == pytest.approx(0.25)
+    assert snapshot.buy_edge_gap_up == pytest.approx(0.15)
     assert snapshot.anchor_divergence_up == pytest.approx(0.15)
+    assert snapshot.valuation_regime == "divergent"
     assert 0.23 <= snapshot.fv_up <= 0.26
     assert 0.74 <= snapshot.fv_dn <= 0.77
+
+
+def test_tradeable_valuation_marks_toxic_divergence_when_buy_gap_large(monkeypatch):
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    engine = PairValuationEngine(cfg)
+    monkeypatch.setattr(engine.provider, "compute", lambda *args, **kwargs: (0.02, 0.98))
+    market = _market()
+    feed_state = SimpleNamespace(
+        mid=100000.0,
+        klines=[],
+        pm_up=0.25,
+        pm_dn=0.75,
+        pm_last_update_ts=time.time(),
+        bids=[],
+        asks=[],
+        trades=[],
+    )
+    up_book = {"best_bid": 0.24, "best_ask": 0.26, "bid_depth_usd": 250.0, "ask_depth_usd": 250.0}
+    dn_book = {"best_bid": 0.74, "best_ask": 0.76, "bid_depth_usd": 250.0, "ask_depth_usd": 250.0}
+
+    _, snapshot = engine.compute(
+        market=market,
+        feed_state=feed_state,
+        up_book=up_book,
+        dn_book=dn_book,
+    )
+
+    assert snapshot.market_tradeable is True
+    assert snapshot.buy_edge_gap_up == pytest.approx(0.23)
+    assert snapshot.valuation_regime == "toxic_divergence"
+
+
+def test_soft_risk_enters_defensive_for_toxic_divergence_inventory():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        midpoint_anchor_up=0.68,
+        midpoint_anchor_dn=0.32,
+        model_anchor_up=0.17,
+        model_anchor_dn=0.83,
+        buy_edge_gap_up=0.51,
+        buy_edge_gap_dn=-0.51,
+        divergence_up=0.10,
+        divergence_dn=0.10,
+        valuation_regime="toxic_divergence",
+    )
+    inventory = _inventory(
+        up_shares=12.0,
+        total_inventory_value_usd=8.2,
+        excess_up_value_usd=3.1,
+        excess_value_usd=3.1,
+        signed_excess_value_usd=3.1,
+        inventory_pressure_abs=0.25,
+        inventory_pressure_signed=0.25,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+
+    assert risk.target_soft_mode == "defensive"
+    assert "toxic divergence inventory" in risk.reason
 
 
 def test_pmgateway_disables_naked_sells_for_live_client():
@@ -1574,21 +1640,41 @@ async def test_state_exposes_midpoint_reference_and_side_brake_fields(monkeypatc
             "lifecycle": "inventory_skewed",
             "analytics": {
                 "midpoint_reference_mode": "midpoint_bounded_model",
+                "buy_edge_gap_up": 0.24,
+                "buy_edge_gap_dn": 0.0,
                 "side_soft_brake_up_active": True,
                 "side_soft_brake_dn_active": False,
                 "side_hard_block_up_sec": 6.5,
                 "side_hard_block_dn_sec": 0.0,
                 "simultaneous_bid_block_prevented_hits_60s": 3,
+                "divergence_soft_brake_up_active": True,
+                "divergence_soft_brake_dn_active": False,
+                "divergence_hard_suppress_up_active": True,
+                "divergence_hard_suppress_dn_active": False,
+                "divergence_soft_brake_hits_60s": 4,
+                "divergence_hard_suppress_hits_60s": 2,
+                "max_buy_edge_gap_60s": 0.24,
+                "dual_bid_exception_active": True,
+                "dual_bid_exception_reason": "divergence_buy_hard_suppress",
             },
         },
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["analytics"]["midpoint_reference_mode"] == "midpoint_bounded_model"
+    assert resp["analytics"]["buy_edge_gap_up"] == pytest.approx(0.24)
+    assert resp["analytics"]["buy_edge_gap_dn"] == pytest.approx(0.0)
     assert resp["analytics"]["side_soft_brake_up_active"] is True
     assert resp["analytics"]["side_soft_brake_dn_active"] is False
     assert resp["analytics"]["side_hard_block_up_sec"] == pytest.approx(6.5)
     assert resp["analytics"]["side_hard_block_dn_sec"] == pytest.approx(0.0)
     assert resp["analytics"]["simultaneous_bid_block_prevented_hits_60s"] == 3
+    assert resp["analytics"]["divergence_soft_brake_up_active"] is True
+    assert resp["analytics"]["divergence_hard_suppress_up_active"] is True
+    assert resp["analytics"]["divergence_soft_brake_hits_60s"] == 4
+    assert resp["analytics"]["divergence_hard_suppress_hits_60s"] == 2
+    assert resp["analytics"]["max_buy_edge_gap_60s"] == pytest.approx(0.24)
+    assert resp["analytics"]["dual_bid_exception_active"] is True
+    assert resp["analytics"]["dual_bid_exception_reason"] == "divergence_buy_hard_suppress"
 
 
 @pytest.mark.asyncio
@@ -1826,11 +1912,22 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "dual_bid_guard_hits_60s": 2,
                 "dual_bid_guard_fail_hits_60s": 1,
                 "midpoint_reference_mode": "midpoint_bounded_model",
+                "buy_edge_gap_up": 0.24,
+                "buy_edge_gap_dn": 0.0,
                 "side_soft_brake_up_active": True,
                 "side_soft_brake_dn_active": False,
                 "side_hard_block_up_sec": 4.0,
                 "side_hard_block_dn_sec": 0.0,
                 "simultaneous_bid_block_prevented_hits_60s": 2,
+                "divergence_soft_brake_up_active": True,
+                "divergence_soft_brake_dn_active": False,
+                "divergence_hard_suppress_up_active": True,
+                "divergence_hard_suppress_dn_active": False,
+                "divergence_soft_brake_hits_60s": 5,
+                "divergence_hard_suppress_hits_60s": 2,
+                "max_buy_edge_gap_60s": 0.24,
+                "dual_bid_exception_active": True,
+                "dual_bid_exception_reason": "divergence_buy_hard_suppress",
                 "gross_inventory_brake_active": True,
                 "gross_inventory_brake_hits_60s": 3,
                 "pair_over_target_buy_blocks_60s": 2,
@@ -1868,11 +1965,20 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["dual_bid_guard_hits_60s"] == 2
     assert resp["mm_regime"]["dual_bid_guard_fail_hits_60s"] == 1
     assert resp["mm_regime"]["midpoint_reference_mode"] == "midpoint_bounded_model"
+    assert resp["mm_regime"]["buy_edge_gap_up"] == pytest.approx(0.24)
+    assert resp["mm_regime"]["buy_edge_gap_dn"] == pytest.approx(0.0)
     assert resp["mm_regime"]["side_soft_brake_up_active"] is True
     assert resp["mm_regime"]["side_soft_brake_dn_active"] is False
     assert resp["mm_regime"]["side_hard_block_up_sec"] == pytest.approx(4.0)
     assert resp["mm_regime"]["side_hard_block_dn_sec"] == pytest.approx(0.0)
     assert resp["mm_regime"]["simultaneous_bid_block_prevented_hits_60s"] == 2
+    assert resp["mm_regime"]["divergence_soft_brake_up_active"] is True
+    assert resp["mm_regime"]["divergence_hard_suppress_up_active"] is True
+    assert resp["mm_regime"]["divergence_soft_brake_hits_60s"] == 5
+    assert resp["mm_regime"]["divergence_hard_suppress_hits_60s"] == 2
+    assert resp["mm_regime"]["max_buy_edge_gap_60s"] == pytest.approx(0.24)
+    assert resp["mm_regime"]["dual_bid_exception_active"] is True
+    assert resp["mm_regime"]["dual_bid_exception_reason"] == "divergence_buy_hard_suppress"
     assert resp["mm_regime"]["gross_inventory_brake_active"] is True
     assert resp["mm_regime"]["gross_inventory_brake_hits_60s"] == 3
     assert resp["mm_regime"]["pair_over_target_buy_blocks_60s"] == 2

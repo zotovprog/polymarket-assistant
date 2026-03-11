@@ -860,6 +860,27 @@ def test_dual_bid_ratio_ignores_no_bid_ticks():
     assert mm._mm_regime_degraded_reason != "low_dual_bid_ratio"
 
 
+def test_divergence_dual_bid_exception_overrides_low_dual_bid_reason():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.45,
+        inventory_skewed_ratio_60s=0.30,
+        defensive_ratio_60s=0.10,
+        unwind_ratio_60s=0.0,
+        emergency_unwind_ratio_60s=0.0,
+        dual_bid_ratio_60s=0.10,
+        one_sided_bid_streak_outside=4,
+        outside_near_expiry=True,
+        quote_balance_state="helpful_only",
+        dual_bid_exception_active=True,
+        dual_bid_exception_reason="divergence_buy_hard_suppress",
+    )
+    assert mm._mm_regime_degraded_reason == "divergence_buy_hard_suppress"
+
+
 def test_two_weak_negative_markouts_only_arm_soft_brake_not_hard_block():
     class _MockClient:
         _orders = {}

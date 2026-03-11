@@ -168,16 +168,21 @@ class PairValuationEngine:
         quality = self.quality.analyze(up_book, dn_book, fv_up, fv_dn)
         divergence_up = abs(fv_up - pm_mid_up) if pm_mid_up is not None else abs(fv_up - midpoint_anchor_up)
         divergence_dn = abs(fv_dn - pm_mid_dn) if pm_mid_dn is not None else abs(fv_dn - midpoint_anchor_dn)
+        buy_edge_gap_up = float(midpoint_anchor_up) - float(model_up)
+        buy_edge_gap_dn = float(midpoint_anchor_dn) - float(model_dn)
         anchor_divergence_up = abs(float(model_up) - float(midpoint_anchor_up))
         anchor_divergence_dn = abs(float(model_dn) - float(midpoint_anchor_dn))
         divergence = max(divergence_up, divergence_dn)
         raw_anchor_divergence = max(anchor_divergence_up, anchor_divergence_dn)
+        max_buy_edge_gap = max(0.0, float(buy_edge_gap_up), float(buy_edge_gap_dn))
         confidence = max(
             0.0,
             min(1.0, (quality.overall_score * 0.7) + (1.0 - min(1.0, divergence / 0.20)) * 0.3),
         )
-        if not quality.tradeable:
-            regime = "illiquid"
+        if valuation_source == "model_fallback":
+            regime = "model_fallback"
+        elif quality.tradeable and max_buy_edge_gap >= 0.18:
+            regime = "toxic_divergence"
         elif raw_anchor_divergence > 0.10:
             regime = "divergent"
         else:
@@ -218,6 +223,8 @@ class PairValuationEngine:
             midpoint_anchor_dn=float(midpoint_anchor_dn),
             model_anchor_up=float(model_up),
             model_anchor_dn=float(model_dn),
+            buy_edge_gap_up=float(buy_edge_gap_up),
+            buy_edge_gap_dn=float(buy_edge_gap_dn),
             anchor_divergence_up=float(anchor_divergence_up),
             anchor_divergence_dn=float(anchor_divergence_dn),
             quote_anchor_mode="midpoint_first",

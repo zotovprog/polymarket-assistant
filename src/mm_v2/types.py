@@ -30,6 +30,8 @@ class PairMarketSnapshot:
     midpoint_anchor_dn: float | None = None
     model_anchor_up: float | None = None
     model_anchor_dn: float | None = None
+    buy_edge_gap_up: float = 0.0
+    buy_edge_gap_dn: float = 0.0
     anchor_divergence_up: float = 0.0
     anchor_divergence_dn: float = 0.0
     quote_anchor_mode: str = "midpoint_first"
@@ -116,6 +118,14 @@ class QuotePlan:
     dual_bid_guard_inventory_budget_hits: int = 0
     midpoint_first_brake_hits: int = 0
     simultaneous_bid_block_prevented: int = 0
+    divergence_soft_brake_up_active: bool = False
+    divergence_soft_brake_dn_active: bool = False
+    divergence_hard_suppress_up_active: bool = False
+    divergence_hard_suppress_dn_active: bool = False
+    divergence_soft_brake_hits: int = 0
+    divergence_hard_suppress_hits: int = 0
+    dual_bid_exception_active: bool = False
+    dual_bid_exception_reason: str = ""
     quote_anchor_mode: str = "midpoint_first"
 
 
@@ -184,6 +194,8 @@ class AnalyticsState:
     tradeable_portfolio_value_usd: float = 0.0
     anchor_divergence_up: float = 0.0
     anchor_divergence_dn: float = 0.0
+    buy_edge_gap_up: float = 0.0
+    buy_edge_gap_dn: float = 0.0
     quote_shift_from_mid_up: float = 0.0
     quote_shift_from_mid_dn: float = 0.0
     post_fill_markout_5s_up: float = 0.0
@@ -247,6 +259,15 @@ class AnalyticsState:
     dual_bid_guard_fail_hits_60s: int = 0
     midpoint_first_brake_hits_60s: int = 0
     simultaneous_bid_block_prevented_hits_60s: int = 0
+    divergence_soft_brake_up_active: bool = False
+    divergence_soft_brake_dn_active: bool = False
+    divergence_hard_suppress_up_active: bool = False
+    divergence_hard_suppress_dn_active: bool = False
+    divergence_soft_brake_hits_60s: int = 0
+    divergence_hard_suppress_hits_60s: int = 0
+    max_buy_edge_gap_60s: float = 0.0
+    dual_bid_exception_active: bool = False
+    dual_bid_exception_reason: str = ""
     harmful_buy_brake_active: bool = False
     harmful_buy_brake_hits_60s: int = 0
     emergency_taker_forced: bool = False

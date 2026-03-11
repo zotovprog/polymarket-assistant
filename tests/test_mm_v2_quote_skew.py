@@ -1701,6 +1701,109 @@ def test_simultaneous_hard_block_keeps_less_toxic_bid_midpoint_safe():
     assert plan.suppressed_reasons.get("dn_bid") == "side_reentry_cooldown"
 
 
+def test_divergence_buy_soft_brake_widens_and_reduces_toxic_bid():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    baseline_snapshot = _snapshot(
+        time_left_sec=600.0,
+        market_tradeable=True,
+        midpoint_anchor_up=0.60,
+        midpoint_anchor_dn=0.40,
+        up_best_bid=0.58,
+        up_best_ask=0.70,
+        model_anchor_up=0.60,
+        model_anchor_dn=0.40,
+        buy_edge_gap_up=0.0,
+        buy_edge_gap_dn=0.0,
+    )
+    snapshot = _snapshot(
+        time_left_sec=600.0,
+        market_tradeable=True,
+        midpoint_anchor_up=0.60,
+        midpoint_anchor_dn=0.40,
+        up_best_bid=0.58,
+        up_best_ask=0.70,
+        model_anchor_up=0.50,
+        model_anchor_dn=0.50,
+        buy_edge_gap_up=0.10,
+        buy_edge_gap_dn=0.0,
+    )
+    inventory = _inventory(free_usdc=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    baseline_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=baseline_snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    baseline_plan = QuotePolicyV2(cfg).generate(
+        snapshot=baseline_snapshot,
+        inventory=inventory,
+        risk=baseline_risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+
+    assert plan.up_bid is not None
+    assert baseline_plan.up_bid is not None
+    assert plan.divergence_soft_brake_up_active is True
+    assert plan.divergence_hard_suppress_up_active is False
+    assert plan.divergence_soft_brake_hits >= 1
+    assert plan.up_bid.price <= baseline_plan.up_bid.price
+    assert plan.up_bid.size < baseline_plan.up_bid.size
+
+
+def test_divergence_buy_hard_suppress_blocks_toxic_bid_and_sets_dual_bid_exception():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        time_left_sec=600.0,
+        market_tradeable=True,
+        midpoint_anchor_up=0.68,
+        midpoint_anchor_dn=0.32,
+        model_anchor_up=0.17,
+        model_anchor_dn=0.83,
+        buy_edge_gap_up=0.51,
+        buy_edge_gap_dn=0.0,
+        up_best_bid=0.67,
+        up_best_ask=0.69,
+        dn_best_bid=0.31,
+        dn_best_ask=0.33,
+    )
+    inventory = _inventory(free_usdc=30.0)
+    risk = replace(
+        HardSafetyKernel(cfg).evaluate(
+            snapshot=snapshot,
+            inventory=inventory,
+            analytics=AnalyticsState(),
+            health=HealthState(),
+        ),
+        soft_mode="normal",
+        target_soft_mode="normal",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+
+    assert plan.up_bid is None
+    assert plan.dn_bid is not None
+    assert plan.suppressed_reasons.get("up_bid") == "divergence_buy_hard_suppress"
+    assert plan.divergence_hard_suppress_up_active is True
+    assert plan.dual_bid_exception_active is True
+    assert plan.dual_bid_exception_reason == "divergence_buy_hard_suppress"
+
+
 def test_harmful_buy_brake_reduces_clip_as_excess_grows():
     cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0, harmful_buy_suppress_ratio=0.50)
     snapshot = _snapshot()
