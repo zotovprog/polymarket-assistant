@@ -647,6 +647,33 @@ class MarketMakerV2:
             return 0.0
         return max(0.0, float(now - self._terminal_liquidation_started_ts))
 
+    def _coerce_terminal_drawdown_risk(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        inventory: PairInventoryState,
+        risk: RiskRegime,
+        health: HealthState,
+    ) -> RiskRegime:
+        if risk.hard_mode != "halted":
+            return risk
+        if not bool(getattr(health, "drawdown_breach_active", False)):
+            return risk
+        if not str(risk.reason or "").startswith("hard drawdown"):
+            return risk
+        terminal_window_active = float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec())
+        if not terminal_window_active:
+            return risk
+        residual_inventory = max(
+            float(inventory.up_shares),
+            float(inventory.dn_shares),
+            float(self._terminal_liquidation_remaining_up),
+            float(self._terminal_liquidation_remaining_dn),
+        )
+        if residual_inventory <= 1e-9 and not self._terminal_liquidation_active:
+            return risk
+        return replace(risk, hard_mode="emergency_unwind")
+
     def _apply_side_markout_result(
         self,
         *,
@@ -1310,6 +1337,12 @@ class MarketMakerV2:
             side_reentry_cooldown_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
             side_hard_block_up_sec=float(self._side_reentry_cooldown_sec("up", now=now)),
             side_hard_block_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
+        )
+        risk = self._coerce_terminal_drawdown_risk(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=risk,
+            health=health,
         )
         emergency_taker_forced, emergency_no_progress_sec = self._update_emergency_taker_force(
             hard_mode=str(risk.hard_mode),
