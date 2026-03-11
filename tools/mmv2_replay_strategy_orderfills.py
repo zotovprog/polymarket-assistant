@@ -391,6 +391,48 @@ def _pick_primary_blocker(buckets: list[str]) -> str:
     return ""
 
 
+def _scenario_error_summary(
+    *,
+    scenario_id: str,
+    scenario_category: str,
+    scenario_dir: Path,
+    error: Exception,
+    dataset_root: str,
+) -> dict[str, Any]:
+    failure_bucket = str(scenario_category) if str(scenario_category) in {
+        "marketability_churn",
+        "edge_divergence",
+        "inventory_regime",
+        "terminal_execution",
+    } else ""
+    summary = {
+        "ok": False,
+        "gate_verdict": "no_go",
+        "failed_criteria": [f"scenario_runtime_error:{type(error).__name__}"],
+        "failure_buckets": [failure_bucket] if failure_bucket else [],
+        "primary_blocker": failure_bucket,
+        "dataset_root": str(dataset_root),
+        "scenario_id": str(scenario_id),
+        "scenario_category": str(scenario_category),
+        "final_pnl_usd": 0.0,
+        "aggregate_pnl_usd": 0.0,
+        "outside_near_expiry_samples": 0,
+        "outside_mode_ratios": {},
+        "mm_effective_share_outside": 0.0,
+        "max_unwind_ratio_60s_outside": 0.0,
+        "max_emergency_unwind_ratio_60s_outside": 0.0,
+        "max_quote_none_streak_outside": 0,
+        "execution_churn_ratio_60s": 0.0,
+        "runtime_sec": 0.0,
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    if summary["failed_criteria"] and not summary["primary_blocker"]:
+        summary["failed_criteria"].append("unknown_failure_bucket")
+    (scenario_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 def _single_run_failed_criteria(summary: dict[str, Any]) -> list[str]:
     failed: list[str] = []
     if bool(summary.get("true_drift_present")):
@@ -926,7 +968,16 @@ def run_manifest_suite(args: argparse.Namespace) -> dict[str, Any]:
         scenario_dir = output_dir / "scenarios" / scenario_id
         scenario_dir.mkdir(parents=True, exist_ok=True)
         scenario_args = _namespace_for_scenario(args, scenario, scenario_dir)
-        summary = run_replay(scenario_args)
+        try:
+            summary = run_replay(scenario_args)
+        except Exception as exc:
+            summary = _scenario_error_summary(
+                scenario_id=scenario_id,
+                scenario_category=str(scenario.get("category") or ""),
+                scenario_dir=scenario_dir,
+                error=exc,
+                dataset_root=str(scenario_args.dataset_root),
+            )
         scenario_results.append(summary)
         aggregate_pnl_usd += float(summary.get("final_pnl_usd") or 0.0)
         outside_samples = int(summary.get("outside_near_expiry_samples") or 0)

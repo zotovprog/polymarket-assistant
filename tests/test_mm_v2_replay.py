@@ -91,3 +91,31 @@ def test_dataset_manifest_quick_suite_runs_and_writes_unified_summary(tmp_path):
     assert "aggregate_pnl_usd" in summary
     assert "outside_mode_ratios" in summary
     assert (out_dir / "summary.json").exists()
+
+
+def test_dataset_manifest_quick_suite_with_missing_dataset_root_returns_structured_summary(tmp_path):
+    out_dir = tmp_path / "dataset-suite-missing-root"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(DATASET_REPLAY_TOOL),
+            "--dataset-root",
+            str((tmp_path / "missing-dataset-root").resolve()),
+            "--manifest",
+            str(DATASET_MANIFEST),
+            "--manifest-mode",
+            "quick",
+            "--output-dir",
+            str(out_dir),
+        ],
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 2), proc.stderr
+    summary = json.loads(proc.stdout)
+    assert "gate_verdict" in summary
+    assert "failed_criteria" in summary
+    assert "failure_buckets" in summary
+    assert "primary_blocker" in summary
+    assert (out_dir / "summary.json").exists()
