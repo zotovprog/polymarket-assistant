@@ -630,6 +630,12 @@ class MarketMakerV2:
     def _terminal_liquidation_timeout_sec(self) -> float:
         return max(1.0, float(self.config.emergency_unwind_timeout_sec))
 
+    def _terminal_liquidation_start_sec(self) -> float:
+        return max(
+            float(self.config.emergency_taker_start_sec),
+            float(self.config.unwind_window_sec),
+        )
+
     def _terminal_liquidation_elapsed(self, *, now: float) -> float:
         if self._terminal_liquidation_started_ts <= 0.0:
             return 0.0
@@ -1303,12 +1309,15 @@ class MarketMakerV2:
             risk=risk,
             ctx=ctx,
         )
+        terminal_window_active = float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec())
         terminal_liquidation_should_arm = bool(
             risk.hard_mode != "halted"
             and self._has_material_inventory(inventory)
-            and float(snapshot.time_left_sec) <= float(self.config.emergency_taker_start_sec)
+            and terminal_window_active
         )
-        if terminal_liquidation_should_arm or self._terminal_liquidation_active:
+        if terminal_liquidation_should_arm or (
+            self._terminal_liquidation_active and terminal_window_active
+        ):
             just_armed_terminal = False
             if not self._terminal_liquidation_active:
                 self._terminal_liquidation_active = True
@@ -1326,7 +1335,7 @@ class MarketMakerV2:
             terminal_timeout = (
                 self._terminal_liquidation_elapsed(now=now) >= self._terminal_liquidation_timeout_sec()
             )
-            if not self._terminal_liquidation_done and not terminal_timeout:
+            if not self._terminal_liquidation_done:
                 step = await self.gateway.run_terminal_liquidation_step(
                     round_idx=int(self._terminal_liquidation_round_idx),
                     cancel_existing=not just_armed_terminal,
@@ -1368,7 +1377,7 @@ class MarketMakerV2:
                     total_usdc=float(terminal_wallet_total_usdc),
                     snapshot=snapshot,
                 )
-            else:
+            elif terminal_timeout:
                 self._terminal_liquidation_reason = (
                     "terminal_liquidation_timeout"
                     if terminal_timeout
