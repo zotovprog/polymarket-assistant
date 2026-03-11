@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any
 
 from mm_shared.types import Quote
@@ -12,6 +13,7 @@ from .types import ExecutionState, QuoteIntent
 class SlotOrder:
     order_id: str
     intent: QuoteIntent
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass

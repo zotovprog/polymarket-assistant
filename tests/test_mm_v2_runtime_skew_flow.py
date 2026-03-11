@@ -22,14 +22,16 @@ from mm_v2.config import (
     UNWIND_EXIT_CONFIRM_TICKS,
     UNWIND_STUCK_WINDOW_SEC,
 )
+from mm_v2.execution_policy import ExecutionPolicyV2
+from mm_v2.order_tracker import OrderTrackerV2
 from mm_v2.pair_valuation import PairValuationResult
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuotePlan, QuoteViabilitySummary, RiskRegime
-from mm_shared.types import MarketInfo
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteIntent, QuotePlan, QuoteViabilitySummary, RiskRegime
+from mm_shared.types import MarketInfo, Quote
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -185,6 +187,74 @@ def test_untradeable_material_inventory_enters_defensive_but_keeps_helpful_bid()
     assert plan.up_bid is not None
     assert plan.dn_bid is None
     assert plan.quote_balance_state == "helpful_only"
+
+
+@pytest.mark.asyncio
+async def test_execution_policy_holds_helpful_sell_during_marketability_rest_window(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.55, size=5.0),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.55,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            min_rest_sec=6.0,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    desired = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.58,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="helpful",
+        min_rest_sec=6.0,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 103.0)
+    await policy.sync(QuotePlan(None, desired, None, None, "defensive", "marketability"))
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 107.5)
+    await policy.sync(QuotePlan(None, desired, None, None, "defensive", "marketability"))
+    assert gateway.cancelled == ["oid-1"]
+    assert len(gateway.placed) == 1
 
 
 def test_helpful_quotes_can_be_restored_by_promotion():

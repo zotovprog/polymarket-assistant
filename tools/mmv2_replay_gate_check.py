@@ -147,6 +147,7 @@ def main() -> int:
     unwind_target_lower_count = 0
     unwind_outside_count = 0
     window_final_pnls_by_start: dict[float, float] = {}
+    terminal_execution_incomplete_present = False
 
     for state in rows:
         if not isinstance(state, dict):
@@ -163,6 +164,8 @@ def main() -> int:
         bucket = _derive_failure_bucket(state)
         if bucket:
             failure_bucket_counts[bucket] += 1
+            if bucket == "terminal_execution":
+                terminal_execution_incomplete_present = True
 
         session_pnl = float(
             analytics.get("session_pnl_equity_usd")
@@ -250,6 +253,8 @@ def main() -> int:
         failed_criteria.append("true_drift_present")
     if hard_halted_any:
         failed_criteria.append("halted_present")
+    if terminal_execution_incomplete_present:
+        failed_criteria.append("terminal_execution_incomplete_present")
     if outside_samples <= 0:
         failed_criteria.append("no_samples_outside_near_expiry")
     else:

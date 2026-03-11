@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "description": "Curated structural replay scenarios over normalized Polymarket orderfills. Dataset-first gate only; not a replacement for paper/live.",
+  "scenarios": [
+    {
+      "id": "marketability_churn_2025_10_07_a",
+      "category": "marketability_churn",
+      "quick": true,
+      "up_token_id": "105832362350788616148612362642992403996714020918558917275151746177525518770551",
+      "dn_token_id": "33945469250963963541781051637999677727672635213493648594066577298999471399137",
+      "date_from": "2025-10-07",
+      "date_to": "2025-10-07",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "marketability_churn_2025_09_25_a",
+      "category": "marketability_churn",
+      "up_token_id": "48243565306661586573515446477323484080329460042758773679286711600713014087812",
+      "dn_token_id": "95300813260229929583387250620333787131816750045688787171342316453841921731133",
+      "date_from": "2025-09-25",
+      "date_to": "2025-09-25",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "edge_divergence_2025_10_07_a",
+      "category": "edge_divergence",
+      "quick": true,
+      "up_token_id": "60156625646569576964584621291475860303247825215466310280401996727843189574431",
+      "dn_token_id": "75662380910516595836713877605277832183886163391379455962356909608435996726535",
+      "date_from": "2025-10-07",
+      "date_to": "2025-10-07",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "edge_divergence_2025_10_06_a",
+      "category": "edge_divergence",
+      "up_token_id": "2818825770987128742744250158925453624883101190492443501313213563391208662555",
+      "dn_token_id": "97439927570995296235895343412469721564929809567233039030193767661203285608819",
+      "date_from": "2025-10-06",
+      "date_to": "2025-10-06",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "inventory_regime_2025_10_05_a",
+      "category": "inventory_regime",
+      "up_token_id": "41190236688886659739304059924325927006341026379642881961434423014894377157800",
+      "dn_token_id": "49535933573096135846080624089152063912277712359083261490841028663816801238728",
+      "date_from": "2025-10-05",
+      "date_to": "2025-10-05",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "terminal_cleanup_good_2025_09_30_a",
+      "category": "terminal_execution",
+      "up_token_id": "58058220266036925358378157363388693669937788094962564603964251668911650234925",
+      "dn_token_id": "82392534072032636500325280408235322391054689943144654242036285909639252252134",
+      "date_from": "2025-09-30",
+      "date_to": "2025-09-30",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    },
+    {
+      "id": "mixed_mm_ok_2025_10_05_a",
+      "category": "edge_divergence",
+      "quick": true,
+      "up_token_id": "110525978396126803333520764889362777946712321304097972954781990176071960228670",
+      "dn_token_id": "99581089644756197688783501329166725654583008864074624095412304296206532899683",
+      "date_from": "2025-10-05",
+      "date_to": "2025-10-05",
+      "max_ticks": 300,
+      "session_budget_usd": 30.0
+    }
+  ]
+}

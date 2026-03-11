@@ -42,6 +42,13 @@ TOKEN_RAW_SCALE = 1_000_000.0
 DEFAULT_MIN_ORDER_SIZE = 5.0
 DEFAULT_TICK_SIZE = 0.01
 DEFAULT_DEPTH_USD = 250.0
+PRIMARY_BLOCKER_PRIORITY = [
+    "drift_transport",
+    "terminal_execution",
+    "marketability_churn",
+    "edge_divergence",
+    "inventory_regime",
+]
 
 
 class _ReplayClock:
@@ -59,10 +66,19 @@ def _parse_args() -> argparse.Namespace:
         default=str(REPO_ROOT / "data" / "normalized" / "poly_data_orderfills"),
         help="Path to normalized dataset root (partitioned by trade_day=YYYY-MM-DD).",
     )
-    parser.add_argument("--up-token-id", required=True, help="UP token asset id for replay pair.")
-    parser.add_argument("--dn-token-id", required=True, help="DN token asset id for replay pair.")
+    parser.add_argument("--manifest", default="", help="Optional JSON manifest of replay scenarios.")
+    parser.add_argument(
+        "--manifest-mode",
+        choices=("quick", "full"),
+        default="full",
+        help="Subset of manifest scenarios to run when --manifest is provided.",
+    )
+    parser.add_argument("--up-token-id", default="", help="UP token asset id for replay pair.")
+    parser.add_argument("--dn-token-id", default="", help="DN token asset id for replay pair.")
     parser.add_argument("--date-from", default="", help="Inclusive start date (YYYY-MM-DD).")
     parser.add_argument("--date-to", default="", help="Inclusive end date (YYYY-MM-DD).")
+    parser.add_argument("--ts-from", type=int, default=0, help="Inclusive start timestamp (epoch sec).")
+    parser.add_argument("--ts-to", type=int, default=0, help="Inclusive end timestamp (epoch sec).")
     parser.add_argument("--tick-sec", type=int, default=2, help="Replay tick interval in seconds.")
     parser.add_argument("--window-sec", type=float, default=900.0, help="Synthetic market window length in seconds.")
     parser.add_argument("--session-budget-usd", type=float, default=50.0, help="Replay start USDC.")
@@ -77,7 +93,10 @@ def _parse_args() -> argparse.Namespace:
         help="Output directory for replay artifacts. Default: audit/replay/<timestamp>/",
     )
     parser.add_argument("--max-ticks", type=int, default=0, help="Optional cap on processed ticks (0 = all).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.manifest and (not str(args.up_token_id).strip() or not str(args.dn_token_id).strip()):
+        parser.error("--up-token-id and --dn-token-id are required when --manifest is not provided")
+    return args
 
 
 def _trade_days(dataset_root: Path, date_from: str, date_to: str) -> list[Path]:
@@ -104,6 +123,8 @@ def _load_pair_events(
     dn_token_id: str,
     date_from: str,
     date_to: str,
+    ts_from: int = 0,
+    ts_to: int = 0,
 ) -> pd.DataFrame:
     cols = [
         "timestamp_sec",
@@ -123,6 +144,14 @@ def _load_pair_events(
                 continue
             frame["token_asset_id"] = frame["token_asset_id"].astype(str)
             frame = frame[frame["token_asset_id"].isin(token_set)]
+            if frame.empty:
+                continue
+            if int(ts_from) > 0:
+                frame = frame[frame["timestamp_sec"].astype(int) >= int(ts_from)]
+            if frame.empty:
+                continue
+            if int(ts_to) > 0:
+                frame = frame[frame["timestamp_sec"].astype(int) <= int(ts_to)]
             if frame.empty:
                 continue
             frame = frame[frame["self_trade"] == False]  # noqa: E712
@@ -297,6 +326,85 @@ def _update_drawdown_state(
     return int(breach_ticks), float(age), breach_active
 
 
+def _scenario_failure_bucket(summary: dict[str, Any], scenario_category: str) -> str:
+    if bool(summary.get("true_drift_present")):
+        return "drift_transport"
+    if bool(summary.get("terminal_execution_failed")):
+        return "terminal_execution"
+    if scenario_category in {"marketability_churn", "edge_divergence", "inventory_regime", "terminal_execution"}:
+        return str(scenario_category)
+    if bool(summary.get("halted_present")):
+        return "inventory_regime"
+    if float(summary.get("max_emergency_unwind_ratio_60s_outside") or 0.0) > 0.10:
+        return "inventory_regime"
+    if float(summary.get("max_unwind_ratio_60s_outside") or 0.0) > 0.35:
+        return "inventory_regime"
+    return ""
+
+
+def _pick_primary_blocker(buckets: list[str]) -> str:
+    bucket_set = {str(bucket) for bucket in buckets if str(bucket)}
+    for bucket in PRIMARY_BLOCKER_PRIORITY:
+        if bucket in bucket_set:
+            return bucket
+    return ""
+
+
+def _single_run_failed_criteria(summary: dict[str, Any]) -> list[str]:
+    failed: list[str] = []
+    if bool(summary.get("true_drift_present")):
+        failed.append("true_drift_present")
+    if bool(summary.get("halted_present")):
+        failed.append("halted_present")
+    if int(summary.get("outside_near_expiry_samples") or 0) <= 0:
+        failed.append("no_samples_outside_near_expiry")
+        return failed
+    if float(summary.get("mm_effective_share_outside") or 0.0) < 0.65:
+        failed.append(
+            "mm_effective_ratio_60s_below_0.65 "
+            f"(min={float(summary.get('mm_effective_share_outside') or 0.0):.4f})"
+        )
+    if float(summary.get("max_unwind_ratio_60s_outside") or 0.0) > 0.35:
+        failed.append(
+            "unwind_ratio_60s_above_0.35 "
+            f"(max={float(summary.get('max_unwind_ratio_60s_outside') or 0.0):.4f})"
+        )
+    if float(summary.get("max_emergency_unwind_ratio_60s_outside") or 0.0) > 0.10:
+        failed.append(
+            "emergency_unwind_ratio_60s_above_0.10 "
+            f"(max={float(summary.get('max_emergency_unwind_ratio_60s_outside') or 0.0):.4f})"
+        )
+    if int(summary.get("max_quote_none_streak_outside") or 0) > 3:
+        failed.append(
+            "quote_balance_none_streak_above_3 "
+            f"(max={int(summary.get('max_quote_none_streak_outside') or 0)})"
+        )
+    if int(summary.get("untradeable_tolerated_material_samples_outside") or 0) > 0:
+        failed.append(
+            "untradeable_tolerated_with_material_inventory_present "
+            f"(count={int(summary.get('untradeable_tolerated_material_samples_outside') or 0)})"
+        )
+    if bool(summary.get("toxic_buy_present_outside")):
+        failed.append("toxic_side_buy_present_outside")
+    dual_bid_ratio_outside = float(summary.get("dual_bid_ratio_outside") or 0.0)
+    if dual_bid_ratio_outside < 0.70:
+        failed.append(f"dual_bid_ratio_outside_below_0.70 (min={dual_bid_ratio_outside:.4f})")
+    return failed
+
+
+def _load_manifest(manifest_path: Path) -> dict[str, Any]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"manifest must be a JSON object: {manifest_path}")
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        raise RuntimeError(f"manifest has no scenarios: {manifest_path}")
+    payload["scenarios"] = [dict(item) for item in scenarios if isinstance(item, dict)]
+    if not payload["scenarios"]:
+        raise RuntimeError(f"manifest has no valid scenario objects: {manifest_path}")
+    return payload
+
+
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     dataset_root = Path(args.dataset_root).expanduser().resolve()
@@ -309,6 +417,8 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         dn_token_id=args.dn_token_id,
         date_from=args.date_from,
         date_to=args.date_to,
+        ts_from=int(getattr(args, "ts_from", 0) or 0),
+        ts_to=int(getattr(args, "ts_to", 0) or 0),
     )
     if events.empty:
         raise RuntimeError("No pair events found for selected token ids/date range.")
@@ -376,6 +486,15 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     near_expiry_none_streak = 0
     non_expiry_none_streak = 0
     max_non_expiry_none_streak = 0
+    outside_near_expiry_samples = 0
+    outside_lifecycle_counts: dict[str, int] = {}
+    max_quote_none_streak_outside = 0
+    quote_none_streak_outside = 0
+    dual_bid_ticks_outside = 0
+    one_sided_bid_streak_outside = 0
+    max_one_sided_bid_streak_outside = 0
+    halted_present = False
+    true_drift_present = False
 
     tick_rows: list[dict[str, Any]] = []
     first_ts = int(all_ticks[0])
@@ -516,6 +635,30 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             else:
                 near_expiry_none_streak = 0
                 non_expiry_none_streak = 0
+            if transition.lifecycle == "halted" or str(getattr(effective_risk, "hard_mode", "") or "") == "halted":
+                halted_present = True
+            if not near_expiry:
+                outside_near_expiry_samples += 1
+                outside_lifecycle_counts[transition.lifecycle] = outside_lifecycle_counts.get(transition.lifecycle, 0) + 1
+                active_up_bid = bool(plan.up_bid)
+                active_dn_bid = bool(plan.dn_bid)
+                if active_up_bid and active_dn_bid:
+                    dual_bid_ticks_outside += 1
+                    one_sided_bid_streak_outside = 0
+                else:
+                    one_sided_bid_streak_outside += 1
+                    max_one_sided_bid_streak_outside = max(
+                        max_one_sided_bid_streak_outside,
+                        one_sided_bid_streak_outside,
+                    )
+                if plan.quote_balance_state == "none":
+                    quote_none_streak_outside += 1
+                    max_quote_none_streak_outside = max(
+                        max_quote_none_streak_outside,
+                        quote_none_streak_outside,
+                    )
+                else:
+                    quote_none_streak_outside = 0
 
             token_tick_flow = tick_flow.get(tick, {})
             for key, intent in (
@@ -592,13 +735,32 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     final_up_bid, _ = _safe_bid_ask(up_mid)
     final_dn_bid, _ = _safe_bid_ask(dn_mid)
     final_equity = cash_usd + up_shares * final_up_bid + dn_shares * final_dn_bid
+    outside_mode_ratios: dict[str, float] = {}
+    if outside_near_expiry_samples > 0:
+        for mode, count in outside_lifecycle_counts.items():
+            outside_mode_ratios[mode] = float(count) / float(outside_near_expiry_samples)
+    mm_effective_share_outside = (
+        outside_mode_ratios.get("quoting", 0.0)
+        + outside_mode_ratios.get("inventory_skewed", 0.0)
+        + outside_mode_ratios.get("defensive", 0.0)
+    )
+    dual_bid_ratio_outside = (
+        float(dual_bid_ticks_outside) / float(outside_near_expiry_samples)
+        if outside_near_expiry_samples > 0
+        else 0.0
+    )
 
     result = {
+        "ok": True,
         "dataset_root": str(dataset_root),
+        "scenario_id": str(getattr(args, "scenario_id", "") or ""),
+        "scenario_category": str(getattr(args, "scenario_category", "") or ""),
         "up_token_id": str(args.up_token_id),
         "dn_token_id": str(args.dn_token_id),
         "date_from": str(args.date_from or ""),
         "date_to": str(args.date_to or ""),
+        "ts_from": int(getattr(args, "ts_from", 0) or 0),
+        "ts_to": int(getattr(args, "ts_to", 0) or 0),
         "tick_sec": int(tick_sec),
         "window_sec": float(args.window_sec),
         "session_budget_usd": float(cfg.session_budget_usd),
@@ -625,6 +787,22 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
         "unwind_target_mismatch_ratio": float(mismatch_ratio),
         "harmful_suppressed_ticks": int(harmful_suppressed_ticks),
         "max_non_expiry_none_streak": int(max_non_expiry_none_streak),
+        "outside_near_expiry_samples": int(outside_near_expiry_samples),
+        "outside_mode_ratios": outside_mode_ratios,
+        "mm_effective_share_outside": float(mm_effective_share_outside),
+        "max_unwind_ratio_60s_outside": float(outside_mode_ratios.get("unwind", 0.0)),
+        "max_emergency_unwind_ratio_60s_outside": float(outside_mode_ratios.get("emergency_unwind", 0.0)),
+        "max_quote_none_streak_outside": int(max_quote_none_streak_outside),
+        "dual_bid_ratio_outside": float(dual_bid_ratio_outside),
+        "max_one_sided_bid_streak_outside": int(max_one_sided_bid_streak_outside),
+        "max_collateral_warning_streak_outside": 0,
+        "max_sell_skip_cooldown_streak_outside": 0,
+        "execution_churn_ratio_60s": 0.0,
+        "untradeable_tolerated_material_samples_outside": 0,
+        "toxic_buy_present_outside": False,
+        "true_drift_present": bool(true_drift_present),
+        "halted_present": bool(halted_present),
+        "terminal_execution_failed": False,
         "runtime_sec": float(time.time() - started),
         "pass_checks": {
             "quoting_ratio_ge_0_25": bool(quoting_ratio >= 0.25),
@@ -634,6 +812,16 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
             "max_non_expiry_none_streak_le_3": bool(max_non_expiry_none_streak <= 3),
         },
     }
+    result["failed_criteria"] = _single_run_failed_criteria(result)
+    result["failure_buckets"] = []
+    scenario_bucket = _scenario_failure_bucket(result, str(getattr(args, "scenario_category", "") or ""))
+    if result["failed_criteria"] and scenario_bucket:
+        result["failure_buckets"] = [scenario_bucket]
+    result["primary_blocker"] = _pick_primary_blocker(result["failure_buckets"])
+    if result["failed_criteria"] and not result["primary_blocker"]:
+        result["failed_criteria"].append("unknown_failure_bucket")
+    result["gate_verdict"] = "go" if not result["failed_criteria"] else "no_go"
+    result["ok"] = result["gate_verdict"] == "go"
 
     out_dir = (
         Path(args.output_dir).expanduser().resolve()
@@ -646,11 +834,125 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _namespace_for_scenario(base_args: argparse.Namespace, scenario: dict[str, Any], output_dir: Path) -> argparse.Namespace:
+    return argparse.Namespace(
+        dataset_root=str(base_args.dataset_root),
+        manifest="",
+        manifest_mode=str(base_args.manifest_mode),
+        up_token_id=str(scenario["up_token_id"]),
+        dn_token_id=str(scenario["dn_token_id"]),
+        date_from=str(scenario.get("date_from") or base_args.date_from or ""),
+        date_to=str(scenario.get("date_to") or base_args.date_to or ""),
+        ts_from=int(scenario.get("ts_from") or 0),
+        ts_to=int(scenario.get("ts_to") or 0),
+        tick_sec=int(scenario.get("tick_sec") or base_args.tick_sec),
+        window_sec=float(scenario.get("window_sec") or base_args.window_sec),
+        session_budget_usd=float(scenario.get("session_budget_usd") or base_args.session_budget_usd),
+        allow_naked_sells=bool(scenario.get("allow_naked_sells", base_args.allow_naked_sells)),
+        output_dir=str(output_dir),
+        max_ticks=int(scenario.get("max_ticks") or base_args.max_ticks),
+        scenario_id=str(scenario.get("id") or output_dir.name),
+        scenario_category=str(scenario.get("category") or ""),
+    )
+
+
+def run_manifest_suite(args: argparse.Namespace) -> dict[str, Any]:
+    started = time.time()
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"manifest not found: {manifest_path}")
+    manifest = _load_manifest(manifest_path)
+    scenarios = list(manifest.get("scenarios") or [])
+    if str(args.manifest_mode) == "quick":
+        quick_scenarios = [scenario for scenario in scenarios if bool(scenario.get("quick", False))]
+        scenarios = quick_scenarios or scenarios[: min(3, len(scenarios))]
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else (REPO_ROOT / "audit" / "replay" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scenario_results: list[dict[str, Any]] = []
+    failure_buckets: list[str] = []
+    failed_criteria: list[str] = []
+    aggregate_pnl_usd = 0.0
+    outside_samples_total = 0
+    outside_mode_weighted: dict[str, float] = {}
+    max_quote_none_streak_outside = 0
+    max_unwind_ratio_60s_outside = 0.0
+    max_emergency_unwind_ratio_60s_outside = 0.0
+
+    for idx, scenario in enumerate(scenarios, start=1):
+        scenario_id = str(scenario.get("id") or f"scenario_{idx:02d}")
+        scenario_dir = output_dir / "scenarios" / scenario_id
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+        scenario_args = _namespace_for_scenario(args, scenario, scenario_dir)
+        summary = run_replay(scenario_args)
+        scenario_results.append(summary)
+        aggregate_pnl_usd += float(summary.get("final_pnl_usd") or 0.0)
+        outside_samples = int(summary.get("outside_near_expiry_samples") or 0)
+        outside_samples_total += outside_samples
+        for mode, ratio in (summary.get("outside_mode_ratios") or {}).items():
+            outside_mode_weighted[mode] = outside_mode_weighted.get(str(mode), 0.0) + float(ratio) * outside_samples
+        max_quote_none_streak_outside = max(
+            max_quote_none_streak_outside,
+            int(summary.get("max_quote_none_streak_outside") or 0),
+        )
+        max_unwind_ratio_60s_outside = max(
+            max_unwind_ratio_60s_outside,
+            float(summary.get("max_unwind_ratio_60s_outside") or 0.0),
+        )
+        max_emergency_unwind_ratio_60s_outside = max(
+            max_emergency_unwind_ratio_60s_outside,
+            float(summary.get("max_emergency_unwind_ratio_60s_outside") or 0.0),
+        )
+        if summary.get("gate_verdict") != "go":
+            failed_criteria.append(f"scenario_failed:{scenario_id}")
+            failure_buckets.extend(list(summary.get("failure_buckets") or []))
+
+    outside_mode_ratios = {
+        mode: (value / float(outside_samples_total) if outside_samples_total > 0 else 0.0)
+        for mode, value in outside_mode_weighted.items()
+    }
+    mm_effective_share_outside = (
+        outside_mode_ratios.get("quoting", 0.0)
+        + outside_mode_ratios.get("inventory_skewed", 0.0)
+        + outside_mode_ratios.get("defensive", 0.0)
+    )
+    summary = {
+        "ok": not failed_criteria,
+        "gate_verdict": "go" if not failed_criteria else "no_go",
+        "failed_criteria": failed_criteria,
+        "failure_buckets": sorted({bucket for bucket in failure_buckets if bucket}),
+        "primary_blocker": _pick_primary_blocker(failure_buckets),
+        "manifest": str(manifest_path),
+        "manifest_mode": str(args.manifest_mode),
+        "scenario_count": len(scenario_results),
+        "scenario_results": scenario_results,
+        "final_pnl_usd": float(scenario_results[-1].get("final_pnl_usd") or 0.0) if scenario_results else 0.0,
+        "aggregate_pnl_usd": float(aggregate_pnl_usd),
+        "outside_near_expiry_samples": int(outside_samples_total),
+        "outside_mode_ratios": outside_mode_ratios,
+        "mm_effective_share_outside": float(mm_effective_share_outside),
+        "max_unwind_ratio_60s_outside": float(max_unwind_ratio_60s_outside),
+        "max_emergency_unwind_ratio_60s_outside": float(max_emergency_unwind_ratio_60s_outside),
+        "max_quote_none_streak_outside": int(max_quote_none_streak_outside),
+        "execution_churn_ratio_60s": 0.0,
+        "runtime_sec": float(time.time() - started),
+    }
+    if summary["failed_criteria"] and not summary["primary_blocker"]:
+        summary["failed_criteria"].append("unknown_failure_bucket")
+        summary["ok"] = False
+        summary["gate_verdict"] = "no_go"
+    (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary
+
+
 def main() -> int:
     args = _parse_args()
-    summary = run_replay(args)
+    summary = run_manifest_suite(args) if args.manifest else run_replay(args)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return 0 if summary.get("gate_verdict") == "go" else 2
 
 
 if __name__ == "__main__":

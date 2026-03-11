@@ -778,8 +778,11 @@ def test_marketability_churn_confirmed_keeps_only_inventory_reducing_intents():
         ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
     )
     assert plan.up_bid is None
+    assert plan.dn_bid is None
     assert plan.suppressed_reasons["up_bid"] == "marketability_churn_confirmed"
+    assert plan.suppressed_reasons["dn_bid"] == "marketability_churn_confirmed"
     assert plan.up_ask is not None
+    assert plan.up_ask.min_rest_sec == pytest.approx(6.0)
     assert plan.quote_viability_reason == "marketability_churn_confirmed"
 
 

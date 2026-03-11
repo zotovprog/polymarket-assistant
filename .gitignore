@@ -14,9 +14,13 @@ data/
 data/raw/
 data/normalized/
 data/replay/
+!data/
+!data/replay/
+!data/replay/mmv2_dataset_scenarios.json
 orderFilled_complete.csv.xz
 data/**/*.parquet
 data/**/*.xz
+!data/replay/poly_replay_slice_test.parquet
 audit/local-paper/
 workspace/
 backtest/report.html

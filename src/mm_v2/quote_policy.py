@@ -63,6 +63,7 @@ class QuotePolicyV2:
     DIVERGENCE_BUY_SIZE_BRAKE_MIN = 0.10
     TOXIC_SIDE_SPREAD_TICKS_MAX = 3
     TOXIC_SIDE_SIZE_BRAKE_MIN = 0.35
+    MARKETABILITY_REDUCING_SELL_MIN_REST_SEC = 6.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -573,6 +574,12 @@ class QuotePolicyV2:
         if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
             marketability_problem_side = str(risk.inventory_side)
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
+        marketability_buy_quarantine_active = bool(
+            marketability_churn_confirmed
+            and material_inventory
+            and risk.hard_mode == "none"
+            and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+        )
         drawdown_brake_active = (
             risk.hard_mode == "none"
             and risk.soft_mode in {"normal", "inventory_skewed"}
@@ -719,10 +726,8 @@ class QuotePolicyV2:
                 and token_side == marketability_problem_side
             )
             if (
-                marketability_churn_side_active
+                marketability_buy_quarantine_active
                 and side == "BUY"
-                and risk.hard_mode == "none"
-                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
             ):
                 built[slot] = None
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
@@ -1014,6 +1019,14 @@ class QuotePolicyV2:
                 inventory_backed_sell=inventory_backed_sell,
             )
             if intent is not None:
+                if (
+                    side == "SELL"
+                    and effect == "helpful"
+                    and risk.hard_mode == "none"
+                    and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                    and (marketability_churn_side_active or marketability_guard_side_active)
+                ):
+                    intent.min_rest_sec = float(self.MARKETABILITY_REDUCING_SELL_MIN_REST_SEC)
                 # Final maker guard after rounding. This prevents any residual
                 # crossed-book post-only prices in endpoint/tick edge cases.
                 if side == "BUY" and best_ask is not None:

@@ -91,6 +91,7 @@ class QuoteIntent:
     size_mult: float = 1.0
     price_adjust_ticks: int = 0
     suppressed_reason: str | None = None
+    min_rest_sec: float = 0.0
 
 
 @dataclass

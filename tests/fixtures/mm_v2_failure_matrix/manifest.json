@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "drift_transport_bad",
+      "input_dir": "drift_transport_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "drift_transport"
+    },
+    {
+      "id": "drift_transport_fixed",
+      "input_dir": "drift_transport_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    },
+    {
+      "id": "inventory_regime_bad",
+      "input_dir": "inventory_regime_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "inventory_regime"
+    },
+    {
+      "id": "inventory_regime_fixed",
+      "input_dir": "inventory_regime_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    },
+    {
+      "id": "edge_divergence_bad",
+      "input_dir": "edge_divergence_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "edge_divergence"
+    },
+    {
+      "id": "edge_divergence_fixed",
+      "input_dir": "edge_divergence_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    },
+    {
+      "id": "marketability_churn_bad",
+      "input_dir": "marketability_churn_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "marketability_churn"
+    },
+    {
+      "id": "marketability_churn_fixed",
+      "input_dir": "marketability_churn_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    },
+    {
+      "id": "terminal_execution_bad",
+      "input_dir": "terminal_execution_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "terminal_execution"
+    },
+    {
+      "id": "terminal_execution_fixed",
+      "input_dir": "terminal_execution_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    }
+  ]
+}
