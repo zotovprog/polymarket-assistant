@@ -191,6 +191,7 @@ class ReconcileV2:
         fv_dn: float,
         sellability_lag_active: bool = False,
         wallet_snapshot_stale: bool = False,
+        terminal_cleanup_grace: bool = False,
     ) -> PairInventoryState:
         if self._expected_up is None or self._expected_dn is None:
             self.align(real_up, real_dn)
@@ -213,6 +214,12 @@ class ReconcileV2:
             self._drift_candidate_count = 0
             self._drift_candidate_started_ts = 0.0
             status_reason = "diff explained by settlement lag"
+        elif terminal_cleanup_grace:
+            self.status = "terminal_grace"
+            self.true_drift = False
+            self._drift_candidate_count = 0
+            self._drift_candidate_started_ts = 0.0
+            status_reason = "terminal cleanup grace"
         elif wallet_snapshot_stale:
             # PM wallet endpoints can be transiently stale/unavailable.
             # Never escalate stale snapshots to true drift.
@@ -262,6 +269,7 @@ class ReconcileV2:
             "startup_realign",
             "wallet_stale",
             "wallet_recovering",
+            "terminal_grace",
         }:
             self._expected_up = max(0.0, float(real_up))
             self._expected_dn = max(0.0, float(real_dn))

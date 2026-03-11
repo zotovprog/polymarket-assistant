@@ -128,6 +128,7 @@ async def test_marketability_snapshot_counts_sell_skip_cooldown():
     snapshot = om.get_marketability_snapshot(up_token_id="tok-up")
     assert snapshot["sell_skip_cooldown_hits_60s"] >= 2
     assert snapshot["sell_place_attempts_60s"] >= 2
+    assert snapshot["up_sell_skip_cooldown_streak"] >= 2
     assert snapshot["reason"] == "sell_skip_cooldown"
     assert snapshot["active"] is True
     assert snapshot["up_active"] is True
@@ -150,6 +151,7 @@ async def test_marketability_snapshot_counts_collateral_warnings():
 
     snapshot = om.get_marketability_snapshot(up_token_id="tok-up")
     assert snapshot["collateral_warning_hits_60s"] >= 2
+    assert snapshot["up_collateral_warning_streak"] >= 2
     assert snapshot["reason"] == "collateral_warning"
     assert snapshot["active"] is True
     assert snapshot["up_active"] is True

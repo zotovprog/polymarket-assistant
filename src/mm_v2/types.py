@@ -161,6 +161,8 @@ class RiskRegime:
     marketability_guard_reason: str = ""
     marketability_guard_up_active: bool = False
     marketability_guard_dn_active: bool = False
+    marketability_churn_confirmed: bool = False
+    marketability_problem_side: Literal["", "up", "dn"] = ""
 
 
 @dataclass
@@ -282,11 +284,14 @@ class AnalyticsState:
     mm_regime_degraded_reason: str = ""
     marketability_guard_active: bool = False
     marketability_guard_reason: str = ""
+    marketability_churn_confirmed: bool = False
+    marketability_problem_side: str = ""
     collateral_warning_hits_60s: int = 0
     sell_skip_cooldown_hits_60s: int = 0
     execution_churn_ratio_60s: float = 0.0
     untradeable_tolerated_samples_60s: int = 0
     failure_bucket_current: str = ""
+    post_terminal_cleanup_grace_active: bool = False
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
     unwind_exit_armed: bool = False
@@ -349,6 +354,7 @@ class HealthState:
     drawdown_breach_age_sec: float = 0.0
     drawdown_breach_active: bool = False
     drawdown_threshold_usd_effective: float = 0.0
+    post_terminal_cleanup_grace_active: bool = False
     drift_evidence: dict[str, Any] = field(default_factory=dict)
 
 

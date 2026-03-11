@@ -1572,10 +1572,13 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
                 "mm_regime_degraded_reason": "high_emergency_ratio",
                 "marketability_guard_active": True,
                 "marketability_guard_reason": "collateral_warning",
+                "marketability_churn_confirmed": True,
+                "marketability_problem_side": "up",
                 "collateral_warning_hits_60s": 4,
                 "sell_skip_cooldown_hits_60s": 3,
                 "execution_churn_ratio_60s": 0.5,
                 "untradeable_tolerated_samples_60s": 2,
+                "post_terminal_cleanup_grace_active": True,
                 "failure_bucket_current": "marketability_churn",
                 "maker_cross_guard_hits_60s": 4,
                 "dual_bid_ratio_60s": 0.72,
@@ -1592,6 +1595,11 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
             },
             "health": {
                 "drawdown_threshold_usd_effective": 15.0,
+                "post_terminal_cleanup_grace_active": True,
+            },
+            "runtime": {
+                "post_terminal_cleanup_grace_active": True,
+                "post_terminal_cleanup_grace_sec": 4.5,
             },
         },
     )
@@ -1599,10 +1607,13 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
     assert resp["analytics"]["marketability_guard_active"] is True
     assert resp["analytics"]["marketability_guard_reason"] == "collateral_warning"
+    assert resp["analytics"]["marketability_churn_confirmed"] is True
+    assert resp["analytics"]["marketability_problem_side"] == "up"
     assert resp["analytics"]["collateral_warning_hits_60s"] == 4
     assert resp["analytics"]["sell_skip_cooldown_hits_60s"] == 3
     assert resp["analytics"]["execution_churn_ratio_60s"] == pytest.approx(0.5)
     assert resp["analytics"]["untradeable_tolerated_samples_60s"] == 2
+    assert resp["analytics"]["post_terminal_cleanup_grace_active"] is True
     assert resp["analytics"]["failure_bucket_current"] == "marketability_churn"
     assert resp["analytics"]["maker_cross_guard_hits_60s"] == 4
     assert resp["analytics"]["dual_bid_ratio_60s"] == pytest.approx(0.72)
@@ -1617,6 +1628,9 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     assert resp["analytics"]["unwind_deferred_hits_60s"] == 2
     assert resp["analytics"]["forced_unwind_extreme_excess_hits_60s"] == 1
     assert resp["health"]["drawdown_threshold_usd_effective"] == pytest.approx(15.0)
+    assert resp["health"]["post_terminal_cleanup_grace_active"] is True
+    assert resp["runtime"]["post_terminal_cleanup_grace_active"] is True
+    assert resp["runtime"]["post_terminal_cleanup_grace_sec"] == pytest.approx(4.5)
 
 
 @pytest.mark.asyncio

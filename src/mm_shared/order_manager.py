@@ -836,6 +836,25 @@ class OrderManager:
                 total += 1
             return int(total)
 
+        def _tail_streak(kind: str, token_id: str | None = None) -> int:
+            token = self._safe_str(token_id)
+            streak = 0
+            started = False
+            for _, event_kind, event_token in reversed(events):
+                if event_kind == "sell_place_attempt":
+                    continue
+                if event_kind != kind:
+                    if started:
+                        break
+                    continue
+                if token and event_token != token:
+                    if started:
+                        break
+                    continue
+                started = True
+                streak += 1
+            return int(streak)
+
         collateral_warning_hits_60s = _count("collateral_warning")
         sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown")
         sell_place_attempts_60s = _count("sell_place_attempt")
@@ -856,6 +875,10 @@ class OrderManager:
         dn_collateral_warning_hits_60s = _count("collateral_warning", dn_token)
         up_sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown", up_token)
         dn_sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown", dn_token)
+        up_collateral_warning_streak = _tail_streak("collateral_warning", up_token)
+        dn_collateral_warning_streak = _tail_streak("collateral_warning", dn_token)
+        up_sell_skip_cooldown_streak = _tail_streak("sell_skip_cooldown", up_token)
+        dn_sell_skip_cooldown_streak = _tail_streak("sell_skip_cooldown", dn_token)
         up_sell_place_attempts_60s = _count("sell_place_attempt", up_token)
         dn_sell_place_attempts_60s = _count("sell_place_attempt", dn_token)
         up_execution_churn_ratio_60s = float(
@@ -889,12 +912,16 @@ class OrderManager:
             "up_reason": str(up_reason),
             "up_collateral_warning_hits_60s": int(up_collateral_warning_hits_60s),
             "up_sell_skip_cooldown_hits_60s": int(up_sell_skip_cooldown_hits_60s),
+            "up_collateral_warning_streak": int(up_collateral_warning_streak),
+            "up_sell_skip_cooldown_streak": int(up_sell_skip_cooldown_streak),
             "up_sell_place_attempts_60s": int(up_sell_place_attempts_60s),
             "up_execution_churn_ratio_60s": float(up_execution_churn_ratio_60s),
             "dn_active": bool(dn_reason),
             "dn_reason": str(dn_reason),
             "dn_collateral_warning_hits_60s": int(dn_collateral_warning_hits_60s),
             "dn_sell_skip_cooldown_hits_60s": int(dn_sell_skip_cooldown_hits_60s),
+            "dn_collateral_warning_streak": int(dn_collateral_warning_streak),
+            "dn_sell_skip_cooldown_streak": int(dn_sell_skip_cooldown_streak),
             "dn_sell_place_attempts_60s": int(dn_sell_place_attempts_60s),
             "dn_execution_churn_ratio_60s": float(dn_execution_churn_ratio_60s),
         }

@@ -500,6 +500,7 @@ class QuotePolicyV2:
             defensive_cap_usd,
             float(self.config.effective_hard_excess_value_ratio()) * budget_usd,
         )
+        material_inventory_usd = max(6.0, 0.20 * budget_usd)
         pre_protective_harmful_buy_guard_usd = max(2.0, 0.60 * defensive_cap_usd)
         harmful_side_floor_block_usd = max(
             pre_protective_harmful_buy_guard_usd,
@@ -567,6 +568,11 @@ class QuotePolicyV2:
         dual_bid_exception_reason = ""
         gross_inventory_brake_active_tick = False
         side_soft_brake_active_tick = False
+        marketability_churn_confirmed = bool(getattr(risk, "marketability_churn_confirmed", False))
+        marketability_problem_side = str(getattr(risk, "marketability_problem_side", "") or "")
+        if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
+            marketability_problem_side = str(risk.inventory_side)
+        material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
         drawdown_brake_active = (
             risk.hard_mode == "none"
             and risk.soft_mode in {"normal", "inventory_skewed"}
@@ -707,6 +713,20 @@ class QuotePolicyV2:
                     False,
                 )
             )
+            marketability_churn_side_active = bool(
+                marketability_churn_confirmed
+                and material_inventory
+                and token_side == marketability_problem_side
+            )
+            if (
+                marketability_churn_side_active
+                and side == "BUY"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "marketability_churn_confirmed"
+                continue
             if (
                 marketability_guard_side_active
                 and side == "BUY"
@@ -802,6 +822,15 @@ class QuotePolicyV2:
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
             expands_gross_inventory = side == "BUY" or (side == "SELL" and not inventory_backed_sell)
+            if (
+                marketability_churn_side_active
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                and (expands_gross_inventory or effect != "helpful")
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "marketability_churn_confirmed"
+                continue
             if (
                 marketability_guard_side_active
                 and risk.hard_mode == "none"
@@ -1144,6 +1173,7 @@ class QuotePolicyV2:
                 blocked_by_harmful_skew = blocked_by_high_skew or blocked_by_pre_protective
                 if existing_reason in {
                     "divergence_buy_hard_suppress",
+                    "marketability_churn_confirmed",
                     "harmful_suppressed_in_defensive",
                     "harmful_suppressed_in_unwind",
                     "target_pair_ratio_cap",
@@ -1443,6 +1473,8 @@ class QuotePolicyV2:
             quote_viability_reason = "helpful_floor_applied"
         elif neutral_floor_applied:
             quote_viability_reason = "min_viable_floor_applied"
+        elif bool(getattr(risk, "marketability_churn_confirmed", False)):
+            quote_viability_reason = "marketability_churn_confirmed"
         elif bool(getattr(risk, "marketability_guard_active", False)):
             quote_viability_reason = "marketability_guard"
         elif side_soft_brake_active_tick:

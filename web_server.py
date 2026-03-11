@@ -3518,10 +3518,18 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
             "dual_bid_exception_reason": str(analytics.get("dual_bid_exception_reason") or ""),
             "marketability_guard_active": bool(analytics.get("marketability_guard_active") or False),
             "marketability_guard_reason": str(analytics.get("marketability_guard_reason") or ""),
+            "marketability_churn_confirmed": bool(analytics.get("marketability_churn_confirmed") or False),
+            "marketability_problem_side": str(analytics.get("marketability_problem_side") or ""),
             "collateral_warning_hits_60s": int(analytics.get("collateral_warning_hits_60s") or 0),
             "sell_skip_cooldown_hits_60s": int(analytics.get("sell_skip_cooldown_hits_60s") or 0),
             "execution_churn_ratio_60s": float(analytics.get("execution_churn_ratio_60s") or 0.0),
             "untradeable_tolerated_samples_60s": int(analytics.get("untradeable_tolerated_samples_60s") or 0),
+            "post_terminal_cleanup_grace_active": bool(
+                analytics.get("post_terminal_cleanup_grace_active")
+                or ((raw.get("health") or {}).get("post_terminal_cleanup_grace_active"))
+                or ((raw.get("runtime") or {}).get("post_terminal_cleanup_grace_active"))
+                or False
+            ),
             "failure_bucket_current": str(analytics.get("failure_bucket_current") or ""),
             "gross_inventory_brake_active": bool(analytics.get("gross_inventory_brake_active") or False),
             "gross_inventory_brake_hits_60s": int(analytics.get("gross_inventory_brake_hits_60s") or 0),

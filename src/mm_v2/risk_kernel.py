@@ -68,6 +68,8 @@ class SoftRiskKernel:
         inventory_nearly_flat_usd = max(2.0, 0.10 * budget)
         marketability_guard_active = bool(getattr(analytics, "marketability_guard_active", False))
         marketability_guard_reason = str(getattr(analytics, "marketability_guard_reason", "") or "")
+        marketability_churn_confirmed = bool(getattr(analytics, "marketability_churn_confirmed", False))
+        marketability_problem_side = str(getattr(analytics, "marketability_problem_side", "") or "")
         up_inventory_value_usd = max(
             0.0,
             float(inventory.up_shares)
@@ -125,6 +127,10 @@ class SoftRiskKernel:
         )
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
         inventory_nearly_flat = float(inventory.total_inventory_value_usd) < inventory_nearly_flat_usd
+        marketability_context_bad = bool(is_untradeable or marketability_guard_active)
+        marketability_problem_matches_inventory = bool(
+            marketability_problem_side in {"up", "dn"} and marketability_problem_side == inventory_side
+        )
         untradeable_inventory_divergence_bad = bool(
             max_divergence >= UNTRADEABLE_MATERIAL_INVENTORY_DIVERGENCE
         )
@@ -170,7 +176,15 @@ class SoftRiskKernel:
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
-            if is_untradeable and marketability_guard_active:
+            if marketability_churn_confirmed and marketability_context_bad and (
+                material_inventory or marketability_problem_matches_inventory or not inventory_nearly_flat
+            ):
+                target_soft_mode = "defensive"
+                if marketability_problem_side in {"up", "dn"}:
+                    soft_reason = f"defensive marketability churn ({marketability_problem_side})"
+                else:
+                    soft_reason = "defensive marketability churn"
+            elif is_untradeable and marketability_guard_active:
                 target_soft_mode = "defensive"
                 if marketability_guard_reason:
                     soft_reason = f"defensive marketability guard ({marketability_guard_reason})"
@@ -195,7 +209,7 @@ class SoftRiskKernel:
             elif is_untradeable and not inventory_nearly_flat:
                 target_soft_mode = "inventory_skewed"
                 soft_reason = "inventory_skewed untradeable nonflat"
-            elif is_untradeable:
+            elif is_untradeable and not marketability_churn_confirmed:
                 soft_reason = "normal quoting (untradeable tolerated)"
             elif flat_bootstrap:
                 # When inventory is effectively flat, avoid overreacting to
@@ -287,6 +301,13 @@ class HardSafetyKernel:
         elif health.residual_inventory_failure and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):
             hard_mode = "emergency_unwind"
             hard_reason = "residual inventory near expiry"
+        if bool(getattr(health, "post_terminal_cleanup_grace_active", False)) and hard_mode == "halted":
+            hard_mode = "emergency_unwind" if has_material_position else "none"
+            hard_reason = (
+                f"terminal cleanup grace: {hard_reason}"
+                if hard_reason
+                else "terminal cleanup grace"
+            )
 
         soft = self.soft_kernel.evaluate(
             snapshot=snapshot,
@@ -308,4 +329,8 @@ class HardSafetyKernel:
             quality_pressure=soft.quality_pressure,
             target_ratio_pressure=soft.target_ratio_pressure,
             early_drawdown_pressure=early_drawdown_pressure,
+            marketability_guard_active=bool(getattr(analytics, "marketability_guard_active", False)),
+            marketability_guard_reason=str(getattr(analytics, "marketability_guard_reason", "") or ""),
+            marketability_churn_confirmed=bool(getattr(analytics, "marketability_churn_confirmed", False)),
+            marketability_problem_side=str(getattr(analytics, "marketability_problem_side", "") or ""),
         )

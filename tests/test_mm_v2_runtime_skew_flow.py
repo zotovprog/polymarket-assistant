@@ -1817,6 +1817,115 @@ async def test_terminal_liquidation_done_reason_is_not_overwritten_by_timeout(mo
     assert state["runtime"]["terminal_liquidation_reason"] == "terminal_liquidation_done"
 
 
+def test_terminal_cleanup_grace_blocks_halted_after_done():
+    cfg = MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0)
+    snapshot = _snapshot(time_left_sec=15.0)
+    inventory = _inventory(
+        up_shares=0.4,
+        total_inventory_value_usd=0.2,
+        free_usdc=15.0,
+        wallet_total_usdc=15.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(
+            drawdown_breach_active=True,
+            post_terminal_cleanup_grace_active=True,
+        ),
+    )
+    assert risk.hard_mode == "none"
+    assert risk.reason.startswith("terminal cleanup grace:")
+
+
+@pytest.mark.asyncio
+async def test_terminal_liquidation_done_with_dust_exposes_cleanup_grace(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0))
+    mm.set_market(_market())
+    snapshot = _snapshot(time_left_sec=12.0)
+    valuation = PairValuationResult(
+        fv_up=snapshot.fv_up,
+        fv_dn=snapshot.fv_dn,
+        pair_mid=0.5,
+        source="midpoint_bounded_model",
+        divergence_up=0.0,
+        divergence_dn=0.0,
+        confidence=snapshot.fv_confidence,
+        regime="normal",
+        pm_age_sec=0.0,
+    )
+    inventory = _inventory(
+        up_shares=0.3,
+        dn_shares=0.2,
+        total_inventory_value_usd=0.25,
+        free_usdc=15.0,
+        wallet_total_usdc=15.0,
+    )
+    seen = {"terminal_cleanup_grace": None}
+
+    async def _check_fills():
+        return []
+
+    async def _get_books():
+        return {}, {}
+
+    def _compute(*, market, feed_state, up_book, dn_book):
+        del market, feed_state, up_book, dn_book
+        return valuation, snapshot
+
+    def _sync_paper_prices(**kwargs):
+        del kwargs
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.3, 0.2, 15.0, 15.0
+
+    async def _get_sellable_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.3, 0.2
+
+    def _reconcile(**kwargs):
+        seen["terminal_cleanup_grace"] = kwargs.get("terminal_cleanup_grace")
+        return inventory
+
+    async def _cancel_all():
+        return 0
+
+    async def _sync(_plan):
+        raise AssertionError("normal execution sync should not run during terminal cleanup grace")
+
+    monkeypatch.setattr(mm.gateway, "check_fills", _check_fills)
+    monkeypatch.setattr(mm.gateway, "get_books", _get_books)
+    monkeypatch.setattr(mm.valuation, "compute", _compute)
+    monkeypatch.setattr(mm.gateway, "sync_paper_prices", _sync_paper_prices)
+    monkeypatch.setattr(mm.gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(mm.gateway, "api_error_stats", lambda: {})
+    monkeypatch.setattr(mm.gateway, "balance_fetch_health_state", lambda: {})
+    monkeypatch.setattr(mm.gateway, "get_sellable_balances", _get_sellable_balances)
+    monkeypatch.setattr(mm.gateway, "sell_release_lag_state", lambda: {"active": False})
+    monkeypatch.setattr(mm.reconcile, "reconcile", _reconcile)
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.execution_policy, "sync", _sync)
+
+    mm._terminal_liquidation_active = True
+    mm._terminal_liquidation_done = True
+    mm._terminal_liquidation_reason = "terminal_liquidation_done"
+    mm._terminal_liquidation_remaining_up = 0.3
+    mm._terminal_liquidation_remaining_dn = 0.2
+
+    await mm._tick()
+
+    state = mm.snapshot()
+    assert seen["terminal_cleanup_grace"] is True
+    assert state["health"]["post_terminal_cleanup_grace_active"] is True
+    assert state["runtime"]["post_terminal_cleanup_grace_active"] is True
+    assert state["runtime"]["post_terminal_cleanup_grace_sec"] >= 0.0
+
+
 def test_balanced_profile_avoids_early_unwind_after_first_fill():
     snapshot = _snapshot()
     first_fill_inventory = _inventory(

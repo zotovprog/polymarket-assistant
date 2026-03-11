@@ -197,6 +197,7 @@ class MarketMakerV2:
         self._terminal_liquidation_remaining_dn: float = 0.0
         self._terminal_liquidation_done: bool = False
         self._terminal_liquidation_reason: str = ""
+        self._post_terminal_cleanup_grace_started_ts: float = 0.0
         self._true_drift_started_ts: float = 0.0
         self._true_drift_last_progress_ts: float = 0.0
         self._true_drift_best_exposure: float = 0.0
@@ -384,6 +385,7 @@ class MarketMakerV2:
         self._terminal_liquidation_remaining_dn = 0.0
         self._terminal_liquidation_done = False
         self._terminal_liquidation_reason = ""
+        self._post_terminal_cleanup_grace_started_ts = 0.0
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -780,6 +782,7 @@ class MarketMakerV2:
         api_stats: dict[str, Any] | None = None,
         sellability_lag_active: bool = False,
         wallet_snapshot_stale: bool = False,
+        post_terminal_cleanup_grace_active: bool = False,
         true_drift_age_sec: float = 0.0,
         true_drift_no_progress_sec: float = 0.0,
         drawdown_breach_ticks: int = 0,
@@ -827,6 +830,7 @@ class MarketMakerV2:
             residual_inventory_failure=bool(self._alerts.get("residual_inventory_v2")),
             sellability_lag_active=bool(sellability_lag_active),
             wallet_snapshot_stale=bool(wallet_snapshot_stale),
+            post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
             true_drift_age_sec=max(0.0, float(true_drift_age_sec)),
             true_drift_no_progress_sec=max(0.0, float(true_drift_no_progress_sec)),
             drawdown_breach_ticks=max(0, int(drawdown_breach_ticks)),
@@ -865,8 +869,35 @@ class MarketMakerV2:
             self._session_pnl_equity_usd if pnl_equity_usd is None else pnl_equity_usd
         )
 
-    def _update_true_drift_progress(self, inventory: PairInventoryState) -> tuple[float, float]:
-        if not self.reconcile.true_drift:
+    def _terminal_cleanup_dust_threshold(self) -> float:
+        if self.market is None:
+            return 5.0
+        return float(self.market.min_order_size)
+
+    def _post_terminal_cleanup_grace_state(self, *, now: float | None = None) -> tuple[bool, float]:
+        ref_now = time.time() if now is None else float(now)
+        active = bool(
+            self._terminal_liquidation_active
+            and self._terminal_liquidation_done
+            and max(
+                float(self._terminal_liquidation_remaining_up),
+                float(self._terminal_liquidation_remaining_dn),
+            ) < self._terminal_cleanup_dust_threshold()
+        )
+        if active:
+            if self._post_terminal_cleanup_grace_started_ts <= 0.0:
+                self._post_terminal_cleanup_grace_started_ts = ref_now
+            return True, max(0.0, ref_now - self._post_terminal_cleanup_grace_started_ts)
+        self._post_terminal_cleanup_grace_started_ts = 0.0
+        return False, 0.0
+
+    def _update_true_drift_progress(
+        self,
+        inventory: PairInventoryState,
+        *,
+        post_terminal_cleanup_grace_active: bool = False,
+    ) -> tuple[float, float]:
+        if post_terminal_cleanup_grace_active or not self.reconcile.true_drift:
             self._true_drift_started_ts = 0.0
             self._true_drift_last_progress_ts = 0.0
             self._true_drift_best_exposure = 0.0
@@ -1097,6 +1128,46 @@ class MarketMakerV2:
             prev = lifecycle
         return transitions
 
+    @staticmethod
+    def _marketability_side_score(marketability_state: dict[str, Any], side: str) -> int:
+        prefix = f"{side}_"
+        return int(
+            max(
+                int(marketability_state.get(f"{prefix}collateral_warning_streak") or 0),
+                int(marketability_state.get(f"{prefix}sell_skip_cooldown_streak") or 0),
+                int(marketability_state.get(f"{prefix}collateral_warning_hits_60s") or 0),
+                int(marketability_state.get(f"{prefix}sell_skip_cooldown_hits_60s") or 0),
+                int(round(float(marketability_state.get(f"{prefix}execution_churn_ratio_60s") or 0.0) * 10.0)),
+            )
+        )
+
+    def _classify_marketability_churn(
+        self,
+        marketability_state: dict[str, Any],
+    ) -> tuple[bool, str]:
+        up_collateral_streak = int(marketability_state.get("up_collateral_warning_streak") or 0)
+        dn_collateral_streak = int(marketability_state.get("dn_collateral_warning_streak") or 0)
+        up_sell_skip_streak = int(marketability_state.get("up_sell_skip_cooldown_streak") or 0)
+        dn_sell_skip_streak = int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0)
+        execution_churn_ratio = float(marketability_state.get("execution_churn_ratio_60s") or 0.0)
+        confirmed = bool(
+            max(
+                up_collateral_streak,
+                dn_collateral_streak,
+                up_sell_skip_streak,
+                dn_sell_skip_streak,
+            )
+            > 3
+            or execution_churn_ratio >= 0.50
+        )
+        if not confirmed:
+            return False, ""
+        up_score = self._marketability_side_score(marketability_state, "up")
+        dn_score = self._marketability_side_score(marketability_state, "dn")
+        if up_score <= 0 and dn_score <= 0:
+            return True, ""
+        return True, ("up" if up_score >= dn_score else "dn")
+
     def _classify_failure_bucket(
         self,
         *,
@@ -1108,8 +1179,11 @@ class MarketMakerV2:
         lifecycle: str,
         marketability_guard_active: bool,
     ) -> str:
-        if bool(health.true_drift) or (
+        if (not bool(getattr(health, "post_terminal_cleanup_grace_active", False))) and (
+            bool(health.true_drift)
+            or (
             bool(health.wallet_snapshot_stale) and bool(health.last_api_error_op)
+            )
         ):
             return "drift_transport"
         if self._terminal_liquidation_active and (
@@ -1120,7 +1194,7 @@ class MarketMakerV2:
             ) >= float(self.market.min_order_size if self.market else 5.0)
         ):
             return "terminal_execution"
-        if marketability_guard_active:
+        if marketability_guard_active or bool(getattr(risk, "marketability_churn_confirmed", False)):
             return "marketability_churn"
         if (
             str(getattr(snapshot, "valuation_regime", "") or "") == "toxic_divergence"
@@ -1282,6 +1356,12 @@ class MarketMakerV2:
         marketability_state = self.gateway.marketability_state()
         marketability_guard_active = bool((marketability_state or {}).get("active"))
         marketability_guard_reason = str((marketability_state or {}).get("reason") or "")
+        marketability_churn_confirmed, marketability_problem_side = self._classify_marketability_churn(
+            dict(marketability_state or {})
+        )
+        post_terminal_cleanup_grace_active, post_terminal_cleanup_grace_sec = (
+            self._post_terminal_cleanup_grace_state(now=now)
+        )
         if effective_wallet_stale:
             stale_reason = "PM wallet snapshot partial/unavailable"
             if not stale_wallet and reconcile_balance_error_active:
@@ -1310,6 +1390,7 @@ class MarketMakerV2:
             fv_dn=valuation.fv_dn,
             sellability_lag_active=bool(sell_release_lag.get("active")),
             wallet_snapshot_stale=effective_wallet_stale,
+            terminal_cleanup_grace=bool(post_terminal_cleanup_grace_active),
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
@@ -1355,15 +1436,21 @@ class MarketMakerV2:
             session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
             marketability_guard_active=bool(marketability_guard_active),
             marketability_guard_reason=str(marketability_guard_reason),
+            marketability_churn_confirmed=bool(marketability_churn_confirmed),
+            marketability_problem_side=str(marketability_problem_side or ""),
             collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
             sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
             execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
         )
-        true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
+        true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(
+            inventory,
+            post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
+        )
         health = self._build_health(
             api_stats=api_stats,
             sellability_lag_active=bool(sell_release_lag.get("active")),
             wallet_snapshot_stale=effective_wallet_stale,
+            post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
             true_drift_age_sec=true_drift_age_sec,
             true_drift_no_progress_sec=true_drift_no_progress_sec,
             drawdown_breach_ticks=drawdown_breach_ticks,
@@ -1395,6 +1482,8 @@ class MarketMakerV2:
             marketability_guard_reason=str(marketability_guard_reason),
             marketability_guard_up_active=bool(marketability_state.get("up_active") or False),
             marketability_guard_dn_active=bool(marketability_state.get("dn_active") or False),
+            marketability_churn_confirmed=bool(marketability_churn_confirmed),
+            marketability_problem_side=str(marketability_problem_side or ""),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -1897,8 +1986,13 @@ class MarketMakerV2:
             quote_balance_state=str(plan.quote_balance_state),
             dual_bid_exception_active=bool(dual_bid_exception_active),
             dual_bid_exception_reason=str(dual_bid_exception_reason),
-            marketability_guard_active=bool(effective_risk.marketability_guard_active),
-            marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
+            marketability_guard_active=bool(
+                effective_risk.marketability_guard_active or effective_risk.marketability_churn_confirmed
+            ),
+            marketability_guard_reason=str(
+                effective_risk.marketability_guard_reason
+                or ("confirmed_churn" if effective_risk.marketability_churn_confirmed else "")
+            ),
         )
         target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
         target_ratio_cap_active = bool(target_ratio_cap_hits_tick > 0)
@@ -2006,10 +2100,13 @@ class MarketMakerV2:
             dual_bid_exception_reason=str(dual_bid_exception_reason),
             marketability_guard_active=bool(effective_risk.marketability_guard_active),
             marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
+            marketability_churn_confirmed=bool(effective_risk.marketability_churn_confirmed),
+            marketability_problem_side=str(effective_risk.marketability_problem_side or ""),
             collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
             sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
             execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
             untradeable_tolerated_samples_60s=int(untradeable_tolerated_samples_60s),
+            post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
             failure_bucket_current=str(failure_bucket_current or ""),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
@@ -2115,6 +2212,7 @@ class MarketMakerV2:
             app_version=app_version,
             app_git_hash=app_git_hash,
         )
+        grace_active, grace_sec = self._post_terminal_cleanup_grace_state(now=time.time())
         snap["runtime"] = {
             "last_terminal_reason": self._last_terminal_reason,
             "last_terminal_ts": self._last_terminal_ts,
@@ -2129,6 +2227,8 @@ class MarketMakerV2:
             "terminal_liquidation_remaining_dn": float(self._terminal_liquidation_remaining_dn),
             "terminal_liquidation_done": bool(self._terminal_liquidation_done),
             "terminal_liquidation_reason": str(self._terminal_liquidation_reason or ""),
+            "post_terminal_cleanup_grace_active": bool(grace_active),
+            "post_terminal_cleanup_grace_sec": float(grace_sec),
             "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
             "drawdown_breach_age_sec": (
                 max(0.0, time.time() - self._drawdown_breach_started_ts)

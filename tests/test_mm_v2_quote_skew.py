@@ -740,6 +740,49 @@ def test_marketability_guard_blocks_pair_expanding_quotes_on_problem_side():
     assert plan.quote_viability_reason == "marketability_guard"
 
 
+def test_marketability_churn_confirmed_keeps_only_inventory_reducing_intents():
+    cfg = MMConfigV2(session_budget_usd=30.0, base_clip_usd=4.0)
+    snapshot = _snapshot(market_tradeable=False, market_quality_score=0.62)
+    inventory = _inventory(
+        up_shares=8.0,
+        total_inventory_value_usd=7.0,
+        excess_up_qty=8.0,
+        excess_up_value_usd=4.2,
+        excess_value_usd=4.2,
+        signed_excess_value_usd=4.2,
+        free_usdc=20.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="collateral_warning",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="up",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        marketability_guard_active=True,
+        marketability_guard_reason="collateral_warning",
+        marketability_churn_confirmed=True,
+        marketability_problem_side="up",
+        marketability_guard_up_active=True,
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.up_bid is None
+    assert plan.suppressed_reasons["up_bid"] == "marketability_churn_confirmed"
+    assert plan.up_ask is not None
+    assert plan.quote_viability_reason == "marketability_churn_confirmed"
+
+
 def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(
