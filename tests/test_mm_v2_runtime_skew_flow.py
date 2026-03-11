@@ -1535,6 +1535,97 @@ async def test_terminal_liquidation_done_before_expiry_does_not_resume_normal_qu
     assert state["lifecycle"] == "unwind"
 
 
+@pytest.mark.asyncio
+async def test_terminal_liquidation_done_reason_is_not_overwritten_by_timeout(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0, emergency_unwind_timeout_sec=10.0))
+    mm.set_market(_market())
+    snapshot = _snapshot(time_left_sec=15.0)
+    valuation = PairValuationResult(
+        fv_up=snapshot.fv_up,
+        fv_dn=snapshot.fv_dn,
+        pair_mid=0.5,
+        source="midpoint_bounded_model",
+        divergence_up=0.0,
+        divergence_dn=0.0,
+        confidence=snapshot.fv_confidence,
+        regime="normal",
+        pm_age_sec=0.0,
+    )
+    inventory = _inventory(
+        up_shares=0.03,
+        dn_shares=4.88,
+        total_inventory_value_usd=2.45,
+        free_usdc=20.5,
+        wallet_total_usdc=20.5,
+    )
+    now = [1000.0]
+
+    async def _check_fills():
+        return []
+
+    async def _get_books():
+        return {}, {}
+
+    def _compute(*, market, feed_state, up_book, dn_book):
+        del market, feed_state, up_book, dn_book
+        return valuation, snapshot
+
+    def _sync_paper_prices(**kwargs):
+        del kwargs
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.03, 4.88, 20.5, 20.5
+
+    async def _get_sellable_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.03, 4.88
+
+    def _reconcile(**kwargs):
+        del kwargs
+        return inventory
+
+    async def _step(*, round_idx=0, cancel_existing=True):
+        raise AssertionError("terminal step should not rerun when terminal_liquidation_done is already true")
+
+    async def _cancel_all():
+        return 0
+
+    async def _sync(_plan):
+        raise AssertionError("normal execution sync should not run during terminal liquidation")
+
+    monkeypatch.setattr("mm_v2.runtime.time.time", lambda: now[0])
+    monkeypatch.setattr(mm.gateway, "check_fills", _check_fills)
+    monkeypatch.setattr(mm.gateway, "get_books", _get_books)
+    monkeypatch.setattr(mm.valuation, "compute", _compute)
+    monkeypatch.setattr(mm.gateway, "sync_paper_prices", _sync_paper_prices)
+    monkeypatch.setattr(mm.gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(mm.gateway, "api_error_stats", lambda: {})
+    monkeypatch.setattr(mm.gateway, "balance_fetch_health_state", lambda: {})
+    monkeypatch.setattr(mm.gateway, "get_sellable_balances", _get_sellable_balances)
+    monkeypatch.setattr(mm.gateway, "sell_release_lag_state", lambda: {"active": False})
+    monkeypatch.setattr(mm.reconcile, "reconcile", _reconcile)
+    monkeypatch.setattr(mm.gateway, "run_terminal_liquidation_step", _step)
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.execution_policy, "sync", _sync)
+
+    mm._terminal_liquidation_active = True
+    mm._terminal_liquidation_started_ts = now[0] - 15.0
+    mm._terminal_liquidation_done = True
+    mm._terminal_liquidation_reason = "terminal_liquidation_done"
+    mm._terminal_liquidation_remaining_up = 0.03
+    mm._terminal_liquidation_remaining_dn = 4.88
+
+    await mm._tick()
+
+    state = mm.snapshot()
+    assert state["runtime"]["terminal_liquidation_done"] is True
+    assert state["runtime"]["terminal_liquidation_reason"] == "terminal_liquidation_done"
+
+
 def test_balanced_profile_avoids_early_unwind_after_first_fill():
     snapshot = _snapshot()
     first_fill_inventory = _inventory(

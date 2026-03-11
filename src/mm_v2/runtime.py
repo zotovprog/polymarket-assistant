@@ -1377,7 +1377,7 @@ class MarketMakerV2:
                     total_usdc=float(terminal_wallet_total_usdc),
                     snapshot=snapshot,
                 )
-            elif terminal_timeout:
+            elif terminal_timeout and not self._terminal_liquidation_done:
                 self._terminal_liquidation_reason = (
                     "terminal_liquidation_timeout"
                     if terminal_timeout
