@@ -1570,6 +1570,13 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
             "lifecycle": "defensive",
             "analytics": {
                 "mm_regime_degraded_reason": "high_emergency_ratio",
+                "marketability_guard_active": True,
+                "marketability_guard_reason": "collateral_warning",
+                "collateral_warning_hits_60s": 4,
+                "sell_skip_cooldown_hits_60s": 3,
+                "execution_churn_ratio_60s": 0.5,
+                "untradeable_tolerated_samples_60s": 2,
+                "failure_bucket_current": "marketability_churn",
                 "maker_cross_guard_hits_60s": 4,
                 "dual_bid_ratio_60s": 0.72,
                 "one_sided_bid_streak_outside": 2,
@@ -1590,6 +1597,13 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
+    assert resp["analytics"]["marketability_guard_active"] is True
+    assert resp["analytics"]["marketability_guard_reason"] == "collateral_warning"
+    assert resp["analytics"]["collateral_warning_hits_60s"] == 4
+    assert resp["analytics"]["sell_skip_cooldown_hits_60s"] == 3
+    assert resp["analytics"]["execution_churn_ratio_60s"] == pytest.approx(0.5)
+    assert resp["analytics"]["untradeable_tolerated_samples_60s"] == 2
+    assert resp["analytics"]["failure_bucket_current"] == "marketability_churn"
     assert resp["analytics"]["maker_cross_guard_hits_60s"] == 4
     assert resp["analytics"]["dual_bid_ratio_60s"] == pytest.approx(0.72)
     assert resp["analytics"]["one_sided_bid_streak_outside"] == 2

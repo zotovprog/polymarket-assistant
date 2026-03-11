@@ -115,6 +115,62 @@ def _start_with_retry(
     raise RuntimeError(f"Unable to start mmv2 within retry timeout: {last_error}")
 
 
+def _derive_failure_bucket(state: dict[str, Any]) -> str:
+    analytics = state.get("analytics") or {}
+    explicit = str(analytics.get("failure_bucket_current") or "").strip()
+    if explicit:
+        return explicit
+    health = state.get("health") or {}
+    risk = state.get("risk") or {}
+    runtime = state.get("runtime") or {}
+    market = state.get("market") or {}
+    lifecycle = str(state.get("lifecycle") or "")
+    if bool(health.get("true_drift")) or bool(health.get("wallet_snapshot_stale")):
+        return "drift_transport"
+    if bool(runtime.get("terminal_liquidation_active")) and (
+        not bool(runtime.get("terminal_liquidation_done"))
+        or max(
+            float(runtime.get("terminal_liquidation_remaining_up") or 0.0),
+            float(runtime.get("terminal_liquidation_remaining_dn") or 0.0),
+        ) >= float((state.get("config") or {}).get("min_order_size") or 5.0)
+    ):
+        return "terminal_execution"
+    if (
+        bool(analytics.get("marketability_guard_active"))
+        or int(analytics.get("collateral_warning_hits_60s") or 0) > 0
+        or int(analytics.get("sell_skip_cooldown_hits_60s") or 0) > 0
+    ):
+        return "marketability_churn"
+    if (
+        str(market.get("valuation_regime") or "") == "toxic_divergence"
+        or bool(analytics.get("divergence_hard_suppress_up_active"))
+        or bool(analytics.get("divergence_hard_suppress_dn_active"))
+        or str(analytics.get("mm_regime_degraded_reason") or "") == "divergence_buy_hard_suppress"
+    ):
+        return "edge_divergence"
+    if (
+        lifecycle in {"unwind", "emergency_unwind", "halted"}
+        or str(risk.get("hard_mode") or "") in {"emergency_unwind", "halted"}
+        or str(risk.get("soft_mode") or "") == "unwind"
+    ):
+        return "inventory_regime"
+    return ""
+
+
+def _pick_primary_blocker(bucket_counts: dict[str, int]) -> str:
+    priority = [
+        "drift_transport",
+        "terminal_execution",
+        "marketability_churn",
+        "edge_divergence",
+        "inventory_regime",
+    ]
+    for bucket in priority:
+        if int(bucket_counts.get(bucket, 0)) > 0:
+            return bucket
+    return ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local-first MMV2 paper verification runner")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
@@ -162,6 +218,7 @@ def main() -> int:
 
     # Gate metrics
     outside_near_expiry_samples = 0
+    outside_lifecycle_counts: dict[str, int] = {}
     min_mm_effective_ratio_60s_outside = float("inf")
     min_dual_bid_ratio_60s_outside = float("inf")
     dual_bid_ratio_60s_outside_samples = 0
@@ -172,8 +229,14 @@ def main() -> int:
     max_one_sided_bid_streak_outside = 0
     max_low_dual_bid_streak_outside = 0
     low_dual_bid_streak_outside = 0
+    max_collateral_warning_streak_outside = 0
+    collateral_warning_streak_outside = 0
+    max_sell_skip_cooldown_streak_outside = 0
+    sell_skip_cooldown_streak_outside = 0
+    untradeable_tolerated_material_samples_outside = 0
     final_pnl_usd = 0.0
     window_final_pnls_by_start: dict[float, float] = {}
+    failure_bucket_counts: dict[str, int] = {}
 
     # Ensure stale run is not hanging.
     try:
@@ -263,10 +326,15 @@ def main() -> int:
             hard_mode = str(risk.get("hard_mode") or "")
             risk_reason = str(risk.get("reason") or "")
             market = state.get("market") or {}
+            inventory = state.get("inventory") or {}
+            runtime = state.get("runtime") or {}
             cfg = state.get("config") or {}
             time_left_sec = float(market.get("time_left_sec") or 0.0)
             unwind_window_sec = float(cfg.get("unwind_window_sec") or 90.0)
             outside_near_expiry = time_left_sec > unwind_window_sec
+            failure_bucket = _derive_failure_bucket(state)
+            if failure_bucket:
+                failure_bucket_counts[failure_bucket] = int(failure_bucket_counts.get(failure_bucket, 0)) + 1
 
             if lifecycle == "halted" or hard_mode == "halted":
                 failures.append(
@@ -372,7 +440,7 @@ def main() -> int:
             if started_key > 0.0:
                 window_final_pnls_by_start[started_key] = session_pnl
             portfolio_mark = analytics.get("portfolio_mark_value_usd")
-            if portfolio_mark is not None:
+            if portfolio_mark is not None and bool(args.paper_mode):
                 portfolio_mark = float(portfolio_mark)
                 if baseline_portfolio is None:
                     baseline_portfolio = portfolio_mark - session_pnl
@@ -397,16 +465,18 @@ def main() -> int:
 
             if outside_near_expiry:
                 outside_near_expiry_samples += 1
+                outside_lifecycle_counts[lifecycle] = int(outside_lifecycle_counts.get(lifecycle, 0)) + 1
                 mm_effective_ratio_60s = _ratio(analytics.get("mm_effective_ratio_60s"))
                 unwind_ratio_60s = _ratio(analytics.get("unwind_ratio_60s"))
                 emergency_unwind_ratio_60s = _ratio(analytics.get("emergency_unwind_ratio_60s"))
                 dual_bid_ratio_60s = _ratio(analytics.get("dual_bid_ratio_60s"))
+                dual_bid_exception_active = bool(analytics.get("dual_bid_exception_active") or False)
                 one_sided_bid_streak_outside = int(analytics.get("one_sided_bid_streak_outside") or 0)
                 min_mm_effective_ratio_60s_outside = min(min_mm_effective_ratio_60s_outside, mm_effective_ratio_60s)
                 if (now - started_at) >= dual_bid_warmup_sec:
                     dual_bid_ratio_60s_outside_samples += 1
                     min_dual_bid_ratio_60s_outside = min(min_dual_bid_ratio_60s_outside, dual_bid_ratio_60s)
-                    if dual_bid_ratio_60s < 0.70:
+                    if dual_bid_ratio_60s < 0.70 and not dual_bid_exception_active:
                         low_dual_bid_streak_outside += 1
                         max_low_dual_bid_streak_outside = max(
                             max_low_dual_bid_streak_outside,
@@ -429,6 +499,37 @@ def main() -> int:
                     max_quote_none_streak_outside = max(max_quote_none_streak_outside, quote_none_streak_outside)
                 else:
                     quote_none_streak_outside = 0
+                outside_terminal = not bool(runtime.get("terminal_liquidation_active"))
+                if outside_terminal:
+                    collateral_warning_hits = int(analytics.get("collateral_warning_hits_60s") or 0)
+                    sell_skip_cooldown_hits = int(analytics.get("sell_skip_cooldown_hits_60s") or 0)
+                    if collateral_warning_hits > 0:
+                        collateral_warning_streak_outside += 1
+                        max_collateral_warning_streak_outside = max(
+                            max_collateral_warning_streak_outside,
+                            collateral_warning_streak_outside,
+                        )
+                    else:
+                        collateral_warning_streak_outside = 0
+                    if sell_skip_cooldown_hits > 0:
+                        sell_skip_cooldown_streak_outside += 1
+                        max_sell_skip_cooldown_streak_outside = max(
+                            max_sell_skip_cooldown_streak_outside,
+                            sell_skip_cooldown_streak_outside,
+                        )
+                    else:
+                        sell_skip_cooldown_streak_outside = 0
+                    material_inventory_usd = max(
+                        6.0,
+                        0.20 * float(cfg.get("session_budget_usd") or args.budget or 30.0),
+                    )
+                    if (
+                        not bool(market.get("market_tradeable"))
+                        and str(risk.get("soft_mode") or "") == "normal"
+                        and str(risk_reason).startswith("normal quoting (untradeable tolerated)")
+                        and float(inventory.get("total_inventory_value_usd") or 0.0) >= material_inventory_usd
+                    ):
+                        untradeable_tolerated_material_samples_outside += 1
 
             prev_portfolio_mark = portfolio_mark
             prev_session_pnl = session_pnl
@@ -490,18 +591,54 @@ def main() -> int:
             failed_criteria.append(
                 f"one_sided_bid_streak_outside_above_6 (max={max_one_sided_bid_streak_outside})"
             )
+        if untradeable_tolerated_material_samples_outside > 0:
+            failed_criteria.append(
+                "untradeable_tolerated_with_material_inventory_present "
+                f"(count={untradeable_tolerated_material_samples_outside})"
+            )
+        if max_collateral_warning_streak_outside > 3:
+            failed_criteria.append(
+                f"collateral_warning_streak_outside_above_3 (max={max_collateral_warning_streak_outside})"
+            )
+        if max_sell_skip_cooldown_streak_outside > 3:
+            failed_criteria.append(
+                f"sell_skip_cooldown_streak_outside_above_3 (max={max_sell_skip_cooldown_streak_outside})"
+            )
 
     gate_verdict = "go" if not failed_criteria else "no_go"
+    failure_buckets = (
+        sorted(bucket for bucket, count in failure_bucket_counts.items() if int(count) > 0)
+        if failed_criteria
+        else []
+    )
+    primary_blocker = _pick_primary_blocker(failure_bucket_counts) if failed_criteria else ""
+    if failed_criteria and not primary_blocker:
+        failed_criteria.append("unknown_failure_bucket")
+    aggregate_pnl_usd = float(sum(window_final_pnls))
+    outside_mode_ratios: dict[str, float] = {}
+    if outside_near_expiry_samples > 0:
+        for mode, count in outside_lifecycle_counts.items():
+            outside_mode_ratios[mode] = float(count) / float(outside_near_expiry_samples)
+    mm_effective_share_outside = (
+        outside_mode_ratios.get("quoting", 0.0)
+        + outside_mode_ratios.get("inventory_skewed", 0.0)
+        + outside_mode_ratios.get("defensive", 0.0)
+    )
     summary = {
         "ok": gate_verdict == "go",
         "gate_verdict": gate_verdict,
         "failed_criteria": failed_criteria,
+        "failure_buckets": failure_buckets,
+        "primary_blocker": primary_blocker,
         "terminal_expected": bool(terminal_expected),
         "samples": samples,
         "max_fill_count": max_fill_count,
         "restart_count": restart_count,
         "final_pnl_usd": float(final_pnl_usd),
+        "aggregate_pnl_usd": float(aggregate_pnl_usd),
         "window_final_pnls": window_final_pnls,
+        "outside_mode_ratios": outside_mode_ratios,
+        "mm_effective_share_outside": float(mm_effective_share_outside),
         "outside_near_expiry": {
             "samples": int(outside_near_expiry_samples),
             "min_mm_effective_ratio_60s": (
@@ -516,12 +653,18 @@ def main() -> int:
             "max_quote_balance_none_streak": int(max_quote_none_streak_outside),
             "max_one_sided_bid_streak_outside": int(max_one_sided_bid_streak_outside),
             "max_low_dual_bid_streak_outside": int(max_low_dual_bid_streak_outside),
+            "max_collateral_warning_streak_outside": int(max_collateral_warning_streak_outside),
+            "max_sell_skip_cooldown_streak_outside": int(max_sell_skip_cooldown_streak_outside),
+            "untradeable_tolerated_material_samples_outside": int(untradeable_tolerated_material_samples_outside),
         },
         "dual_bid_ratio_60s_min_outside": (
             1.0 if min_dual_bid_ratio_60s_outside == float("inf") else float(min_dual_bid_ratio_60s_outside)
         ),
         "max_one_sided_bid_streak_outside": int(max_one_sided_bid_streak_outside),
         "max_low_dual_bid_streak_outside": int(max_low_dual_bid_streak_outside),
+        "max_collateral_warning_streak_outside": int(max_collateral_warning_streak_outside),
+        "max_sell_skip_cooldown_streak_outside": int(max_sell_skip_cooldown_streak_outside),
+        "untradeable_tolerated_material_samples_outside": int(untradeable_tolerated_material_samples_outside),
         "failures": failures,
         "params": {
             "base_url": args.base_url,

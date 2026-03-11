@@ -700,6 +700,22 @@ class QuotePolicyV2:
                 built[slot] = None
                 suppressed_reasons[slot] = "harmful_buy_blocked_drawdown"
                 continue
+            marketability_guard_side_active = bool(
+                getattr(
+                    risk,
+                    "marketability_guard_up_active" if token_side == "up" else "marketability_guard_dn_active",
+                    False,
+                )
+            )
+            if (
+                marketability_guard_side_active
+                and side == "BUY"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "marketability_guard"
+                continue
             if (
                 risk.soft_mode == "inventory_skewed"
                 and side == "BUY"
@@ -786,6 +802,15 @@ class QuotePolicyV2:
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
             expands_gross_inventory = side == "BUY" or (side == "SELL" and not inventory_backed_sell)
+            if (
+                marketability_guard_side_active
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                and expands_gross_inventory
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "marketability_guard"
+                continue
             if (
                 risk.soft_mode in {"defensive", "unwind"}
                 and inventory.pair_value_over_target_usd > 0.0
@@ -1418,6 +1443,8 @@ class QuotePolicyV2:
             quote_viability_reason = "helpful_floor_applied"
         elif neutral_floor_applied:
             quote_viability_reason = "min_viable_floor_applied"
+        elif bool(getattr(risk, "marketability_guard_active", False)):
+            quote_viability_reason = "marketability_guard"
         elif side_soft_brake_active_tick:
             quote_viability_reason = "side_reentry_soft_brake"
         elif quote_balance_state == "reduced":

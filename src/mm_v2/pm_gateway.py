@@ -93,6 +93,33 @@ class PMGateway:
     def balance_fetch_health_state(self) -> dict[str, Any]:
         return self.order_mgr.get_balance_fetch_health_snapshot()
 
+    def marketability_state(self) -> dict[str, Any]:
+        if not self.market:
+            return {
+                "active": False,
+                "reason": "",
+                "collateral_warning_hits_60s": 0,
+                "sell_skip_cooldown_hits_60s": 0,
+                "sell_place_attempts_60s": 0,
+                "execution_churn_ratio_60s": 0.0,
+                "up_active": False,
+                "up_reason": "",
+                "up_collateral_warning_hits_60s": 0,
+                "up_sell_skip_cooldown_hits_60s": 0,
+                "up_sell_place_attempts_60s": 0,
+                "up_execution_churn_ratio_60s": 0.0,
+                "dn_active": False,
+                "dn_reason": "",
+                "dn_collateral_warning_hits_60s": 0,
+                "dn_sell_skip_cooldown_hits_60s": 0,
+                "dn_sell_place_attempts_60s": 0,
+                "dn_execution_churn_ratio_60s": 0.0,
+            }
+        return self.order_mgr.get_marketability_snapshot(
+            up_token_id=self.market.up_token_id,
+            dn_token_id=self.market.dn_token_id,
+        )
+
     async def get_balances(self) -> tuple[float | None, float | None, float | None, float | None]:
         """Backward-compatible alias for wallet balances."""
         return await self.get_wallet_balances()

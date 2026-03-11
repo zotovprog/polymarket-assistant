@@ -211,6 +211,7 @@ class OrderManager:
         self._last_fallback_poll_count: int = 0
         self._order_args_supports_fee_rate: bool = self._detect_order_args_fee_rate_support()
         self._recent_api_errors: deque[APIErrorEvent] = deque(maxlen=50)
+        self._recent_marketability_events: deque[tuple[float, str, str]] = deque(maxlen=500)
         self._api_error_counts: dict[str, int] = {}
         self._transport_error_counts: dict[str, int] = {}
         self._last_api_error_ts: float = 0.0
@@ -779,6 +780,125 @@ class OrderManager:
             "last_error_ts": round(self._last_api_error_ts, 3) if self._last_api_error_ts > 0 else 0.0,
         }
 
+    def _record_marketability_event(
+        self,
+        *,
+        kind: str,
+        token_id: str | None = None,
+    ) -> None:
+        self._recent_marketability_events.append(
+            (
+                float(time.time()),
+                str(kind or "").strip(),
+                self._safe_str(token_id),
+            )
+        )
+
+    @staticmethod
+    def _marketability_reason_from_counts(
+        *,
+        collateral_warning_hits: int,
+        sell_skip_cooldown_hits: int,
+        sell_place_attempts: int,
+        execution_churn_ratio: float,
+    ) -> str:
+        if collateral_warning_hits >= 2:
+            return "collateral_warning"
+        if sell_skip_cooldown_hits >= 2:
+            return "sell_skip_cooldown"
+        if sell_place_attempts >= 3 and execution_churn_ratio >= 0.35:
+            return "execution_churn"
+        return ""
+
+    def get_marketability_snapshot(
+        self,
+        *,
+        up_token_id: str | None = None,
+        dn_token_id: str | None = None,
+        window_sec: float = 60.0,
+    ) -> dict[str, Any]:
+        now = time.time()
+        window_start = now - max(1.0, float(window_sec))
+        events = [
+            (ts, kind, token_id)
+            for ts, kind, token_id in self._recent_marketability_events
+            if float(ts) >= window_start
+        ]
+
+        def _count(kind: str, token_id: str | None = None) -> int:
+            token = self._safe_str(token_id)
+            total = 0
+            for _, event_kind, event_token in events:
+                if event_kind != kind:
+                    continue
+                if token and event_token != token:
+                    continue
+                total += 1
+            return int(total)
+
+        collateral_warning_hits_60s = _count("collateral_warning")
+        sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown")
+        sell_place_attempts_60s = _count("sell_place_attempt")
+        execution_churn_ratio_60s = float(
+            (collateral_warning_hits_60s + sell_skip_cooldown_hits_60s)
+            / max(1, sell_place_attempts_60s)
+        )
+        reason = self._marketability_reason_from_counts(
+            collateral_warning_hits=collateral_warning_hits_60s,
+            sell_skip_cooldown_hits=sell_skip_cooldown_hits_60s,
+            sell_place_attempts=sell_place_attempts_60s,
+            execution_churn_ratio=execution_churn_ratio_60s,
+        )
+
+        up_token = self._safe_str(up_token_id)
+        dn_token = self._safe_str(dn_token_id)
+        up_collateral_warning_hits_60s = _count("collateral_warning", up_token)
+        dn_collateral_warning_hits_60s = _count("collateral_warning", dn_token)
+        up_sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown", up_token)
+        dn_sell_skip_cooldown_hits_60s = _count("sell_skip_cooldown", dn_token)
+        up_sell_place_attempts_60s = _count("sell_place_attempt", up_token)
+        dn_sell_place_attempts_60s = _count("sell_place_attempt", dn_token)
+        up_execution_churn_ratio_60s = float(
+            (up_collateral_warning_hits_60s + up_sell_skip_cooldown_hits_60s)
+            / max(1, up_sell_place_attempts_60s)
+        )
+        dn_execution_churn_ratio_60s = float(
+            (dn_collateral_warning_hits_60s + dn_sell_skip_cooldown_hits_60s)
+            / max(1, dn_sell_place_attempts_60s)
+        )
+        up_reason = self._marketability_reason_from_counts(
+            collateral_warning_hits=up_collateral_warning_hits_60s,
+            sell_skip_cooldown_hits=up_sell_skip_cooldown_hits_60s,
+            sell_place_attempts=up_sell_place_attempts_60s,
+            execution_churn_ratio=up_execution_churn_ratio_60s,
+        )
+        dn_reason = self._marketability_reason_from_counts(
+            collateral_warning_hits=dn_collateral_warning_hits_60s,
+            sell_skip_cooldown_hits=dn_sell_skip_cooldown_hits_60s,
+            sell_place_attempts=dn_sell_place_attempts_60s,
+            execution_churn_ratio=dn_execution_churn_ratio_60s,
+        )
+        return {
+            "active": bool(reason),
+            "reason": str(reason),
+            "collateral_warning_hits_60s": int(collateral_warning_hits_60s),
+            "sell_skip_cooldown_hits_60s": int(sell_skip_cooldown_hits_60s),
+            "sell_place_attempts_60s": int(sell_place_attempts_60s),
+            "execution_churn_ratio_60s": float(execution_churn_ratio_60s),
+            "up_active": bool(up_reason),
+            "up_reason": str(up_reason),
+            "up_collateral_warning_hits_60s": int(up_collateral_warning_hits_60s),
+            "up_sell_skip_cooldown_hits_60s": int(up_sell_skip_cooldown_hits_60s),
+            "up_sell_place_attempts_60s": int(up_sell_place_attempts_60s),
+            "up_execution_churn_ratio_60s": float(up_execution_churn_ratio_60s),
+            "dn_active": bool(dn_reason),
+            "dn_reason": str(dn_reason),
+            "dn_collateral_warning_hits_60s": int(dn_collateral_warning_hits_60s),
+            "dn_sell_skip_cooldown_hits_60s": int(dn_sell_skip_cooldown_hits_60s),
+            "dn_sell_place_attempts_60s": int(dn_sell_place_attempts_60s),
+            "dn_execution_churn_ratio_60s": float(dn_execution_churn_ratio_60s),
+        }
+
     def get_placement_error_total(self) -> int:
         """Count real placement/signing failures recorded through API-error paths."""
         placement_ops = (
@@ -1230,6 +1350,7 @@ class OrderManager:
         cooldown_left = self._cancel_repost_cooldown_left(quote.token_id)
         if cooldown_left <= 0:
             return False
+        self._record_marketability_event(kind="sell_skip_cooldown", token_id=quote.token_id)
         self._throttled_warn(
             f"sell_post_cancel_cooldown:{source}:{quote.token_id}",
             (
@@ -1935,6 +2056,8 @@ class OrderManager:
         """
         use_post_only = self.config.use_post_only if post_only is None else post_only
         is_mock = hasattr(self.client, '_orders')
+        if (quote.side or "").upper() == "SELL":
+            self._record_marketability_event(kind="sell_place_attempt", token_id=quote.token_id)
         if not ignore_sell_cooldowns:
             if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="single_place"):
                 return None
@@ -1982,6 +2105,7 @@ class OrderManager:
         if is_mock:
             usdc_avail = float(getattr(self.client, '_usdc_balance', 0.0))
             if collateral > usdc_avail:
+                self._record_marketability_event(kind="collateral_warning", token_id=quote.token_id)
                 log.warning(
                     "Collateral warning: %s %s %.1f@%.2f needs $%.2f but only $%.2f USDC available",
                     quote.side, quote.token_id[:8], quote.size, quote.price,
@@ -2216,6 +2340,8 @@ class OrderManager:
         token_fee_rate_bps: dict[str, int] = {}
 
         for quote in quotes:
+            if (quote.side or "").upper() == "SELL":
+                self._record_marketability_event(kind="sell_place_attempt", token_id=quote.token_id)
             if quote.side == "SELL" and self._should_skip_sell_after_cancel(quote, source="batch_precheck"):
                 signed_orders.append(None)
                 continue
@@ -2974,6 +3100,7 @@ class OrderManager:
                     self._ws_fills_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+        self._recent_marketability_events.clear()
 
     async def cancel_all(self, *, force_exchange: bool = False) -> int:
         """Cancel active orders.

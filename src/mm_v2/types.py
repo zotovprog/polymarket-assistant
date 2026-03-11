@@ -157,6 +157,10 @@ class RiskRegime:
     side_reentry_cooldown_dn_sec: float = 0.0
     side_hard_block_up_sec: float = 0.0
     side_hard_block_dn_sec: float = 0.0
+    marketability_guard_active: bool = False
+    marketability_guard_reason: str = ""
+    marketability_guard_up_active: bool = False
+    marketability_guard_dn_active: bool = False
 
 
 @dataclass
@@ -276,6 +280,13 @@ class AnalyticsState:
     unwind_deferred_hits_60s: int = 0
     forced_unwind_extreme_excess_hits_60s: int = 0
     mm_regime_degraded_reason: str = ""
+    marketability_guard_active: bool = False
+    marketability_guard_reason: str = ""
+    collateral_warning_hits_60s: int = 0
+    sell_skip_cooldown_hits_60s: int = 0
+    execution_churn_ratio_60s: float = 0.0
+    untradeable_tolerated_samples_60s: int = 0
+    failure_bucket_current: str = ""
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
     unwind_exit_armed: bool = False

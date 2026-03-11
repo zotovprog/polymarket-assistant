@@ -42,7 +42,6 @@ class SoftRiskKernel:
         inventory: PairInventoryState,
         analytics: AnalyticsState,
     ) -> SoftRiskAssessment:
-        del analytics
         budget = max(0.01, float(self.config.session_budget_usd))
         soft_cap = max(0.01, float(self.config.soft_excess_value_ratio) * budget)
         defensive_cap = max(soft_cap, float(self.config.defensive_excess_value_ratio) * budget)
@@ -66,6 +65,9 @@ class SoftRiskKernel:
         target_ratio_activation_usd = float(self.config.effective_target_ratio_activation_usd())
         gross_brake_activation_usd = max(1.5, 0.05 * budget)
         material_inventory_usd = max(6.0, 0.20 * budget)
+        inventory_nearly_flat_usd = max(2.0, 0.10 * budget)
+        marketability_guard_active = bool(getattr(analytics, "marketability_guard_active", False))
+        marketability_guard_reason = str(getattr(analytics, "marketability_guard_reason", "") or "")
         up_inventory_value_usd = max(
             0.0,
             float(inventory.up_shares)
@@ -122,6 +124,7 @@ class SoftRiskKernel:
             is_untradeable and (severe_untradeable_quality or severe_untradeable_divergence)
         )
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
+        inventory_nearly_flat = float(inventory.total_inventory_value_usd) < inventory_nearly_flat_usd
         untradeable_inventory_divergence_bad = bool(
             max_divergence >= UNTRADEABLE_MATERIAL_INVENTORY_DIVERGENCE
         )
@@ -167,7 +170,13 @@ class SoftRiskKernel:
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
-            if is_untradeable and material_inventory and (
+            if is_untradeable and marketability_guard_active:
+                target_soft_mode = "defensive"
+                if marketability_guard_reason:
+                    soft_reason = f"defensive marketability guard ({marketability_guard_reason})"
+                else:
+                    soft_reason = "defensive marketability guard"
+            elif is_untradeable and material_inventory and (
                 untradeable_inventory_divergence_bad or untradeable_inventory_quality_bad
             ):
                 target_soft_mode = "defensive"
@@ -183,6 +192,9 @@ class SoftRiskKernel:
                     soft_reason = "defensive market regime (untradeable severe quality)"
                 else:
                     soft_reason = "defensive market regime (untradeable severe divergence)"
+            elif is_untradeable and not inventory_nearly_flat:
+                target_soft_mode = "inventory_skewed"
+                soft_reason = "inventory_skewed untradeable nonflat"
             elif is_untradeable:
                 soft_reason = "normal quoting (untradeable tolerated)"
             elif flat_bootstrap:

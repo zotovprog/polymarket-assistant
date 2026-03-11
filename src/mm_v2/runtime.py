@@ -102,6 +102,7 @@ class MarketMakerV2:
         self._divergence_soft_brake_history: list[tuple[float, int]] = []
         self._divergence_hard_suppress_history: list[tuple[float, int]] = []
         self._buy_edge_gap_history: list[tuple[float, float]] = []
+        self._untradeable_tolerated_history: list[tuple[float, int]] = []
         self._emergency_taker_forced_history: list[tuple[float, int]] = []
         self._one_sided_bid_streak_outside: int = 0
         self._unwind_deferred_history: list[tuple[float, int]] = []
@@ -359,6 +360,7 @@ class MarketMakerV2:
         self._divergence_soft_brake_history.clear()
         self._divergence_hard_suppress_history.clear()
         self._buy_edge_gap_history.clear()
+        self._untradeable_tolerated_history.clear()
         self._emergency_taker_forced_history.clear()
         self._one_sided_bid_streak_outside = 0
         self._unwind_deferred_history.clear()
@@ -1095,6 +1097,45 @@ class MarketMakerV2:
             prev = lifecycle
         return transitions
 
+    def _classify_failure_bucket(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        inventory: PairInventoryState,
+        risk: RiskRegime,
+        health: HealthState,
+        plan: QuotePlan,
+        lifecycle: str,
+        marketability_guard_active: bool,
+    ) -> str:
+        if bool(health.true_drift) or (
+            bool(health.wallet_snapshot_stale) and bool(health.last_api_error_op)
+        ):
+            return "drift_transport"
+        if self._terminal_liquidation_active and (
+            (not bool(self._terminal_liquidation_done))
+            or max(
+                float(self._terminal_liquidation_remaining_up),
+                float(self._terminal_liquidation_remaining_dn),
+            ) >= float(self.market.min_order_size if self.market else 5.0)
+        ):
+            return "terminal_execution"
+        if marketability_guard_active:
+            return "marketability_churn"
+        if (
+            str(getattr(snapshot, "valuation_regime", "") or "") == "toxic_divergence"
+            or bool(getattr(plan, "divergence_hard_suppress_up_active", False))
+            or bool(getattr(plan, "divergence_hard_suppress_dn_active", False))
+        ):
+            return "edge_divergence"
+        if (
+            str(risk.hard_mode or "") in {"emergency_unwind", "halted"}
+            or str(risk.soft_mode or "") == "unwind"
+            or str(lifecycle or "") in {"unwind", "emergency_unwind", "halted"}
+        ):
+            return "inventory_regime"
+        return ""
+
     def _update_mm_regime_alert(
         self,
         *,
@@ -1109,6 +1150,8 @@ class MarketMakerV2:
         quote_balance_state: str = "",
         dual_bid_exception_active: bool = False,
         dual_bid_exception_reason: str = "",
+        marketability_guard_active: bool = False,
+        marketability_guard_reason: str = "",
     ) -> None:
         now = time.time()
         mm_active_ratio_60s = float(
@@ -1119,6 +1162,8 @@ class MarketMakerV2:
             reason = "high_unwind_ratio"
         elif emergency_unwind_ratio_60s > 0.20:
             reason = "high_emergency_ratio"
+        elif marketability_guard_active:
+            reason = "marketability_churn"
         elif mm_active_ratio_60s < 0.30:
             reason = "low_mm_effective"
         elif outside_near_expiry and dual_bid_exception_active and dual_bid_exception_reason:
@@ -1137,6 +1182,7 @@ class MarketMakerV2:
                     "mm_regime_degraded",
                     (
                         f"MM regime degraded: reason={reason}, "
+                        f"marketability_guard_reason={marketability_guard_reason or 'none'}, "
                         f"mm_effective_ratio_60s={mm_active_ratio_60s:.2f}, "
                         f"quoting_ratio_60s={quoting_ratio_60s:.2f}, "
                         f"dual_bid_ratio_60s={dual_bid_ratio_60s:.2f}, "
@@ -1233,6 +1279,9 @@ class MarketMakerV2:
             reference_balances=(float(up), float(dn)),
         )
         sell_release_lag = self.gateway.sell_release_lag_state()
+        marketability_state = self.gateway.marketability_state()
+        marketability_guard_active = bool((marketability_state or {}).get("active"))
+        marketability_guard_reason = str((marketability_state or {}).get("reason") or "")
         if effective_wallet_stale:
             stale_reason = "PM wallet snapshot partial/unavailable"
             if not stale_wallet and reconcile_balance_error_active:
@@ -1304,6 +1353,11 @@ class MarketMakerV2:
             session_pnl_equity_usd=self._session_pnl_equity_usd,
             session_pnl_operator_usd=self._session_pnl_operator_usd,
             session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
+            marketability_guard_active=bool(marketability_guard_active),
+            marketability_guard_reason=str(marketability_guard_reason),
+            collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
+            sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
+            execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
         )
         true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(inventory)
         health = self._build_health(
@@ -1337,6 +1391,10 @@ class MarketMakerV2:
             side_reentry_cooldown_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
             side_hard_block_up_sec=float(self._side_reentry_cooldown_sec("up", now=now)),
             side_hard_block_dn_sec=float(self._side_reentry_cooldown_sec("dn", now=now)),
+            marketability_guard_active=bool(marketability_guard_active),
+            marketability_guard_reason=str(marketability_guard_reason),
+            marketability_guard_up_active=bool(marketability_state.get("up_active") or False),
+            marketability_guard_dn_active=bool(marketability_state.get("dn_active") or False),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -1626,6 +1684,14 @@ class MarketMakerV2:
         )
         unwind_deferred_hits_tick = 1 if transition.unwind_deferred else 0
         forced_unwind_extreme_excess_hits_tick = 1 if transition.forced_unwind_extreme_excess else 0
+        untradeable_tolerated_tick = int(
+            (
+                not bool(snapshot.market_tradeable)
+                and not bool(self._terminal_liquidation_active)
+                and str(effective_risk.soft_mode or "") == "normal"
+                and str(effective_risk.reason or "").startswith("normal quoting (untradeable tolerated)")
+            )
+        )
         current_active_order_ids = set(self.gateway.active_order_ids())
         removed_orders_tick = len(self._prev_active_order_ids - current_active_order_ids)
         self._prev_active_order_ids = current_active_order_ids
@@ -1656,6 +1722,7 @@ class MarketMakerV2:
         self._divergence_soft_brake_history.append((now, int(divergence_soft_brake_hits_tick)))
         self._divergence_hard_suppress_history.append((now, int(divergence_hard_suppress_hits_tick)))
         self._buy_edge_gap_history.append((now, float(buy_edge_gap_tick)))
+        self._untradeable_tolerated_history.append((now, int(untradeable_tolerated_tick)))
         self._emergency_taker_forced_history.append((now, 1 if emergency_taker_forced else 0))
         self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
         self._forced_unwind_extreme_excess_history.append((now, int(forced_unwind_extreme_excess_hits_tick)))
@@ -1681,6 +1748,7 @@ class MarketMakerV2:
         self._prune_history(self._divergence_soft_brake_history, now=window_now)
         self._prune_history(self._divergence_hard_suppress_history, now=window_now)
         self._prune_history(self._buy_edge_gap_history, now=window_now)
+        self._prune_history(self._untradeable_tolerated_history, now=window_now)
         self._prune_history(self._emergency_taker_forced_history, now=window_now)
         self._prune_history(self._unwind_deferred_history, now=window_now)
         self._prune_history(self._forced_unwind_extreme_excess_history, now=window_now)
@@ -1765,6 +1833,11 @@ class MarketMakerV2:
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
+        untradeable_tolerated_samples_60s = self._window_sum(
+            self._untradeable_tolerated_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
         dual_bid_outside_samples_60s = self._window_sum(
             self._dual_bid_outside_sample_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
@@ -1803,6 +1876,15 @@ class MarketMakerV2:
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
+        failure_bucket_current = self._classify_failure_bucket(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=effective_risk,
+            health=health,
+            plan=plan,
+            lifecycle=str(lifecycle),
+            marketability_guard_active=bool(effective_risk.marketability_guard_active),
+        )
         self._update_mm_regime_alert(
             quoting_ratio_60s=float(regime_ratios["quoting_ratio_60s"]),
             inventory_skewed_ratio_60s=float(regime_ratios["inventory_skewed_ratio_60s"]),
@@ -1815,6 +1897,8 @@ class MarketMakerV2:
             quote_balance_state=str(plan.quote_balance_state),
             dual_bid_exception_active=bool(dual_bid_exception_active),
             dual_bid_exception_reason=str(dual_bid_exception_reason),
+            marketability_guard_active=bool(effective_risk.marketability_guard_active),
+            marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
         )
         target_ratio_activation_usd_effective = float(self.config.effective_target_ratio_activation_usd())
         target_ratio_cap_active = bool(target_ratio_cap_hits_tick > 0)
@@ -1920,6 +2004,13 @@ class MarketMakerV2:
             max_buy_edge_gap_60s=float(max_buy_edge_gap_60s),
             dual_bid_exception_active=bool(dual_bid_exception_active),
             dual_bid_exception_reason=str(dual_bid_exception_reason),
+            marketability_guard_active=bool(effective_risk.marketability_guard_active),
+            marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
+            collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
+            sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
+            execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
+            untradeable_tolerated_samples_60s=int(untradeable_tolerated_samples_60s),
+            failure_bucket_current=str(failure_bucket_current or ""),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),

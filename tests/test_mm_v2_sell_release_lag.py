@@ -111,6 +111,52 @@ async def test_sell_during_cooldown_is_locally_suppressed():
 
 
 @pytest.mark.asyncio
+async def test_marketability_snapshot_counts_sell_skip_cooldown():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    client = _MockPlaceClient()
+    om = OrderManager(client, cfg)
+    om._set_cancel_repost_cooldown("tok-up")
+
+    for _ in range(2):
+        result = await om.place_order(
+            Quote(side="SELL", token_id="tok-up", price=0.51, size=5.0),
+            post_only=True,
+        )
+        assert result is None
+
+    snapshot = om.get_marketability_snapshot(up_token_id="tok-up")
+    assert snapshot["sell_skip_cooldown_hits_60s"] >= 2
+    assert snapshot["sell_place_attempts_60s"] >= 2
+    assert snapshot["reason"] == "sell_skip_cooldown"
+    assert snapshot["active"] is True
+    assert snapshot["up_active"] is True
+    assert snapshot["up_reason"] == "sell_skip_cooldown"
+
+
+@pytest.mark.asyncio
+async def test_marketability_snapshot_counts_collateral_warnings():
+    cfg = MMConfig()
+    client = _MockPlaceClient()
+    client._usdc_balance = 1.0
+    om = OrderManager(client, cfg)
+
+    for _ in range(2):
+        oid = await om.place_order(
+            Quote(side="SELL", token_id="tok-up", price=0.60, size=10.0),
+            post_only=True,
+        )
+        assert oid is not None
+
+    snapshot = om.get_marketability_snapshot(up_token_id="tok-up")
+    assert snapshot["collateral_warning_hits_60s"] >= 2
+    assert snapshot["reason"] == "collateral_warning"
+    assert snapshot["active"] is True
+    assert snapshot["up_active"] is True
+    assert snapshot["up_reason"] == "collateral_warning"
+
+
+@pytest.mark.asyncio
 async def test_cancel_all_terminal_liquidation_sell_does_not_start_repost_cooldown():
     cfg = MMConfig()
     cfg.sell_release_grace_sec = 3.0

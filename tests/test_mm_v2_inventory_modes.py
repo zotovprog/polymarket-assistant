@@ -225,6 +225,34 @@ def test_non_severe_untradeable_market_is_tolerated_for_mm():
     assert 0.0 < risk.quality_pressure < 1.0
 
 
+def test_untradeable_marketability_guard_forces_defensive():
+    cfg = MMConfigV2(session_budget_usd=30.0)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(
+            market_tradeable=False,
+            market_quality_score=0.62,
+            divergence_up=0.08,
+            divergence_dn=0.07,
+        ),
+        inventory=_inventory(
+            up_shares=6.0,
+            total_inventory_value_usd=6.5,
+            excess_up_qty=6.0,
+            excess_up_value_usd=3.5,
+            excess_value_usd=3.5,
+            signed_excess_value_usd=3.5,
+        ),
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="collateral_warning",
+        ),
+        health=HealthState(),
+    )
+    assert risk.soft_mode == "defensive"
+    assert risk.hard_mode == "none"
+    assert risk.reason == "defensive marketability guard (collateral_warning)"
+
+
 def test_non_severe_untradeable_market_keeps_inventory_skewed_on_soft_excess():
     cfg = MMConfigV2(session_budget_usd=30.0)
     risk = HardSafetyKernel(cfg).evaluate(

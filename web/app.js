@@ -878,6 +878,13 @@ function updateMMRegime(mmRegime, state) {
     const emergencyNoProgressSec = Number(mmRegime?.emergency_no_progress_sec ?? 0);
     const unwindDeferredHits = Number(mmRegime?.unwind_deferred_hits_60s ?? 0);
     const forcedUnwindHits = Number(mmRegime?.forced_unwind_extreme_excess_hits_60s ?? 0);
+    const marketabilityGuardActive = Boolean(mmRegime?.marketability_guard_active ?? false);
+    const marketabilityGuardReason = String(mmRegime?.marketability_guard_reason || '').trim();
+    const collateralWarningHits = Number(mmRegime?.collateral_warning_hits_60s ?? 0);
+    const sellSkipCooldownHits = Number(mmRegime?.sell_skip_cooldown_hits_60s ?? 0);
+    const executionChurnRatio = Math.max(0, Number(mmRegime?.execution_churn_ratio_60s ?? 0));
+    const untradeableToleratedSamples = Number(mmRegime?.untradeable_tolerated_samples_60s ?? 0);
+    const failureBucketCurrent = String(mmRegime?.failure_bucket_current || '').trim();
 
     let status = 'HEALTHY';
     let statusClass = 'mm-status-badge mm-status-healthy';
@@ -886,6 +893,7 @@ function updateMMRegime(mmRegime, state) {
         statusClass = 'mm-status-badge mm-status-degraded';
     } else if (
         mmEffective < 0.30 ||
+        degradedReason === 'marketability_churn' ||
         degradedReason === 'low_dual_bid_ratio' ||
         unwind > 0.5 ||
         emergencyUnwind > 0.20 ||
@@ -919,7 +927,12 @@ function updateMMRegime(mmRegime, state) {
         why += ` Regime alert reason: ${degradedReason}.`;
         if (degradedReason === 'low_dual_bid_ratio') {
             why += ' Dual-Bid core просел: слишком часто активен только один bid вне near-expiry.';
+        } else if (degradedReason === 'marketability_churn') {
+            why += ' Рынок плохо исполним: collateral pressure или cancel/repost churn давят обычный MM контур.';
         }
+    }
+    if (marketabilityGuardActive) {
+        why += ` Marketability guard активен${marketabilityGuardReason ? `: ${marketabilityGuardReason}` : ''}.`;
     }
     if (harmfulBuyBrakeActive) {
         why += ' Harmful BUY brake активен: скорость набора перекоса ограничена.';
@@ -939,8 +952,15 @@ function updateMMRegime(mmRegime, state) {
     setText('mm-regime-why', why);
     const signalHints = [];
     if (makerGuardHits > 0) signalHints.push(`maker_guard=${makerGuardHits}`);
+    if (failureBucketCurrent) signalHints.push(`failure_bucket=${failureBucketCurrent}`);
     signalHints.push(`dual_bid_ratio=${(dualBid * 100).toFixed(0)}%`);
     signalHints.push(`one_sided_streak=${Math.max(0, oneSidedBidStreak)}`);
+    if (marketabilityGuardActive) signalHints.push('marketability_guard=1');
+    if (marketabilityGuardReason) signalHints.push(`marketability_reason=${marketabilityGuardReason}`);
+    if (collateralWarningHits > 0) signalHints.push(`collateral_warn=${collateralWarningHits}`);
+    if (sellSkipCooldownHits > 0) signalHints.push(`sell_skip=${sellSkipCooldownHits}`);
+    if (executionChurnRatio > 0) signalHints.push(`churn=${executionChurnRatio.toFixed(2)}`);
+    if (untradeableToleratedSamples > 0) signalHints.push(`untradeable_tol=${untradeableToleratedSamples}`);
     if (dualBidGuardHits > 0) signalHints.push(`dual_bid_guard_hits=${dualBidGuardHits}`);
     if (dualBidGuardFailHits > 0) signalHints.push(`dual_bid_guard_fail=${dualBidGuardFailHits}`);
     if (harmfulBuyBrakeHits > 0) signalHints.push(`harmful_buy_brake=${harmfulBuyBrakeHits}`);

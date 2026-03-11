@@ -28,7 +28,7 @@ from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteViabilitySummary, RiskRegime
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuotePlan, QuoteViabilitySummary, RiskRegime
 from mm_shared.types import MarketInfo
 
 
@@ -819,6 +819,31 @@ def test_mm_regime_degraded_reason_low_dual_bid_ratio():
     assert "low_dual_bid_ratio" in alert["message"]
 
 
+def test_mm_regime_degraded_reason_marketability_churn():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._mm_regime_degraded_started_ts = time.time() - 130.0
+    mm._update_mm_regime_alert(
+        quoting_ratio_60s=0.45,
+        inventory_skewed_ratio_60s=0.20,
+        defensive_ratio_60s=0.10,
+        unwind_ratio_60s=0.0,
+        emergency_unwind_ratio_60s=0.0,
+        dual_bid_ratio_60s=0.90,
+        one_sided_bid_streak_outside=0,
+        outside_near_expiry=True,
+        quote_balance_state="reduced",
+        marketability_guard_active=True,
+        marketability_guard_reason="collateral_warning",
+    )
+    assert mm._mm_regime_degraded_reason == "marketability_churn"
+    alert = mm._alerts.get("mm_regime_degraded")
+    assert alert is not None
+    assert "marketability_guard_reason=collateral_warning" in alert["message"]
+
+
 def test_one_sided_bid_streak_tracks_only_outside_near_expiry():
     class _MockClient:
         _orders = {}
@@ -879,6 +904,35 @@ def test_divergence_dual_bid_exception_overrides_low_dual_bid_reason():
         dual_bid_exception_reason="divergence_buy_hard_suppress",
     )
     assert mm._mm_regime_degraded_reason == "divergence_buy_hard_suppress"
+
+
+def test_failure_bucket_prefers_marketability_churn():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm.market = _market()
+    bucket = mm._classify_failure_bucket(
+        snapshot=_snapshot(market_tradeable=False),
+        inventory=_inventory(total_inventory_value_usd=7.0, excess_value_usd=4.0, signed_excess_value_usd=4.0),
+        risk=RiskRegime(
+            soft_mode="defensive",
+            hard_mode="none",
+            target_soft_mode="defensive",
+            reason="defensive marketability guard (collateral_warning)",
+            inventory_pressure=0.3,
+            edge_score=0.0,
+            drawdown_pct_budget=1.0,
+            marketability_guard_active=True,
+            marketability_guard_reason="collateral_warning",
+            marketability_guard_up_active=True,
+        ),
+        health=HealthState(),
+        plan=QuotePlan(None, None, None, None, "defensive", "marketability"),
+        lifecycle="defensive",
+        marketability_guard_active=True,
+    )
+    assert bucket == "marketability_churn"
 
 
 def test_two_weak_negative_markouts_only_arm_soft_brake_not_hard_block():
