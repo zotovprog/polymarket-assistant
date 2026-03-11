@@ -22,6 +22,7 @@ from mm_v2.config import (
     UNWIND_EXIT_CONFIRM_TICKS,
     UNWIND_STUCK_WINDOW_SEC,
 )
+from mm_v2.pair_valuation import PairValuationResult
 from mm_v2.quote_policy import QuoteContext, QuotePolicyV2
 from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
@@ -1038,6 +1039,209 @@ def test_hard_mode_clear_allows_emergency_unwind_exit_path():
         result = sm.transition(snapshot=snapshot, inventory=inventory, risk=cleared_risk, viability=viability)
     assert result is not None
     assert result.lifecycle == "defensive"
+
+
+@pytest.mark.asyncio
+async def test_near_expiry_material_inventory_uses_terminal_liquidation_step_not_normal_requote(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(emergency_taker_start_sec=20.0))
+    mm.set_market(_market())
+    snapshot = _snapshot(time_left_sec=5.0)
+    valuation = PairValuationResult(
+        fv_up=snapshot.fv_up,
+        fv_dn=snapshot.fv_dn,
+        pair_mid=0.5,
+        source="midpoint_bounded_model",
+        divergence_up=0.0,
+        divergence_dn=0.0,
+        confidence=snapshot.fv_confidence,
+        regime="normal",
+        pm_age_sec=0.0,
+    )
+    inventory = _inventory(
+        up_shares=6.0,
+        total_inventory_value_usd=3.0,
+        free_usdc=15.0,
+        wallet_total_usdc=15.0,
+    )
+    calls = {"sync": 0, "step": 0, "cancel_all": 0}
+
+    async def _check_fills():
+        return []
+
+    async def _get_books():
+        return {}, {}
+
+    def _compute(*, market, feed_state, up_book, dn_book):
+        del market, feed_state, up_book, dn_book
+        return valuation, snapshot
+
+    def _sync_paper_prices(**kwargs):
+        del kwargs
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 6.0, 0.0, 15.0, 15.0
+
+    async def _get_sellable_balances(*, reference_balances=None):
+        del reference_balances
+        return 6.0, 0.0
+
+    def _reconcile(**kwargs):
+        del kwargs
+        return inventory
+
+    async def _step(*, round_idx=0, cancel_existing=True):
+        calls["step"] += 1
+        assert round_idx == 0
+        assert cancel_existing is False
+        return {
+            "attempted_orders": 1,
+            "placed_orders": 1,
+            "remaining_up": 6.0,
+            "remaining_dn": 0.0,
+            "wallet_total_usdc": 15.0,
+            "done": False,
+            "reason": "no_book_liquidity",
+            "placed_order_ids": ["oid-1"],
+            "cancelled_orders": 0,
+        }
+
+    async def _cancel_all():
+        calls["cancel_all"] += 1
+        return 0
+
+    async def _sync(_plan):
+        calls["sync"] += 1
+
+    monkeypatch.setattr(mm.gateway, "check_fills", _check_fills)
+    monkeypatch.setattr(mm.gateway, "get_books", _get_books)
+    monkeypatch.setattr(mm.valuation, "compute", _compute)
+    monkeypatch.setattr(mm.gateway, "sync_paper_prices", _sync_paper_prices)
+    monkeypatch.setattr(mm.gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(mm.gateway, "api_error_stats", lambda: {})
+    monkeypatch.setattr(mm.gateway, "balance_fetch_health_state", lambda: {})
+    monkeypatch.setattr(mm.gateway, "get_sellable_balances", _get_sellable_balances)
+    monkeypatch.setattr(mm.gateway, "sell_release_lag_state", lambda: {"active": False})
+    monkeypatch.setattr(mm.reconcile, "reconcile", _reconcile)
+    monkeypatch.setattr(mm.gateway, "run_terminal_liquidation_step", _step)
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.execution_policy, "sync", _sync)
+
+    await mm._tick()
+
+    state = mm.snapshot()
+    assert calls["cancel_all"] == 1
+    assert calls["step"] == 1
+    assert calls["sync"] == 0
+    assert state["lifecycle"] == "unwind"
+    assert state["quote_balance_state"] == "none"
+    assert state["runtime"]["terminal_liquidation_active"] is True
+    assert state["runtime"]["terminal_liquidation_attempted_orders"] == 1
+    assert state["runtime"]["terminal_liquidation_placed_orders"] == 1
+    assert state["runtime"]["terminal_liquidation_reason"] == "no_book_liquidity"
+
+
+@pytest.mark.asyncio
+async def test_terminal_liquidation_done_at_expiry_sets_explicit_terminal_reason(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(emergency_taker_start_sec=20.0))
+    mm.set_market(_market())
+    mm._running = True
+    snapshot = _snapshot(time_left_sec=0.0)
+    valuation = PairValuationResult(
+        fv_up=snapshot.fv_up,
+        fv_dn=snapshot.fv_dn,
+        pair_mid=0.5,
+        source="midpoint_bounded_model",
+        divergence_up=0.0,
+        divergence_dn=0.0,
+        confidence=snapshot.fv_confidence,
+        regime="normal",
+        pm_age_sec=0.0,
+    )
+    inventory = _inventory(
+        up_shares=6.0,
+        total_inventory_value_usd=3.0,
+        free_usdc=15.0,
+        wallet_total_usdc=15.0,
+    )
+    calls = {"cancel_all": 0}
+
+    async def _check_fills():
+        return []
+
+    async def _get_books():
+        return {}, {}
+
+    def _compute(*, market, feed_state, up_book, dn_book):
+        del market, feed_state, up_book, dn_book
+        return valuation, snapshot
+
+    def _sync_paper_prices(**kwargs):
+        del kwargs
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.0, 0.0, 21.0, 21.0
+
+    async def _get_sellable_balances(*, reference_balances=None):
+        del reference_balances
+        return 6.0, 0.0
+
+    def _reconcile(**kwargs):
+        del kwargs
+        return inventory
+
+    async def _step(*, round_idx=0, cancel_existing=True):
+        del round_idx, cancel_existing
+        return {
+            "attempted_orders": 1,
+            "placed_orders": 1,
+            "remaining_up": 0.0,
+            "remaining_dn": 0.0,
+            "wallet_total_usdc": 21.0,
+            "done": True,
+            "reason": "ok",
+            "placed_order_ids": ["oid-1"],
+            "cancelled_orders": 0,
+        }
+
+    async def _cancel_all():
+        calls["cancel_all"] += 1
+        return 0
+
+    async def _sync(_plan):
+        raise AssertionError("normal execution sync should not run during terminal liquidation")
+
+    monkeypatch.setattr(mm.gateway, "check_fills", _check_fills)
+    monkeypatch.setattr(mm.gateway, "get_books", _get_books)
+    monkeypatch.setattr(mm.valuation, "compute", _compute)
+    monkeypatch.setattr(mm.gateway, "sync_paper_prices", _sync_paper_prices)
+    monkeypatch.setattr(mm.gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(mm.gateway, "api_error_stats", lambda: {})
+    monkeypatch.setattr(mm.gateway, "balance_fetch_health_state", lambda: {})
+    monkeypatch.setattr(mm.gateway, "get_sellable_balances", _get_sellable_balances)
+    monkeypatch.setattr(mm.gateway, "sell_release_lag_state", lambda: {"active": False})
+    monkeypatch.setattr(mm.reconcile, "reconcile", _reconcile)
+    monkeypatch.setattr(mm.gateway, "run_terminal_liquidation_step", _step)
+    monkeypatch.setattr(mm.gateway, "cancel_all", _cancel_all)
+    monkeypatch.setattr(mm.execution_policy, "sync", _sync)
+
+    await mm._tick()
+
+    state = mm.snapshot()
+    assert calls["cancel_all"] == 2
+    assert mm._running is False
+    assert state["runtime"]["terminal_liquidation_done"] is True
+    assert state["runtime"]["terminal_liquidation_reason"] == "terminal_liquidation_done"
+    assert state["runtime"]["last_terminal_reason"] == "terminal_liquidation_done"
+    assert state["runtime"]["last_terminal_up_shares"] == pytest.approx(0.0)
+    assert state["runtime"]["last_terminal_dn_shares"] == pytest.approx(0.0)
 
 
 def test_balanced_profile_avoids_early_unwind_after_first_fill():

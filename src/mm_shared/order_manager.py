@@ -848,6 +848,14 @@ class OrderManager:
         if until > prev:
             self._cancel_repost_cooldown_until[token] = until
 
+    @staticmethod
+    def _should_arm_cancel_repost_cooldown(quote: Quote | None) -> bool:
+        if quote is None:
+            return False
+        if (quote.side or "").upper() != "SELL":
+            return False
+        return str(getattr(quote, "order_context", "quote") or "quote") != "terminal_liquidation"
+
     def _cancel_repost_cooldown_left(self, token_id: str) -> float:
         token = self._safe_str(token_id)
         if not token:
@@ -2476,7 +2484,7 @@ class OrderManager:
             for oid in cancelled_ids:
                 quote = self._active_orders.get(oid)
                 self._add_recent_cancelled_sell_reserve(oid, quote)
-                if quote is not None and (quote.side or "").upper() == "SELL":
+                if self._should_arm_cancel_repost_cooldown(quote):
                     self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(oid, quote)
                 self._active_orders.pop(oid, None)
@@ -2524,7 +2532,7 @@ class OrderManager:
         for oid in cancelled_ids:
             quote = self._active_orders.get(oid)
             self._add_recent_cancelled_sell_reserve(oid, quote)
-            if quote is not None and (quote.side or "").upper() == "SELL":
+            if self._should_arm_cancel_repost_cooldown(quote):
                 self._set_cancel_repost_cooldown(quote.token_id)
             self._track_recent_order(oid, quote)
             self._active_orders.pop(oid, None)
@@ -2917,7 +2925,7 @@ class OrderManager:
             quote = self._active_orders.get(order_id)
             if quote is not None:
                 self._add_recent_cancelled_sell_reserve(order_id, quote)
-                if (quote.side or "").upper() == "SELL":
+                if self._should_arm_cancel_repost_cooldown(quote):
                     self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(order_id, quote, reason="cancelled")
             self._active_orders.pop(order_id, None)
@@ -2991,7 +2999,7 @@ class OrderManager:
             cancelled = len(ids)
             for oid, quote in existing.items():
                 self._add_recent_cancelled_sell_reserve(oid, quote)
-                if quote is not None and (quote.side or "").upper() == "SELL":
+                if self._should_arm_cancel_repost_cooldown(quote):
                     self._set_cancel_repost_cooldown(quote.token_id)
                 self._track_recent_order(oid, quote, reason="batch_cancel")
             for oid in ids:

@@ -2635,6 +2635,13 @@ class MMRuntimeV2(MMRuntime):
             "last_terminal_up_shares": 0.0,
             "last_terminal_dn_shares": 0.0,
             "last_terminal_pnl_equity_usd": 0.0,
+            "terminal_liquidation_active": False,
+            "terminal_liquidation_attempted_orders": 0,
+            "terminal_liquidation_placed_orders": 0,
+            "terminal_liquidation_remaining_up": 0.0,
+            "terminal_liquidation_remaining_dn": 0.0,
+            "terminal_liquidation_done": False,
+            "terminal_liquidation_reason": "",
         }
 
     def _idle_snapshot_v2(self) -> dict[str, Any]:
@@ -2842,6 +2849,23 @@ class MMRuntimeV2(MMRuntime):
                 "last_terminal_dn_shares": float(self._last_terminal_runtime_v2.get("last_terminal_dn_shares") or 0.0),
                 "last_terminal_pnl_equity_usd": float(
                     self._last_terminal_runtime_v2.get("last_terminal_pnl_equity_usd") or 0.0
+                ),
+                "terminal_liquidation_active": bool(self._last_terminal_runtime_v2.get("terminal_liquidation_active")),
+                "terminal_liquidation_attempted_orders": int(
+                    self._last_terminal_runtime_v2.get("terminal_liquidation_attempted_orders") or 0
+                ),
+                "terminal_liquidation_placed_orders": int(
+                    self._last_terminal_runtime_v2.get("terminal_liquidation_placed_orders") or 0
+                ),
+                "terminal_liquidation_remaining_up": float(
+                    self._last_terminal_runtime_v2.get("terminal_liquidation_remaining_up") or 0.0
+                ),
+                "terminal_liquidation_remaining_dn": float(
+                    self._last_terminal_runtime_v2.get("terminal_liquidation_remaining_dn") or 0.0
+                ),
+                "terminal_liquidation_done": bool(self._last_terminal_runtime_v2.get("terminal_liquidation_done")),
+                "terminal_liquidation_reason": str(
+                    self._last_terminal_runtime_v2.get("terminal_liquidation_reason") or ""
                 ),
                 "live_budget_gate_passed": bool(self._live_budget_gate_passed),
                 "paper_budget_gate_passed": bool(self._paper_budget_gate_passed),
@@ -3054,6 +3078,21 @@ class MMRuntimeV2(MMRuntime):
                             "last_terminal_pnl_equity_usd": float(
                                 runtime_block.get("last_terminal_pnl_equity_usd") or 0.0
                             ),
+                            "terminal_liquidation_active": bool(runtime_block.get("terminal_liquidation_active")),
+                            "terminal_liquidation_attempted_orders": int(
+                                runtime_block.get("terminal_liquidation_attempted_orders") or 0
+                            ),
+                            "terminal_liquidation_placed_orders": int(
+                                runtime_block.get("terminal_liquidation_placed_orders") or 0
+                            ),
+                            "terminal_liquidation_remaining_up": float(
+                                runtime_block.get("terminal_liquidation_remaining_up") or 0.0
+                            ),
+                            "terminal_liquidation_remaining_dn": float(
+                                runtime_block.get("terminal_liquidation_remaining_dn") or 0.0
+                            ),
+                            "terminal_liquidation_done": bool(runtime_block.get("terminal_liquidation_done")),
+                            "terminal_liquidation_reason": str(runtime_block.get("terminal_liquidation_reason") or ""),
                         }
                     )
             stop_liquidation = await self.mm_v2.stop(liquidate=liquidate and not emergency)
@@ -3064,6 +3103,25 @@ class MMRuntimeV2(MMRuntime):
                 )
                 self._last_terminal_runtime_v2["last_terminal_dn_shares"] = float(
                     stop_liquidation.get("remaining_dn") or self._last_terminal_runtime_v2["last_terminal_dn_shares"]
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_active"] = False
+                self._last_terminal_runtime_v2["terminal_liquidation_attempted_orders"] = int(
+                    stop_liquidation.get("attempted_orders") or 0
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_placed_orders"] = int(
+                    stop_liquidation.get("placed_orders") or 0
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_remaining_up"] = float(
+                    stop_liquidation.get("remaining_up") or 0.0
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_remaining_dn"] = float(
+                    stop_liquidation.get("remaining_dn") or 0.0
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_done"] = bool(
+                    stop_liquidation.get("done", False)
+                )
+                self._last_terminal_runtime_v2["terminal_liquidation_reason"] = str(
+                    stop_liquidation.get("reason") or ""
                 )
         await self._stop_feed_tasks()
         await self._teardown_mongo_logger()
@@ -3098,6 +3156,21 @@ class MMRuntimeV2(MMRuntime):
                     "last_terminal_up_shares": float(runtime_block.get("last_terminal_up_shares") or 0.0),
                     "last_terminal_dn_shares": float(runtime_block.get("last_terminal_dn_shares") or 0.0),
                     "last_terminal_pnl_equity_usd": float(runtime_block.get("last_terminal_pnl_equity_usd") or 0.0),
+                    "terminal_liquidation_active": bool(runtime_block.get("terminal_liquidation_active")),
+                    "terminal_liquidation_attempted_orders": int(
+                        runtime_block.get("terminal_liquidation_attempted_orders") or 0
+                    ),
+                    "terminal_liquidation_placed_orders": int(
+                        runtime_block.get("terminal_liquidation_placed_orders") or 0
+                    ),
+                    "terminal_liquidation_remaining_up": float(
+                        runtime_block.get("terminal_liquidation_remaining_up") or 0.0
+                    ),
+                    "terminal_liquidation_remaining_dn": float(
+                        runtime_block.get("terminal_liquidation_remaining_dn") or 0.0
+                    ),
+                    "terminal_liquidation_done": bool(runtime_block.get("terminal_liquidation_done")),
+                    "terminal_liquidation_reason": str(runtime_block.get("terminal_liquidation_reason") or ""),
                 }
             )
             runtime_block["live_budget_gate_passed"] = bool(self._live_budget_gate_passed)

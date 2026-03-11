@@ -76,6 +76,25 @@ async def test_cancel_sell_starts_repost_cooldown():
 
 
 @pytest.mark.asyncio
+async def test_cancel_terminal_liquidation_sell_does_not_start_repost_cooldown():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    om = OrderManager(_CancelOnlyClient(), cfg)
+    oid = "term-sell-1"
+    om._active_orders[oid] = Quote(
+        side="SELL",
+        token_id="tok-up",
+        price=0.51,
+        size=6.0,
+        order_context="terminal_liquidation",
+    )
+
+    ok = await om.cancel_order(oid)
+    assert ok is True
+    assert om._cancel_repost_cooldown_left("tok-up") == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
 async def test_sell_during_cooldown_is_locally_suppressed():
     cfg = MMConfig()
     cfg.sell_release_grace_sec = 3.0
@@ -89,6 +108,44 @@ async def test_sell_during_cooldown_is_locally_suppressed():
     )
     assert result is None
     assert client._order_idx == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_terminal_liquidation_sell_does_not_start_repost_cooldown():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    client = _MockPlaceClient()
+    om = OrderManager(client, cfg)
+    om._active_orders["term-sell-2"] = Quote(
+        side="SELL",
+        token_id="tok-up",
+        price=0.52,
+        size=5.5,
+        order_context="terminal_liquidation",
+    )
+
+    cancelled = await om.cancel_all()
+    assert cancelled == 1
+    assert om._cancel_repost_cooldown_left("tok-up") == pytest.approx(0.0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_orders_batch_terminal_liquidation_sell_does_not_start_repost_cooldown():
+    cfg = MMConfig()
+    cfg.sell_release_grace_sec = 3.0
+    client = _MockPlaceClient()
+    om = OrderManager(client, cfg)
+    om._active_orders["term-sell-3"] = Quote(
+        side="SELL",
+        token_id="tok-up",
+        price=0.52,
+        size=5.5,
+        order_context="terminal_liquidation",
+    )
+
+    cancelled = await om.cancel_orders_batch(["term-sell-3"])
+    assert cancelled == 1
+    assert om._cancel_repost_cooldown_left("tok-up") == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio

@@ -257,9 +257,108 @@ async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(mon
     assert sellable_refs
     assert sellable_refs[0] == pytest.approx((6.2, 7.4))
     for _quote, kwargs in calls:
+        assert _quote.order_context == "terminal_liquidation"
         assert kwargs.get("post_only") is False
         assert kwargs.get("ignore_sell_cooldowns") is True
         assert kwargs.get("ignore_recent_cancelled_reserve") is True
+
+
+@pytest.mark.asyncio
+async def test_pmgateway_run_terminal_liquidation_step_returns_step_contract(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    gateway = PMGateway(_MockClient(), MMConfigV2())
+    gateway.set_market(_market())
+    calls: list[tuple[Quote, dict]] = []
+
+    async def _sellable_balances(*, reference_balances=None):
+        del reference_balances
+        return 0.0, 0.0
+
+    async def _wallet_balances(*, reference_balances=None):
+        del reference_balances
+        return 6.2, 0.0, 15.0, 15.0
+
+    async def _get_full_book(_token_id: str):
+        return {"best_bid": 0.51}
+
+    async def _place_order(quote: Quote, **kwargs):
+        calls.append((quote, kwargs))
+        return "oid-1"
+
+    async def _check_fills():
+        return []
+
+    monkeypatch.setattr(gateway, "get_sellable_balances", _sellable_balances)
+    monkeypatch.setattr(gateway, "get_wallet_balances", _wallet_balances)
+    monkeypatch.setattr(gateway.order_mgr, "get_full_book", _get_full_book)
+    monkeypatch.setattr(gateway.order_mgr, "place_order", _place_order)
+    monkeypatch.setattr(gateway.order_mgr, "check_fills", _check_fills)
+
+    result = await gateway.run_terminal_liquidation_step(round_idx=0, cancel_existing=False)
+
+    assert result["attempted_orders"] == 1
+    assert result["placed_orders"] == 1
+    assert result["remaining_up"] == pytest.approx(6.2)
+    assert result["remaining_dn"] == pytest.approx(0.0)
+    assert result["done"] is False
+    assert result["reason"] == "ok"
+    assert len(calls) == 1
+    quote, kwargs = calls[0]
+    assert quote.order_context == "terminal_liquidation"
+    assert kwargs.get("post_only") is False
+    assert kwargs.get("ignore_sell_cooldowns") is True
+    assert kwargs.get("ignore_recent_cancelled_reserve") is True
+
+
+@pytest.mark.asyncio
+async def test_pmgateway_stop_liquidation_reuses_terminal_step(monkeypatch):
+    class _MockClient:
+        _orders = {}
+
+    gateway = PMGateway(_MockClient(), MMConfigV2())
+    gateway.set_market(_market())
+    rounds: list[tuple[int, bool]] = []
+
+    async def _step(*, round_idx: int = 0, cancel_existing: bool = True):
+        rounds.append((round_idx, cancel_existing))
+        if round_idx == 0:
+            return {
+                "attempted_orders": 1,
+                "placed_orders": 1,
+                "remaining_up": 5.0,
+                "remaining_dn": 0.0,
+                "wallet_total_usdc": 15.0,
+                "done": False,
+                "reason": "ok",
+                "placed_order_ids": ["oid-1"],
+                "cancelled_orders": 0,
+            }
+        return {
+            "attempted_orders": 0,
+            "placed_orders": 0,
+            "remaining_up": 0.0,
+            "remaining_dn": 0.0,
+            "wallet_total_usdc": 15.0,
+            "done": True,
+            "reason": "ok",
+            "placed_order_ids": [],
+            "cancelled_orders": 0,
+        }
+
+    async def _check_fills():
+        return []
+
+    monkeypatch.setattr(gateway, "run_terminal_liquidation_step", _step)
+    monkeypatch.setattr(gateway.order_mgr, "check_fills", _check_fills)
+
+    result = await gateway.emergency_flatten_on_stop(rounds=2, round_delay_sec=0.01)
+
+    assert rounds[0] == (0, False)
+    assert rounds[1] == (1, False)
+    assert result["done"] is True
+    assert result["remaining_up"] == pytest.approx(0.0)
 
 
 def test_order_manager_crosses_book_not_counted_as_transport_failure():
@@ -1322,6 +1421,36 @@ async def test_state_exposes_runtime_terminal_reason(monkeypatch):
     assert resp["runtime"]["paper_budget_gate_passed"] is False
     assert resp["runtime"]["drawdown_breach_ticks"] == 4
     assert resp["runtime"]["drawdown_breach_age_sec"] == pytest.approx(9.5)
+
+
+@pytest.mark.asyncio
+async def test_state_exposes_terminal_liquidation_runtime_fields(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "lifecycle": "unwind",
+            "runtime": {
+                "terminal_liquidation_active": True,
+                "terminal_liquidation_attempted_orders": 3,
+                "terminal_liquidation_placed_orders": 2,
+                "terminal_liquidation_remaining_up": 7.41,
+                "terminal_liquidation_remaining_dn": 0.0,
+                "terminal_liquidation_done": False,
+                "terminal_liquidation_reason": "terminal_liquidation_active",
+            },
+        },
+    )
+    resp = await web_server.mmv2_state(request=object())
+    assert resp["runtime"]["terminal_liquidation_active"] is True
+    assert resp["runtime"]["terminal_liquidation_attempted_orders"] == 3
+    assert resp["runtime"]["terminal_liquidation_placed_orders"] == 2
+    assert resp["runtime"]["terminal_liquidation_remaining_up"] == pytest.approx(7.41)
+    assert resp["runtime"]["terminal_liquidation_remaining_dn"] == pytest.approx(0.0)
+    assert resp["runtime"]["terminal_liquidation_done"] is False
+    assert resp["runtime"]["terminal_liquidation_reason"] == "terminal_liquidation_active"
 
 
 @pytest.mark.asyncio

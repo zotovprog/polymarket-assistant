@@ -194,6 +194,119 @@ class PMGateway:
     async def cancel_all(self) -> int:
         return await self.order_mgr.cancel_all(force_exchange=True)
 
+    def terminal_liquidation_order_ids(self) -> list[str]:
+        return [
+            order_id
+            for order_id, quote in self.order_mgr.active_orders.items()
+            if str(getattr(quote, "order_context", "quote") or "quote") == "terminal_liquidation"
+        ]
+
+    async def cancel_terminal_liquidation_orders(self) -> int:
+        return await self.order_mgr.cancel_orders_batch(self.terminal_liquidation_order_ids())
+
+    async def run_terminal_liquidation_step(
+        self,
+        *,
+        round_idx: int = 0,
+        cancel_existing: bool = True,
+    ) -> dict[str, Any]:
+        if not self.market:
+            return {
+                "attempted_orders": 0,
+                "placed_orders": 0,
+                "remaining_up": 0.0,
+                "remaining_dn": 0.0,
+                "done": True,
+                "reason": "no_market",
+                "placed_order_ids": [],
+                "cancelled_orders": 0,
+            }
+
+        cancelled_orders = 0
+        if cancel_existing:
+            await self.order_mgr.check_fills()
+            cancelled_orders = await self.cancel_terminal_liquidation_orders()
+
+        attempted_orders = 0
+        placed_orders = 0
+        placed_order_ids: list[str] = []
+        had_material_inventory = False
+        tick = max(0.0001, float(self.market.tick_size or 0.01))
+        min_size = max(0.0, float(self.market.min_order_size or 0.0))
+
+        up_owned, dn_owned, _, _ = await self.get_wallet_balances()
+        up_sellable, dn_sellable = await self.get_sellable_balances(
+            reference_balances=(
+                float(up_owned or 0.0),
+                float(dn_owned or 0.0),
+            ),
+        )
+        for token_id, raw_sellable, raw_owned in (
+            (self.market.up_token_id, up_sellable, up_owned),
+            (self.market.dn_token_id, dn_sellable, dn_owned),
+        ):
+            sellable = max(0.0, float(raw_sellable or 0.0))
+            owned = max(0.0, float(raw_owned or 0.0))
+            size = math.floor(max(sellable, owned) * 100.0) / 100.0
+            if size < min_size:
+                continue
+            had_material_inventory = True
+            book = await self.order_mgr.get_full_book(token_id)
+            best_bid_raw = book.get("best_bid")
+            try:
+                best_bid = float(best_bid_raw)
+            except Exception:
+                best_bid = 0.0
+            if best_bid <= 0:
+                continue
+            discount_ticks = 1 + (2 * int(round_idx))
+            price = max(0.01, round(best_bid - (tick * discount_ticks), 10))
+            quote = Quote(
+                side="SELL",
+                token_id=token_id,
+                price=float(price),
+                size=float(size),
+                order_context="terminal_liquidation",
+            )
+            attempted_orders += 1
+            order_id = await self.order_mgr.place_order(
+                quote,
+                post_only=False,
+                fallback_taker=False,
+                ignore_sell_cooldowns=True,
+                ignore_recent_cancelled_reserve=True,
+            )
+            if order_id:
+                placed_orders += 1
+                placed_order_ids.append(order_id)
+                log.info(
+                    "Terminal liquidation placed SELL %s %.2f@%.2f id=%s round=%d",
+                    token_id[:8],
+                    size,
+                    price,
+                    order_id[:12],
+                    int(round_idx),
+                )
+
+        up_remaining, dn_remaining, total_usdc, _ = await self.get_wallet_balances()
+        rem_up = max(0.0, float(up_remaining or 0.0))
+        rem_dn = max(0.0, float(dn_remaining or 0.0))
+        done = rem_up < min_size and rem_dn < min_size
+        reason = "ok"
+        if not done and had_material_inventory and placed_orders == 0:
+            reason = "no_book_liquidity"
+        return {
+            "attempted_orders": attempted_orders,
+            "placed_orders": placed_orders,
+            "remaining_up": round(rem_up, 4),
+            "remaining_dn": round(rem_dn, 4),
+            "wallet_total_usdc": round(max(0.0, float(total_usdc or 0.0)), 4),
+            "done": bool(done),
+            "reason": reason,
+            "placed_order_ids": placed_order_ids,
+            "cancelled_orders": int(cancelled_orders),
+        }
+
     async def emergency_flatten_on_stop(
         self,
         *,
@@ -217,66 +330,16 @@ class PMGateway:
 
         attempted_orders = 0
         placed_orders = 0
-        tick = max(0.0001, float(self.market.tick_size or 0.01))
         min_size = max(0.0, float(self.market.min_order_size or 0.0))
 
         for round_idx in range(max(1, int(rounds))):
-            up_owned, dn_owned, _, _ = await self.get_wallet_balances()
-            up_sellable, dn_sellable = await self.get_sellable_balances(
-                reference_balances=(
-                    float(up_owned or 0.0),
-                    float(dn_owned or 0.0),
-                ),
+            step = await self.run_terminal_liquidation_step(
+                round_idx=round_idx,
+                cancel_existing=False,
             )
-            per_round_order_ids: list[str] = []
-            for token_id, raw_sellable, raw_owned in (
-                (self.market.up_token_id, up_sellable, up_owned),
-                (self.market.dn_token_id, dn_sellable, dn_owned),
-            ):
-                sellable = max(0.0, float(raw_sellable or 0.0))
-                owned = max(0.0, float(raw_owned or 0.0))
-                # During stop liquidation PM may lag token release after cancel.
-                # Use the more permissive owned-vs-sellable estimate here to
-                # keep unwind attempts progressing instead of stalling locally.
-                size = math.floor(max(sellable, owned) * 100.0) / 100.0
-                if size < min_size:
-                    continue
-                book = await self.order_mgr.get_full_book(token_id)
-                best_bid_raw = book.get("best_bid")
-                try:
-                    best_bid = float(best_bid_raw)
-                except Exception:
-                    best_bid = 0.0
-                if best_bid <= 0:
-                    continue
-                # Use a crossing SELL price to prioritize execution.
-                discount_ticks = 1 + (2 * int(round_idx))
-                price = max(0.01, round(best_bid - (tick * discount_ticks), 10))
-                quote = Quote(
-                    side="SELL",
-                    token_id=token_id,
-                    price=float(price),
-                    size=float(size),
-                )
-                attempted_orders += 1
-                order_id = await self.order_mgr.place_order(
-                    quote,
-                    post_only=False,
-                    fallback_taker=False,
-                    ignore_sell_cooldowns=True,
-                    ignore_recent_cancelled_reserve=True,
-                )
-                if order_id:
-                    placed_orders += 1
-                    per_round_order_ids.append(order_id)
-                    log.info(
-                        "Stop liquidation placed SELL %s %.2f@%.2f id=%s",
-                        token_id[:8],
-                        size,
-                        price,
-                        order_id[:12],
-                    )
-
+            attempted_orders += int(step.get("attempted_orders") or 0)
+            placed_orders += int(step.get("placed_orders") or 0)
+            per_round_order_ids = list(step.get("placed_order_ids") or [])
             if not per_round_order_ids:
                 break
 

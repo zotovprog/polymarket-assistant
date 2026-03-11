@@ -36,6 +36,7 @@ from .types import (
     QuotePlan,
     QuoteViabilitySummary,
     RiskRegime,
+    SoftTransitionResult,
 )
 
 
@@ -183,6 +184,15 @@ class MarketMakerV2:
         self._last_terminal_up_shares: float = 0.0
         self._last_terminal_dn_shares: float = 0.0
         self._last_terminal_pnl_equity_usd: float = 0.0
+        self._terminal_liquidation_active: bool = False
+        self._terminal_liquidation_started_ts: float = 0.0
+        self._terminal_liquidation_round_idx: int = 0
+        self._terminal_liquidation_attempted_orders: int = 0
+        self._terminal_liquidation_placed_orders: int = 0
+        self._terminal_liquidation_remaining_up: float = 0.0
+        self._terminal_liquidation_remaining_dn: float = 0.0
+        self._terminal_liquidation_done: bool = False
+        self._terminal_liquidation_reason: str = ""
         self._true_drift_started_ts: float = 0.0
         self._true_drift_last_progress_ts: float = 0.0
         self._true_drift_best_exposure: float = 0.0
@@ -357,6 +367,15 @@ class MarketMakerV2:
         self._last_terminal_up_shares = 0.0
         self._last_terminal_dn_shares = 0.0
         self._last_terminal_pnl_equity_usd = 0.0
+        self._terminal_liquidation_active = False
+        self._terminal_liquidation_started_ts = 0.0
+        self._terminal_liquidation_round_idx = 0
+        self._terminal_liquidation_attempted_orders = 0
+        self._terminal_liquidation_placed_orders = 0
+        self._terminal_liquidation_remaining_up = 0.0
+        self._terminal_liquidation_remaining_dn = 0.0
+        self._terminal_liquidation_done = False
+        self._terminal_liquidation_reason = ""
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -598,6 +617,23 @@ class MarketMakerV2:
             int(self._negative_spread_capture_streak_dn) > 0
             or int(self._toxic_fill_streak_dn) > 0
         )
+
+    def _has_material_inventory(self, inventory: PairInventoryState) -> bool:
+        if not self.market:
+            return False
+        min_size = max(0.0, float(self.market.min_order_size or 0.0))
+        return bool(
+            float(inventory.up_shares) >= min_size
+            or float(inventory.dn_shares) >= min_size
+        )
+
+    def _terminal_liquidation_timeout_sec(self) -> float:
+        return max(1.0, float(self.config.emergency_unwind_timeout_sec))
+
+    def _terminal_liquidation_elapsed(self, *, now: float) -> float:
+        if self._terminal_liquidation_started_ts <= 0.0:
+            return 0.0
+        return max(0.0, float(now - self._terminal_liquidation_started_ts))
 
     def _apply_side_markout_result(
         self,
@@ -1267,41 +1303,185 @@ class MarketMakerV2:
             risk=risk,
             ctx=ctx,
         )
-        transition = self.state_machine.transition(
-            snapshot=snapshot,
-            inventory=inventory,
-            risk=risk,
-            viability=self._provisional_quote_viability(provisional_plan),
+        terminal_liquidation_should_arm = bool(
+            risk.hard_mode != "halted"
+            and self._has_material_inventory(inventory)
+            and float(snapshot.time_left_sec) <= float(self.config.emergency_taker_start_sec)
         )
-        effective_risk = replace(
-            risk,
-            soft_mode=transition.effective_soft_mode,
-            target_soft_mode=transition.target_soft_mode,
-            reason=transition.reason or risk.reason,
-            emergency_taker_forced=bool(emergency_taker_forced),
-        )
+        if terminal_liquidation_should_arm or self._terminal_liquidation_active:
+            just_armed_terminal = False
+            if not self._terminal_liquidation_active:
+                self._terminal_liquidation_active = True
+                self._terminal_liquidation_started_ts = now
+                self._terminal_liquidation_round_idx = 0
+                self._terminal_liquidation_attempted_orders = 0
+                self._terminal_liquidation_placed_orders = 0
+                self._terminal_liquidation_remaining_up = float(inventory.up_shares)
+                self._terminal_liquidation_remaining_dn = float(inventory.dn_shares)
+                self._terminal_liquidation_done = False
+                self._terminal_liquidation_reason = "terminal_liquidation_active"
+                just_armed_terminal = True
+                await self.gateway.cancel_all()
+                self.tracker.refresh_from_active(self.gateway.active_orders())
+            terminal_timeout = (
+                self._terminal_liquidation_elapsed(now=now) >= self._terminal_liquidation_timeout_sec()
+            )
+            if not self._terminal_liquidation_done and not terminal_timeout:
+                step = await self.gateway.run_terminal_liquidation_step(
+                    round_idx=int(self._terminal_liquidation_round_idx),
+                    cancel_existing=not just_armed_terminal,
+                )
+                self._terminal_liquidation_round_idx += 1
+                self._terminal_liquidation_attempted_orders += int(step.get("attempted_orders") or 0)
+                self._terminal_liquidation_placed_orders += int(step.get("placed_orders") or 0)
+                self._terminal_liquidation_remaining_up = float(step.get("remaining_up") or 0.0)
+                self._terminal_liquidation_remaining_dn = float(step.get("remaining_dn") or 0.0)
+                self._terminal_liquidation_done = bool(step.get("done", False))
+                step_reason = str(step.get("reason") or "")
+                if self._terminal_liquidation_done:
+                    self._terminal_liquidation_reason = (
+                        step_reason
+                        if step_reason not in {"", "ok"}
+                        else "terminal_liquidation_done"
+                    )
+                else:
+                    self._terminal_liquidation_reason = (
+                        step_reason or "terminal_liquidation_active"
+                    )
+                terminal_wallet_total_usdc = float(step.get("wallet_total_usdc") or 0.0)
+                inventory = replace(
+                    inventory,
+                    up_shares=float(self._terminal_liquidation_remaining_up),
+                    dn_shares=float(self._terminal_liquidation_remaining_dn),
+                    free_usdc=float(terminal_wallet_total_usdc),
+                    reserved_usdc=0.0,
+                    wallet_total_usdc=float(terminal_wallet_total_usdc),
+                    wallet_reserved_usdc=0.0,
+                )
+                (
+                    position_mark_value_bid,
+                    position_mark_value_mid,
+                    portfolio_mark_value,
+                    tradeable_portfolio_value,
+                ) = self._update_session_pnl(
+                    inventory,
+                    total_usdc=float(terminal_wallet_total_usdc),
+                    snapshot=snapshot,
+                )
+            else:
+                self._terminal_liquidation_reason = (
+                    "terminal_liquidation_timeout"
+                    if terminal_timeout
+                    else "terminal_liquidation_done"
+                )
+            if float(snapshot.time_left_sec) <= 0.0 and (
+                bool(self._terminal_liquidation_done) or bool(terminal_timeout)
+            ):
+                await self.gateway.cancel_all()
+                self.tracker.refresh_from_active(self.gateway.active_orders())
+                lifecycle = "expired"
+                self.state_machine._set_lifecycle("expired")
+                self._set_terminal_reason(str(self._terminal_liquidation_reason or "expired"))
+                self._running = False
+                if (
+                    max(
+                        float(self._terminal_liquidation_remaining_up),
+                        float(self._terminal_liquidation_remaining_dn),
+                    )
+                    >= float(self.market.min_order_size)
+                ):
+                    self.set_alert(
+                        "terminal_liquidation_v2",
+                        (
+                            "Terminal liquidation incomplete: "
+                            f"rem_up={self._terminal_liquidation_remaining_up:.4f} "
+                            f"rem_dn={self._terminal_liquidation_remaining_dn:.4f}"
+                        ),
+                        level="warning",
+                    )
+                else:
+                    self.clear_alert("terminal_liquidation_v2")
+            else:
+                lifecycle = "unwind"
+                self.state_machine._set_lifecycle("unwind")
+                if self._terminal_liquidation_done:
+                    self.clear_alert("terminal_liquidation_v2")
+                else:
+                    self.set_alert(
+                        "terminal_liquidation_v2",
+                        (
+                            "Terminal liquidation active: "
+                            f"rem_up={self._terminal_liquidation_remaining_up:.4f} "
+                            f"rem_dn={self._terminal_liquidation_remaining_dn:.4f}"
+                        ),
+                        level="warning",
+                    )
+            transition = SoftTransitionResult(
+                lifecycle=lifecycle,  # type: ignore[arg-type]
+                effective_soft_mode="unwind" if lifecycle != "expired" else "normal",
+                target_soft_mode="unwind",
+                reason=str(self._terminal_liquidation_reason or "terminal_liquidation_active"),
+            )
+            effective_risk = replace(
+                risk,
+                soft_mode="unwind",
+                target_soft_mode="unwind",
+                reason=str(self._terminal_liquidation_reason or risk.reason),
+                emergency_taker_forced=bool(emergency_taker_forced),
+            )
+            plan = QuotePlan(
+                None,
+                None,
+                None,
+                None,
+                "unwind",
+                str(self._terminal_liquidation_reason or "terminal_liquidation_active"),
+                quote_balance_state="none",
+                quote_viability_reason="terminal_liquidation",
+            )
+        else:
+            if self._terminal_liquidation_active:
+                self._terminal_liquidation_active = False
+                self._terminal_liquidation_reason = ""
+                self._terminal_liquidation_done = False
+                self._terminal_liquidation_started_ts = 0.0
+                self._terminal_liquidation_round_idx = 0
+                self.clear_alert("terminal_liquidation_v2")
+            transition = self.state_machine.transition(
+                snapshot=snapshot,
+                inventory=inventory,
+                risk=risk,
+                viability=self._provisional_quote_viability(provisional_plan),
+            )
+            effective_risk = replace(
+                risk,
+                soft_mode=transition.effective_soft_mode,
+                target_soft_mode=transition.target_soft_mode,
+                reason=transition.reason or risk.reason,
+                emergency_taker_forced=bool(emergency_taker_forced),
+            )
+            lifecycle = transition.lifecycle
+            if lifecycle in {"halted", "expired"}:
+                await self.gateway.cancel_all()
+                self.tracker.refresh_from_active(self.gateway.active_orders())
+                plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
+                terminal_reason = risk.reason if lifecycle == "halted" else "expired"
+                self._set_terminal_reason(terminal_reason or lifecycle)
+                self._running = False
+            else:
+                plan = QuotePolicyV2(self.config).generate(
+                    snapshot=snapshot,
+                    inventory=inventory,
+                    risk=effective_risk,
+                    ctx=ctx,
+                )
+                await self.execution_policy.sync(plan)
         lifecycle = transition.lifecycle
         unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
             effective_soft_mode=effective_risk.soft_mode,
             target_soft_mode=effective_risk.target_soft_mode,
         )
         outside_near_expiry = float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
-        if lifecycle in {"halted", "expired"}:
-            await self.gateway.cancel_all()
-            plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
-            terminal_reason = risk.reason if lifecycle == "halted" else "expired"
-            self._set_terminal_reason(terminal_reason or lifecycle)
-            # Expired/halted must terminate the loop so the outer runtime can
-            # start the next window without manual recovery.
-            self._running = False
-        else:
-            plan = QuotePolicyV2(self.config).generate(
-                snapshot=snapshot,
-                inventory=inventory,
-                risk=effective_risk,
-                ctx=ctx,
-            )
-            await self.execution_policy.sync(plan)
         helpful_quote_count = sum(
             1
             for intent in (plan.up_bid, plan.up_ask, plan.dn_bid, plan.dn_ask)
@@ -1741,6 +1921,13 @@ class MarketMakerV2:
             "last_terminal_up_shares": float(self._last_terminal_up_shares),
             "last_terminal_dn_shares": float(self._last_terminal_dn_shares),
             "last_terminal_pnl_equity_usd": float(self._last_terminal_pnl_equity_usd),
+            "terminal_liquidation_active": bool(self._terminal_liquidation_active),
+            "terminal_liquidation_attempted_orders": int(self._terminal_liquidation_attempted_orders),
+            "terminal_liquidation_placed_orders": int(self._terminal_liquidation_placed_orders),
+            "terminal_liquidation_remaining_up": float(self._terminal_liquidation_remaining_up),
+            "terminal_liquidation_remaining_dn": float(self._terminal_liquidation_remaining_dn),
+            "terminal_liquidation_done": bool(self._terminal_liquidation_done),
+            "terminal_liquidation_reason": str(self._terminal_liquidation_reason or ""),
             "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
             "drawdown_breach_age_sec": (
                 max(0.0, time.time() - self._drawdown_breach_started_ts)

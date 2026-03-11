@@ -42,6 +42,7 @@ class Quote:
     token_id: str          # Polymarket token ID
     price: float           # Quote price (0.01 - 0.99)
     size: float            # Size in shares
+    order_context: str = "quote"  # quote | terminal_liquidation
     order_id: Optional[str] = None  # Filled after placement
     placed_at: float = 0.0       # Unix timestamp when placed on exchange
 
