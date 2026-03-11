@@ -49,6 +49,7 @@ PRIMARY_BLOCKER_PRIORITY = [
     "edge_divergence",
     "inventory_regime",
 ]
+CURATED_REPLAY_SLICE = REPO_ROOT / "data" / "replay" / "poly_replay_slice_test.parquet"
 
 
 class _ReplayClock:
@@ -116,6 +117,15 @@ def _trade_days(dataset_root: Path, date_from: str, date_to: str) -> list[Path]:
     return out
 
 
+def _resolve_dataset_source(dataset_root_arg: str) -> Path:
+    dataset_root = Path(dataset_root_arg).expanduser().resolve()
+    if dataset_root.exists():
+        return dataset_root
+    if CURATED_REPLAY_SLICE.exists():
+        return CURATED_REPLAY_SLICE.resolve()
+    raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+
+
 def _load_pair_events(
     dataset_root: Path,
     *,
@@ -137,6 +147,37 @@ def _load_pair_events(
     ]
     frames: list[pd.DataFrame] = []
     token_set = {str(up_token_id), str(dn_token_id)}
+    if dataset_root.is_file():
+        frame = pd.read_parquet(dataset_root)
+        if frame.empty or "token_asset_id" not in frame.columns or "timestamp_sec" not in frame.columns:
+            return pd.DataFrame(columns=cols + ["shares", "tick_ts"])
+        frame = frame.copy()
+        frame["token_asset_id"] = frame["token_asset_id"].astype(str)
+        frame = frame[frame["token_asset_id"].isin(token_set)]
+        if frame.empty:
+            return pd.DataFrame(columns=cols + ["shares", "tick_ts"])
+        if "trade_day" not in frame.columns:
+            frame["trade_day"] = pd.to_datetime(frame["timestamp_sec"], unit="s", utc=True).dt.strftime("%Y-%m-%d")
+        if "taker_side" not in frame.columns:
+            frame["taker_side"] = "BUY"
+        if "self_trade" not in frame.columns:
+            frame["self_trade"] = False
+        if int(ts_from) > 0:
+            frame = frame[frame["timestamp_sec"].astype(int) >= int(ts_from)]
+        if frame.empty:
+            return pd.DataFrame(columns=cols + ["shares", "tick_ts"])
+        if int(ts_to) > 0:
+            frame = frame[frame["timestamp_sec"].astype(int) <= int(ts_to)]
+        if frame.empty:
+            return pd.DataFrame(columns=cols + ["shares", "tick_ts"])
+        frame = frame[frame["self_trade"] == False]  # noqa: E712
+        if frame.empty:
+            return pd.DataFrame(columns=cols + ["shares", "tick_ts"])
+        frame = frame.reindex(columns=cols)
+        frame["price_prob"] = frame["price_prob"].astype(float).clip(0.01, 0.99)
+        frame["shares"] = (frame["token_amount_raw"].astype(float) / TOKEN_RAW_SCALE).clip(lower=0.0)
+        frame = frame[frame["shares"] > 0.0]
+        return frame.sort_values("timestamp_sec").reset_index(drop=True)
     for day_dir in _trade_days(dataset_root, date_from, date_to):
         for part in sorted(day_dir.glob("*.parquet")):
             frame = pd.read_parquet(part, columns=cols)
@@ -407,9 +448,7 @@ def _load_manifest(manifest_path: Path) -> dict[str, Any]:
 
 def run_replay(args: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
-    dataset_root = Path(args.dataset_root).expanduser().resolve()
-    if not dataset_root.exists():
-        raise FileNotFoundError(f"Dataset root not found: {dataset_root}")
+    dataset_root = _resolve_dataset_source(str(args.dataset_root))
 
     events = _load_pair_events(
         dataset_root,

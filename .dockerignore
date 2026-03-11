@@ -14,6 +14,10 @@ executions.*.jsonl
 .web_access_key
 node_modules/
 data/
+!data/
+!data/replay/
+!data/replay/mmv2_dataset_scenarios.json
+!data/replay/poly_replay_slice_test.parquet
 workspace/
 docs/
 backtest/report.html
