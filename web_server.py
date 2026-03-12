@@ -182,6 +182,7 @@ class PaperSweepStartRequest(BaseModel):
     timeframe: str = "15m"
     initial_usdc: float = 300.0
     base_clips: list[float] = Field(default_factory=lambda: [8.0, 12.0, 14.0, 20.0])
+    variants: list[dict[str, Any]] | None = None
     force_normal_soft_mode: bool = False
 
     @field_validator("base_clips", mode="before")
@@ -192,7 +193,7 @@ class PaperSweepStartRequest(BaseModel):
         if isinstance(value, str):
             value = [part.strip() for part in value.split(",") if part.strip()]
         if not isinstance(value, list):
-            raise ValueError("base_clips must be a list of numbers or csv string")
+            value = [float(value)]
         parsed: list[float] = []
         for item in value:
             clip = float(item)
@@ -3448,6 +3449,17 @@ class PaperSweepRuntimeV2(MMRuntime):
         inventory = raw.get("inventory") or {}
         quotes = raw.get("quotes") or {}
         market = raw.get("market") or {}
+        config_overrides = dict(variant.get("config_overrides") or {})
+        mm_obj = variant.get("mm")
+        effective_config: dict[str, float] = {}
+        if mm_obj and hasattr(mm_obj, "config"):
+            effective_config = {
+                "base_half_spread_bps": float(mm_obj.config.base_half_spread_bps),
+                "vol_spread_multiplier": float(mm_obj.config.vol_spread_multiplier),
+                "inventory_skew_strength": float(mm_obj.config.inventory_skew_strength),
+                "min_edge_bps": float(mm_obj.config.min_edge_bps),
+                "base_clip_usd": float(mm_obj.config.base_clip_usd),
+            }
         active_quotes = sum(
             1
             for value in quotes.values()
@@ -3495,6 +3507,8 @@ class PaperSweepRuntimeV2(MMRuntime):
             "active_quotes": int(active_quotes),
             "market_id": str(market.get("market_id") or ""),
             "time_left_sec": float(market.get("time_left_sec") or 0.0),
+            "config_overrides": config_overrides,
+            "effective_config": effective_config,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -3551,6 +3565,45 @@ class PaperSweepRuntimeV2(MMRuntime):
             return state
         return dict(self._last_state)
 
+    def export_bundle(self) -> dict[str, Any]:
+        state = self.snapshot()
+        exported_variants: list[dict[str, Any]] = []
+        if not self._variants:
+            for item in list(state.get("variants") or []):
+                exported_variants.append(
+                    {
+                        "summary": dict(item),
+                        "fills": [],
+                        "fills_total": int(item.get("fill_count") or 0),
+                        "note": "fills_unavailable_runtime_variants_already_released",
+                    }
+                )
+            return {
+                "state": state,
+                "variants": exported_variants,
+            }
+
+        for variant in self._variants:
+            mm = variant.get("mm")
+            if not mm:
+                continue
+            raw = mm.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+            summary = self._variant_summary(variant, raw)
+            fills_total = int(getattr(mm, "_fills", None) and len(mm._fills) or 0)
+            fills_page = mm.fills_page(limit=max(1, fills_total), offset=0) if fills_total > 0 else {"fills": [], "total": 0}
+            exported_variants.append(
+                {
+                    "summary": summary,
+                    "raw_state": raw,
+                    "fills": list(fills_page.get("fills") or []),
+                    "fills_total": int(fills_page.get("total") or 0),
+                }
+            )
+        return {
+            "state": state,
+            "variants": exported_variants,
+        }
+
     async def start(
         self,
         coin: str,
@@ -3558,6 +3611,7 @@ class PaperSweepRuntimeV2(MMRuntime):
         *,
         initial_usdc: float = 300.0,
         base_clips: list[float] | None = None,
+        variants: list[dict[str, Any]] | None = None,
         force_normal_soft_mode: bool = False,
         base_config: MMConfigV2 | None = None,
     ) -> dict[str, Any]:
@@ -3570,7 +3624,7 @@ class PaperSweepRuntimeV2(MMRuntime):
         self._paper_mode = True
         self._initial_usdc = float(initial_usdc)
         self._force_normal_soft_mode_paper = bool(force_normal_soft_mode)
-        normalized_clips = self._normalize_base_clips(base_clips)
+        normalized_clips = self._normalize_base_clips(base_clips) if not variants else []
 
         self.feed_state = feeds.State()
         symbol = config.COIN_BINANCE[self._coin]
@@ -3620,12 +3674,33 @@ class PaperSweepRuntimeV2(MMRuntime):
             template.session_budget_usd = float(initial_usdc)
             self.mm_config_v2 = copy.deepcopy(template)
 
-            variants: list[dict[str, Any]] = []
+            variants_list: list[dict[str, Any]] = []
             started: list[MarketMakerV2] = []
             try:
-                for clip in normalized_clips:
+                if variants:
+                    variant_specs: list[dict[str, Any]] = []
+                    for i, variant in enumerate(variants):
+                        payload = dict(variant)
+                        label = str(payload.pop("label", f"v{i}"))
+                        clip = float(payload.pop("base_clip_usd", payload.pop("clip_usd", template.base_clip_usd)))
+                        variant_specs.append(
+                            {
+                                "label": label,
+                                "clip_usd": clip,
+                                "overrides": dict(payload),
+                            }
+                        )
+                else:
+                    variant_specs = [
+                        {"label": f"${clip:g}", "clip_usd": clip, "overrides": {}}
+                        for clip in normalized_clips
+                    ]
+
+                for spec in variant_specs:
                     cfg = copy.deepcopy(template)
-                    cfg.base_clip_usd = float(clip)
+                    cfg.base_clip_usd = float(spec["clip_usd"])
+                    if spec["overrides"]:
+                        cfg.update(**spec["overrides"])
                     clob = _create_clob_client(paper_mode=True, initial_usdc=float(initial_usdc))
                     mm = MarketMakerV2(
                         self.feed_state,
@@ -3636,11 +3711,12 @@ class PaperSweepRuntimeV2(MMRuntime):
                     mm.set_market(copy.deepcopy(market))
                     await mm.start()
                     started.append(mm)
-                    variants.append(
+                    variants_list.append(
                         {
-                            "id": f"clip-{str(clip).replace('.', '_')}",
-                            "label": f"${clip:g}",
-                            "clip_usd": float(clip),
+                            "id": f"v-{str(spec['label']).replace(' ', '_').replace('.', '_')}",
+                            "label": str(spec["label"]),
+                            "clip_usd": float(spec["clip_usd"]),
+                            "config_overrides": dict(spec["overrides"]),
                             "mm": mm,
                         }
                     )
@@ -3652,7 +3728,7 @@ class PaperSweepRuntimeV2(MMRuntime):
                         pass
                 raise
 
-            self._variants = variants
+            self._variants = variants_list
             self._started_at = time.time()
             self._running = True
             return self.snapshot()
@@ -4267,6 +4343,7 @@ async def mmv2_paper_sweep_start(req: PaperSweepStartRequest, request: Request):
         req.timeframe,
         initial_usdc=float(req.initial_usdc),
         base_clips=list(req.base_clips),
+        variants=req.variants,
         force_normal_soft_mode=bool(req.force_normal_soft_mode),
         base_config=copy.deepcopy(_runtime_v2.mm_config_v2),
     )
@@ -4284,6 +4361,12 @@ async def mmv2_paper_sweep_stop(request: Request):
 async def mmv2_paper_sweep_state(request: Request):
     _require_auth(request)
     return _paper_sweep_v2.snapshot()
+
+
+@app.get("/api/mmv2/paper-sweep/export")
+async def mmv2_paper_sweep_export(request: Request):
+    _require_auth(request)
+    return _paper_sweep_v2.export_bundle()
 
 
 @app.post("/api/mmv2/validate-credentials")
@@ -4306,7 +4389,9 @@ async def mmv2_stop(request: Request):
 @app.get("/api/mmv2/state")
 async def mmv2_state(request: Request):
     _require_auth(request)
-    return _runtime_v2.snapshot()
+    snap = _runtime_v2.snapshot()
+    snap["paper_sweep"] = _paper_sweep_v2.snapshot()
+    return snap
 
 
 @app.post("/api/mmv2/config")

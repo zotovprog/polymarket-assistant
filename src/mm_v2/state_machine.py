@@ -144,11 +144,16 @@ class StateMachineV2:
                 reason=risk.reason,
             )
         if risk.hard_mode == "emergency_unwind":
+            target_soft_mode = getattr(risk, "target_soft_mode", risk.soft_mode)
             self._set_lifecycle("emergency_unwind")
             return SoftTransitionResult(
                 lifecycle=self.lifecycle,  # type: ignore[arg-type]
-                effective_soft_mode=self._effective_soft_mode(self.lifecycle),  # type: ignore[arg-type]
-                target_soft_mode=getattr(risk, "target_soft_mode", risk.soft_mode),  # type: ignore[arg-type]
+                effective_soft_mode=(
+                    "unwind"
+                    if target_soft_mode == "unwind"
+                    else self._effective_soft_mode(self.lifecycle)
+                ),  # type: ignore[arg-type]
+                target_soft_mode=target_soft_mode,  # type: ignore[arg-type]
                 reason=risk.reason,
             )
 
@@ -433,3 +438,7 @@ class StateMachineV2:
             unwind_deferred=bool(unwind_deferred),
             forced_unwind_extreme_excess=bool(forced_unwind_extreme_excess),
         )
+
+
+# Backward-compatible alias for legacy imports.
+SoftModeStateMachine = StateMachineV2

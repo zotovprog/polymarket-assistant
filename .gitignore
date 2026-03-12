@@ -21,6 +21,7 @@ orderFilled_complete.csv.xz
 data/**/*.parquet
 data/**/*.xz
 !data/replay/poly_replay_slice_test.parquet
+data/polymarket-transactions/
 audit/local-paper/
 workspace/
 backtest/report.html

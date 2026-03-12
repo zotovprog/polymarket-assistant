@@ -782,12 +782,17 @@ class MarketMakerV2:
         ]
 
         def _move_bps(lookback_sec: float) -> float:
-            reference = underlying_mid
             target_ts = float(now) - float(lookback_sec)
+            reference = underlying_mid
+            found_reference = False
             for ts, px in self._underlying_mid_history:
-                if ts >= target_ts:
+                if ts <= target_ts:
                     reference = float(px)
+                    found_reference = True
+                else:
                     break
+            if not found_reference and self._underlying_mid_history:
+                reference = float(self._underlying_mid_history[0][1])
             return abs(underlying_mid - reference) / max(1e-9, reference) * 10000.0
 
         move_bps_1s = _move_bps(1.0)
@@ -823,13 +828,30 @@ class MarketMakerV2:
             return
         if self._force_normal_no_guards_active(snapshot=snapshot, risk=risk):
             return
-        if float(snapshot.time_left_sec) > float(self.config.unwind_window_sec):
+        time_left_sec = float(snapshot.time_left_sec)
+        terminal_window_active = time_left_sec <= float(self._terminal_liquidation_start_sec())
+        has_paired_shares = float(inventory.paired_qty) > 1e-9
+        pair_entry_cost = max(0.0, float(getattr(inventory, "pair_entry_cost", 0.0) or 0.0))
+        merge_for_underwater_pairs = bool(pair_entry_cost > 1.0 and has_paired_shares)
+        merge_for_terminal_pairs = bool(terminal_window_active and has_paired_shares)
+        merge_override_active = bool(merge_for_underwater_pairs or merge_for_terminal_pairs)
+        unwind_merge_window_active = bool(
+            time_left_sec <= float(self.config.unwind_window_sec)
+            and not terminal_window_active
+        )
+        if not (unwind_merge_window_active or merge_override_active):
             return
-        if float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec()):
+        hard_mode = str(risk.hard_mode or "")
+        if hard_mode != "none" and not (
+            hard_mode == "emergency_unwind" and merge_override_active
+        ):
             return
-        if str(risk.hard_mode or "") != "none":
+        if not has_paired_shares:
             return
-        if float(inventory.paired_qty) < float(self.market.min_order_size):
+        if (
+            float(inventory.paired_qty) < float(self.market.min_order_size)
+            and not merge_override_active
+        ):
             return
         if (float(now) - float(self._last_merge_attempt_ts)) < 10.0:
             return
@@ -1998,9 +2020,13 @@ class MarketMakerV2:
             ctx=ctx,
         )
         terminal_window_active = float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec())
+        has_any_inventory = bool(
+            float(inventory.up_shares) > 1e-9
+            or float(inventory.dn_shares) > 1e-9
+        )
         terminal_liquidation_should_arm = bool(
             risk.hard_mode != "halted"
-            and self._has_material_inventory(inventory)
+            and (self._has_material_inventory(inventory) or has_any_inventory)
             and terminal_window_active
         )
         if terminal_liquidation_should_arm or (
@@ -2034,12 +2060,33 @@ class MarketMakerV2:
                 self._terminal_liquidation_remaining_up = float(step.get("remaining_up") or 0.0)
                 self._terminal_liquidation_remaining_dn = float(step.get("remaining_dn") or 0.0)
                 self._terminal_liquidation_done = bool(step.get("done", False))
+                remaining_inventory = replace(
+                    inventory,
+                    up_shares=float(self._terminal_liquidation_remaining_up),
+                    dn_shares=float(self._terminal_liquidation_remaining_dn),
+                )
+                remaining_has_any_inventory = bool(
+                    float(remaining_inventory.up_shares) > 1e-9
+                    or float(remaining_inventory.dn_shares) > 1e-9
+                )
+                terminal_done_reason = ""
+                if (
+                    not self._terminal_liquidation_done
+                    and not self._has_material_inventory(remaining_inventory)
+                    and remaining_has_any_inventory
+                    and self._terminal_liquidation_round_idx >= 2
+                ):
+                    self._terminal_liquidation_done = True
+                    terminal_done_reason = "sub_minimum_inventory_done"
                 step_reason = str(step.get("reason") or "")
                 if self._terminal_liquidation_done:
                     self._terminal_liquidation_reason = (
-                        step_reason
-                        if step_reason not in {"", "ok"}
-                        else "terminal_liquidation_done"
+                        terminal_done_reason
+                        or (
+                            step_reason
+                            if step_reason not in {"", "ok"}
+                            else "terminal_liquidation_done"
+                        )
                     )
                 else:
                     self._terminal_liquidation_reason = (
@@ -2047,9 +2094,7 @@ class MarketMakerV2:
                     )
                 terminal_wallet_total_usdc = float(step.get("wallet_total_usdc") or 0.0)
                 inventory = replace(
-                    inventory,
-                    up_shares=float(self._terminal_liquidation_remaining_up),
-                    dn_shares=float(self._terminal_liquidation_remaining_dn),
+                    remaining_inventory,
                     free_usdc=float(terminal_wallet_total_usdc),
                     reserved_usdc=0.0,
                     wallet_total_usdc=float(terminal_wallet_total_usdc),
@@ -2831,3 +2876,7 @@ class MarketMakerV2:
         snap["is_running"] = bool(self._running)
         snap["started_at"] = self._started_at
         return snap
+
+
+# Backward-compatible alias for legacy imports.
+MMRuntimeV2 = MarketMakerV2

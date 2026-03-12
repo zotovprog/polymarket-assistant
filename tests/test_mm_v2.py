@@ -783,7 +783,7 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert cfg.base_half_spread_bps == pytest.approx(100.0)
     assert cfg.vol_spread_multiplier == pytest.approx(2.0)
     assert cfg.maker_fee_bps == pytest.approx(0.0)
-    assert cfg.taker_fee_bps == pytest.approx(156.25)
+    assert cfg.taker_fee_bps == pytest.approx(78.0)
     assert cfg.min_edge_bps == pytest.approx(20.0)
     assert cfg.inventory_skew_strength == pytest.approx(2.0)
     assert cfg.tick_interval_sec == pytest.approx(1.0)
@@ -2045,6 +2045,7 @@ async def test_paper_sweep_start_route_delegates_to_runtime(monkeypatch):
         *,
         initial_usdc,
         base_clips,
+        variants,
         force_normal_soft_mode,
         base_config,
     ):
@@ -2054,6 +2055,7 @@ async def test_paper_sweep_start_route_delegates_to_runtime(monkeypatch):
                 "timeframe": timeframe,
                 "initial_usdc": initial_usdc,
                 "base_clips": list(base_clips),
+                "variants": variants,
                 "force_normal_soft_mode": force_normal_soft_mode,
                 "base_config": base_config,
             }

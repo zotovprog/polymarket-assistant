@@ -57,6 +57,7 @@ class MMConfigV2:
         "base_half_spread_bps": (5.0, 5000.0),
         "max_half_spread_bps": (25.0, 10000.0),
         "vol_spread_multiplier": (0.5, 10.0),
+        "spread_amplifier_knee_min": (0.5, 30.0),
         "maker_fee_bps": (0.0, 1000.0),
         "taker_fee_bps": (0.0, 1000.0),
         "min_edge_bps": (0.0, 1000.0),
@@ -96,8 +97,9 @@ class MMConfigV2:
     base_half_spread_bps: float = 100.0
     max_half_spread_bps: float = 600.0
     vol_spread_multiplier: float = 2.0
+    spread_amplifier_knee_min: float = 5.0
     maker_fee_bps: float = 0.0
-    taker_fee_bps: float = 156.25
+    taker_fee_bps: float = 78.0
     min_edge_bps: float = 20.0
     inventory_skew_strength: float = 2.0
     defensive_spread_mult: float = 1.5

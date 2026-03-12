@@ -287,7 +287,10 @@ class QuotePolicyV2:
             vol_spread,
             fee_spread,
         )
-        base *= max(1.0, min(3.0, math.sqrt(5.0 / tau_min)))
+        base *= max(
+            1.0,
+            min(3.0, math.sqrt(float(self.config.spread_amplifier_knee_min) / tau_min)),
+        )
         if risk.soft_mode == "defensive":
             base *= float(self.config.defensive_spread_mult)
         elif risk.soft_mode == "unwind":
