@@ -882,12 +882,19 @@ function updateMMRegime(mmRegime, state) {
     const marketabilityGuardReason = String(mmRegime?.marketability_guard_reason || '').trim();
     const marketabilityChurnConfirmed = Boolean(mmRegime?.marketability_churn_confirmed ?? false);
     const marketabilityProblemSide = String(mmRegime?.marketability_problem_side || '').trim();
+    const marketabilitySideLocked = String(mmRegime?.marketability_side_locked || '').trim();
+    const marketabilitySideLockAgeSec = Number(mmRegime?.marketability_side_lock_age_sec ?? 0);
     const collateralWarningHits = Number(mmRegime?.collateral_warning_hits_60s ?? 0);
     const sellSkipCooldownHits = Number(mmRegime?.sell_skip_cooldown_hits_60s ?? 0);
     const executionChurnRatio = Math.max(0, Number(mmRegime?.execution_churn_ratio_60s ?? 0));
     const untradeableToleratedSamples = Number(mmRegime?.untradeable_tolerated_samples_60s ?? 0);
     const postTerminalCleanupGraceActive = Boolean(mmRegime?.post_terminal_cleanup_grace_active ?? false);
     const failureBucketCurrent = String(mmRegime?.failure_bucket_current || '').trim();
+    const executionReplayBlockerHint = String(mmRegime?.execution_replay_blocker_hint || '').trim();
+    const holdOrderAgeUpSec = Number(mmRegime?.sell_churn_hold_order_age_up_sec ?? 0);
+    const holdOrderAgeDnSec = Number(mmRegime?.sell_churn_hold_order_age_dn_sec ?? 0);
+    const holdRepriceDueUp = Boolean(mmRegime?.sell_churn_hold_reprice_due_up ?? false);
+    const holdRepriceDueDn = Boolean(mmRegime?.sell_churn_hold_reprice_due_dn ?? false);
 
     let status = 'HEALTHY';
     let statusClass = 'mm-status-badge mm-status-healthy';
@@ -940,6 +947,9 @@ function updateMMRegime(mmRegime, state) {
     if (marketabilityChurnConfirmed) {
         why += ` Churn подтвержден${marketabilityProblemSide ? ` на стороне ${marketabilityProblemSide.toUpperCase()}` : ''}: pair-expanding intents урезаны.`;
     }
+    if (marketabilitySideLocked) {
+        why += ` Сторона churn зафиксирована: ${marketabilitySideLocked.toUpperCase()} (${Math.max(0, marketabilitySideLockAgeSec).toFixed(0)}s).`;
+    }
     if (harmfulBuyBrakeActive) {
         why += ' Harmful BUY brake активен: скорость набора перекоса ограничена.';
     }
@@ -958,6 +968,9 @@ function updateMMRegime(mmRegime, state) {
     if (helpfulCount || harmfulCount) {
         why += ` Helpful/Harmful: ${helpfulCount}/${harmfulCount}.`;
     }
+    if (executionReplayBlockerHint) {
+        why += ` Execution hint: ${executionReplayBlockerHint}.`;
+    }
     setText('mm-regime-why', why);
     const signalHints = [];
     if (makerGuardHits > 0) signalHints.push(`maker_guard=${makerGuardHits}`);
@@ -968,11 +981,17 @@ function updateMMRegime(mmRegime, state) {
     if (marketabilityGuardReason) signalHints.push(`marketability_reason=${marketabilityGuardReason}`);
     if (marketabilityChurnConfirmed) signalHints.push('marketability_churn=1');
     if (marketabilityProblemSide) signalHints.push(`marketability_side=${marketabilityProblemSide}`);
+    if (marketabilitySideLocked) signalHints.push(`marketability_lock=${marketabilitySideLocked}`);
     if (collateralWarningHits > 0) signalHints.push(`collateral_warn=${collateralWarningHits}`);
     if (sellSkipCooldownHits > 0) signalHints.push(`sell_skip=${sellSkipCooldownHits}`);
     if (executionChurnRatio > 0) signalHints.push(`churn=${executionChurnRatio.toFixed(2)}`);
+    if (holdOrderAgeUpSec > 0) signalHints.push(`hold_up_age=${holdOrderAgeUpSec.toFixed(0)}s`);
+    if (holdOrderAgeDnSec > 0) signalHints.push(`hold_dn_age=${holdOrderAgeDnSec.toFixed(0)}s`);
+    if (holdRepriceDueUp) signalHints.push('hold_up_reprice_due=1');
+    if (holdRepriceDueDn) signalHints.push('hold_dn_reprice_due=1');
     if (untradeableToleratedSamples > 0) signalHints.push(`untradeable_tol=${untradeableToleratedSamples}`);
     if (postTerminalCleanupGraceActive) signalHints.push('post_terminal_grace=1');
+    if (executionReplayBlockerHint) signalHints.push(`replay_hint=${executionReplayBlockerHint}`);
     if (dualBidGuardHits > 0) signalHints.push(`dual_bid_guard_hits=${dualBidGuardHits}`);
     if (dualBidGuardFailHits > 0) signalHints.push(`dual_bid_guard_fail=${dualBidGuardFailHits}`);
     if (harmfulBuyBrakeHits > 0) signalHints.push(`harmful_buy_brake=${harmfulBuyBrakeHits}`);

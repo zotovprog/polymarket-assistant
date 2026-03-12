@@ -137,8 +137,18 @@ def _derive_failure_bucket(state: dict[str, Any]) -> str:
         return "terminal_execution"
     if (
         bool(analytics.get("marketability_guard_active"))
-        or int(analytics.get("collateral_warning_hits_60s") or 0) > 0
-        or int(analytics.get("sell_skip_cooldown_hits_60s") or 0) > 0
+        or bool(analytics.get("marketability_churn_confirmed"))
+        or int(analytics.get("collateral_warning_streak_current") or 0) > 0
+        or int(analytics.get("sell_skip_cooldown_streak_current") or 0) > 0
+        or (
+            "collateral_warning_streak_current" not in analytics
+            and int(analytics.get("collateral_warning_hits_60s") or 0) > 0
+        )
+        or (
+            "sell_skip_cooldown_streak_current" not in analytics
+            and int(analytics.get("sell_skip_cooldown_hits_60s") or 0) > 0
+        )
+        or float(analytics.get("execution_churn_ratio_60s") or 0.0) >= 0.50
     ):
         return "marketability_churn"
     if (
@@ -501,24 +511,50 @@ def main() -> int:
                     quote_none_streak_outside = 0
                 outside_terminal = not bool(runtime.get("terminal_liquidation_active"))
                 if outside_terminal:
-                    collateral_warning_hits = int(analytics.get("collateral_warning_hits_60s") or 0)
-                    sell_skip_cooldown_hits = int(analytics.get("sell_skip_cooldown_hits_60s") or 0)
-                    if collateral_warning_hits > 0:
-                        collateral_warning_streak_outside += 1
+                    has_live_streaks = (
+                        "collateral_warning_streak_current" in analytics
+                        or "sell_skip_cooldown_streak_current" in analytics
+                        or "up_collateral_warning_streak" in analytics
+                        or "up_sell_skip_cooldown_streak" in analytics
+                    )
+                    if has_live_streaks:
+                        collateral_warning_streak_outside = max(
+                            int(analytics.get("collateral_warning_streak_current") or 0),
+                            int(analytics.get("up_collateral_warning_streak") or 0),
+                            int(analytics.get("dn_collateral_warning_streak") or 0),
+                        )
                         max_collateral_warning_streak_outside = max(
                             max_collateral_warning_streak_outside,
                             collateral_warning_streak_outside,
                         )
-                    else:
-                        collateral_warning_streak_outside = 0
-                    if sell_skip_cooldown_hits > 0:
-                        sell_skip_cooldown_streak_outside += 1
+                        sell_skip_cooldown_streak_outside = max(
+                            int(analytics.get("sell_skip_cooldown_streak_current") or 0),
+                            int(analytics.get("up_sell_skip_cooldown_streak") or 0),
+                            int(analytics.get("dn_sell_skip_cooldown_streak") or 0),
+                        )
                         max_sell_skip_cooldown_streak_outside = max(
                             max_sell_skip_cooldown_streak_outside,
                             sell_skip_cooldown_streak_outside,
                         )
                     else:
-                        sell_skip_cooldown_streak_outside = 0
+                        collateral_warning_hits = int(analytics.get("collateral_warning_hits_60s") or 0)
+                        sell_skip_cooldown_hits = int(analytics.get("sell_skip_cooldown_hits_60s") or 0)
+                        if collateral_warning_hits > 0:
+                            collateral_warning_streak_outside += 1
+                            max_collateral_warning_streak_outside = max(
+                                max_collateral_warning_streak_outside,
+                                collateral_warning_streak_outside,
+                            )
+                        else:
+                            collateral_warning_streak_outside = 0
+                        if sell_skip_cooldown_hits > 0:
+                            sell_skip_cooldown_streak_outside += 1
+                            max_sell_skip_cooldown_streak_outside = max(
+                                max_sell_skip_cooldown_streak_outside,
+                                sell_skip_cooldown_streak_outside,
+                            )
+                        else:
+                            sell_skip_cooldown_streak_outside = 0
                     material_inventory_usd = max(
                         6.0,
                         0.20 * float(cfg.get("session_budget_usd") or args.budget or 30.0),

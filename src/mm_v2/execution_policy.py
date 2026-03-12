@@ -9,6 +9,8 @@ from .types import QuoteIntent, QuotePlan
 
 
 class ExecutionPolicyV2:
+    SELL_HOLD_REASONS = {"sell_churn_hold_mode", "sell_reprice_hold_mode"}
+
     def __init__(self, gateway: PMGateway, tracker: OrderTrackerV2, *, requote_threshold_bps: float = 15.0):
         self.gateway = gateway
         self.tracker = tracker
@@ -40,15 +42,25 @@ class ExecutionPolicyV2:
             return False
         age_sec = max(0.0, float(time.time()) - created_at)
         if bool(getattr(desired, "hold_mode_active", False)):
-            if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
-                return False
-            if str(getattr(desired, "inventory_effect", "") or "") != "helpful":
-                return False
+            current_hold_reason = str(getattr(current_intent, "hold_mode_reason", "") or "")
+            desired_hold_reason = str(getattr(desired, "hold_mode_reason", "") or "")
+            sell_hold_mode = (
+                current_hold_reason in ExecutionPolicyV2.SELL_HOLD_REASONS
+                or desired_hold_reason in ExecutionPolicyV2.SELL_HOLD_REASONS
+            )
+            if not sell_hold_mode:
+                if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
+                    return False
+                if str(getattr(desired, "inventory_effect", "") or "") != "helpful":
+                    return False
             hold_max_age_sec = float(getattr(desired, "hold_max_age_sec", 0.0) or 0.0)
             if hold_max_age_sec > 0.0 and age_sec >= hold_max_age_sec:
                 return False
             # For SELLs a higher desired price means the current order is no longer maker-safe.
-            if float(current_intent.price) + 1e-9 < float(desired.price):
+            if (
+                not sell_hold_mode
+                and float(current_intent.price) + 1e-9 < float(desired.price)
+            ):
                 return False
             hold_reprice_threshold_ticks = int(getattr(desired, "hold_reprice_threshold_ticks", 0) or 0)
             hold_tick_size = float(getattr(desired, "hold_tick_size", 0.0) or 0.0)
@@ -75,8 +87,9 @@ class ExecutionPolicyV2:
             return False
         if not bool(getattr(current_intent, "hold_mode_active", False)):
             return False
-        if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
-            return False
+        if str(getattr(current_intent, "hold_mode_reason", "") or "") != "sell_churn_hold_mode":
+            if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
+                return False
         hold_max_age_sec = float(getattr(current_intent, "hold_max_age_sec", 0.0) or 0.0)
         age_sec = max(0.0, float(time.time()) - created_at)
         if hold_max_age_sec > 0.0 and age_sec >= hold_max_age_sec:
@@ -91,6 +104,34 @@ class ExecutionPolicyV2:
         self._sell_churn_hold_reprice_suppressed_hits = 0
         self._sell_churn_hold_cancel_avoided_hits = 0
         return metrics
+
+    def hold_order_state(
+        self,
+        slot_key: str,
+        *,
+        desired: QuoteIntent | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        existing = self.tracker.get(slot_key)
+        if existing is None:
+            return {"active": False, "age_sec": 0.0, "reprice_due": False}
+        current_intent = getattr(existing, "intent", None)
+        if current_intent is None:
+            return {"active": False, "age_sec": 0.0, "reprice_due": False}
+        if not bool(getattr(current_intent, "hold_mode_active", False)):
+            return {"active": False, "age_sec": 0.0, "reprice_due": False}
+        if str(getattr(current_intent, "hold_mode_reason", "") or "") != "sell_churn_hold_mode":
+            return {"active": False, "age_sec": 0.0, "reprice_due": False}
+        age_sec = self.tracker.age_sec(slot_key, now=now)
+        if desired is None:
+            reprice_due = not self._should_hold_existing_without_desired(existing)
+        else:
+            reprice_due = not self._should_hold_existing(existing, desired)
+        return {
+            "active": True,
+            "age_sec": float(age_sec),
+            "reprice_due": bool(reprice_due),
+        }
 
     async def _sync_slot(self, slot_key: str, desired: QuoteIntent | None) -> None:
         existing = self.tracker.get(slot_key)

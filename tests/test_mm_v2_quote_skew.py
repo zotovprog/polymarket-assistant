@@ -784,13 +784,57 @@ def test_marketability_churn_confirmed_keeps_only_inventory_reducing_intents():
     assert plan.up_ask is not None
     assert plan.up_ask.min_rest_sec == pytest.approx(6.0)
     assert plan.up_ask.hold_mode_active is True
-    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
-    assert plan.up_ask.hold_reprice_threshold_ticks == 6
-    assert plan.up_ask.hold_max_age_sec == pytest.approx(20.0)
-    assert plan.sell_churn_hold_up_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_reprice_hold_mode"
+    assert plan.up_ask.hold_reprice_threshold_ticks == 12
+    assert plan.up_ask.hold_max_age_sec == pytest.approx(6.0)
+    assert plan.sell_churn_hold_up_active is False
     assert plan.sell_churn_hold_dn_active is False
-    assert plan.sell_churn_hold_side == "up"
+    assert plan.sell_churn_hold_side == ""
     assert plan.quote_viability_reason == "marketability_churn_confirmed"
+
+
+def test_flat_start_sells_get_short_sell_reprice_hold_mode():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.9,
+        fv_up=0.54,
+        fv_dn=0.46,
+        pm_mid_up=0.53,
+        pm_mid_dn=0.47,
+        up_best_bid=0.52,
+        up_best_ask=0.54,
+        dn_best_bid=0.46,
+        dn_best_ask=0.48,
+    )
+    inventory = _inventory(
+        up_shares=0.0,
+        dn_shares=0.0,
+        sellable_up_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=0.0,
+        free_usdc=300.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.dn_ask is not None
+    assert plan.up_ask.hold_mode_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_reprice_hold_mode"
+    assert plan.up_ask.hold_reprice_threshold_ticks == 12
+    assert plan.up_ask.hold_max_age_sec == pytest.approx(6.0)
+    assert plan.dn_ask.hold_mode_active is True
+    assert plan.dn_ask.hold_mode_reason == "sell_reprice_hold_mode"
 
 
 def test_sell_churn_hold_mode_marks_explicit_dual_bid_exception():
@@ -845,6 +889,381 @@ def test_sell_churn_hold_mode_marks_explicit_dual_bid_exception():
     assert plan.sell_churn_hold_side == "dn"
     assert plan.dual_bid_exception_active is True
     assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
+
+
+def test_sell_churn_hold_uses_inventory_side_when_raw_problem_side_has_no_inventory():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.84,
+        fv_up=0.37,
+        fv_dn=0.63,
+        pm_mid_up=0.24,
+        pm_mid_dn=0.77,
+        up_best_bid=0.37,
+        up_best_ask=0.39,
+        dn_best_bid=0.61,
+        dn_best_ask=0.63,
+    )
+    inventory = _inventory(
+        up_shares=12.96,
+        sellable_up_shares=12.96,
+        dn_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=4.8,
+        excess_up_qty=12.96,
+        excess_up_value_usd=4.8,
+        excess_value_usd=4.8,
+        signed_excess_value_usd=4.8,
+        free_usdc=294.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="dn",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_churn_confirmed=True,
+        marketability_problem_side="dn",
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=True,
+        soft_mode="inventory_skewed",
+        target_soft_mode="defensive",
+        inventory_side="up",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.up_ask.hold_mode_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.sell_churn_hold_up_active is True
+    assert plan.sell_churn_hold_dn_active is False
+    assert plan.sell_churn_hold_side == "up"
+    assert plan.dual_bid_exception_active is True
+    assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
+
+
+def test_sell_churn_hold_prefers_locked_side_over_flapping_problem_side():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.84,
+        up_best_bid=0.37,
+        up_best_ask=0.39,
+        dn_best_bid=0.61,
+        dn_best_ask=0.63,
+    )
+    inventory = _inventory(
+        up_shares=12.96,
+        sellable_up_shares=12.96,
+        dn_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=4.8,
+        excess_up_qty=12.96,
+        excess_up_value_usd=4.8,
+        excess_value_usd=4.8,
+        signed_excess_value_usd=4.8,
+        free_usdc=294.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="dn",
+            marketability_side_locked="up",
+            marketability_side_lock_age_sec=8.0,
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_churn_confirmed=True,
+        marketability_problem_side="dn",
+        marketability_side_locked="up",
+        marketability_side_lock_age_sec=8.0,
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=True,
+        soft_mode="inventory_skewed",
+        target_soft_mode="defensive",
+        inventory_side="up",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.sell_churn_hold_side == "up"
+
+
+def test_marketability_churn_suppresses_non_helpful_flat_sells():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.84,
+        fv_up=0.45,
+        fv_dn=0.55,
+        pm_mid_up=0.45,
+        pm_mid_dn=0.55,
+        up_best_bid=0.44,
+        up_best_ask=0.46,
+        dn_best_bid=0.54,
+        dn_best_ask=0.56,
+    )
+    inventory = _inventory(
+        up_shares=0.0,
+        sellable_up_shares=0.0,
+        dn_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=0.0,
+        excess_value_usd=0.0,
+        signed_excess_value_usd=0.0,
+        free_usdc=300.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="up",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_churn_confirmed=True,
+        marketability_problem_side="up",
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=True,
+        soft_mode="defensive",
+        target_soft_mode="defensive",
+        inventory_side="flat",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is None
+    assert plan.dn_ask is None
+    assert plan.suppressed_reasons["up_ask"] == "marketability_churn_confirmed"
+    assert plan.suppressed_reasons["dn_ask"] == "marketability_churn_confirmed"
+
+
+def test_sell_skip_churn_keeps_buy_quarantine_active_in_unwind():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.91,
+        fv_up=0.55,
+        fv_dn=0.45,
+        pm_mid_up=0.52,
+        pm_mid_dn=0.49,
+        up_best_bid=0.53,
+        up_best_ask=0.55,
+        dn_best_bid=0.45,
+        dn_best_ask=0.47,
+        time_left_sec=840.0,
+    )
+    inventory = _inventory(
+        up_shares=4.79,
+        sellable_up_shares=4.79,
+        dn_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=2.97,
+        excess_up_qty=4.79,
+        excess_up_value_usd=2.97,
+        excess_value_usd=2.97,
+        signed_excess_value_usd=2.97,
+        free_usdc=297.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="up",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        soft_mode="unwind",
+        target_soft_mode="unwind",
+        inventory_side="up",
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=False,
+        marketability_churn_confirmed=True,
+        marketability_problem_side="up",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.up_ask.hold_mode_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.dn_bid is None
+    assert plan.suppressed_reasons["dn_bid"] == "marketability_churn_confirmed"
+    assert plan.dual_bid_exception_active is True
+    assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
+
+
+def test_sell_skip_guard_holds_inventory_backed_problem_side_sell_even_if_not_helpful():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=False,
+        market_quality_score=0.6,
+        fv_up=0.17,
+        fv_dn=0.83,
+        pm_mid_up=0.20,
+        pm_mid_dn=0.81,
+        up_best_bid=0.13,
+        up_best_ask=0.15,
+        dn_best_bid=0.85,
+        dn_best_ask=0.87,
+    )
+    inventory = _inventory(
+        up_shares=7.79,
+        sellable_up_shares=7.79,
+        dn_shares=6.2,
+        sellable_dn_shares=6.2,
+        total_inventory_value_usd=9.47,
+        excess_up_qty=7.79,
+        excess_up_value_usd=1.32,
+        excess_value_usd=1.32,
+        signed_excess_value_usd=1.32,
+        free_usdc=293.4,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_problem_side="dn",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        soft_mode="defensive",
+        target_soft_mode="defensive",
+        inventory_side="up",
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_guard_up_active=False,
+        marketability_guard_dn_active=True,
+        marketability_problem_side="dn",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.dn_ask is not None
+    assert plan.dn_ask.inventory_effect == "harmful"
+    assert plan.dn_ask.hold_mode_active is True
+    assert plan.dn_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.sell_churn_hold_dn_active is True
+    assert plan.sell_churn_hold_side == "dn"
+
+
+def test_sell_skip_churn_keeps_problem_side_helpful_sell_alive_below_min_owned_inventory():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.88,
+        fv_up=0.47,
+        fv_dn=0.53,
+        pm_mid_up=0.45,
+        pm_mid_dn=0.55,
+        up_best_bid=0.44,
+        up_best_ask=0.46,
+        dn_best_bid=0.54,
+        dn_best_ask=0.56,
+        time_left_sec=840.0,
+    )
+    inventory = _inventory(
+        up_shares=3.95,
+        sellable_up_shares=3.95,
+        dn_shares=0.0,
+        sellable_dn_shares=0.0,
+        total_inventory_value_usd=1.78,
+        excess_up_qty=3.95,
+        excess_up_value_usd=1.78,
+        excess_value_usd=1.78,
+        signed_excess_value_usd=1.78,
+        free_usdc=298.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="up",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        soft_mode="defensive",
+        target_soft_mode="defensive",
+        inventory_side="up",
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=False,
+        marketability_churn_confirmed=True,
+        marketability_problem_side="up",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+    assert plan.up_ask is not None
+    assert plan.up_ask.size >= 5.0
+    assert plan.up_ask.hold_mode_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.dn_bid is None
+    assert plan.suppressed_reasons["dn_bid"] == "marketability_churn_confirmed"
+    assert plan.quote_balance_state == "helpful_only"
 
 
 

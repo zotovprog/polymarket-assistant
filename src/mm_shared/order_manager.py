@@ -841,13 +841,17 @@ class OrderManager:
             streak = 0
             started = False
             for _, event_kind, event_token in reversed(events):
-                if event_kind == "sell_place_attempt":
-                    continue
-                if event_kind != kind:
+                if token and event_token != token:
                     if started:
                         break
                     continue
-                if token and event_token != token:
+                if event_kind == "sell_place_attempt":
+                    continue
+                if event_kind == "sell_place_success":
+                    if kind == "sell_skip_cooldown":
+                        break
+                    continue
+                if event_kind != kind:
                     if started:
                         break
                     continue
@@ -2054,6 +2058,7 @@ class OrderManager:
         self._order_post_only[order_id] = post_only
         self.invalidate_usdc_cache()
         if quote.side == "SELL":
+            self._record_marketability_event(kind="sell_place_success", token_id=quote.token_id)
             self._sell_reject_cooldown_until.pop(quote.token_id, None)
             self._cancel_repost_cooldown_until.pop(quote.token_id, None)
             self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)
@@ -2526,6 +2531,7 @@ class OrderManager:
                         self._active_orders[order_id] = quote
                         self._order_post_only[order_id] = use_post_only
                         if quote.side == "SELL":
+                            self._record_marketability_event(kind="sell_place_success", token_id=quote.token_id)
                             self._sell_reject_cooldown_until.pop(quote.token_id, None)
                             self._cancel_repost_cooldown_until.pop(quote.token_id, None)
                             self._clear_recent_cancelled_sell_reserves_for_token(quote.token_id)

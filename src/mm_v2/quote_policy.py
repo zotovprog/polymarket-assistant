@@ -66,6 +66,8 @@ class QuotePolicyV2:
     MARKETABILITY_REDUCING_SELL_MIN_REST_SEC = 6.0
     SELL_CHURN_HOLD_REPRICE_TICKS = 6
     SELL_CHURN_HOLD_MAX_AGE_SEC = 20.0
+    SELL_REPRICE_HOLD_REPRICE_TICKS = 12
+    SELL_REPRICE_HOLD_MAX_AGE_SEC = 6.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -575,35 +577,55 @@ class QuotePolicyV2:
         gross_inventory_brake_active_tick = False
         side_soft_brake_active_tick = False
         marketability_churn_confirmed = bool(getattr(risk, "marketability_churn_confirmed", False))
-        marketability_problem_side = str(getattr(risk, "marketability_problem_side", "") or "")
+        marketability_problem_side = str(getattr(risk, "marketability_side_locked", "") or "")
+        if marketability_problem_side not in {"up", "dn"}:
+            marketability_problem_side = str(getattr(risk, "marketability_problem_side", "") or "")
+        marketability_guard_reason = str(getattr(risk, "marketability_guard_reason", "") or "")
         if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
             marketability_problem_side = str(risk.inventory_side)
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
-        problem_side_inventory_present = False
-        problem_side_material_inventory = False
-        if marketability_problem_side == "up":
-            problem_side_inventory_present = max(
+        side_inventory_present = {
+            "up": max(
                 float(inventory.sellable_up_shares),
                 float(inventory.up_shares),
-            ) > 1e-9
-            problem_side_material_inventory = max(
+            ) > 1e-9,
+            "dn": max(
+                float(inventory.sellable_dn_shares),
+                float(inventory.dn_shares),
+            ) > 1e-9,
+        }
+        side_material_inventory = {
+            "up": max(
                 float(inventory.sellable_up_shares),
                 float(inventory.up_shares),
-            ) >= float(ctx.min_order_size)
-        elif marketability_problem_side == "dn":
-            problem_side_inventory_present = max(
+            ) >= float(ctx.min_order_size),
+            "dn": max(
                 float(inventory.sellable_dn_shares),
                 float(inventory.dn_shares),
-            ) > 1e-9
-            problem_side_material_inventory = max(
-                float(inventory.sellable_dn_shares),
-                float(inventory.dn_shares),
-            ) >= float(ctx.min_order_size)
+            ) >= float(ctx.min_order_size),
+        }
+        if (
+            marketability_problem_side in {"up", "dn"}
+            and not side_inventory_present[marketability_problem_side]
+            and risk.inventory_side in {"up", "dn"}
+            and side_inventory_present[str(risk.inventory_side)]
+        ):
+            marketability_problem_side = str(risk.inventory_side)
+        problem_side_inventory_present = bool(
+            side_inventory_present.get(marketability_problem_side, False)
+        )
+        problem_side_material_inventory = bool(
+            side_material_inventory.get(marketability_problem_side, False)
+        )
         marketability_buy_quarantine_active = bool(
             marketability_churn_confirmed
-            and problem_side_material_inventory
+            and problem_side_inventory_present
             and risk.hard_mode == "none"
-            and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            and risk.soft_mode in {"normal", "inventory_skewed", "defensive", "unwind"}
+            and (
+                risk.soft_mode != "unwind"
+                or marketability_guard_reason == "sell_skip_cooldown"
+            )
         )
         drawdown_brake_active = (
             risk.hard_mode == "none"
@@ -750,9 +772,38 @@ class QuotePolicyV2:
                 and problem_side_inventory_present
                 and token_side == marketability_problem_side
             )
+            sell_churn_hold_candidate = bool(
+                side == "SELL"
+                and side_inventory_present.get(token_side, False)
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive", "unwind"}
+                and (marketability_churn_side_active or marketability_guard_side_active)
+                and marketability_guard_reason == "sell_skip_cooldown"
+            )
+            allow_defensive_churn_inventory_sell = bool(
+                sell_churn_hold_candidate
+                and side == "SELL"
+                and risk.soft_mode == "defensive"
+                and side_material_inventory.get(token_side, False)
+            )
             if (
                 marketability_buy_quarantine_active
                 and side == "BUY"
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "marketability_churn_confirmed"
+                continue
+            if (
+                marketability_churn_confirmed
+                and side == "SELL"
+                and effect != "helpful"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                and (
+                    token_side == marketability_problem_side
+                    or not material_inventory
+                )
+                and not sell_churn_hold_candidate
             ):
                 built[slot] = None
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
@@ -775,7 +826,11 @@ class QuotePolicyV2:
                 built[slot] = None
                 suppressed_reasons[slot] = "harmful_buy_blocked_high_skew"
                 continue
-            if risk.soft_mode in {"defensive", "unwind"} and effect == "harmful":
+            if (
+                risk.soft_mode in {"defensive", "unwind"}
+                and effect == "harmful"
+                and not allow_defensive_churn_inventory_sell
+            ):
                 built[slot] = None
                 suppressed_reasons[slot] = (
                     "harmful_suppressed_in_defensive"
@@ -851,12 +906,19 @@ class QuotePolicyV2:
                     built[slot] = None
                     suppressed_reasons[slot] = "live_requires_inventory_backed_sell"
                     continue
-            expands_gross_inventory = side == "BUY" or (side == "SELL" and not inventory_backed_sell)
+            expands_gross_inventory = side == "BUY" or (
+                side == "SELL"
+                and not inventory_backed_sell
+                and not sell_churn_hold_candidate
+            )
             if (
                 marketability_churn_side_active
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
-                and (expands_gross_inventory or effect != "helpful")
+                and (
+                    expands_gross_inventory
+                    or (effect != "helpful" and not sell_churn_hold_candidate)
+                )
             ):
                 built[slot] = None
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
@@ -1024,10 +1086,19 @@ class QuotePolicyV2:
                         and side_min_clip_usd <= side_floor_headroom_usd + 1e-9
                     ):
                         effective_clip_usd = max(effective_clip_usd, side_min_clip_usd)
+            if side == "SELL" and sell_churn_hold_candidate:
+                min_sell_clip_usd = (
+                    float(ctx.min_order_size) * max(0.01, float(adjusted_price))
+                    if inventory_backed_sell
+                    else float(ctx.min_order_size) * max(0.01, 1.0 - float(adjusted_price))
+                )
+                effective_clip_usd = max(effective_clip_usd, min_sell_clip_usd)
             if inventory_backed_sell:
                 share_cap = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
             else:
                 share_cap = max(0.0, effective_clip_usd / pair_reference_price)
+                if side == "SELL" and sell_churn_hold_candidate:
+                    share_cap = max(share_cap, float(ctx.min_order_size))
             role_name = role if risk.soft_mode != "unwind" else "unwind"
             intent, suppressed = self._make_intent(
                 token=token,
@@ -1046,13 +1117,25 @@ class QuotePolicyV2:
             if intent is not None:
                 if (
                     side == "SELL"
-                    and effect == "helpful"
                     and risk.hard_mode == "none"
                     and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+                    and not bool(getattr(intent, "hold_mode_active", False))
+                ):
+                    intent.hold_mode_active = True
+                    intent.hold_mode_reason = "sell_reprice_hold_mode"
+                    intent.hold_reprice_threshold_ticks = int(self.SELL_REPRICE_HOLD_REPRICE_TICKS)
+                    intent.hold_max_age_sec = float(self.SELL_REPRICE_HOLD_MAX_AGE_SEC)
+                    intent.hold_tick_size = float(ctx.tick_size)
+                if (
+                    side == "SELL"
+                    and risk.hard_mode == "none"
+                    and risk.soft_mode in {"normal", "inventory_skewed", "defensive", "unwind"}
                     and (marketability_churn_side_active or marketability_guard_side_active)
+                    and side_inventory_present.get(token_side, False)
+                    and (effect == "helpful" or sell_churn_hold_candidate)
                 ):
                     intent.min_rest_sec = float(self.MARKETABILITY_REDUCING_SELL_MIN_REST_SEC)
-                    if marketability_churn_side_active:
+                    if sell_churn_hold_candidate:
                         intent.hold_mode_active = True
                         intent.hold_mode_reason = "sell_churn_hold_mode"
                         intent.hold_reprice_threshold_ticks = int(self.SELL_CHURN_HOLD_REPRICE_TICKS)
@@ -1391,7 +1474,7 @@ class QuotePolicyV2:
         if (
             outside_near_expiry
             and risk.hard_mode == "none"
-            and risk.soft_mode in {"normal", "inventory_skewed"}
+            and risk.soft_mode in {"normal", "inventory_skewed", "unwind"}
             and bool(snapshot.market_tradeable)
         ):
             up_reason = str(suppressed_reasons.get("up_bid") or "")

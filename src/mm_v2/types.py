@@ -172,6 +172,8 @@ class RiskRegime:
     marketability_guard_dn_active: bool = False
     marketability_churn_confirmed: bool = False
     marketability_problem_side: Literal["", "up", "dn"] = ""
+    marketability_side_locked: Literal["", "up", "dn"] = ""
+    marketability_side_lock_age_sec: float = 0.0
 
 
 @dataclass
@@ -295,16 +297,29 @@ class AnalyticsState:
     marketability_guard_reason: str = ""
     marketability_churn_confirmed: bool = False
     marketability_problem_side: str = ""
+    marketability_side_locked: str = ""
+    marketability_side_lock_age_sec: float = 0.0
     sell_churn_hold_up_active: bool = False
     sell_churn_hold_dn_active: bool = False
     sell_churn_hold_side: str = ""
+    sell_churn_hold_order_age_up_sec: float = 0.0
+    sell_churn_hold_order_age_dn_sec: float = 0.0
+    sell_churn_hold_reprice_due_up: bool = False
+    sell_churn_hold_reprice_due_dn: bool = False
     sell_churn_hold_reprice_suppressed_hits_60s: int = 0
     sell_churn_hold_cancel_avoided_hits_60s: int = 0
     collateral_warning_hits_60s: int = 0
     sell_skip_cooldown_hits_60s: int = 0
+    up_collateral_warning_streak: int = 0
+    dn_collateral_warning_streak: int = 0
+    up_sell_skip_cooldown_streak: int = 0
+    dn_sell_skip_cooldown_streak: int = 0
+    collateral_warning_streak_current: int = 0
+    sell_skip_cooldown_streak_current: int = 0
     execution_churn_ratio_60s: float = 0.0
     untradeable_tolerated_samples_60s: int = 0
     failure_bucket_current: str = ""
+    execution_replay_blocker_hint: str = ""
     post_terminal_cleanup_grace_active: bool = False
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0

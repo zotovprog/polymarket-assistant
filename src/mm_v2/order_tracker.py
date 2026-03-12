@@ -26,6 +26,19 @@ class OrderTrackerV2:
     def get(self, slot_key: str) -> SlotOrder | None:
         return self.slots.get(slot_key)
 
+    def get_intent(self, slot_key: str) -> QuoteIntent | None:
+        entry = self.get(slot_key)
+        if entry is None:
+            return None
+        return entry.intent
+
+    def age_sec(self, slot_key: str, *, now: float | None = None) -> float:
+        entry = self.get(slot_key)
+        if entry is None:
+            return 0.0
+        ref_now = float(time.time() if now is None else now)
+        return max(0.0, ref_now - float(entry.created_at or 0.0))
+
     def set(self, slot_key: str, order_id: str, intent: QuoteIntent) -> None:
         self.slots[slot_key] = SlotOrder(order_id=order_id, intent=intent)
 

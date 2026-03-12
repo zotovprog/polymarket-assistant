@@ -70,6 +70,9 @@ class SoftRiskKernel:
         marketability_guard_reason = str(getattr(analytics, "marketability_guard_reason", "") or "")
         marketability_churn_confirmed = bool(getattr(analytics, "marketability_churn_confirmed", False))
         marketability_problem_side = str(getattr(analytics, "marketability_problem_side", "") or "")
+        marketability_side_locked = str(getattr(analytics, "marketability_side_locked", "") or "")
+        if marketability_side_locked in {"up", "dn"}:
+            marketability_problem_side = marketability_side_locked
         up_inventory_value_usd = max(
             0.0,
             float(inventory.up_shares)
@@ -333,4 +336,6 @@ class HardSafetyKernel:
             marketability_guard_reason=str(getattr(analytics, "marketability_guard_reason", "") or ""),
             marketability_churn_confirmed=bool(getattr(analytics, "marketability_churn_confirmed", False)),
             marketability_problem_side=str(getattr(analytics, "marketability_problem_side", "") or ""),
+            marketability_side_locked=str(getattr(analytics, "marketability_side_locked", "") or ""),
+            marketability_side_lock_age_sec=float(getattr(analytics, "marketability_side_lock_age_sec", 0.0) or 0.0),
         )

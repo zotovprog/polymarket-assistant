@@ -1574,9 +1574,15 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
                 "marketability_guard_reason": "collateral_warning",
                 "marketability_churn_confirmed": True,
                 "marketability_problem_side": "up",
+                "marketability_side_locked": "up",
+                "marketability_side_lock_age_sec": 9.5,
                 "sell_churn_hold_up_active": True,
                 "sell_churn_hold_dn_active": False,
                 "sell_churn_hold_side": "up",
+                "sell_churn_hold_order_age_up_sec": 12.0,
+                "sell_churn_hold_order_age_dn_sec": 0.0,
+                "sell_churn_hold_reprice_due_up": False,
+                "sell_churn_hold_reprice_due_dn": False,
                 "sell_churn_hold_reprice_suppressed_hits_60s": 5,
                 "sell_churn_hold_cancel_avoided_hits_60s": 7,
                 "collateral_warning_hits_60s": 4,
@@ -1585,6 +1591,7 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
                 "untradeable_tolerated_samples_60s": 2,
                 "post_terminal_cleanup_grace_active": True,
                 "failure_bucket_current": "marketability_churn",
+                "execution_replay_blocker_hint": "sell_churn_hold_mode",
                 "maker_cross_guard_hits_60s": 4,
                 "dual_bid_ratio_60s": 0.72,
                 "one_sided_bid_streak_outside": 2,
@@ -1614,9 +1621,15 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     assert resp["analytics"]["marketability_guard_reason"] == "collateral_warning"
     assert resp["analytics"]["marketability_churn_confirmed"] is True
     assert resp["analytics"]["marketability_problem_side"] == "up"
+    assert resp["analytics"]["marketability_side_locked"] == "up"
+    assert resp["analytics"]["marketability_side_lock_age_sec"] == pytest.approx(9.5)
     assert resp["analytics"]["sell_churn_hold_up_active"] is True
     assert resp["analytics"]["sell_churn_hold_dn_active"] is False
     assert resp["analytics"]["sell_churn_hold_side"] == "up"
+    assert resp["analytics"]["sell_churn_hold_order_age_up_sec"] == pytest.approx(12.0)
+    assert resp["analytics"]["sell_churn_hold_order_age_dn_sec"] == pytest.approx(0.0)
+    assert resp["analytics"]["sell_churn_hold_reprice_due_up"] is False
+    assert resp["analytics"]["sell_churn_hold_reprice_due_dn"] is False
     assert resp["analytics"]["sell_churn_hold_reprice_suppressed_hits_60s"] == 5
     assert resp["analytics"]["sell_churn_hold_cancel_avoided_hits_60s"] == 7
     assert resp["analytics"]["collateral_warning_hits_60s"] == 4
@@ -1625,6 +1638,7 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     assert resp["analytics"]["untradeable_tolerated_samples_60s"] == 2
     assert resp["analytics"]["post_terminal_cleanup_grace_active"] is True
     assert resp["analytics"]["failure_bucket_current"] == "marketability_churn"
+    assert resp["analytics"]["execution_replay_blocker_hint"] == "sell_churn_hold_mode"
     assert resp["analytics"]["maker_cross_guard_hits_60s"] == 4
     assert resp["analytics"]["dual_bid_ratio_60s"] == pytest.approx(0.72)
     assert resp["analytics"]["one_sided_bid_streak_outside"] == 2
@@ -1970,14 +1984,21 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "marketability_guard_reason": "sell_skip_cooldown",
                 "marketability_churn_confirmed": True,
                 "marketability_problem_side": "dn",
+                "marketability_side_locked": "dn",
+                "marketability_side_lock_age_sec": 18.0,
                 "sell_churn_hold_up_active": False,
                 "sell_churn_hold_dn_active": True,
                 "sell_churn_hold_side": "dn",
+                "sell_churn_hold_order_age_up_sec": 0.0,
+                "sell_churn_hold_order_age_dn_sec": 21.0,
+                "sell_churn_hold_reprice_due_up": False,
+                "sell_churn_hold_reprice_due_dn": True,
                 "sell_churn_hold_reprice_suppressed_hits_60s": 9,
                 "sell_churn_hold_cancel_avoided_hits_60s": 11,
                 "collateral_warning_hits_60s": 1,
                 "sell_skip_cooldown_hits_60s": 6,
                 "execution_churn_ratio_60s": 0.52,
+                "execution_replay_blocker_hint": "sell_churn_hold_mode",
                 "gross_inventory_brake_active": True,
                 "gross_inventory_brake_hits_60s": 3,
                 "pair_over_target_buy_blocks_60s": 2,
@@ -2033,14 +2054,21 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["marketability_guard_reason"] == "sell_skip_cooldown"
     assert resp["mm_regime"]["marketability_churn_confirmed"] is True
     assert resp["mm_regime"]["marketability_problem_side"] == "dn"
+    assert resp["mm_regime"]["marketability_side_locked"] == "dn"
+    assert resp["mm_regime"]["marketability_side_lock_age_sec"] == pytest.approx(18.0)
     assert resp["mm_regime"]["sell_churn_hold_up_active"] is False
     assert resp["mm_regime"]["sell_churn_hold_dn_active"] is True
     assert resp["mm_regime"]["sell_churn_hold_side"] == "dn"
+    assert resp["mm_regime"]["sell_churn_hold_order_age_up_sec"] == pytest.approx(0.0)
+    assert resp["mm_regime"]["sell_churn_hold_order_age_dn_sec"] == pytest.approx(21.0)
+    assert resp["mm_regime"]["sell_churn_hold_reprice_due_up"] is False
+    assert resp["mm_regime"]["sell_churn_hold_reprice_due_dn"] is True
     assert resp["mm_regime"]["sell_churn_hold_reprice_suppressed_hits_60s"] == 9
     assert resp["mm_regime"]["sell_churn_hold_cancel_avoided_hits_60s"] == 11
     assert resp["mm_regime"]["collateral_warning_hits_60s"] == 1
     assert resp["mm_regime"]["sell_skip_cooldown_hits_60s"] == 6
     assert resp["mm_regime"]["execution_churn_ratio_60s"] == pytest.approx(0.52)
+    assert resp["mm_regime"]["execution_replay_blocker_hint"] == "sell_churn_hold_mode"
     assert resp["mm_regime"]["gross_inventory_brake_active"] is True
     assert resp["mm_regime"]["gross_inventory_brake_hits_60s"] == 3
     assert resp["mm_regime"]["pair_over_target_buy_blocks_60s"] == 2

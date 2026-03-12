@@ -56,6 +56,9 @@ class MarketMakerV2:
     HARD_BLOCK_NEGATIVE_STREAK = 3
     HARD_BLOCK_TOXIC_STREAK = 2
     SIDE_REENTRY_COOLDOWN_SEC = 12.0
+    MARKETABILITY_CHURN_HOLD_SEC = 12.0
+    MARKETABILITY_SIDE_LOCK_SEC = 20.0
+    MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN = 2
 
     def __init__(self, feed_state: Any, clob_client: Any, config: MMConfigV2):
         self.feed_state = feed_state
@@ -137,6 +140,10 @@ class MarketMakerV2:
         self._mm_regime_degraded_reason = ""
         self._unwind_target_mismatch_ticks = 0
         self._unwind_target_mismatch_started_ts = 0.0
+        self._marketability_churn_hold_until = 0.0
+        self._marketability_side_locked = ""
+        self._marketability_side_locked_until = 0.0
+        self._marketability_side_lock_started_ts = 0.0
         self._last_snapshot: PairMarketSnapshot | None = None
         self._post_fill_markout_5s_up = 0.0
         self._post_fill_markout_5s_dn = 0.0
@@ -1143,14 +1150,105 @@ class MarketMakerV2:
             )
         )
 
+    def _marketability_locked_side(self, *, now: float | None = None) -> str:
+        ref_now = float(time.time() if now is None else now)
+        if (
+            self._marketability_side_locked in {"up", "dn"}
+            and ref_now < float(self._marketability_side_locked_until)
+        ):
+            return str(self._marketability_side_locked)
+        return ""
+
+    def _marketability_side_lock_age_sec(self, *, now: float | None = None) -> float:
+        locked_side = self._marketability_locked_side(now=now)
+        if locked_side not in {"up", "dn"} or self._marketability_side_lock_started_ts <= 0.0:
+            return 0.0
+        ref_now = float(time.time() if now is None else now)
+        return max(0.0, ref_now - float(self._marketability_side_lock_started_ts))
+
+    def _set_marketability_side_lock(self, side: str, *, now: float | None = None) -> None:
+        ref_now = float(time.time() if now is None else now)
+        if side not in {"up", "dn"}:
+            self._marketability_side_locked = ""
+            self._marketability_side_locked_until = 0.0
+            self._marketability_side_lock_started_ts = 0.0
+            return
+        if self._marketability_side_locked != side:
+            self._marketability_side_lock_started_ts = ref_now
+        elif self._marketability_side_lock_started_ts <= 0.0:
+            self._marketability_side_lock_started_ts = ref_now
+        self._marketability_side_locked = str(side)
+        self._marketability_side_locked_until = ref_now + float(self.MARKETABILITY_SIDE_LOCK_SEC)
+
+    def _clear_marketability_side_lock(self) -> None:
+        self._marketability_side_locked = ""
+        self._marketability_side_locked_until = 0.0
+        self._marketability_side_lock_started_ts = 0.0
+
+    def _has_active_sell_churn_hold_order(self, side: str | None = None) -> bool:
+        slot_keys = []
+        if side in {"up", "dn"}:
+            slot_keys.append(f"{side}_sell")
+        else:
+            slot_keys.extend(["up_sell", "dn_sell"])
+        for slot_key in slot_keys:
+            intent = self.tracker.get_intent(slot_key)
+            if intent is None:
+                continue
+            if (
+                bool(getattr(intent, "hold_mode_active", False))
+                and str(getattr(intent, "hold_mode_reason", "") or "") == "sell_churn_hold_mode"
+            ):
+                return True
+        return False
+
+    def _execution_replay_blocker_hint(
+        self,
+        *,
+        failure_bucket_current: str,
+        plan: QuotePlan,
+        risk: RiskRegime,
+        health: HealthState,
+    ) -> str:
+        if failure_bucket_current == "marketability_churn":
+            if str(getattr(plan, "sell_churn_hold_side", "") or "") in {"up", "dn"}:
+                return "sell_churn_hold_mode"
+            if str(getattr(risk, "marketability_guard_reason", "") or "") == "sell_skip_cooldown":
+                return "cancel/repost_churn"
+            if str(getattr(risk, "marketability_guard_reason", "") or "") == "collateral_warning":
+                return "collateral_warning"
+            return "marketability_churn"
+        if failure_bucket_current == "edge_divergence":
+            if bool(getattr(plan, "divergence_hard_suppress_up_active", False)) or bool(
+                getattr(plan, "divergence_hard_suppress_dn_active", False)
+            ):
+                return "divergence hard suppress"
+            return "edge_divergence"
+        if failure_bucket_current == "terminal_execution":
+            return "terminal_execution"
+        if failure_bucket_current == "drift_transport":
+            if bool(getattr(health, "post_terminal_cleanup_grace_active", False)):
+                return "post-terminal false drift"
+            return "drift_transport"
+        if failure_bucket_current == "inventory_regime":
+            return "inventory_regime"
+        return ""
+
     def _classify_marketability_churn(
         self,
         marketability_state: dict[str, Any],
+        *,
+        now: float | None = None,
     ) -> tuple[bool, str]:
+        ref_now = float(time.time() if now is None else now)
         up_collateral_streak = int(marketability_state.get("up_collateral_warning_streak") or 0)
         dn_collateral_streak = int(marketability_state.get("dn_collateral_warning_streak") or 0)
         up_sell_skip_streak = int(marketability_state.get("up_sell_skip_cooldown_streak") or 0)
         dn_sell_skip_streak = int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0)
+        up_collateral_hits = int(marketability_state.get("up_collateral_warning_hits_60s") or 0)
+        dn_collateral_hits = int(marketability_state.get("dn_collateral_warning_hits_60s") or 0)
+        up_sell_skip_hits = int(marketability_state.get("up_sell_skip_cooldown_hits_60s") or 0)
+        dn_sell_skip_hits = int(marketability_state.get("dn_sell_skip_cooldown_hits_60s") or 0)
         execution_churn_ratio = float(marketability_state.get("execution_churn_ratio_60s") or 0.0)
         confirmed = bool(
             max(
@@ -1158,17 +1256,72 @@ class MarketMakerV2:
                 dn_collateral_streak,
                 up_sell_skip_streak,
                 dn_sell_skip_streak,
+                up_collateral_hits,
+                dn_collateral_hits,
+                up_sell_skip_hits,
+                dn_sell_skip_hits,
             )
             > 3
             or execution_churn_ratio >= 0.50
         )
+        locked_side = self._marketability_locked_side(now=ref_now)
         if not confirmed:
+            if ref_now < float(self._marketability_churn_hold_until):
+                return True, str(locked_side or "")
+            self._marketability_churn_hold_until = 0.0
+            if not self._has_active_sell_churn_hold_order():
+                self._clear_marketability_side_lock()
             return False, ""
         up_score = self._marketability_side_score(marketability_state, "up")
         dn_score = self._marketability_side_score(marketability_state, "dn")
         if up_score <= 0 and dn_score <= 0:
-            return True, ""
-        return True, ("up" if up_score >= dn_score else "dn")
+            self._marketability_churn_hold_until = ref_now + float(self.MARKETABILITY_CHURN_HOLD_SEC)
+            return True, str(locked_side or "")
+        side = "up" if up_score >= dn_score else "dn"
+        if locked_side in {"up", "dn"}:
+            other_side = "dn" if locked_side == "up" else "up"
+            locked_score = self._marketability_side_score(marketability_state, locked_side)
+            other_score = self._marketability_side_score(marketability_state, other_side)
+            if locked_score > 0 and other_score < (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN)):
+                side = locked_side
+            elif other_score >= (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN)):
+                side = other_side
+        self._marketability_churn_hold_until = ref_now + float(self.MARKETABILITY_CHURN_HOLD_SEC)
+        self._set_marketability_side_lock(side, now=ref_now)
+        return True, side
+
+    def _normalize_marketability_churn_state(
+        self,
+        *,
+        confirmed: bool,
+        side: str,
+        marketability_state: dict[str, Any],
+        inventory: PairInventoryState,
+    ) -> tuple[bool, str]:
+        locked_side = self._marketability_locked_side()
+        active_hold_order = self._has_active_sell_churn_hold_order(side or locked_side or None)
+        if not confirmed:
+            if not active_hold_order:
+                self._clear_marketability_side_lock()
+            return False, ""
+        flat_inventory = (
+            abs(float(inventory.up_shares)) <= 1e-9
+            and abs(float(inventory.dn_shares)) <= 1e-9
+        )
+        if not flat_inventory:
+            resolved_side = str(side or locked_side or "")
+            if resolved_side in {"up", "dn"}:
+                self._set_marketability_side_lock(resolved_side)
+            return True, resolved_side
+        if bool(marketability_state.get("active")):
+            return True, str(side or locked_side or "")
+        if bool(marketability_state.get("up_active")) or bool(marketability_state.get("dn_active")):
+            return True, str(side or locked_side or "")
+        if active_hold_order:
+            return True, str(side or locked_side or "")
+        self._marketability_churn_hold_until = 0.0
+        self._clear_marketability_side_lock()
+        return False, ""
 
     def _classify_failure_bucket(
         self,
@@ -1396,6 +1549,14 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
+        marketability_churn_confirmed, marketability_problem_side = self._normalize_marketability_churn_state(
+            confirmed=bool(marketability_churn_confirmed),
+            side=str(marketability_problem_side or ""),
+            marketability_state=dict(marketability_state or {}),
+            inventory=inventory,
+        )
+        marketability_side_locked = self._marketability_locked_side(now=now)
+        marketability_side_lock_age_sec = self._marketability_side_lock_age_sec(now=now)
         (
             position_mark_value_bid,
             position_mark_value_mid,
@@ -1440,8 +1601,22 @@ class MarketMakerV2:
             marketability_guard_reason=str(marketability_guard_reason),
             marketability_churn_confirmed=bool(marketability_churn_confirmed),
             marketability_problem_side=str(marketability_problem_side or ""),
+            marketability_side_locked=str(marketability_side_locked or ""),
+            marketability_side_lock_age_sec=float(marketability_side_lock_age_sec),
             collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
             sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
+            up_collateral_warning_streak=int(marketability_state.get("up_collateral_warning_streak") or 0),
+            dn_collateral_warning_streak=int(marketability_state.get("dn_collateral_warning_streak") or 0),
+            up_sell_skip_cooldown_streak=int(marketability_state.get("up_sell_skip_cooldown_streak") or 0),
+            dn_sell_skip_cooldown_streak=int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0),
+            collateral_warning_streak_current=max(
+                int(marketability_state.get("up_collateral_warning_streak") or 0),
+                int(marketability_state.get("dn_collateral_warning_streak") or 0),
+            ),
+            sell_skip_cooldown_streak_current=max(
+                int(marketability_state.get("up_sell_skip_cooldown_streak") or 0),
+                int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0),
+            ),
             execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
         )
         true_drift_age_sec, true_drift_no_progress_sec = self._update_true_drift_progress(
@@ -1486,6 +1661,8 @@ class MarketMakerV2:
             marketability_guard_dn_active=bool(marketability_state.get("dn_active") or False),
             marketability_churn_confirmed=bool(marketability_churn_confirmed),
             marketability_problem_side=str(marketability_problem_side or ""),
+            marketability_side_locked=str(marketability_side_locked or ""),
+            marketability_side_lock_age_sec=float(marketability_side_lock_age_sec),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -2029,6 +2206,22 @@ class MarketMakerV2:
             snapshot=snapshot,
             token_side="dn",
         )
+        up_sell_hold_state = self.execution_policy.hold_order_state(
+            "up_sell",
+            desired=plan.up_ask,
+            now=window_now,
+        )
+        dn_sell_hold_state = self.execution_policy.hold_order_state(
+            "dn_sell",
+            desired=plan.dn_ask,
+            now=window_now,
+        )
+        execution_replay_blocker_hint = self._execution_replay_blocker_hint(
+            failure_bucket_current=str(failure_bucket_current or ""),
+            plan=plan,
+            risk=effective_risk,
+            health=health,
+        )
         analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl_equity_usd,
@@ -2125,17 +2318,36 @@ class MarketMakerV2:
             marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
             marketability_churn_confirmed=bool(effective_risk.marketability_churn_confirmed),
             marketability_problem_side=str(effective_risk.marketability_problem_side or ""),
+            marketability_side_locked=str(marketability_side_locked or ""),
+            marketability_side_lock_age_sec=float(marketability_side_lock_age_sec),
             sell_churn_hold_up_active=bool(getattr(plan, "sell_churn_hold_up_active", False)),
             sell_churn_hold_dn_active=bool(getattr(plan, "sell_churn_hold_dn_active", False)),
             sell_churn_hold_side=str(getattr(plan, "sell_churn_hold_side", "") or ""),
+            sell_churn_hold_order_age_up_sec=float(up_sell_hold_state.get("age_sec") or 0.0),
+            sell_churn_hold_order_age_dn_sec=float(dn_sell_hold_state.get("age_sec") or 0.0),
+            sell_churn_hold_reprice_due_up=bool(up_sell_hold_state.get("reprice_due", False)),
+            sell_churn_hold_reprice_due_dn=bool(dn_sell_hold_state.get("reprice_due", False)),
             sell_churn_hold_reprice_suppressed_hits_60s=int(sell_churn_hold_reprice_suppressed_hits_60s),
             sell_churn_hold_cancel_avoided_hits_60s=int(sell_churn_hold_cancel_avoided_hits_60s),
             collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
             sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
+            up_collateral_warning_streak=int(marketability_state.get("up_collateral_warning_streak") or 0),
+            dn_collateral_warning_streak=int(marketability_state.get("dn_collateral_warning_streak") or 0),
+            up_sell_skip_cooldown_streak=int(marketability_state.get("up_sell_skip_cooldown_streak") or 0),
+            dn_sell_skip_cooldown_streak=int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0),
+            collateral_warning_streak_current=max(
+                int(marketability_state.get("up_collateral_warning_streak") or 0),
+                int(marketability_state.get("dn_collateral_warning_streak") or 0),
+            ),
+            sell_skip_cooldown_streak_current=max(
+                int(marketability_state.get("up_sell_skip_cooldown_streak") or 0),
+                int(marketability_state.get("dn_sell_skip_cooldown_streak") or 0),
+            ),
             execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),
             untradeable_tolerated_samples_60s=int(untradeable_tolerated_samples_60s),
             post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
             failure_bucket_current=str(failure_bucket_current or ""),
+            execution_replay_blocker_hint=str(execution_replay_blocker_hint or ""),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),

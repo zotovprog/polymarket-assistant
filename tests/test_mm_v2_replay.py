@@ -20,6 +20,8 @@ from mm_v2.replay import classify_replay_bundle, discover_artifact_dirs, load_re
 FIXTURES = BASE / "tests" / "fixtures" / "mm_v2_replay"
 FAILURE_MATRIX_FIXTURES = BASE / "tests" / "fixtures" / "mm_v2_failure_matrix"
 REPLAY_GATE_TOOL = BASE / "tools" / "mmv2_replay_gate_check.py"
+EXECUTION_REPLAY_TOOL = BASE / "tools" / "mmv2_execution_artifact_replay.py"
+DEV_GATE_TOOL = BASE / "tools" / "mmv2_dev_gate.py"
 DATASET_REPLAY_TOOL = BASE / "tools" / "mmv2_replay_strategy_orderfills.py"
 DATASET_MANIFEST = BASE / "data" / "replay" / "mmv2_dataset_scenarios.json"
 
@@ -197,3 +199,75 @@ def test_replay_gate_does_not_flag_terminal_execution_when_done_with_dust(tmp_pa
     summary = json.loads(proc.stdout)
     assert "terminal_execution_incomplete_present" not in summary["failed_criteria"]
     assert "terminal_execution" not in summary["failure_buckets"]
+
+
+def test_execution_artifact_replay_buckets_sell_churn_bad_fixture(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(EXECUTION_REPLAY_TOOL),
+            "--input-dir",
+            str((FAILURE_MATRIX_FIXTURES / "sell_churn_paper300_bad").resolve()),
+            "--output-root",
+            str((tmp_path / "execution-replay-bad").resolve()),
+        ],
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2, proc.stderr
+    summary = json.loads(proc.stdout)
+    assert summary["primary_blocker"] == "marketability_churn"
+    assert summary["execution_replay_blocker_hint"] in {"marketability_churn", "sell_churn_hold_mode"}
+    assert "unknown_failure_bucket" not in summary["failed_criteria"]
+    assert "marketability_churn" in summary["failure_buckets"]
+
+
+def test_execution_artifact_replay_accepts_fixed_sell_churn_fixture(tmp_path):
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(EXECUTION_REPLAY_TOOL),
+            "--input-dir",
+            str((FAILURE_MATRIX_FIXTURES / "sell_churn_paper300_fixed").resolve()),
+            "--output-root",
+            str((tmp_path / "execution-replay-fixed").resolve()),
+        ],
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    summary = json.loads(proc.stdout)
+    assert summary["gate_verdict"] == "go"
+    assert summary["primary_blocker"] == ""
+    assert summary["terminal_ok"] is True
+
+
+def test_dev_gate_quick_uses_dataset_then_execution_then_fixture_order(tmp_path):
+    out_dir = tmp_path / "dev-gate"
+    audit_root = tmp_path / "empty-audit"
+    audit_root.mkdir()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(DEV_GATE_TOOL),
+            "--mode",
+            "quick",
+            "--audit-root",
+            str(audit_root),
+            "--output-root",
+            str(out_dir),
+        ],
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 2), proc.stderr
+    summary = json.loads(proc.stdout)
+    stage_names = [stage["stage"] for stage in summary["stages"]]
+    assert stage_names[:3] == [
+        "dataset_replay",
+        "execution_artifact_replay",
+        "fixture_replay",
+    ]

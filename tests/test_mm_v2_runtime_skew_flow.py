@@ -332,6 +332,226 @@ async def test_execution_policy_sell_churn_hold_avoids_cancel_for_small_reprice(
 
 
 @pytest.mark.asyncio
+async def test_execution_policy_sell_churn_hold_avoids_cancel_for_small_upward_reprice(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.71, size=5.0),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.71,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    desired = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.73,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="helpful",
+        hold_mode_active=True,
+        hold_mode_reason="sell_churn_hold_mode",
+        hold_reprice_threshold_ticks=6,
+        hold_max_age_sec=20.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 110.0)
+    await policy.sync(QuotePlan(None, desired, None, None, "defensive", "marketability"))
+    metrics = policy.consume_sync_metrics()
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+    assert metrics["sell_churn_hold_cancel_avoided_hits"] == 1
+    assert metrics["sell_churn_hold_reprice_suppressed_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_policy_sell_reprice_hold_avoids_cancel_for_small_reprice(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.54, size=7.8),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.54,
+            size=7.8,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="neutral",
+            hold_mode_active=True,
+            hold_mode_reason="sell_reprice_hold_mode",
+            hold_reprice_threshold_ticks=2,
+            hold_max_age_sec=6.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    desired = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.55,
+        size=5.4,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="neutral",
+        hold_mode_active=True,
+        hold_mode_reason="sell_reprice_hold_mode",
+        hold_reprice_threshold_ticks=2,
+        hold_max_age_sec=6.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 103.0)
+    await policy.sync(QuotePlan(None, desired, None, None, "normal", "sell_reprice"))
+
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+
+
+@pytest.mark.asyncio
+async def test_execution_policy_sell_churn_hold_allows_inventory_backed_non_helpful_sell(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="dn-token", price=0.97, size=5.0),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "dn_sell",
+        "oid-1",
+        QuoteIntent(
+            token="dn-token",
+            side="SELL",
+            price=0.97,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="harmful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["dn_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    desired = QuoteIntent(
+        token="dn-token",
+        side="SELL",
+        price=0.95,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="harmful",
+        hold_mode_active=True,
+        hold_mode_reason="sell_churn_hold_mode",
+        hold_reprice_threshold_ticks=6,
+        hold_max_age_sec=20.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 110.0)
+    await policy.sync(QuotePlan(None, None, None, desired, "defensive", "marketability"))
+    metrics = policy.consume_sync_metrics()
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+    assert metrics["sell_churn_hold_cancel_avoided_hits"] == 1
+    assert metrics["sell_churn_hold_reprice_suppressed_hits"] == 1
+
+
+@pytest.mark.asyncio
 async def test_execution_policy_sell_churn_hold_reprices_on_large_move_or_age(monkeypatch):
     class DummyGateway:
         def __init__(self) -> None:
@@ -974,6 +1194,177 @@ def test_dynamic_drawdown_threshold_delays_emergency_for_same_pnl():
     assert low_ticks >= 1
     assert high_ticks == 0
     assert low_cfg.effective_hard_drawdown_usd() < high_cfg.effective_hard_drawdown_usd()
+
+
+def test_marketability_churn_stays_confirmed_from_hits_without_live_streak():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 0,
+            "dn_sell_skip_cooldown_streak": 0,
+            "up_collateral_warning_hits_60s": 0,
+            "dn_collateral_warning_hits_60s": 0,
+            "up_sell_skip_cooldown_hits_60s": 5,
+            "dn_sell_skip_cooldown_hits_60s": 1,
+            "up_execution_churn_ratio_60s": 0.1,
+            "dn_execution_churn_ratio_60s": 0.0,
+            "execution_churn_ratio_60s": 0.2,
+        }
+    )
+    assert confirmed is True
+    assert side == "up"
+
+
+def test_marketability_churn_confirmation_has_short_hysteresis():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 4,
+            "dn_sell_skip_cooldown_streak": 0,
+            "up_collateral_warning_hits_60s": 0,
+            "dn_collateral_warning_hits_60s": 0,
+            "up_sell_skip_cooldown_hits_60s": 4,
+            "dn_sell_skip_cooldown_hits_60s": 0,
+            "up_execution_churn_ratio_60s": 0.5,
+            "dn_execution_churn_ratio_60s": 0.0,
+            "execution_churn_ratio_60s": 0.5,
+        },
+        now=100.0,
+    )
+    assert confirmed is True
+    assert side == "up"
+
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 0,
+            "dn_sell_skip_cooldown_streak": 0,
+            "up_collateral_warning_hits_60s": 1,
+            "dn_collateral_warning_hits_60s": 0,
+            "up_sell_skip_cooldown_hits_60s": 1,
+            "dn_sell_skip_cooldown_hits_60s": 0,
+            "up_execution_churn_ratio_60s": 0.1,
+            "dn_execution_churn_ratio_60s": 0.0,
+            "execution_churn_ratio_60s": 0.1,
+        },
+        now=105.0,
+    )
+    assert confirmed is True
+    assert side == "up"
+
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 0,
+            "dn_sell_skip_cooldown_streak": 0,
+            "up_collateral_warning_hits_60s": 0,
+            "dn_collateral_warning_hits_60s": 0,
+            "up_sell_skip_cooldown_hits_60s": 0,
+            "dn_sell_skip_cooldown_hits_60s": 0,
+            "up_execution_churn_ratio_60s": 0.0,
+            "dn_execution_churn_ratio_60s": 0.0,
+            "execution_churn_ratio_60s": 0.0,
+        },
+        now=113.5,
+    )
+    assert confirmed is False
+    assert side == ""
+
+
+def test_marketability_churn_hold_clears_after_flat_inventory_without_active_guard():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._marketability_churn_hold_until = 200.0
+    mm._set_marketability_side_lock("up", now=100.0)
+    confirmed, side = mm._normalize_marketability_churn_state(
+        confirmed=True,
+        side="up",
+        marketability_state={},
+        inventory=_inventory(up_shares=0.0, dn_shares=0.0),
+    )
+    assert confirmed is False
+    assert side == ""
+    assert mm._marketability_churn_hold_until == 0.0
+    assert mm._marketability_locked_side(now=200.0) == ""
+
+
+def test_marketability_side_lock_does_not_flip_without_dominant_other_side():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 5,
+            "dn_sell_skip_cooldown_streak": 0,
+            "up_collateral_warning_hits_60s": 0,
+            "dn_collateral_warning_hits_60s": 0,
+            "up_sell_skip_cooldown_hits_60s": 5,
+            "dn_sell_skip_cooldown_hits_60s": 0,
+            "up_execution_churn_ratio_60s": 0.6,
+            "dn_execution_churn_ratio_60s": 0.0,
+            "execution_churn_ratio_60s": 0.6,
+        },
+        now=100.0,
+    )
+    assert confirmed is True
+    assert side == "up"
+    assert mm._marketability_locked_side(now=100.0) == "up"
+
+    confirmed, side = mm._classify_marketability_churn(
+        {
+            "up_collateral_warning_streak": 0,
+            "dn_collateral_warning_streak": 0,
+            "up_sell_skip_cooldown_streak": 2,
+            "dn_sell_skip_cooldown_streak": 3,
+            "up_collateral_warning_hits_60s": 2,
+            "dn_collateral_warning_hits_60s": 2,
+            "up_sell_skip_cooldown_hits_60s": 3,
+            "dn_sell_skip_cooldown_hits_60s": 4,
+            "up_execution_churn_ratio_60s": 0.3,
+            "dn_execution_churn_ratio_60s": 0.4,
+            "execution_churn_ratio_60s": 0.5,
+        },
+        now=108.0,
+    )
+    assert confirmed is True
+    assert side == "up"
+    assert mm._marketability_locked_side(now=108.0) == "up"
+
+
+def test_marketability_side_lock_and_churn_clear_after_flat_without_hold_order():
+    class _MockClient:
+        _orders = {}
+
+    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+    mm._marketability_churn_hold_until = 200.0
+    mm._set_marketability_side_lock("dn", now=100.0)
+    confirmed, side = mm._normalize_marketability_churn_state(
+        confirmed=True,
+        side="dn",
+        marketability_state={"active": False, "up_active": False, "dn_active": False},
+        inventory=_inventory(up_shares=0.0, dn_shares=0.0),
+    )
+    assert confirmed is False
+    assert side == ""
+    assert mm._marketability_locked_side(now=150.0) == ""
+    assert mm._marketability_churn_hold_until == 0.0
 
 
 def test_emergency_taker_force_enables_only_after_confirmed_no_progress(monkeypatch):

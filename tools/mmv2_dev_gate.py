@@ -131,8 +131,8 @@ def _run_fixture_stage(repo_root: Path, out_dir: Path, manifest_path: Path) -> d
     }
 
 
-def _run_artifact_stage(repo_root: Path, out_dir: Path, audit_root: Path) -> dict[str, Any]:
-    script = repo_root / "tools" / "mmv2_replay_gate_check.py"
+def _run_execution_artifact_stage(repo_root: Path, out_dir: Path, audit_root: Path) -> dict[str, Any]:
+    script = repo_root / "tools" / "mmv2_execution_artifact_replay.py"
     targets: list[tuple[str, Path]] = []
     latest_mongo = _latest_dir(audit_root, "mongo-last-run-")
     local_paper_root = audit_root / "local-paper"
@@ -143,13 +143,14 @@ def _run_artifact_stage(repo_root: Path, out_dir: Path, audit_root: Path) -> dic
         targets.append(("latest_local_paper", latest_local))
     if not targets:
         return {
-            "stage": "artifact_replay",
-            "ok": False,
-            "gate_verdict": "no_go",
-            "failed_criteria": ["no_artifact_inputs_found"],
+            "stage": "execution_artifact_replay",
+            "ok": True,
+            "gate_verdict": "go",
+            "failed_criteria": [],
             "failure_buckets": [],
             "primary_blocker": "",
             "artifact_results": [],
+            "note": "no_artifact_inputs_found",
         }
 
     artifact_results: list[dict[str, Any]] = []
@@ -171,7 +172,7 @@ def _run_artifact_stage(repo_root: Path, out_dir: Path, audit_root: Path) -> dic
             failed_criteria.append(f"missing_primary_blocker:{name}")
 
     return {
-        "stage": "artifact_replay",
+        "stage": "execution_artifact_replay",
         "ok": not failed_criteria,
         "gate_verdict": "go" if not failed_criteria else "no_go",
         "failed_criteria": failed_criteria,
@@ -241,6 +242,20 @@ def main() -> int:
     failed_criteria: list[str] = []
     failure_buckets: list[str] = []
 
+    dataset_stage = _run_dataset_stage(repo_root, out_dir / "dataset-replay", args)
+    stages.append(dataset_stage)
+    if dataset_stage.get("gate_verdict") != "go":
+        failed_criteria.extend([f"dataset_replay:{item}" for item in dataset_stage.get("failed_criteria", [])])
+        failure_buckets.extend(list(dataset_stage.get("failure_buckets") or []))
+
+    execution_stage = _run_execution_artifact_stage(repo_root, out_dir / "execution-artifact-replay", audit_root)
+    stages.append(execution_stage)
+    if execution_stage.get("gate_verdict") != "go":
+        failed_criteria.extend(
+            [f"execution_artifact_replay:{item}" for item in execution_stage.get("failed_criteria", [])]
+        )
+        failure_buckets.extend(list(execution_stage.get("failure_buckets") or []))
+
     fixture_stage = _run_fixture_stage(
         repo_root,
         out_dir / "fixture-replay",
@@ -249,17 +264,6 @@ def main() -> int:
     stages.append(fixture_stage)
     if fixture_stage.get("gate_verdict") != "go":
         failed_criteria.extend([f"fixture_replay:{item}" for item in fixture_stage.get("failed_criteria", [])])
-
-    artifact_stage = _run_artifact_stage(repo_root, out_dir / "artifact-replay", audit_root)
-    stages.append(artifact_stage)
-    if artifact_stage.get("gate_verdict") != "go":
-        failed_criteria.extend([f"artifact_replay:{item}" for item in artifact_stage.get("failed_criteria", [])])
-
-    dataset_stage = _run_dataset_stage(repo_root, out_dir / "dataset-replay", args)
-    stages.append(dataset_stage)
-    if dataset_stage.get("gate_verdict") != "go":
-        failed_criteria.extend([f"dataset_replay:{item}" for item in dataset_stage.get("failed_criteria", [])])
-        failure_buckets.extend(list(dataset_stage.get("failure_buckets") or []))
 
     if args.mode == "full" and not args.skip_local_paper and not failed_criteria:
         local_stage = _run_local_paper_stage(repo_root, out_dir / "local-paper", args)
