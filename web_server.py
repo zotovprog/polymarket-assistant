@@ -3434,6 +3434,7 @@ class PaperSweepRuntimeV2(MMRuntime):
         runtime = raw.get("runtime") or {}
         inventory = raw.get("inventory") or {}
         quotes = raw.get("quotes") or {}
+        market = raw.get("market") or {}
         active_quotes = sum(
             1
             for value in quotes.values()
@@ -3479,6 +3480,8 @@ class PaperSweepRuntimeV2(MMRuntime):
             "terminal_liquidation_remaining_up": float(runtime.get("terminal_liquidation_remaining_up") or 0.0),
             "terminal_liquidation_remaining_dn": float(runtime.get("terminal_liquidation_remaining_dn") or 0.0),
             "active_quotes": int(active_quotes),
+            "market_id": str(market.get("market_id") or ""),
+            "time_left_sec": float(market.get("time_left_sec") or 0.0),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -3510,6 +3513,7 @@ class PaperSweepRuntimeV2(MMRuntime):
             aggregate = sum(float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants)
             best = max([float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants], default=0.0)
             worst = min([float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants], default=0.0)
+            active_variant = next((variant for variant in variants if bool(variant.get("is_running"))), variants[0] if variants else {})
             state = {
                 "is_running": bool(running_variants > 0),
                 "started_at": float(self._started_at or 0.0),
@@ -3525,6 +3529,8 @@ class PaperSweepRuntimeV2(MMRuntime):
                 "aggregate_pnl_usd": float(aggregate),
                 "best_pnl_usd": float(best),
                 "worst_pnl_usd": float(worst),
+                "market_id": str(active_variant.get("market_id") or ""),
+                "time_left_sec": float(active_variant.get("time_left_sec") or 0.0),
                 "variants": variants,
             }
             self._last_state = state

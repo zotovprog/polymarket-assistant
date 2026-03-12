@@ -1750,11 +1750,19 @@ async def test_paper_sweep_state_endpoint_returns_runtime_snapshot(monkeypatch):
     monkeypatch.setattr(
         web_server._paper_sweep_v2,
         "snapshot",
-        lambda: {"is_running": True, "variant_count": 4, "variants": [{"label": "$8"}]},
+        lambda: {
+            "is_running": True,
+            "variant_count": 4,
+            "market_id": "BTC_15m_test",
+            "time_left_sec": 321.0,
+            "variants": [{"label": "$8", "time_left_sec": 321.0}],
+        },
     )
     resp = await web_server.mmv2_paper_sweep_state(request=object())
     assert resp["is_running"] is True
     assert resp["variant_count"] == 4
+    assert resp["market_id"] == "BTC_15m_test"
+    assert resp["time_left_sec"] == pytest.approx(321.0)
     assert resp["variants"][0]["label"] == "$8"
 
 

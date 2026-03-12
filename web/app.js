@@ -1322,6 +1322,14 @@ function formatUsdSigned(v) {
     return `${sign}$${n.toFixed(2)}`;
 }
 
+function formatSweepTimeLeft(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds ?? 0)));
+    if (total <= 0) return 'expired';
+    const mins = Math.floor(total / 60);
+    const secs = total % 60;
+    return `${mins}m ${secs}s left`;
+}
+
 function updatePaperSweep(sweep) {
     const statusEl = document.getElementById('paper-sweep-status');
     const summaryEl = document.getElementById('paper-sweep-summary');
@@ -1335,6 +1343,10 @@ function updatePaperSweep(sweep) {
     const aggregatePnl = Number(sweep?.aggregate_pnl_usd ?? 0);
     const runningCount = Number(sweep?.running_variants ?? 0);
     const budget = Number(sweep?.initial_usdc ?? 0);
+    const timeLeftSec = Number(sweep?.time_left_sec ?? 0);
+    const marketId = String(sweep?.market_id || '').trim();
+    const coin = String(sweep?.coin || '').trim();
+    const timeframe = String(sweep?.timeframe || '').trim();
 
     btnEl.innerHTML = isRunning
         ? '<i class="fas fa-stop"></i> Stop Sweep'
@@ -1350,9 +1362,13 @@ function updatePaperSweep(sweep) {
     }
 
     statusEl.textContent = isRunning
-        ? `Running ${runningCount}/${variantCount}`
+        ? `Window live · ${formatSweepTimeLeft(timeLeftSec)} · ${runningCount}/${variantCount} running`
         : `Completed ${variantCount}`;
-    metaEl.textContent = `Budget per variant: $${budget.toFixed(0)} | Aggregate PnL: ${formatUsdSigned(aggregatePnl)}`;
+    metaEl.textContent = [
+        marketId ? `${coin} ${timeframe} · ${marketId}` : `${coin} ${timeframe}`.trim(),
+        `Budget per variant: $${budget.toFixed(0)}`,
+        `Aggregate PnL: ${formatUsdSigned(aggregatePnl)}`,
+    ].filter(Boolean).join(' | ');
     summaryEl.className = 'paper-sweep-summary';
     summaryEl.innerHTML = variants.map((variant) => {
         const hardMode = String(variant.hard_mode || 'none');
