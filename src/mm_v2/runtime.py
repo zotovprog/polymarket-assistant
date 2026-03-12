@@ -128,8 +128,10 @@ class MarketMakerV2:
         self._starting_usdc = 0.0
         self._session_pnl = 0.0
         self._session_pnl_equity_usd = 0.0
+        self._session_pnl_drawdown_usd = 0.0
         self._session_pnl_operator_ema_usd = 0.0
         self._session_pnl_operator_usd = 0.0
+        self._portfolio_mark_value_mid_usd = 0.0
         self._operator_pnl_initialized = False
         self._avg_entry_price_up = 0.0
         self._avg_entry_price_dn = 0.0
@@ -167,6 +169,10 @@ class MarketMakerV2:
         self._marketability_side_locked = ""
         self._marketability_side_locked_until = 0.0
         self._marketability_side_lock_started_ts = 0.0
+        self._underlying_mid_history: list[tuple[float, float]] = []
+        self._fast_move_pause_until: float = 0.0
+        self._last_merge_attempt_ts: float = 0.0
+        self._private_key: str = ""
         self._last_snapshot: PairMarketSnapshot | None = None
         self._post_fill_markout_5s_up = 0.0
         self._post_fill_markout_5s_dn = 0.0
@@ -408,8 +414,10 @@ class MarketMakerV2:
         self._started_at = time.time()
         self._session_pnl = 0.0
         self._session_pnl_equity_usd = 0.0
+        self._session_pnl_drawdown_usd = 0.0
         self._session_pnl_operator_ema_usd = 0.0
         self._session_pnl_operator_usd = 0.0
+        self._portfolio_mark_value_mid_usd = 0.0
         self._operator_pnl_initialized = False
         self._drawdown_breach_ticks = 0
         self._drawdown_breach_started_ts = 0.0
@@ -473,6 +481,9 @@ class MarketMakerV2:
         self._terminal_liquidation_done = False
         self._terminal_liquidation_reason = ""
         self._post_terminal_cleanup_grace_started_ts = 0.0
+        self._underlying_mid_history.clear()
+        self._fast_move_pause_until = 0.0
+        self._last_merge_attempt_ts = 0.0
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -626,14 +637,21 @@ class MarketMakerV2:
         inventory: PairInventoryState,
         total_usdc: float,
         snapshot: PairMarketSnapshot,
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         position_mark_bid, position_mark_mid = self._position_mark_values(
             snapshot=snapshot,
             inventory=inventory,
         )
         portfolio_mark_value = max(0.0, float(total_usdc)) + position_mark_bid
+        portfolio_mark_value_mid = max(0.0, float(total_usdc)) + position_mark_mid
         tradeable_portfolio_value = max(0.0, float(inventory.free_usdc)) + position_mark_bid
-        return position_mark_bid, position_mark_mid, portfolio_mark_value, tradeable_portfolio_value
+        return (
+            position_mark_bid,
+            position_mark_mid,
+            portfolio_mark_value,
+            portfolio_mark_value_mid,
+            tradeable_portfolio_value,
+        )
 
     def _update_session_pnl(
         self,
@@ -641,29 +659,42 @@ class MarketMakerV2:
         *,
         total_usdc: float,
         snapshot: PairMarketSnapshot,
-    ) -> tuple[float, float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         # PnL must use wallet-total USDC + marked inventory value.
         # Pending/reserved order bookkeeping must not move session PnL.
-        position_mark_bid, position_mark_mid, current_portfolio, tradeable_portfolio = self._portfolio_components(
-            inventory=inventory,
-            total_usdc=total_usdc,
-            snapshot=snapshot,
-        )
+        (
+            position_mark_bid,
+            position_mark_mid,
+            current_portfolio,
+            current_portfolio_mid,
+            tradeable_portfolio,
+        ) = self._portfolio_components(inventory=inventory, total_usdc=total_usdc, snapshot=snapshot)
         equity_pnl = current_portfolio - self._starting_portfolio
+        operator_pnl = current_portfolio_mid - self._starting_portfolio
+        drawdown_portfolio = max(0.0, float(total_usdc)) + ((float(position_mark_bid) + float(position_mark_mid)) * 0.5)
+        drawdown_pnl = drawdown_portfolio - self._starting_portfolio
         self._session_pnl_equity_usd = float(equity_pnl)
+        self._session_pnl_drawdown_usd = float(drawdown_pnl)
         # Backward-compatible alias.
         self._session_pnl = self._session_pnl_equity_usd
+        self._portfolio_mark_value_mid_usd = float(current_portfolio_mid)
         if not self._operator_pnl_initialized:
-            self._session_pnl_operator_ema_usd = self._session_pnl_equity_usd
+            self._session_pnl_operator_ema_usd = float(operator_pnl)
             self._operator_pnl_initialized = True
         else:
             alpha = float(self.OPERATOR_PNL_EMA_ALPHA)
             self._session_pnl_operator_ema_usd = (
-                alpha * self._session_pnl_equity_usd
+                alpha * float(operator_pnl)
                 + (1.0 - alpha) * self._session_pnl_operator_ema_usd
             )
         self._session_pnl_operator_usd = self._session_pnl_operator_ema_usd
-        return position_mark_bid, position_mark_mid, current_portfolio, tradeable_portfolio
+        return (
+            position_mark_bid,
+            position_mark_mid,
+            current_portfolio,
+            current_portfolio_mid,
+            tradeable_portfolio,
+        )
 
     @staticmethod
     def _token_side_for_fill(fill: Fill, market: MarketInfo | None) -> str:
@@ -730,8 +761,95 @@ class MarketMakerV2:
     def _terminal_liquidation_start_sec(self) -> float:
         return max(
             float(self.config.emergency_taker_start_sec),
-            float(self.config.unwind_window_sec),
+            float(self.config.terminal_liquidation_start_sec),
         )
+
+    def _update_fast_move_state(self, *, snapshot: PairMarketSnapshot, now: float) -> None:
+        underlying_mid = max(0.0, float(getattr(snapshot, "underlying_mid_price", 0.0) or 0.0))
+        if underlying_mid <= 0.0:
+            snapshot.price_move_bps_1s = 0.0
+            snapshot.price_move_bps_5s = 0.0
+            snapshot.fast_move_soft_active = False
+            snapshot.fast_move_hard_active = False
+            snapshot.fast_move_pause_active = now < float(self._fast_move_pause_until)
+            return
+        self._underlying_mid_history.append((float(now), underlying_mid))
+        cutoff = float(now) - 6.0
+        self._underlying_mid_history = [
+            (ts, px)
+            for ts, px in self._underlying_mid_history
+            if ts >= cutoff and px > 0.0
+        ]
+
+        def _move_bps(lookback_sec: float) -> float:
+            reference = underlying_mid
+            target_ts = float(now) - float(lookback_sec)
+            for ts, px in self._underlying_mid_history:
+                if ts >= target_ts:
+                    reference = float(px)
+                    break
+            return abs(underlying_mid - reference) / max(1e-9, reference) * 10000.0
+
+        move_bps_1s = _move_bps(1.0)
+        move_bps_5s = _move_bps(5.0)
+        soft_active = bool(
+            move_bps_1s >= float(self.config.fast_move_soft_bps_1s)
+            or move_bps_5s >= float(self.config.fast_move_soft_bps_5s)
+        )
+        hard_active = bool(
+            move_bps_1s >= float(self.config.fast_move_hard_bps_1s)
+            or move_bps_5s >= float(self.config.fast_move_hard_bps_5s)
+        )
+        if hard_active:
+            self._fast_move_pause_until = max(
+                float(self._fast_move_pause_until),
+                float(now) + float(self.config.fast_move_pause_sec),
+            )
+        snapshot.price_move_bps_1s = float(move_bps_1s)
+        snapshot.price_move_bps_5s = float(move_bps_5s)
+        snapshot.fast_move_soft_active = bool(soft_active)
+        snapshot.fast_move_hard_active = bool(hard_active)
+        snapshot.fast_move_pause_active = bool(now < float(self._fast_move_pause_until))
+
+    async def _maybe_merge_pairs(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        inventory: PairInventoryState,
+        risk: RiskRegime,
+        now: float,
+    ) -> None:
+        if not self.market or not self.market.condition_id:
+            return
+        if self._force_normal_no_guards_active(snapshot=snapshot, risk=risk):
+            return
+        if float(snapshot.time_left_sec) > float(self.config.unwind_window_sec):
+            return
+        if float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec()):
+            return
+        if str(risk.hard_mode or "") != "none":
+            return
+        if float(inventory.paired_qty) < float(self.market.min_order_size):
+            return
+        if (float(now) - float(self._last_merge_attempt_ts)) < 10.0:
+            return
+        if not hasattr(self.gateway.order_mgr.client, "_orders") and not str(self._private_key or "").strip():
+            return
+        self._last_merge_attempt_ts = float(now)
+        try:
+            result = await self.gateway.merge_pairs(
+                condition_id=str(self.market.condition_id),
+                amount_shares=float(inventory.paired_qty),
+                private_key=str(self._private_key or ""),
+            )
+        except Exception as exc:
+            self.set_alert("merge_pairs_v2", f"Pair merge failed: {exc}", level="warning")
+            return
+        if bool((result or {}).get("success")):
+            self.clear_alert("merge_pairs_v2")
+            self.gateway.invalidate_balance_caches()
+        elif (result or {}).get("error"):
+            self.set_alert("merge_pairs_v2", f"Pair merge skipped: {result.get('error')}", level="warning")
 
     def _terminal_liquidation_elapsed(self, *, now: float) -> float:
         if self._terminal_liquidation_started_ts <= 0.0:
@@ -1609,6 +1727,7 @@ class MarketMakerV2:
             dn_book=dn_book,
         )
         now = time.time()
+        self._update_fast_move_state(snapshot=snapshot, now=now)
         self._update_pending_markouts(snapshot=snapshot, now=now)
         self.gateway.sync_paper_prices(
             fv_up=valuation.fv_up,
@@ -1705,6 +1824,7 @@ class MarketMakerV2:
             position_mark_value_bid,
             position_mark_value_mid,
             portfolio_mark_value,
+            portfolio_mark_value_mid,
             tradeable_portfolio_value,
         ) = self._update_session_pnl(
             inventory,
@@ -1712,7 +1832,7 @@ class MarketMakerV2:
             snapshot=snapshot,
         )
         drawdown_breach_ticks, drawdown_breach_age_sec, drawdown_breach_active = self._update_drawdown_breach(
-            self._session_pnl_equity_usd,
+            self._session_pnl_drawdown_usd,
         )
         drawdown_threshold_usd_effective = float(self.config.effective_hard_drawdown_usd())
         if inventory.free_usdc > (inventory.wallet_total_usdc + 1e-6):
@@ -1739,14 +1859,21 @@ class MarketMakerV2:
             fill_count=len(self._fills),
             session_pnl=self._session_pnl_equity_usd,
             session_pnl_equity_usd=self._session_pnl_equity_usd,
+            session_pnl_drawdown_usd=self._session_pnl_drawdown_usd,
             session_pnl_operator_usd=self._session_pnl_operator_usd,
             session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
+            portfolio_mark_value_mid_usd=float(portfolio_mark_value_mid),
             pair_entry_cost=float(inventory.pair_entry_cost),
             pair_entry_pnl_per_share=float(inventory.pair_entry_pnl_per_share),
             rolling_markout_up_5s=float(self._rolling_markout_up_5s),
             rolling_markout_dn_5s=float(self._rolling_markout_dn_5s),
             rolling_spread_capture_up=float(self._rolling_spread_capture_up),
             rolling_spread_capture_dn=float(self._rolling_spread_capture_dn),
+            price_move_bps_1s=float(snapshot.price_move_bps_1s),
+            price_move_bps_5s=float(snapshot.price_move_bps_5s),
+            fast_move_soft_active=bool(snapshot.fast_move_soft_active),
+            fast_move_hard_active=bool(snapshot.fast_move_hard_active),
+            fast_move_pause_active=bool(snapshot.fast_move_pause_active),
             marketability_guard_active=bool(marketability_guard_active),
             marketability_guard_reason=str(marketability_guard_reason),
             marketability_churn_confirmed=bool(marketability_churn_confirmed),
@@ -1819,6 +1946,9 @@ class MarketMakerV2:
             rolling_markout_dn_5s=float(self._rolling_markout_dn_5s),
             rolling_spread_capture_up=float(self._rolling_spread_capture_up),
             rolling_spread_capture_dn=float(self._rolling_spread_capture_dn),
+            fast_move_soft_active=bool(snapshot.fast_move_soft_active),
+            fast_move_hard_active=bool(snapshot.fast_move_hard_active),
+            fast_move_pause_active=bool(snapshot.fast_move_pause_active),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -1929,6 +2059,7 @@ class MarketMakerV2:
                     position_mark_value_bid,
                     position_mark_value_mid,
                     portfolio_mark_value,
+                    portfolio_mark_value_mid,
                     tradeable_portfolio_value,
                 ) = self._update_session_pnl(
                     inventory,
@@ -2421,16 +2552,24 @@ class MarketMakerV2:
             risk=effective_risk,
             health=health,
         )
+        await self._maybe_merge_pairs(
+            snapshot=snapshot,
+            inventory=inventory,
+            risk=effective_risk,
+            now=window_now,
+        )
         analytics = AnalyticsState(
             fill_count=len(self._fills),
             session_pnl=self._session_pnl_equity_usd,
             session_pnl_equity_usd=self._session_pnl_equity_usd,
+            session_pnl_drawdown_usd=self._session_pnl_drawdown_usd,
             session_pnl_operator_usd=self._session_pnl_operator_usd,
             session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
             position_mark_value_usd=float(position_mark_value_bid),
             position_mark_value_bid_usd=float(position_mark_value_bid),
             position_mark_value_mid_usd=float(position_mark_value_mid),
             portfolio_mark_value_usd=float(portfolio_mark_value),
+            portfolio_mark_value_mid_usd=float(portfolio_mark_value_mid),
             tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
             pair_entry_cost=float(inventory.pair_entry_cost),
             pair_entry_pnl_per_share=float(inventory.pair_entry_pnl_per_share),
@@ -2517,6 +2656,11 @@ class MarketMakerV2:
             divergence_soft_brake_hits_60s=int(divergence_soft_brake_hits_60s),
             divergence_hard_suppress_hits_60s=int(divergence_hard_suppress_hits_60s),
             max_buy_edge_gap_60s=float(max_buy_edge_gap_60s),
+            price_move_bps_1s=float(snapshot.price_move_bps_1s),
+            price_move_bps_5s=float(snapshot.price_move_bps_5s),
+            fast_move_soft_active=bool(snapshot.fast_move_soft_active),
+            fast_move_hard_active=bool(snapshot.fast_move_hard_active),
+            fast_move_pause_active=bool(snapshot.fast_move_pause_active),
             dual_bid_exception_active=bool(dual_bid_exception_active),
             dual_bid_exception_reason=str(dual_bid_exception_reason),
             marketability_guard_active=bool(effective_risk.marketability_guard_active),

@@ -174,7 +174,7 @@ def test_force_normal_soft_mode_active_only_outside_terminal_and_without_hard_ri
     mm = MarketMakerV2(
         SimpleNamespace(),
         _MockClient(),
-        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0),
+        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0, terminal_liquidation_start_sec=90.0),
         force_normal_soft_mode_paper=True,
     )
     assert mm._force_normal_soft_mode_active(
@@ -198,7 +198,7 @@ def test_force_normal_no_guards_active_only_outside_terminal_and_without_hard_ri
     mm = MarketMakerV2(
         SimpleNamespace(),
         _MockClient(),
-        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0),
+        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0, terminal_liquidation_start_sec=90.0),
         force_normal_no_guards_paper=True,
     )
     assert mm._force_normal_no_guards_active(
@@ -2008,7 +2008,15 @@ async def test_close_window_material_inventory_arms_terminal_liquidation_before_
     class _MockClient:
         _orders = {}
 
-    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0))
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(
+            unwind_window_sec=90.0,
+            emergency_taker_start_sec=20.0,
+            terminal_liquidation_start_sec=90.0,
+        ),
+    )
     mm.set_market(_market())
     snapshot = _snapshot(time_left_sec=60.0)
     valuation = PairValuationResult(
@@ -2105,7 +2113,16 @@ async def test_terminal_liquidation_timeout_does_not_stop_further_steps_before_e
     class _MockClient:
         _orders = {}
 
-    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0, emergency_unwind_timeout_sec=10.0))
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(
+            unwind_window_sec=90.0,
+            emergency_taker_start_sec=20.0,
+            terminal_liquidation_start_sec=90.0,
+            emergency_unwind_timeout_sec=10.0,
+        ),
+    )
     mm.set_market(_market())
     snapshot = _snapshot(time_left_sec=40.0)
     valuation = PairValuationResult(
@@ -2307,7 +2324,15 @@ async def test_terminal_liquidation_done_before_expiry_does_not_resume_normal_qu
     class _MockClient:
         _orders = {}
 
-    mm = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0))
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(
+            unwind_window_sec=90.0,
+            emergency_taker_start_sec=20.0,
+            terminal_liquidation_start_sec=90.0,
+        ),
+    )
     mm.set_market(_market())
     snapshot = _snapshot(time_left_sec=30.0)
     valuation = PairValuationResult(

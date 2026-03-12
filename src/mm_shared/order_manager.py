@@ -3753,7 +3753,13 @@ class OrderManager:
                    On-chain merge requires tokens on msg.sender's address.
         """
         if hasattr(self.client, "_orders"):  # Paper mode
+            token_ids = list(self._current_token_ids)
+            if len(token_ids) >= 2:
+                for token_id in token_ids[:2]:
+                    cur = max(0.0, float(self._mock_token_balances.get(token_id, 0.0)))
+                    self._mock_token_balances[token_id] = max(0.0, cur - float(amount_shares))
             self.client._usdc_balance += amount_shares
+            self.invalidate_usdc_cache()
             log.info("[MOCK] Merge %.2f pairs -> $%.2f USDC", amount_shares, amount_shares)
             return {"success": True, "amount_usdc": amount_shares}
 

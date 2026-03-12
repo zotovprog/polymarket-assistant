@@ -41,6 +41,12 @@ class PairMarketSnapshot:
     valuation_source: str = "midpoint_first"
     valuation_regime: str = "normal"
     pm_age_sec: float = 999.0
+    underlying_mid_price: float = 0.0
+    price_move_bps_1s: float = 0.0
+    price_move_bps_5s: float = 0.0
+    fast_move_soft_active: bool = False
+    fast_move_hard_active: bool = False
+    fast_move_pause_active: bool = False
 
 
 @dataclass
@@ -183,6 +189,9 @@ class RiskRegime:
     rolling_markout_dn_5s: float = 0.0
     rolling_spread_capture_up: float = 0.0
     rolling_spread_capture_dn: float = 0.0
+    fast_move_soft_active: bool = False
+    fast_move_hard_active: bool = False
+    fast_move_pause_active: bool = False
 
 
 @dataclass
@@ -211,12 +220,14 @@ class AnalyticsState:
     fill_count: int = 0
     session_pnl: float = 0.0
     session_pnl_equity_usd: float = 0.0
+    session_pnl_drawdown_usd: float = 0.0
     session_pnl_operator_usd: float = 0.0
     session_pnl_operator_ema_usd: float = 0.0
     position_mark_value_usd: float = 0.0
     position_mark_value_bid_usd: float = 0.0
     position_mark_value_mid_usd: float = 0.0
     portfolio_mark_value_usd: float = 0.0
+    portfolio_mark_value_mid_usd: float = 0.0
     tradeable_portfolio_value_usd: float = 0.0
     pair_entry_cost: float = 0.0
     pair_entry_pnl_per_share: float = 0.0
@@ -298,6 +309,11 @@ class AnalyticsState:
     divergence_soft_brake_hits_60s: int = 0
     divergence_hard_suppress_hits_60s: int = 0
     max_buy_edge_gap_60s: float = 0.0
+    price_move_bps_1s: float = 0.0
+    price_move_bps_5s: float = 0.0
+    fast_move_soft_active: bool = False
+    fast_move_hard_active: bool = False
+    fast_move_pause_active: bool = False
     dual_bid_exception_active: bool = False
     dual_bid_exception_reason: str = ""
     harmful_buy_brake_active: bool = False

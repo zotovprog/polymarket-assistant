@@ -63,7 +63,7 @@ async def test_mmv2_paper_quotes_both_sides_from_flat(monkeypatch):
     monkeypatch.setattr(web_server.random, "random", lambda: 1.0)
     monkeypatch.setattr(web_server.random, "uniform", lambda a, _b: a)
 
-    client = web_server.MockClobClient(fill_prob=0.0, usdc_balance=15.0)
+    client = web_server.MockClobClient(fill_prob=0.0, usdc_balance=30.0)
     cfg = MMConfigV2(base_clip_usd=6.0, tick_interval_sec=10.0)
     mm = MarketMakerV2(_feed_state(), client, cfg)
     mm.set_market(_market())

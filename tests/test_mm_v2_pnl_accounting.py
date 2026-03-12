@@ -292,7 +292,8 @@ def test_operator_pnl_is_ema_smoothed():
     mm._update_session_pnl(inv, total_usdc=9.0, snapshot=snap_a)
     first_equity = mm._session_pnl_equity_usd
     first_operator = mm._session_pnl_operator_usd
-    assert first_operator == pytest.approx(first_equity)
+    assert first_equity == pytest.approx(-0.2)
+    assert first_operator == pytest.approx(-0.1)
 
     mm._update_session_pnl(inv, total_usdc=9.0, snapshot=snap_b)
     second_equity = mm._session_pnl_equity_usd

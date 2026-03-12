@@ -408,6 +408,22 @@ class PMGateway:
     def api_error_stats(self) -> dict[str, Any]:
         return self.order_mgr.get_api_error_stats()
 
+    async def merge_pairs(
+        self,
+        *,
+        condition_id: str,
+        amount_shares: float,
+        private_key: str,
+    ) -> dict[str, Any]:
+        return await self.order_mgr.merge_positions(
+            condition_id=condition_id,
+            amount_shares=float(amount_shares),
+            private_key=str(private_key or ""),
+        )
+
+    def invalidate_balance_caches(self) -> None:
+        self.order_mgr.invalidate_usdc_cache()
+
     async def ensure_sell_allowances(self) -> None:
         if not self.market:
             return

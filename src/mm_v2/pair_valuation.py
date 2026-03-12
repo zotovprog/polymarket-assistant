@@ -237,5 +237,6 @@ class PairValuationEngine:
             valuation_source=valuation_source,
             valuation_regime=result.regime,
             pm_age_sec=pm_age,
+            underlying_mid_price=float(mid),
         )
         return result, snapshot

@@ -237,6 +237,27 @@ class QuotePolicyV2:
         progress = max(0.0, min(1.0, progress))
         return max(0.20, 1.0 - 0.80 * progress)
 
+    def _buy_headroom_usd(
+        self,
+        *,
+        free_usdc: float,
+        risk: RiskRegime,
+        snapshot: PairMarketSnapshot,
+    ) -> float:
+        if risk.soft_mode == "unwind":
+            ratio = 0.25
+        elif risk.soft_mode == "defensive":
+            ratio = 0.35
+        elif risk.soft_mode == "inventory_skewed":
+            ratio = 0.50
+        else:
+            ratio = 0.60
+        if bool(getattr(snapshot, "fast_move_soft_active", False)):
+            ratio = min(ratio, 0.30)
+        if bool(getattr(snapshot, "fast_move_pause_active", False)):
+            ratio = min(ratio, 0.15)
+        return max(1.0, float(free_usdc) * float(ratio))
+
     def _min_viable_clip_usd(self, snapshot: PairMarketSnapshot, ctx: QuoteContext) -> float:
         return float(ctx.min_order_size) * self._pair_reference_price(snapshot)
 
@@ -255,14 +276,18 @@ class QuotePolicyV2:
 
     def _spread(self, risk: RiskRegime, snapshot: PairMarketSnapshot) -> float:
         vol = max(0.0003, float(getattr(snapshot, "realized_vol_per_min", 0.0005) or 0.0005))
-        time_left_min = max(0.1, float(snapshot.time_left_sec) / 60.0)
-        vol_spread = vol * math.sqrt(time_left_min) * float(self.config.vol_spread_multiplier)
-        fee_spread = self._bps_to_price(float(self.config.maker_fee_bps) * 2.0)
+        tau_min = max(0.1, min(15.0, float(snapshot.time_left_sec) / 60.0))
+        vol_spread = vol * (float(self.config.vol_spread_multiplier) / math.sqrt(tau_min))
+        fee_bps = float(self.config.maker_fee_bps) * 2.0
+        if risk.soft_mode == "unwind" or risk.hard_mode == "emergency_unwind":
+            fee_bps = max(fee_bps, float(self.config.taker_fee_bps) * 2.0)
+        fee_spread = self._bps_to_price(fee_bps)
         base = max(
             self._bps_to_price(self.config.base_half_spread_bps),
             vol_spread,
             fee_spread,
         )
+        base *= max(1.0, min(3.0, math.sqrt(5.0 / tau_min)))
         if risk.soft_mode == "defensive":
             base *= float(self.config.defensive_spread_mult)
         elif risk.soft_mode == "unwind":
@@ -500,7 +525,11 @@ class QuotePolicyV2:
         spread = self._spread(risk, snapshot)
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
-        budget_headroom_usd = max(1.0, free_usdc * 0.20)
+        budget_headroom_usd = self._buy_headroom_usd(
+            free_usdc=free_usdc,
+            risk=risk,
+            snapshot=snapshot,
+        )
         dual_bid_guard_headroom_usd = max(1.0, free_usdc)
         min_viable_clip_usd = self._min_viable_clip_usd(snapshot, ctx)
         harmful_buy_guard_usd = float(self.config.effective_harmful_buy_suppress_usd())
@@ -774,6 +803,16 @@ class QuotePolicyV2:
                         built[slot] = None
                         suppressed_reasons[slot] = "min_edge_not_met"
                         continue
+            if (
+                not diagnostic_no_guards
+                and
+                side == "BUY"
+                and bool(getattr(snapshot, "fast_move_pause_active", False))
+                and risk.hard_mode == "none"
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "fast_move_pause"
+                continue
             if (
                 not diagnostic_no_guards
                 and

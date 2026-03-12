@@ -171,6 +171,11 @@ class SoftRiskKernel:
         elif excess_value_usd >= defensive_cap:
             target_soft_mode = "defensive"
             soft_reason = "defensive excess regime"
+        elif bool(getattr(snapshot, "fast_move_hard_active", False)) or bool(
+            getattr(snapshot, "fast_move_pause_active", False)
+        ):
+            target_soft_mode = "defensive"
+            soft_reason = "defensive fast move"
         elif toxic_divergence_inventory_up or toxic_divergence_inventory_dn:
             target_soft_mode = "defensive"
             if toxic_divergence_inventory_up and toxic_divergence_inventory_dn:
@@ -231,6 +236,9 @@ class SoftRiskKernel:
             elif market_quality_bad or divergence_bad:
                 target_soft_mode = "defensive"
                 soft_reason = "defensive market regime"
+            elif bool(getattr(snapshot, "fast_move_soft_active", False)):
+                target_soft_mode = "inventory_skewed" if inventory_nearly_flat else "defensive"
+                soft_reason = "inventory fast move"
         if target_soft_mode == "normal" and excess_value_usd >= soft_cap:
             target_soft_mode = "inventory_skewed"
             soft_reason = f"soft excess ${excess_value_usd:.2f}"
@@ -272,10 +280,12 @@ class HardSafetyKernel:
         analytics: AnalyticsState,
         health: HealthState,
     ) -> RiskRegime:
-        equity_pnl = float(getattr(analytics, "session_pnl_equity_usd", 0.0) or 0.0)
-        if abs(equity_pnl) < 1e-12 and abs(float(getattr(analytics, "session_pnl", 0.0) or 0.0)) > 0.0:
+        drawdown_pnl = float(getattr(analytics, "session_pnl_drawdown_usd", 0.0) or 0.0)
+        if abs(drawdown_pnl) < 1e-12:
+            drawdown_pnl = float(getattr(analytics, "session_pnl_equity_usd", 0.0) or 0.0)
+        if abs(drawdown_pnl) < 1e-12 and abs(float(getattr(analytics, "session_pnl", 0.0) or 0.0)) > 0.0:
             # Backward-compatible fallback while tests/fixtures migrate.
-            equity_pnl = float(getattr(analytics, "session_pnl", 0.0) or 0.0)
+            drawdown_pnl = float(getattr(analytics, "session_pnl", 0.0) or 0.0)
         hard_mode = "none"
         hard_reason = ""
         has_material_position = inventory.up_shares > 0.5 or inventory.dn_shares > 0.5
@@ -284,9 +294,9 @@ class HardSafetyKernel:
         if self.config.hard_drawdown_usd > 0:
             drawdown_budget = max(
                 0.0,
-                1.0 - max(0.0, -equity_pnl) / effective_drawdown_usd,
+                1.0 - max(0.0, -drawdown_pnl) / effective_drawdown_usd,
             )
-        early_drawdown_pressure = max(0.0, -equity_pnl / effective_drawdown_usd)
+        early_drawdown_pressure = max(0.0, -drawdown_pnl / effective_drawdown_usd)
 
         if health.true_drift:
             if has_material_position:
@@ -308,7 +318,7 @@ class HardSafetyKernel:
         elif bool(getattr(health, "drawdown_breach_active", False)):
             hard_mode = "emergency_unwind" if has_material_position else "halted"
             hard_reason = (
-                f"hard drawdown ${equity_pnl:.2f} "
+                f"hard drawdown ${drawdown_pnl:.2f} "
                 f"(thr ${effective_drawdown_usd:.2f})"
             )
         elif health.residual_inventory_failure and snapshot.time_left_sec <= float(self.config.emergency_taker_start_sec):

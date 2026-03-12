@@ -55,6 +55,7 @@ class FairValueEngine:
         self.vol_cap = vol_cap
         self.signal_weight = signal_weight
         self._last_vol: float = 0.0005  # fallback vol (typical BTC per-minute)
+        self._last_drift: float = 0.0
         self._last_source: str = "model"  # "model" or "pm_anchor" or "blended"
 
     @property
@@ -66,6 +67,11 @@ class FairValueEngine:
     def last_vol(self) -> float:
         """Last realized per-kline volatility used by the model."""
         return float(self._last_vol)
+
+    @property
+    def last_drift(self) -> float:
+        """Last bounded per-kline drift estimate used by the model."""
+        return float(self._last_drift)
 
     def realized_vol(self, klines: list[dict]) -> float:
         """Compute realized volatility from kline closes.
@@ -97,6 +103,29 @@ class FairValueEngine:
         self._last_vol = vol
         return vol
 
+    def realized_drift(self, klines: list[dict]) -> float:
+        """Compute bounded per-kline drift from recent log returns."""
+        if len(klines) < 3:
+            self._last_drift = 0.0
+            return 0.0
+
+        closes = [k["c"] for k in klines[-self.vol_window:]]
+        returns: list[float] = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] > 0:
+                returns.append(math.log(closes[i] / closes[i - 1]))
+        if len(returns) < 2:
+            self._last_drift = 0.0
+            return 0.0
+
+        recent = returns[-min(5, len(returns)) :]
+        long_mean = sum(returns) / len(returns)
+        short_mean = sum(recent) / len(recent)
+        raw_drift = (0.7 * short_mean) + (0.3 * long_mean)
+        drift_cap = max(0.0002, min(0.0030, self.realized_vol(klines) * 0.75))
+        self._last_drift = max(-drift_cap, min(drift_cap, raw_drift))
+        return float(self._last_drift)
+
     def binary_fair_value(self, mid: float, strike: float,
                           time_remaining_sec: float,
                           klines: list[dict]) -> float:
@@ -125,11 +154,12 @@ class FairValueEngine:
         t_kline = max(time_remaining_sec / 60.0, 0.1)  # in minutes
 
         sigma = self.realized_vol(klines)
+        drift = self.realized_drift(klines)
 
         # d2 for digital option: P(S_T > K) = N(d2)
         # d2 = (ln(S/K) + (r - σ²/2) * T) / (σ * √T)
         # r ≈ 0 for short timeframes
-        d2 = (math.log(mid / strike) - 0.5 * sigma * sigma * t_kline) / \
+        d2 = (math.log(mid / strike) + (drift - 0.5 * sigma * sigma) * t_kline) / \
              (sigma * math.sqrt(t_kline) + 1e-10)
 
         prob = _norm_cdf(d2)

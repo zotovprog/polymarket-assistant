@@ -3144,6 +3144,7 @@ class MMRuntimeV2(MMRuntime):
             force_normal_soft_mode_paper=self._force_normal_soft_mode_paper,
             force_normal_no_guards_paper=self._force_normal_no_guards_paper,
         )
+        self.mm_v2._private_key = PM_PRIVATE_KEY
         self.mm_v2.set_market(market)
         await self._attach_mongo_logger(
             register_fill=lambda mongo: self.mm_v2.on_fill(

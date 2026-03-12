@@ -64,10 +64,16 @@ class MMConfigV2:
         "defensive_spread_mult": (1.0, 10.0),
         "defensive_size_mult": (0.1, 1.0),
         "unwind_window_sec": (5.0, 600.0),
+        "terminal_liquidation_start_sec": (5.0, 600.0),
         "emergency_unwind_timeout_sec": (1.0, 120.0),
         "emergency_taker_start_sec": (5.0, 120.0),
         "hard_drawdown_usd": (1.0, 1000.0),
         "hard_drawdown_budget_ratio": (0.05, 0.80),
+        "fast_move_soft_bps_1s": (1.0, 1000.0),
+        "fast_move_hard_bps_1s": (1.0, 2000.0),
+        "fast_move_soft_bps_5s": (1.0, 2000.0),
+        "fast_move_hard_bps_5s": (1.0, 4000.0),
+        "fast_move_pause_sec": (0.5, 30.0),
         "max_transport_failures": (1.0, 20.0),
         "tick_interval_sec": (0.25, 10.0),
         "min_market_quality_score": (0.0, 1.0),
@@ -91,16 +97,22 @@ class MMConfigV2:
     max_half_spread_bps: float = 600.0
     vol_spread_multiplier: float = 2.0
     maker_fee_bps: float = 0.0
-    taker_fee_bps: float = 0.0
+    taker_fee_bps: float = 156.25
     min_edge_bps: float = 20.0
     inventory_skew_strength: float = 2.0
     defensive_spread_mult: float = 1.5
     defensive_size_mult: float = 0.4
-    unwind_window_sec: float = 90.0
+    unwind_window_sec: float = 240.0
+    terminal_liquidation_start_sec: float = 20.0
     emergency_unwind_timeout_sec: float = 10.0
     emergency_taker_start_sec: float = 20.0
     hard_drawdown_usd: float = 4.0
     hard_drawdown_budget_ratio: float = 0.30
+    fast_move_soft_bps_1s: float = 30.0
+    fast_move_hard_bps_1s: float = 60.0
+    fast_move_soft_bps_5s: float = 50.0
+    fast_move_hard_bps_5s: float = 100.0
+    fast_move_pause_sec: float = 5.0
     max_transport_failures: int = 5
     market_scope: str = "BTC_15m"
 
