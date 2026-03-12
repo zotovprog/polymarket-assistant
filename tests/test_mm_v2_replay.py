@@ -119,3 +119,81 @@ def test_dataset_manifest_quick_suite_with_missing_dataset_root_returns_structur
     assert "failure_buckets" in summary
     assert "primary_blocker" in summary
     assert (out_dir / "summary.json").exists()
+
+
+def test_replay_gate_does_not_flag_terminal_execution_when_done_with_dust(tmp_path):
+    state_dir = tmp_path / "terminal-done-dust"
+    state_dir.mkdir()
+    rows = [
+        {
+            "lifecycle": "defensive",
+            "started_at": 1.0,
+            "market": {"time_left_sec": 120.0, "market_tradeable": True},
+            "risk": {"soft_mode": "defensive", "hard_mode": "none", "target_soft_mode": "defensive"},
+            "analytics": {
+                "session_pnl_equity_usd": -0.5,
+                "mm_effective_ratio_60s": 1.0,
+                "unwind_ratio_60s": 0.0,
+                "emergency_unwind_ratio_60s": 0.0,
+                "quote_balance_state": "reduced",
+                "failure_bucket_current": "",
+                "collateral_warning_hits_60s": 0,
+                "sell_skip_cooldown_hits_60s": 0,
+            },
+            "inventory": {"total_inventory_value_usd": 8.0},
+            "runtime": {
+                "terminal_liquidation_active": True,
+                "terminal_liquidation_done": False,
+                "terminal_liquidation_remaining_up": 8.0,
+                "terminal_liquidation_remaining_dn": 0.0,
+            },
+            "health": {"true_drift": False, "wallet_snapshot_stale": False},
+            "config": {"unwind_window_sec": 90.0, "min_order_size": 5.0, "session_budget_usd": 30.0},
+        },
+        {
+            "lifecycle": "expired",
+            "started_at": 1.0,
+            "market": {"time_left_sec": 0.0, "market_tradeable": True},
+            "risk": {"soft_mode": "unwind", "hard_mode": "emergency_unwind", "target_soft_mode": "unwind"},
+            "analytics": {
+                "session_pnl_equity_usd": -0.5,
+                "mm_effective_ratio_60s": 0.0,
+                "unwind_ratio_60s": 0.0,
+                "emergency_unwind_ratio_60s": 0.0,
+                "quote_balance_state": "none",
+                "failure_bucket_current": "",
+                "collateral_warning_hits_60s": 0,
+                "sell_skip_cooldown_hits_60s": 0,
+            },
+            "inventory": {"total_inventory_value_usd": 2.0},
+            "runtime": {
+                "terminal_liquidation_active": True,
+                "terminal_liquidation_done": True,
+                "terminal_liquidation_remaining_up": 4.0,
+                "terminal_liquidation_remaining_dn": 2.0,
+            },
+            "health": {"true_drift": False, "wallet_snapshot_stale": False},
+            "config": {"unwind_window_sec": 90.0, "min_order_size": 5.0, "session_budget_usd": 30.0},
+        },
+    ]
+    (state_dir / "snapshots.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(REPLAY_GATE_TOOL),
+            "--input-dir",
+            str(state_dir),
+            "--output-root",
+            str(tmp_path / "replay-out"),
+        ],
+        cwd=str(BASE),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode in (0, 2), proc.stderr
+    summary = json.loads(proc.stdout)
+    assert "terminal_execution_incomplete_present" not in summary["failed_criteria"]
+    assert "terminal_execution" not in summary["failure_buckets"]

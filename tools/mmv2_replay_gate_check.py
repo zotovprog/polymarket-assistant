@@ -33,21 +33,31 @@ def _load_snapshots(path: Path) -> list[dict[str, Any]]:
 def _derive_failure_bucket(state: dict[str, Any]) -> str:
     analytics = state.get("analytics") or {}
     explicit = str(analytics.get("failure_bucket_current") or "").strip()
-    if explicit:
-        return explicit
     health = state.get("health") or {}
     risk = state.get("risk") or {}
     runtime = state.get("runtime") or {}
     market = state.get("market") or {}
-    lifecycle = str(state.get("lifecycle") or "")
-    if bool(health.get("true_drift")) or bool(health.get("wallet_snapshot_stale")):
-        return "drift_transport"
-    if bool(runtime.get("terminal_liquidation_active")) and (
+    min_order_size = float((state.get("config") or {}).get("min_order_size") or 5.0)
+    time_left_sec = float(market.get("time_left_sec") or 0.0)
+    if explicit and explicit != "terminal_execution":
+        return explicit
+    if explicit == "terminal_execution" and time_left_sec <= 0.0 and (
         not bool(runtime.get("terminal_liquidation_done"))
         or max(
             float(runtime.get("terminal_liquidation_remaining_up") or 0.0),
             float(runtime.get("terminal_liquidation_remaining_dn") or 0.0),
-        ) >= float((state.get("config") or {}).get("min_order_size") or 5.0)
+        ) >= min_order_size
+    ):
+        return explicit
+    lifecycle = str(state.get("lifecycle") or "")
+    if bool(health.get("true_drift")) or bool(health.get("wallet_snapshot_stale")):
+        return "drift_transport"
+    if bool(runtime.get("terminal_liquidation_active")) and time_left_sec <= 0.0 and (
+        not bool(runtime.get("terminal_liquidation_done"))
+        or max(
+            float(runtime.get("terminal_liquidation_remaining_up") or 0.0),
+            float(runtime.get("terminal_liquidation_remaining_dn") or 0.0),
+        ) >= min_order_size
     ):
         return "terminal_execution"
     if (
@@ -164,8 +174,6 @@ def main() -> int:
         bucket = _derive_failure_bucket(state)
         if bucket:
             failure_bucket_counts[bucket] += 1
-            if bucket == "terminal_execution":
-                terminal_execution_incomplete_present = True
 
         session_pnl = float(
             analytics.get("session_pnl_equity_usd")
@@ -247,6 +255,22 @@ def main() -> int:
                 and float(inventory.get("total_inventory_value_usd") or 0.0) >= material_inventory_usd
             ):
                 untradeable_tolerated_material_samples_outside += 1
+
+    final_state = rows[-1] if rows else {}
+    final_runtime = final_state.get("runtime") or {}
+    final_market = final_state.get("market") or {}
+    final_cfg = final_state.get("config") or {}
+    final_min_order_size = float(final_cfg.get("min_order_size") or 5.0)
+    if bool(final_runtime.get("terminal_liquidation_active")) and float(final_market.get("time_left_sec") or 0.0) <= 0.0:
+        if (
+            not bool(final_runtime.get("terminal_liquidation_done"))
+            or max(
+                float(final_runtime.get("terminal_liquidation_remaining_up") or 0.0),
+                float(final_runtime.get("terminal_liquidation_remaining_dn") or 0.0),
+            ) >= final_min_order_size
+        ):
+            terminal_execution_incomplete_present = True
+            failure_bucket_counts["terminal_execution"] += 1
 
     failed_criteria: list[str] = []
     if true_drift_any:
