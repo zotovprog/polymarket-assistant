@@ -482,6 +482,191 @@ body {
     transition: width 1s linear, background 0.3s;
 }
 
+.paper-sweep-panel {
+    margin: 0 var(--sp-4) var(--sp-3);
+    padding: var(--sp-4);
+    background: linear-gradient(180deg, rgba(6, 182, 212, 0.08) 0%, rgba(24, 24, 27, 0.92) 100%);
+    border: 1px solid rgba(6, 182, 212, 0.2);
+    border-left: 4px solid var(--info);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md);
+}
+
+.paper-sweep-controls {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-3);
+    flex-wrap: wrap;
+}
+
+.paper-sweep-heading {
+    min-width: 180px;
+}
+
+.paper-sweep-title {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    color: var(--text-primary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.paper-sweep-title i {
+    color: var(--info);
+}
+
+.paper-sweep-meta {
+    margin-top: var(--sp-2);
+    color: var(--text-muted);
+}
+
+.sweep-input {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    background: var(--surface-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--sp-2) var(--sp-3);
+    color: var(--text-secondary);
+}
+
+.sweep-input span {
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+
+.sweep-input input {
+    width: 160px;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    outline: none;
+}
+
+.paper-sweep-summary {
+    margin-top: var(--sp-3);
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: var(--sp-2);
+}
+
+.paper-sweep-summary.empty {
+    display: block;
+}
+
+.paper-sweep-empty {
+    padding: var(--sp-3);
+    border: 1px dashed var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-muted);
+    font-size: var(--text-sm);
+}
+
+.paper-sweep-card {
+    background: rgba(24, 24, 27, 0.9);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--sp-3);
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+}
+
+.paper-sweep-card.running {
+    border-color: rgba(59, 130, 246, 0.35);
+}
+
+.paper-sweep-card.done {
+    border-color: rgba(16, 185, 129, 0.28);
+}
+
+.paper-sweep-card.problem {
+    border-color: rgba(239, 68, 68, 0.35);
+}
+
+.paper-sweep-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-2);
+}
+
+.paper-sweep-card-title {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    font-weight: 700;
+    color: var(--text-primary);
+}
+
+.paper-sweep-badge {
+    padding: 2px 8px;
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border-subtle);
+    font-size: 0.6875rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-secondary);
+    background: rgba(161, 161, 170, 0.12);
+}
+
+.paper-sweep-badge.running {
+    color: #7dd3fc;
+    background: rgba(14, 165, 233, 0.16);
+    border-color: rgba(14, 165, 233, 0.28);
+}
+
+.paper-sweep-badge.done {
+    color: #86efac;
+    background: rgba(22, 163, 74, 0.16);
+    border-color: rgba(22, 163, 74, 0.3);
+}
+
+.paper-sweep-badge.problem {
+    color: #fca5a5;
+    background: rgba(239, 68, 68, 0.16);
+    border-color: rgba(239, 68, 68, 0.3);
+}
+
+.paper-sweep-pnl {
+    font-family: var(--font-mono);
+    font-size: var(--text-xl);
+    font-weight: 700;
+}
+
+.paper-sweep-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--sp-2);
+}
+
+.paper-sweep-metric-label {
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.paper-sweep-metric-value {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+}
+
+.paper-sweep-reason {
+    font-size: var(--text-xs);
+    color: var(--text-secondary);
+    line-height: 1.45;
+}
+
 /* ── 7. PnL Section (simplified) ──────────────────────────── */
 .pnl-section {
     margin: 0 var(--sp-4) var(--sp-3);

@@ -1744,10 +1744,26 @@ async def test_mmv2_state_endpoint_returns_runtime_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_paper_sweep_state_endpoint_returns_runtime_snapshot(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        web_server._paper_sweep_v2,
+        "snapshot",
+        lambda: {"is_running": True, "variant_count": 4, "variants": [{"label": "$8"}]},
+    )
+    resp = await web_server.mmv2_paper_sweep_state(request=object())
+    assert resp["is_running"] is True
+    assert resp["variant_count"] == 4
+    assert resp["variants"][0]["label"] == "$8"
+
+
+@pytest.mark.asyncio
 async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", True)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
     captured = {}
 
     async def _fake_start(
@@ -1794,6 +1810,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
     web_server._runtime_v2.mm_config_v2.session_budget_usd = 75.0
     captured = {}
 
@@ -1834,6 +1851,7 @@ async def test_live_start_rejects_budget_below_30(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
     web_server._runtime_v2.mm_config_v2.session_budget_usd = 15.0
 
     req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=False, dev=True)
@@ -1848,6 +1866,7 @@ async def test_live_start_rejects_force_normal_soft_mode(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
     web_server._runtime_v2.mm_config_v2.session_budget_usd = 30.0
 
     req = web_server.StartRequest(
@@ -1868,12 +1887,90 @@ async def test_paper_start_rejects_budget_below_30(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
 
     req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=20.0, dev=True)
     with pytest.raises(web_server.HTTPException) as exc:
         await web_server.mmv2_start(req=req, request=object())
     assert exc.value.status_code == 400
     assert "paper_min_budget_30_required" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_mmv2_start_rejects_when_paper_sweep_running(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": True})
+
+    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=30.0, dev=True)
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_start(req=req, request=object())
+    assert exc.value.status_code == 409
+    assert "paper sweep" in str(exc.value.detail).lower()
+
+
+@pytest.mark.asyncio
+async def test_paper_sweep_start_route_delegates_to_runtime(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime_v2, "snapshot", lambda: {"is_running": False})
+    captured = {}
+
+    async def _fake_start(
+        coin,
+        timeframe,
+        *,
+        initial_usdc,
+        base_clips,
+        force_normal_soft_mode,
+        base_config,
+    ):
+        captured.update(
+            {
+                "coin": coin,
+                "timeframe": timeframe,
+                "initial_usdc": initial_usdc,
+                "base_clips": list(base_clips),
+                "force_normal_soft_mode": force_normal_soft_mode,
+                "base_config": base_config,
+            }
+        )
+        return {"is_running": True, "variant_count": len(base_clips)}
+
+    monkeypatch.setattr(web_server._paper_sweep_v2, "start", _fake_start)
+    req = web_server.PaperSweepStartRequest(
+        coin="BTC",
+        timeframe="15m",
+        initial_usdc=300.0,
+        base_clips=[8.0, 12.0, 14.0],
+        force_normal_soft_mode=True,
+    )
+    resp = await web_server.mmv2_paper_sweep_start(req=req, request=object())
+    assert resp["ok"] is True
+    assert captured["coin"] == "BTC"
+    assert captured["timeframe"] == "15m"
+    assert captured["initial_usdc"] == pytest.approx(300.0)
+    assert captured["base_clips"] == [8.0, 12.0, 14.0]
+    assert captured["force_normal_soft_mode"] is True
+    assert isinstance(captured["base_config"], MMConfigV2)
+
+
+@pytest.mark.asyncio
+async def test_paper_sweep_start_rejects_when_main_runtime_active(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime_v2, "snapshot", lambda: {"is_running": True})
+
+    req = web_server.PaperSweepStartRequest(
+        coin="BTC",
+        timeframe="15m",
+        initial_usdc=300.0,
+        base_clips=[8.0, 12.0],
+    )
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_paper_sweep_start(req=req, request=object())
+    assert exc.value.status_code == 409
+    assert "main mm runtime" in str(exc.value.detail).lower()
 
 
 def test_runtime_v2_start_accepts_session_budget_kwarg():
@@ -2142,6 +2239,47 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["emergency_no_progress_sec"] == pytest.approx(0.0)
     assert resp["mm_regime"]["unwind_deferred_hits_60s"] == 2
     assert resp["mm_regime"]["forced_unwind_extreme_excess_hits_60s"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dashboard_snapshot_includes_paper_sweep_summary(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(
+        web_server._runtime_v2,
+        "snapshot",
+        lambda: {
+            "app_version": "test",
+            "app_git_hash": "deadbeef",
+            "is_running": False,
+            "lifecycle": "bootstrapping",
+            "market": {},
+            "valuation": {},
+            "inventory": {},
+            "quotes": {},
+            "risk": {},
+            "health": {},
+            "analytics": {},
+            "alerts": [],
+            "config": {},
+            "runtime": {},
+        },
+    )
+    monkeypatch.setattr(
+        web_server._paper_sweep_v2,
+        "snapshot",
+        lambda: {
+            "is_running": True,
+            "variant_count": 2,
+            "variants": [
+                {"label": "$8", "session_pnl_equity_usd": 1.25},
+                {"label": "$12", "session_pnl_equity_usd": -0.5},
+            ],
+        },
+    )
+    resp = web_server._dashboard_snapshot("v2")
+    assert resp["paper_sweep"]["is_running"] is True
+    assert resp["paper_sweep"]["variant_count"] == 2
+    assert resp["paper_sweep"]["variants"][0]["label"] == "$8"
 
 
 @pytest.mark.asyncio

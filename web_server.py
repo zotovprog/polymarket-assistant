@@ -176,6 +176,41 @@ class StartRequest(BaseModel):
     force_normal_soft_mode: bool = False
 
 
+class PaperSweepStartRequest(BaseModel):
+    coin: str = "BTC"
+    timeframe: str = "15m"
+    initial_usdc: float = 300.0
+    base_clips: list[float] = Field(default_factory=lambda: [8.0, 12.0, 14.0, 20.0])
+    force_normal_soft_mode: bool = False
+
+    @field_validator("base_clips", mode="before")
+    @classmethod
+    def _parse_base_clips(cls, value: Any) -> list[float]:
+        if value is None:
+            return [8.0, 12.0, 14.0, 20.0]
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",") if part.strip()]
+        if not isinstance(value, list):
+            raise ValueError("base_clips must be a list of numbers or csv string")
+        parsed: list[float] = []
+        for item in value:
+            clip = float(item)
+            if clip <= 0:
+                raise ValueError("base_clips must be positive")
+            parsed.append(clip)
+        deduped: list[float] = []
+        seen: set[float] = set()
+        for clip in parsed:
+            rounded = round(float(clip), 6)
+            if rounded in seen:
+                continue
+            seen.add(rounded)
+            deduped.append(float(clip))
+        if not deduped:
+            raise ValueError("base_clips cannot be empty")
+        return deduped
+
+
 class ConfigUpdateRequest(BaseModel):
     half_spread_bps: Optional[float] = Field(default=None)
     min_spread_bps: Optional[float] = None
@@ -3346,10 +3381,326 @@ class MMRuntimeV2(MMRuntime):
         self._verification_task = asyncio.create_task(self._verification_runner(kind))
         return self.get_verification_status()
 
+
+class PaperSweepRuntimeV2(MMRuntime):
+    DEFAULT_BASE_CLIPS = (8.0, 12.0, 14.0, 20.0)
+
+    def __init__(self):
+        super().__init__()
+        self.mm_config_v2: MMConfigV2 = MMConfigV2()
+        self._variants: list[dict[str, Any]] = []
+        self._started_at: float = 0.0
+        self._force_normal_soft_mode_paper: bool = False
+        self._last_state: dict[str, Any] = self._idle_snapshot()
+
+    def _idle_snapshot(self) -> dict[str, Any]:
+        return {
+            "is_running": False,
+            "started_at": float(self._started_at or 0.0),
+            "coin": self._coin or "BTC",
+            "timeframe": self._timeframe or "15m",
+            "paper_mode": True,
+            "initial_usdc": float(self._initial_usdc or 0.0),
+            "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+            "base_clips": list(self.DEFAULT_BASE_CLIPS),
+            "variant_count": 0,
+            "running_variants": 0,
+            "completed_variants": 0,
+            "aggregate_pnl_usd": 0.0,
+            "best_pnl_usd": 0.0,
+            "worst_pnl_usd": 0.0,
+            "variants": [],
+        }
+
+    def _normalize_base_clips(self, base_clips: list[float] | None) -> list[float]:
+        values = list(base_clips or self.DEFAULT_BASE_CLIPS)
+        normalized: list[float] = []
+        seen: set[float] = set()
+        for clip in values:
+            value = round(float(clip), 6)
+            if value <= 0.0 or value > 100.0:
+                raise HTTPException(status_code=400, detail="base_clips must be between 0 and 100")
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(float(clip))
+        if not normalized:
+            raise HTTPException(status_code=400, detail="base_clips cannot be empty")
+        return normalized
+
+    def _variant_summary(self, variant: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
+        analytics = raw.get("analytics") or {}
+        risk = raw.get("risk") or {}
+        runtime = raw.get("runtime") or {}
+        inventory = raw.get("inventory") or {}
+        quotes = raw.get("quotes") or {}
+        active_quotes = sum(
+            1
+            for value in quotes.values()
+            if isinstance(value, dict) and value.get("active", True) and "price" in value
+        )
+        lifecycle = str(raw.get("lifecycle") or "bootstrapping")
+        is_running = bool(raw.get("is_running", lifecycle not in {"expired", "halted"}))
+        return {
+            "id": str(variant.get("id") or ""),
+            "label": str(variant.get("label") or ""),
+            "base_clip_usd": float(variant.get("clip_usd") or 0.0),
+            "is_running": is_running,
+            "lifecycle": lifecycle,
+            "soft_mode": str(risk.get("soft_mode") or "normal"),
+            "target_soft_mode": str(risk.get("target_soft_mode") or risk.get("soft_mode") or "normal"),
+            "hard_mode": str(risk.get("hard_mode") or "none"),
+            "reason": str(risk.get("reason") or ""),
+            "session_pnl_equity_usd": float(
+                analytics.get("session_pnl_equity_usd")
+                if analytics.get("session_pnl_equity_usd") is not None
+                else analytics.get("session_pnl") or 0.0
+            ),
+            "session_pnl_operator_usd": float(
+                analytics.get("session_pnl_operator_usd")
+                if analytics.get("session_pnl_operator_usd") is not None
+                else analytics.get("session_pnl_equity_usd") or analytics.get("session_pnl") or 0.0
+            ),
+            "portfolio_mark_value_usd": float(analytics.get("portfolio_mark_value_usd") or 0.0),
+            "tradeable_portfolio_value_usd": float(analytics.get("tradeable_portfolio_value_usd") or 0.0),
+            "position_mark_value_usd": float(analytics.get("position_mark_value_usd") or 0.0),
+            "wallet_total_usdc": float(inventory.get("wallet_total_usdc") or 0.0),
+            "fill_count": int(analytics.get("fill_count") or 0),
+            "mm_effective_ratio_60s": float(analytics.get("mm_effective_ratio_60s") or 0.0),
+            "dual_bid_ratio_60s": float(analytics.get("dual_bid_ratio_60s") or 0.0),
+            "failure_bucket_current": str(analytics.get("failure_bucket_current") or ""),
+            "marketability_churn_confirmed": bool(analytics.get("marketability_churn_confirmed") or False),
+            "marketability_problem_side": str(analytics.get("marketability_problem_side") or ""),
+            "sell_churn_hold_side": str(analytics.get("sell_churn_hold_side") or ""),
+            "quote_balance_state": str(analytics.get("quote_balance_state") or ""),
+            "dual_bid_exception_reason": str(analytics.get("dual_bid_exception_reason") or ""),
+            "terminal_liquidation_done": bool(runtime.get("terminal_liquidation_done") or False),
+            "terminal_liquidation_reason": str(runtime.get("terminal_liquidation_reason") or ""),
+            "terminal_liquidation_remaining_up": float(runtime.get("terminal_liquidation_remaining_up") or 0.0),
+            "terminal_liquidation_remaining_dn": float(runtime.get("terminal_liquidation_remaining_dn") or 0.0),
+            "active_quotes": int(active_quotes),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        if self._variants:
+            variants: list[dict[str, Any]] = []
+            running_variants = 0
+            for variant in self._variants:
+                mm = variant.get("mm")
+                if not mm:
+                    continue
+                try:
+                    raw = mm.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+                except Exception as exc:
+                    raw = {
+                        "is_running": False,
+                        "lifecycle": "halted",
+                        "risk": {"soft_mode": "normal", "hard_mode": "halted", "reason": f"snapshot_error: {exc}"},
+                        "analytics": {"session_pnl_equity_usd": 0.0, "session_pnl_operator_usd": 0.0},
+                        "runtime": {},
+                        "inventory": {},
+                        "quotes": {},
+                    }
+                summary = self._variant_summary(variant, raw)
+                variants.append(summary)
+                if summary["is_running"]:
+                    running_variants += 1
+            if running_variants == 0:
+                self._running = False
+            aggregate = sum(float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants)
+            best = max([float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants], default=0.0)
+            worst = min([float(variant.get("session_pnl_equity_usd") or 0.0) for variant in variants], default=0.0)
+            state = {
+                "is_running": bool(running_variants > 0),
+                "started_at": float(self._started_at or 0.0),
+                "coin": self._coin or "BTC",
+                "timeframe": self._timeframe or "15m",
+                "paper_mode": True,
+                "initial_usdc": float(self._initial_usdc or 0.0),
+                "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+                "base_clips": [float(variant.get("clip_usd") or 0.0) for variant in self._variants],
+                "variant_count": len(variants),
+                "running_variants": int(running_variants),
+                "completed_variants": int(len(variants) - running_variants),
+                "aggregate_pnl_usd": float(aggregate),
+                "best_pnl_usd": float(best),
+                "worst_pnl_usd": float(worst),
+                "variants": variants,
+            }
+            self._last_state = state
+            return state
+        return dict(self._last_state)
+
+    async def start(
+        self,
+        coin: str,
+        timeframe: str,
+        *,
+        initial_usdc: float = 300.0,
+        base_clips: list[float] | None = None,
+        force_normal_soft_mode: bool = False,
+        base_config: MMConfigV2 | None = None,
+    ) -> dict[str, Any]:
+        if self._running and any(bool(variant.get("mm") and variant["mm"]._running) for variant in self._variants):
+            raise HTTPException(status_code=400, detail="paper sweep already running")
+        await self.stop(liquidate=False)
+
+        self._coin = str(coin).upper()
+        self._timeframe = str(timeframe)
+        self._paper_mode = True
+        self._initial_usdc = float(initial_usdc)
+        self._force_normal_soft_mode_paper = bool(force_normal_soft_mode)
+        normalized_clips = self._normalize_base_clips(base_clips)
+
+        self.feed_state = feeds.State()
+        symbol = config.COIN_BINANCE[self._coin]
+        kline_interval = config.TF_KLINE[self._timeframe]
+        self._feed_tasks = [
+            asyncio.create_task(feeds.ob_poller(symbol, self.feed_state)),
+            asyncio.create_task(feeds.binance_feed(symbol, kline_interval, self.feed_state)),
+        ]
+
+        try:
+            tokens = await asyncio.wait_for(
+                asyncio.to_thread(feeds.fetch_pm_tokens, self._coin, self._timeframe),
+                timeout=15.0,
+            )
+            if not tokens or not tokens[0] or not tokens[1]:
+                raise HTTPException(status_code=503, detail="PM tokens not found for paper sweep")
+            up_id, dn_id, cond_id = tokens
+            self.feed_state.pm_up_id = up_id
+            self.feed_state.pm_dn_id = dn_id
+            self._feed_tasks.append(asyncio.create_task(feeds.pm_feed(self.feed_state)))
+            market = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._build_market_info_from_tokens,
+                    self._coin,
+                    self._timeframe,
+                    up_id,
+                    dn_id,
+                    condition_id=cond_id,
+                ),
+                timeout=45.0,
+            )
+            if market and market.up_token_id and not market.up_token_id.startswith("placeholder"):
+                await self._enrich_market_info(market, self._coin, self._timeframe)
+
+            startup_block_reason = self._startup_window_block_reason(market)
+            if startup_block_reason:
+                raise HTTPException(status_code=409, detail=startup_block_reason)
+            if not market or not self._is_valid_strike(getattr(market, "strike", 0.0)):
+                raise HTTPException(status_code=503, detail="paper sweep cannot start without a valid strike")
+
+            for _ in range(100):
+                if self.feed_state.mid and self.feed_state.mid > 0:
+                    break
+                await asyncio.sleep(0.1)
+
+            template = copy.deepcopy(base_config or self.mm_config_v2)
+            template.session_budget_usd = float(initial_usdc)
+            self.mm_config_v2 = copy.deepcopy(template)
+
+            variants: list[dict[str, Any]] = []
+            started: list[MarketMakerV2] = []
+            try:
+                for clip in normalized_clips:
+                    cfg = copy.deepcopy(template)
+                    cfg.base_clip_usd = float(clip)
+                    clob = _create_clob_client(paper_mode=True, initial_usdc=float(initial_usdc))
+                    mm = MarketMakerV2(
+                        self.feed_state,
+                        clob,
+                        cfg,
+                        force_normal_soft_mode_paper=bool(force_normal_soft_mode),
+                    )
+                    mm.set_market(copy.deepcopy(market))
+                    await mm.start()
+                    started.append(mm)
+                    variants.append(
+                        {
+                            "id": f"clip-{str(clip).replace('.', '_')}",
+                            "label": f"${clip:g}",
+                            "clip_usd": float(clip),
+                            "mm": mm,
+                        }
+                    )
+            except Exception:
+                for mm in started:
+                    try:
+                        await mm.stop(liquidate=False)
+                    except Exception:
+                        pass
+                raise
+
+            self._variants = variants
+            self._started_at = time.time()
+            self._running = True
+            return self.snapshot()
+        except Exception:
+            await self._stop_feed_tasks()
+            self._variants = []
+            self._running = False
+            raise
+
+    async def stop(self, *, liquidate: bool = True) -> dict[str, Any]:
+        self._running = False
+        variants = list(self._variants)
+        self._variants = []
+        for variant in variants:
+            mm = variant.get("mm")
+            if not mm:
+                continue
+            try:
+                await mm.stop(liquidate=liquidate)
+            except Exception as exc:
+                log.warning("Paper sweep variant stop failed for clip=%s: %s", variant.get("clip_usd"), exc)
+        await self._stop_feed_tasks()
+        if variants:
+            summaries: list[dict[str, Any]] = []
+            for variant in variants:
+                mm = variant.get("mm")
+                if not mm:
+                    continue
+                try:
+                    raw = mm.snapshot(app_version=APP_VERSION, app_git_hash=APP_GIT_HASH)
+                except Exception as exc:
+                    raw = {
+                        "is_running": False,
+                        "lifecycle": "halted",
+                        "risk": {"soft_mode": "normal", "hard_mode": "halted", "reason": f"snapshot_error: {exc}"},
+                        "analytics": {"session_pnl_equity_usd": 0.0, "session_pnl_operator_usd": 0.0},
+                        "runtime": {},
+                        "inventory": {},
+                        "quotes": {},
+                    }
+                summaries.append(self._variant_summary(variant, raw))
+            aggregate = sum(float(item.get("session_pnl_equity_usd") or 0.0) for item in summaries)
+            best = max([float(item.get("session_pnl_equity_usd") or 0.0) for item in summaries], default=0.0)
+            worst = min([float(item.get("session_pnl_equity_usd") or 0.0) for item in summaries], default=0.0)
+            self._last_state = {
+                "is_running": False,
+                "started_at": float(self._started_at or 0.0),
+                "coin": self._coin or "BTC",
+                "timeframe": self._timeframe or "15m",
+                "paper_mode": True,
+                "initial_usdc": float(self._initial_usdc or 0.0),
+                "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+                "base_clips": [float(item.get("base_clip_usd") or 0.0) for item in summaries],
+                "variant_count": len(summaries),
+                "running_variants": 0,
+                "completed_variants": len(summaries),
+                "aggregate_pnl_usd": float(aggregate),
+                "best_pnl_usd": float(best),
+                "worst_pnl_usd": float(worst),
+                "variants": summaries,
+            }
+        return self.snapshot()
+
 # ── Singleton runtime ───────────────────────────────────────────
 # Legacy V1 runtime path is removed. Keep `_runtime` as compatibility alias
 # to the V2 singleton for internal helpers that still reference this name.
 _runtime_v2 = MMRuntimeV2()
+_paper_sweep_v2 = PaperSweepRuntimeV2()
 _runtime = _runtime_v2
 
 
@@ -3635,7 +3986,9 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _dashboard_snapshot(preferred: str | None = None) -> dict[str, Any]:
     del preferred
-    return _dashboard_snapshot_from_v2(_runtime_v2.snapshot())
+    snap = _dashboard_snapshot_from_v2(_runtime_v2.snapshot())
+    snap["paper_sweep"] = _paper_sweep_v2.snapshot()
+    return snap
 
 
 # ── WebSocket Connection Manager ───────────────────────────────
@@ -3845,6 +4198,8 @@ async def mm_fills(request: Request, limit: int = 50, offset: int = 0, response:
 @app.post("/api/mmv2/start")
 async def mmv2_start(req: StartRequest, request: Request):
     _require_auth(request)
+    if _paper_sweep_v2.snapshot().get("is_running"):
+        raise HTTPException(status_code=409, detail="paper sweep is running; stop it before starting main MM")
     if req.paper_mode:
         session_budget_usd = float(req.initial_usdc)
     elif "initial_usdc" in req.model_fields_set:
@@ -3877,6 +4232,35 @@ async def mmv2_start(req: StartRequest, request: Request):
         force_normal_soft_mode=req.force_normal_soft_mode,
     )
     return {"ok": True, "state": result}
+
+
+@app.post("/api/mmv2/paper-sweep/start")
+async def mmv2_paper_sweep_start(req: PaperSweepStartRequest, request: Request):
+    _require_auth(request)
+    if _runtime_v2.snapshot().get("is_running"):
+        raise HTTPException(status_code=409, detail="main MM runtime is running; stop it before paper sweep")
+    result = await _paper_sweep_v2.start(
+        req.coin,
+        req.timeframe,
+        initial_usdc=float(req.initial_usdc),
+        base_clips=list(req.base_clips),
+        force_normal_soft_mode=bool(req.force_normal_soft_mode),
+        base_config=copy.deepcopy(_runtime_v2.mm_config_v2),
+    )
+    return {"ok": True, "state": result}
+
+
+@app.post("/api/mmv2/paper-sweep/stop")
+async def mmv2_paper_sweep_stop(request: Request):
+    _require_auth(request)
+    result = await _paper_sweep_v2.stop()
+    return {"ok": True, "state": result}
+
+
+@app.get("/api/mmv2/paper-sweep/state")
+async def mmv2_paper_sweep_state(request: Request):
+    _require_auth(request)
+    return _paper_sweep_v2.snapshot()
 
 
 @app.post("/api/mmv2/validate-credentials")

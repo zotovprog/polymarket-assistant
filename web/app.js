@@ -526,6 +526,7 @@ function updateUI(s) {
     // Market Quality
     updateMarketQuality(s.market_quality);
     updateMMRegime(s.mm_regime || {}, s);
+    updatePaperSweep(s.paper_sweep || null);
 
     // Latency panel
     if (s.latency) {
@@ -1214,6 +1215,53 @@ async function toggleMM() {
     setTimeout(pollState, 500);
 }
 
+async function togglePaperSweep() {
+    const sweep = lastState.paper_sweep || {};
+    const isSweepRunning = Boolean(sweep.is_running);
+    if (isSweepRunning) {
+        const r = await fetch(`${API_BASE}/api/mmv2/paper-sweep/stop`, { method: 'POST' });
+        if (!r.ok) {
+            const err = await r.json().catch(() => ({ detail: 'Failed to stop paper sweep' }));
+            showToast(err.detail || 'Failed to stop paper sweep', 'error');
+            return;
+        }
+        showToast('Paper sweep stopped', 'warning');
+        setTimeout(pollState, 300);
+        return;
+    }
+    const coin = document.getElementById('coin-select').value;
+    const tf = document.getElementById('tf-select').value;
+    const stake = parseFloat(document.getElementById('stake-usdc').value) || 300;
+    const clipsRaw = String(document.getElementById('paper-sweep-clips').value || '').trim();
+    const clips = clipsRaw
+        .split(',')
+        .map((value) => parseFloat(value.trim()))
+        .filter((value) => Number.isFinite(value) && value > 0);
+    if (!clips.length) {
+        showToast('Enter at least one base clip', 'error');
+        return;
+    }
+    const forceNormal = Boolean(document.getElementById('paper-sweep-force-normal')?.checked);
+    const r = await fetch(`${API_BASE}/api/mmv2/paper-sweep/start`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            coin,
+            timeframe: tf,
+            initial_usdc: stake,
+            base_clips: clips,
+            force_normal_soft_mode: forceNormal,
+        }),
+    });
+    if (!r.ok) {
+        const err = await r.json().catch(() => ({ detail: 'Failed to start paper sweep' }));
+        showToast(err.detail || 'Failed to start paper sweep', 'error');
+        return;
+    }
+    showToast('Paper sweep started');
+    setTimeout(pollState, 300);
+}
+
 async function emergency() {
     if (confirm('Emergency stop \u2014 cancel all orders?')) {
         await fetch(`${API_BASE}/api/mmv2/stop`, { method: 'POST' });
@@ -1266,6 +1314,112 @@ function showToast(msg, type = 'success') {
         toast.classList.remove('show');
         setTimeout(() => toast.remove(), 300);
     }, 3000);
+}
+
+function formatUsdSigned(v) {
+    const n = Number(v ?? 0);
+    const sign = n > 0 ? '+' : '';
+    return `${sign}$${n.toFixed(2)}`;
+}
+
+function updatePaperSweep(sweep) {
+    const statusEl = document.getElementById('paper-sweep-status');
+    const summaryEl = document.getElementById('paper-sweep-summary');
+    const metaEl = document.getElementById('paper-sweep-meta');
+    const btnEl = document.getElementById('btn-paper-sweep');
+    if (!summaryEl || !statusEl || !metaEl || !btnEl) return;
+
+    const variants = Array.isArray(sweep?.variants) ? sweep.variants : [];
+    const isRunning = Boolean(sweep?.is_running);
+    const variantCount = Number(sweep?.variant_count ?? variants.length ?? 0);
+    const aggregatePnl = Number(sweep?.aggregate_pnl_usd ?? 0);
+    const runningCount = Number(sweep?.running_variants ?? 0);
+    const budget = Number(sweep?.initial_usdc ?? 0);
+
+    btnEl.innerHTML = isRunning
+        ? '<i class="fas fa-stop"></i> Stop Sweep'
+        : '<i class="fas fa-layer-group"></i> Run Sweep';
+    btnEl.classList.toggle('running', isRunning);
+
+    if (!variantCount && !isRunning) {
+        statusEl.textContent = 'Idle';
+        metaEl.textContent = 'Uses current session stake as budget per variant.';
+        summaryEl.className = 'paper-sweep-summary empty';
+        summaryEl.innerHTML = '<div class="paper-sweep-empty">No parallel paper simulations running.</div>';
+        return;
+    }
+
+    statusEl.textContent = isRunning
+        ? `Running ${runningCount}/${variantCount}`
+        : `Completed ${variantCount}`;
+    metaEl.textContent = `Budget per variant: $${budget.toFixed(0)} | Aggregate PnL: ${formatUsdSigned(aggregatePnl)}`;
+    summaryEl.className = 'paper-sweep-summary';
+    summaryEl.innerHTML = variants.map((variant) => {
+        const hardMode = String(variant.hard_mode || 'none');
+        const failureBucket = String(variant.failure_bucket_current || '').trim();
+        const running = Boolean(variant.is_running);
+        const cardClass = hardMode !== 'none' || failureBucket
+            ? 'paper-sweep-card problem'
+            : (running ? 'paper-sweep-card running' : 'paper-sweep-card done');
+        const badgeClass = hardMode !== 'none' || failureBucket
+            ? 'paper-sweep-badge problem'
+            : (running ? 'paper-sweep-badge running' : 'paper-sweep-badge done');
+        const badgeText = hardMode !== 'none'
+            ? hardMode
+            : (failureBucket || (running ? 'running' : 'done'));
+        const reasonParts = [];
+        if (variant.reason) reasonParts.push(variant.reason);
+        if (variant.marketability_churn_confirmed && variant.marketability_problem_side) {
+            reasonParts.push(`churn=${String(variant.marketability_problem_side).toUpperCase()}`);
+        }
+        if (variant.sell_churn_hold_side) {
+            reasonParts.push(`hold=${String(variant.sell_churn_hold_side).toUpperCase()}`);
+        }
+        if (variant.dual_bid_exception_reason) {
+            reasonParts.push(`exception=${variant.dual_bid_exception_reason}`);
+        }
+        if (variant.terminal_liquidation_done) {
+            reasonParts.push('terminal_done=1');
+        }
+        return `
+            <div class="${cardClass}">
+                <div class="paper-sweep-card-head">
+                    <div class="paper-sweep-card-title">${variant.label}</div>
+                    <div class="${badgeClass}">${badgeText}</div>
+                </div>
+                <div class="paper-sweep-pnl ${Number(variant.session_pnl_equity_usd || 0) >= 0 ? 'pnl-positive' : 'pnl-negative'}">
+                    ${formatUsdSigned(variant.session_pnl_equity_usd || 0)}
+                </div>
+                <div class="paper-sweep-grid">
+                    <div>
+                        <div class="paper-sweep-metric-label">Lifecycle</div>
+                        <div class="paper-sweep-metric-value">${String(variant.lifecycle || '—').toUpperCase()}</div>
+                    </div>
+                    <div>
+                        <div class="paper-sweep-metric-label">Mode</div>
+                        <div class="paper-sweep-metric-value">${String(variant.soft_mode || 'normal').toUpperCase()}</div>
+                    </div>
+                    <div>
+                        <div class="paper-sweep-metric-label">MM 60s</div>
+                        <div class="paper-sweep-metric-value">${(Number(variant.mm_effective_ratio_60s || 0) * 100).toFixed(0)}%</div>
+                    </div>
+                    <div>
+                        <div class="paper-sweep-metric-label">Dual-Bid 60s</div>
+                        <div class="paper-sweep-metric-value">${(Number(variant.dual_bid_ratio_60s || 0) * 100).toFixed(0)}%</div>
+                    </div>
+                    <div>
+                        <div class="paper-sweep-metric-label">Fills</div>
+                        <div class="paper-sweep-metric-value">${Number(variant.fill_count || 0)}</div>
+                    </div>
+                    <div>
+                        <div class="paper-sweep-metric-label">Active Quotes</div>
+                        <div class="paper-sweep-metric-value">${Number(variant.active_quotes || 0)}</div>
+                    </div>
+                </div>
+                <div class="paper-sweep-reason">${reasonParts.join(' | ') || 'No active guard reason.'}</div>
+            </div>
+        `;
+    }).join('');
 }
 
 // ── Logs ─────────────────────────────────────────────

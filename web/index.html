@@ -99,6 +99,32 @@
             </div>
         </div>
 
+        <div class="paper-sweep-panel">
+            <div class="paper-sweep-controls">
+                <div class="paper-sweep-heading">
+                    <div class="paper-sweep-title"><i class="fas fa-flask"></i> Paper Sweep</div>
+                    <div id="paper-sweep-status" class="stat-small">Idle</div>
+                </div>
+                <label class="sweep-input" title="Base clip variants in USD">
+                    <span>Clips</span>
+                    <input type="text" id="paper-sweep-clips" value="8,12,14,20" placeholder="8,12,14,20">
+                </label>
+                <label class="paper-toggle" title="Paper-only normal soft mode override">
+                    <input type="checkbox" id="paper-sweep-force-normal">
+                    <span>Normal only</span>
+                </label>
+                <button id="btn-paper-sweep" class="btn btn-secondary" onclick="togglePaperSweep()">
+                    <i class="fas fa-layer-group"></i> Run Sweep
+                </button>
+            </div>
+            <div id="paper-sweep-meta" class="stat-small paper-sweep-meta">
+                Uses current session stake as budget per variant.
+            </div>
+            <div id="paper-sweep-summary" class="paper-sweep-summary empty">
+                <div class="paper-sweep-empty">No parallel paper simulations running.</div>
+            </div>
+        </div>
+
         <!-- 3. PnL Section (full width, simplified) -->
         <div class="pnl-section">
             <div class="pnl-big-cards">
