@@ -176,7 +176,7 @@ class SoftRiskKernel:
         else:
             market_quality_bad = float(snapshot.market_quality_score) < min_quality
             divergence_bad = max_divergence > DIVERGENCE_DEFENSIVE_THRESHOLD
-            if marketability_churn_confirmed and marketability_context_bad and (
+            if marketability_churn_confirmed and (
                 material_inventory or marketability_problem_matches_inventory or not inventory_nearly_flat
             ):
                 target_soft_mode = "defensive"

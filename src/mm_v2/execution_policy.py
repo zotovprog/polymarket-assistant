@@ -13,6 +13,8 @@ class ExecutionPolicyV2:
         self.gateway = gateway
         self.tracker = tracker
         self.requote_threshold_bps = max(1.0, float(requote_threshold_bps))
+        self._sell_churn_hold_reprice_suppressed_hits = 0
+        self._sell_churn_hold_cancel_avoided_hits = 0
 
     def _materially_different(self, current: QuoteIntent, new: QuoteIntent) -> bool:
         if current.side != new.side or current.token != new.token or current.post_only != new.post_only:
@@ -24,8 +26,6 @@ class ExecutionPolicyV2:
     @staticmethod
     def _should_hold_existing(existing: Any, desired: QuoteIntent) -> bool:
         min_rest_sec = float(getattr(desired, "min_rest_sec", 0.0) or 0.0)
-        if min_rest_sec <= 0.0:
-            return False
         current_intent = getattr(existing, "intent", None)
         created_at = float(getattr(existing, "created_at", 0.0) or 0.0)
         if current_intent is None or created_at <= 0.0:
@@ -36,14 +36,43 @@ class ExecutionPolicyV2:
             return False
         if desired.side != "SELL":
             return False
+        if str(getattr(current_intent, "quote_role", "") or "") != str(getattr(desired, "quote_role", "") or ""):
+            return False
+        age_sec = max(0.0, float(time.time()) - created_at)
+        if bool(getattr(desired, "hold_mode_active", False)):
+            if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
+                return False
+            if str(getattr(desired, "inventory_effect", "") or "") != "helpful":
+                return False
+            hold_max_age_sec = float(getattr(desired, "hold_max_age_sec", 0.0) or 0.0)
+            if hold_max_age_sec > 0.0 and age_sec >= hold_max_age_sec:
+                return False
+            # For SELLs a higher desired price means the current order is no longer maker-safe.
+            if float(current_intent.price) + 1e-9 < float(desired.price):
+                return False
+            hold_reprice_threshold_ticks = int(getattr(desired, "hold_reprice_threshold_ticks", 0) or 0)
+            hold_tick_size = float(getattr(desired, "hold_tick_size", 0.0) or 0.0)
+            if hold_reprice_threshold_ticks > 0 and hold_tick_size > 0.0:
+                max_price_delta = float(hold_reprice_threshold_ticks) * hold_tick_size
+                if abs(float(current_intent.price) - float(desired.price)) > max_price_delta + 1e-9:
+                    return False
+            return True
+        if min_rest_sec <= 0.0:
+            return False
         if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
             return False
         if str(getattr(desired, "inventory_effect", "") or "") != "helpful":
             return False
-        if str(getattr(current_intent, "quote_role", "") or "") != str(getattr(desired, "quote_role", "") or ""):
-            return False
-        age_sec = max(0.0, float(time.time()) - created_at)
         return age_sec < min_rest_sec
+
+    def consume_sync_metrics(self) -> dict[str, int]:
+        metrics = {
+            "sell_churn_hold_reprice_suppressed_hits": int(self._sell_churn_hold_reprice_suppressed_hits),
+            "sell_churn_hold_cancel_avoided_hits": int(self._sell_churn_hold_cancel_avoided_hits),
+        }
+        self._sell_churn_hold_reprice_suppressed_hits = 0
+        self._sell_churn_hold_cancel_avoided_hits = 0
+        return metrics
 
     async def _sync_slot(self, slot_key: str, desired: QuoteIntent | None) -> None:
         existing = self.tracker.get(slot_key)
@@ -55,6 +84,10 @@ class ExecutionPolicyV2:
         if existing and not self._materially_different(existing.intent, desired):
             return
         if existing and self._should_hold_existing(existing, desired):
+            if bool(getattr(desired, "hold_mode_active", False)):
+                self._sell_churn_hold_cancel_avoided_hits += 1
+                if abs(float(existing.intent.price) - float(desired.price)) > 1e-9:
+                    self._sell_churn_hold_reprice_suppressed_hits += 1
             return
         if existing:
             await self.gateway.cancel(existing.order_id)

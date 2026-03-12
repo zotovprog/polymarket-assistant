@@ -102,6 +102,8 @@ class MarketMakerV2:
         self._divergence_soft_brake_history: list[tuple[float, int]] = []
         self._divergence_hard_suppress_history: list[tuple[float, int]] = []
         self._buy_edge_gap_history: list[tuple[float, float]] = []
+        self._sell_churn_hold_reprice_suppressed_history: list[tuple[float, int]] = []
+        self._sell_churn_hold_cancel_avoided_history: list[tuple[float, int]] = []
         self._untradeable_tolerated_history: list[tuple[float, int]] = []
         self._emergency_taker_forced_history: list[tuple[float, int]] = []
         self._one_sided_bid_streak_outside: int = 0
@@ -1236,12 +1238,12 @@ class MarketMakerV2:
             reason = "high_unwind_ratio"
         elif emergency_unwind_ratio_60s > 0.20:
             reason = "high_emergency_ratio"
+        elif outside_near_expiry and dual_bid_exception_active and dual_bid_exception_reason:
+            reason = str(dual_bid_exception_reason)
         elif marketability_guard_active:
             reason = "marketability_churn"
         elif mm_active_ratio_60s < 0.30:
             reason = "low_mm_effective"
-        elif outside_near_expiry and dual_bid_exception_active and dual_bid_exception_reason:
-            reason = str(dual_bid_exception_reason)
         elif outside_near_expiry and dual_bid_ratio_60s < 0.70:
             reason = "low_dual_bid_ratio"
         elif str(quote_balance_state or "").lower() == "none":
@@ -1689,6 +1691,7 @@ class MarketMakerV2:
                     ctx=ctx,
                 )
                 await self.execution_policy.sync(plan)
+        sync_metrics = self.execution_policy.consume_sync_metrics()
         lifecycle = transition.lifecycle
         unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
             effective_soft_mode=effective_risk.soft_mode,
@@ -1751,6 +1754,12 @@ class MarketMakerV2:
         )
         divergence_soft_brake_hits_tick = int(getattr(plan, "divergence_soft_brake_hits", 0) or 0)
         divergence_hard_suppress_hits_tick = int(getattr(plan, "divergence_hard_suppress_hits", 0) or 0)
+        sell_churn_hold_reprice_suppressed_tick = int(
+            sync_metrics.get("sell_churn_hold_reprice_suppressed_hits") or 0
+        )
+        sell_churn_hold_cancel_avoided_tick = int(
+            sync_metrics.get("sell_churn_hold_cancel_avoided_hits") or 0
+        )
         buy_edge_gap_tick = max(
             0.0,
             float(getattr(snapshot, "buy_edge_gap_up", 0.0) or 0.0),
@@ -1811,6 +1820,8 @@ class MarketMakerV2:
         self._divergence_soft_brake_history.append((now, int(divergence_soft_brake_hits_tick)))
         self._divergence_hard_suppress_history.append((now, int(divergence_hard_suppress_hits_tick)))
         self._buy_edge_gap_history.append((now, float(buy_edge_gap_tick)))
+        self._sell_churn_hold_reprice_suppressed_history.append((now, int(sell_churn_hold_reprice_suppressed_tick)))
+        self._sell_churn_hold_cancel_avoided_history.append((now, int(sell_churn_hold_cancel_avoided_tick)))
         self._untradeable_tolerated_history.append((now, int(untradeable_tolerated_tick)))
         self._emergency_taker_forced_history.append((now, 1 if emergency_taker_forced else 0))
         self._unwind_deferred_history.append((now, int(unwind_deferred_hits_tick)))
@@ -1837,6 +1848,8 @@ class MarketMakerV2:
         self._prune_history(self._divergence_soft_brake_history, now=window_now)
         self._prune_history(self._divergence_hard_suppress_history, now=window_now)
         self._prune_history(self._buy_edge_gap_history, now=window_now)
+        self._prune_history(self._sell_churn_hold_reprice_suppressed_history, now=window_now)
+        self._prune_history(self._sell_churn_hold_cancel_avoided_history, now=window_now)
         self._prune_history(self._untradeable_tolerated_history, now=window_now)
         self._prune_history(self._emergency_taker_forced_history, now=window_now)
         self._prune_history(self._unwind_deferred_history, now=window_now)
@@ -1919,6 +1932,16 @@ class MarketMakerV2:
         )
         max_buy_edge_gap_60s = self._window_max(
             self._buy_edge_gap_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        sell_churn_hold_reprice_suppressed_hits_60s = self._window_sum(
+            self._sell_churn_hold_reprice_suppressed_history,
+            window_sec=float(MM_REGIME_WINDOW_SEC),
+            now=window_now,
+        )
+        sell_churn_hold_cancel_avoided_hits_60s = self._window_sum(
+            self._sell_churn_hold_cancel_avoided_history,
             window_sec=float(MM_REGIME_WINDOW_SEC),
             now=window_now,
         )
@@ -2102,6 +2125,11 @@ class MarketMakerV2:
             marketability_guard_reason=str(effective_risk.marketability_guard_reason or ""),
             marketability_churn_confirmed=bool(effective_risk.marketability_churn_confirmed),
             marketability_problem_side=str(effective_risk.marketability_problem_side or ""),
+            sell_churn_hold_up_active=bool(getattr(plan, "sell_churn_hold_up_active", False)),
+            sell_churn_hold_dn_active=bool(getattr(plan, "sell_churn_hold_dn_active", False)),
+            sell_churn_hold_side=str(getattr(plan, "sell_churn_hold_side", "") or ""),
+            sell_churn_hold_reprice_suppressed_hits_60s=int(sell_churn_hold_reprice_suppressed_hits_60s),
+            sell_churn_hold_cancel_avoided_hits_60s=int(sell_churn_hold_cancel_avoided_hits_60s),
             collateral_warning_hits_60s=int(marketability_state.get("collateral_warning_hits_60s") or 0),
             sell_skip_cooldown_hits_60s=int(marketability_state.get("sell_skip_cooldown_hits_60s") or 0),
             execution_churn_ratio_60s=float(marketability_state.get("execution_churn_ratio_60s") or 0.0),

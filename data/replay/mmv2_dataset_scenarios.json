@@ -11,7 +11,7 @@
       "date_from": "2025-10-07",
       "date_to": "2025-10-07",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "marketability_churn_2025_09_25_a",
@@ -21,7 +21,7 @@
       "date_from": "2025-09-25",
       "date_to": "2025-09-25",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "edge_divergence_2025_10_07_a",
@@ -32,7 +32,7 @@
       "date_from": "2025-10-07",
       "date_to": "2025-10-07",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "edge_divergence_2025_10_06_a",
@@ -42,7 +42,7 @@
       "date_from": "2025-10-06",
       "date_to": "2025-10-06",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "inventory_regime_2025_10_05_a",
@@ -52,7 +52,7 @@
       "date_from": "2025-10-05",
       "date_to": "2025-10-05",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "terminal_cleanup_good_2025_09_30_a",
@@ -62,7 +62,7 @@
       "date_from": "2025-09-30",
       "date_to": "2025-09-30",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     },
     {
       "id": "mixed_mm_ok_2025_10_05_a",
@@ -73,7 +73,7 @@
       "date_from": "2025-10-05",
       "date_to": "2025-10-05",
       "max_ticks": 300,
-      "session_budget_usd": 30.0
+      "session_budget_usd": 300.0
     }
   ]
 }

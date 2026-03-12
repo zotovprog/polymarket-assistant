@@ -92,6 +92,11 @@ class QuoteIntent:
     price_adjust_ticks: int = 0
     suppressed_reason: str | None = None
     min_rest_sec: float = 0.0
+    hold_mode_active: bool = False
+    hold_mode_reason: str = ""
+    hold_reprice_threshold_ticks: int = 0
+    hold_max_age_sec: float = 0.0
+    hold_tick_size: float = 0.0
 
 
 @dataclass
@@ -128,6 +133,9 @@ class QuotePlan:
     dual_bid_exception_active: bool = False
     dual_bid_exception_reason: str = ""
     quote_anchor_mode: str = "midpoint_first"
+    sell_churn_hold_up_active: bool = False
+    sell_churn_hold_dn_active: bool = False
+    sell_churn_hold_side: str = ""
 
 
 @dataclass
@@ -287,6 +295,11 @@ class AnalyticsState:
     marketability_guard_reason: str = ""
     marketability_churn_confirmed: bool = False
     marketability_problem_side: str = ""
+    sell_churn_hold_up_active: bool = False
+    sell_churn_hold_dn_active: bool = False
+    sell_churn_hold_side: str = ""
+    sell_churn_hold_reprice_suppressed_hits_60s: int = 0
+    sell_churn_hold_cancel_avoided_hits_60s: int = 0
     collateral_warning_hits_60s: int = 0
     sell_skip_cooldown_hits_60s: int = 0
     execution_churn_ratio_60s: float = 0.0

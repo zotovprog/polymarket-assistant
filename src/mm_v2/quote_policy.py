@@ -64,6 +64,8 @@ class QuotePolicyV2:
     TOXIC_SIDE_SPREAD_TICKS_MAX = 3
     TOXIC_SIDE_SIZE_BRAKE_MIN = 0.35
     MARKETABILITY_REDUCING_SELL_MIN_REST_SEC = 6.0
+    SELL_CHURN_HOLD_REPRICE_TICKS = 6
+    SELL_CHURN_HOLD_MAX_AGE_SEC = 20.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -567,6 +569,9 @@ class QuotePolicyV2:
         divergence_hard_suppress_hits = 0
         dual_bid_exception_active = False
         dual_bid_exception_reason = ""
+        sell_churn_hold_up_active = False
+        sell_churn_hold_dn_active = False
+        sell_churn_hold_side = ""
         gross_inventory_brake_active_tick = False
         side_soft_brake_active_tick = False
         marketability_churn_confirmed = bool(getattr(risk, "marketability_churn_confirmed", False))
@@ -574,9 +579,20 @@ class QuotePolicyV2:
         if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
             marketability_problem_side = str(risk.inventory_side)
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
+        problem_side_material_inventory = False
+        if marketability_problem_side == "up":
+            problem_side_material_inventory = max(
+                float(inventory.sellable_up_shares),
+                float(inventory.up_shares),
+            ) >= float(ctx.min_order_size)
+        elif marketability_problem_side == "dn":
+            problem_side_material_inventory = max(
+                float(inventory.sellable_dn_shares),
+                float(inventory.dn_shares),
+            ) >= float(ctx.min_order_size)
         marketability_buy_quarantine_active = bool(
             marketability_churn_confirmed
-            and material_inventory
+            and problem_side_material_inventory
             and risk.hard_mode == "none"
             and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
         )
@@ -722,7 +738,7 @@ class QuotePolicyV2:
             )
             marketability_churn_side_active = bool(
                 marketability_churn_confirmed
-                and material_inventory
+                and problem_side_material_inventory
                 and token_side == marketability_problem_side
             )
             if (
@@ -1027,6 +1043,17 @@ class QuotePolicyV2:
                     and (marketability_churn_side_active or marketability_guard_side_active)
                 ):
                     intent.min_rest_sec = float(self.MARKETABILITY_REDUCING_SELL_MIN_REST_SEC)
+                    if marketability_churn_side_active:
+                        intent.hold_mode_active = True
+                        intent.hold_mode_reason = "sell_churn_hold_mode"
+                        intent.hold_reprice_threshold_ticks = int(self.SELL_CHURN_HOLD_REPRICE_TICKS)
+                        intent.hold_max_age_sec = float(self.SELL_CHURN_HOLD_MAX_AGE_SEC)
+                        intent.hold_tick_size = float(ctx.tick_size)
+                        sell_churn_hold_side = token_side
+                        if token_side == "up":
+                            sell_churn_hold_up_active = True
+                        else:
+                            sell_churn_hold_dn_active = True
                 # Final maker guard after rounding. This prevents any residual
                 # crossed-book post-only prices in endpoint/tick edge cases.
                 if side == "BUY" and best_ask is not None:
@@ -1373,6 +1400,9 @@ class QuotePolicyV2:
             ):
                 dual_bid_exception_active = True
                 dual_bid_exception_reason = "divergence_buy_hard_suppress"
+            elif sell_churn_hold_side in {"up", "dn"} and (not up_bid_active or not dn_bid_active):
+                dual_bid_exception_active = True
+                dual_bid_exception_reason = "sell_churn_hold_mode"
 
         regime = risk.soft_mode
         reason = risk.reason
@@ -1524,4 +1554,7 @@ class QuotePolicyV2:
             dual_bid_exception_active=bool(dual_bid_exception_active),
             dual_bid_exception_reason=str(dual_bid_exception_reason or ""),
             quote_anchor_mode="midpoint_first",
+            sell_churn_hold_up_active=bool(sell_churn_hold_up_active),
+            sell_churn_hold_dn_active=bool(sell_churn_hold_dn_active),
+            sell_churn_hold_side=str(sell_churn_hold_side or ""),
         )

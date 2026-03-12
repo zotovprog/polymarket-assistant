@@ -50,6 +50,18 @@
       "expected_primary_blocker": ""
     },
     {
+      "id": "sell_churn_paper300_bad",
+      "input_dir": "sell_churn_paper300_bad",
+      "expected_gate_verdict": "no_go",
+      "expected_primary_blocker": "marketability_churn"
+    },
+    {
+      "id": "sell_churn_paper300_fixed",
+      "input_dir": "sell_churn_paper300_fixed",
+      "expected_gate_verdict": "go",
+      "expected_primary_blocker": ""
+    },
+    {
       "id": "terminal_execution_bad",
       "input_dir": "terminal_execution_bad",
       "expected_gate_verdict": "no_go",

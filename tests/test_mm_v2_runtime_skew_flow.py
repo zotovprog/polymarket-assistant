@@ -257,6 +257,192 @@ async def test_execution_policy_holds_helpful_sell_during_marketability_rest_win
     assert len(gateway.placed) == 1
 
 
+@pytest.mark.asyncio
+async def test_execution_policy_sell_churn_hold_avoids_cancel_for_small_reprice(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.55, size=5.0),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.55,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    desired = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.53,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="helpful",
+        hold_mode_active=True,
+        hold_mode_reason="sell_churn_hold_mode",
+        hold_reprice_threshold_ticks=6,
+        hold_max_age_sec=20.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 110.0)
+    await policy.sync(QuotePlan(None, desired, None, None, "defensive", "marketability"))
+    metrics = policy.consume_sync_metrics()
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+    assert metrics["sell_churn_hold_cancel_avoided_hits"] == 1
+    assert metrics["sell_churn_hold_reprice_suppressed_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execution_policy_sell_churn_hold_reprices_on_large_move_or_age(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.55, size=5.0),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            order_id = f"oid-{len(self.placed) + 1}"
+            self._active_orders[order_id] = Quote(
+                side=intent.side,
+                token_id=intent.token,
+                price=float(intent.price),
+                size=float(intent.size),
+            )
+            return order_id
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.55,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    large_move = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.47,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="helpful",
+        hold_mode_active=True,
+        hold_mode_reason="sell_churn_hold_mode",
+        hold_reprice_threshold_ticks=6,
+        hold_max_age_sec=20.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 110.0)
+    await policy.sync(QuotePlan(None, large_move, None, None, "defensive", "marketability"))
+    assert gateway.cancelled == ["oid-1"]
+    assert len(gateway.placed) == 1
+
+    gateway.cancelled.clear()
+    gateway.placed.clear()
+    tracker.set(
+        "up_sell",
+        "oid-2",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.55,
+            size=5.0,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    gateway._active_orders = {"oid-2": Quote(side="SELL", token_id="up-token", price=0.55, size=5.0)}
+    tracker.slots["up_sell"].created_at = 100.0
+    stale_desired = QuoteIntent(
+        token="up-token",
+        side="SELL",
+        price=0.53,
+        size=5.0,
+        quote_role="base_ask",
+        post_only=True,
+        inventory_effect="helpful",
+        hold_mode_active=True,
+        hold_mode_reason="sell_churn_hold_mode",
+        hold_reprice_threshold_ticks=6,
+        hold_max_age_sec=20.0,
+        hold_tick_size=0.01,
+    )
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 121.0)
+    await policy.sync(QuotePlan(None, stale_desired, None, None, "defensive", "marketability"))
+    assert gateway.cancelled == ["oid-2"]
+    assert len(gateway.placed) == 1
+
+
 def test_helpful_quotes_can_be_restored_by_promotion():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(

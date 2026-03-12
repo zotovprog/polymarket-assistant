@@ -1574,6 +1574,11 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
                 "marketability_guard_reason": "collateral_warning",
                 "marketability_churn_confirmed": True,
                 "marketability_problem_side": "up",
+                "sell_churn_hold_up_active": True,
+                "sell_churn_hold_dn_active": False,
+                "sell_churn_hold_side": "up",
+                "sell_churn_hold_reprice_suppressed_hits_60s": 5,
+                "sell_churn_hold_cancel_avoided_hits_60s": 7,
                 "collateral_warning_hits_60s": 4,
                 "sell_skip_cooldown_hits_60s": 3,
                 "execution_churn_ratio_60s": 0.5,
@@ -1609,6 +1614,11 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     assert resp["analytics"]["marketability_guard_reason"] == "collateral_warning"
     assert resp["analytics"]["marketability_churn_confirmed"] is True
     assert resp["analytics"]["marketability_problem_side"] == "up"
+    assert resp["analytics"]["sell_churn_hold_up_active"] is True
+    assert resp["analytics"]["sell_churn_hold_dn_active"] is False
+    assert resp["analytics"]["sell_churn_hold_side"] == "up"
+    assert resp["analytics"]["sell_churn_hold_reprice_suppressed_hits_60s"] == 5
+    assert resp["analytics"]["sell_churn_hold_cancel_avoided_hits_60s"] == 7
     assert resp["analytics"]["collateral_warning_hits_60s"] == 4
     assert resp["analytics"]["sell_skip_cooldown_hits_60s"] == 3
     assert resp["analytics"]["execution_churn_ratio_60s"] == pytest.approx(0.5)
@@ -1956,6 +1966,18 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "max_buy_edge_gap_60s": 0.24,
                 "dual_bid_exception_active": True,
                 "dual_bid_exception_reason": "divergence_buy_hard_suppress",
+                "marketability_guard_active": True,
+                "marketability_guard_reason": "sell_skip_cooldown",
+                "marketability_churn_confirmed": True,
+                "marketability_problem_side": "dn",
+                "sell_churn_hold_up_active": False,
+                "sell_churn_hold_dn_active": True,
+                "sell_churn_hold_side": "dn",
+                "sell_churn_hold_reprice_suppressed_hits_60s": 9,
+                "sell_churn_hold_cancel_avoided_hits_60s": 11,
+                "collateral_warning_hits_60s": 1,
+                "sell_skip_cooldown_hits_60s": 6,
+                "execution_churn_ratio_60s": 0.52,
                 "gross_inventory_brake_active": True,
                 "gross_inventory_brake_hits_60s": 3,
                 "pair_over_target_buy_blocks_60s": 2,
@@ -2007,6 +2029,18 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["max_buy_edge_gap_60s"] == pytest.approx(0.24)
     assert resp["mm_regime"]["dual_bid_exception_active"] is True
     assert resp["mm_regime"]["dual_bid_exception_reason"] == "divergence_buy_hard_suppress"
+    assert resp["mm_regime"]["marketability_guard_active"] is True
+    assert resp["mm_regime"]["marketability_guard_reason"] == "sell_skip_cooldown"
+    assert resp["mm_regime"]["marketability_churn_confirmed"] is True
+    assert resp["mm_regime"]["marketability_problem_side"] == "dn"
+    assert resp["mm_regime"]["sell_churn_hold_up_active"] is False
+    assert resp["mm_regime"]["sell_churn_hold_dn_active"] is True
+    assert resp["mm_regime"]["sell_churn_hold_side"] == "dn"
+    assert resp["mm_regime"]["sell_churn_hold_reprice_suppressed_hits_60s"] == 9
+    assert resp["mm_regime"]["sell_churn_hold_cancel_avoided_hits_60s"] == 11
+    assert resp["mm_regime"]["collateral_warning_hits_60s"] == 1
+    assert resp["mm_regime"]["sell_skip_cooldown_hits_60s"] == 6
+    assert resp["mm_regime"]["execution_churn_ratio_60s"] == pytest.approx(0.52)
     assert resp["mm_regime"]["gross_inventory_brake_active"] is True
     assert resp["mm_regime"]["gross_inventory_brake_hits_60s"] == 3
     assert resp["mm_regime"]["pair_over_target_buy_blocks_60s"] == 2

@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--key", default="")
     parser.add_argument("--coin", default="BTC")
     parser.add_argument("--timeframe", default="15m")
-    parser.add_argument("--budget", type=float, default=30.0)
+    parser.add_argument("--budget", type=float, default=300.0)
     parser.add_argument("--poll-sec", type=float, default=5.0)
     parser.add_argument("--local-paper-duration-sec", type=int, default=2700)
     parser.add_argument("--skip-local-paper", action="store_true")

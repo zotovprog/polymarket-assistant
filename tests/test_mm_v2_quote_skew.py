@@ -783,7 +783,68 @@ def test_marketability_churn_confirmed_keeps_only_inventory_reducing_intents():
     assert plan.suppressed_reasons["dn_bid"] == "marketability_churn_confirmed"
     assert plan.up_ask is not None
     assert plan.up_ask.min_rest_sec == pytest.approx(6.0)
+    assert plan.up_ask.hold_mode_active is True
+    assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
+    assert plan.up_ask.hold_reprice_threshold_ticks == 6
+    assert plan.up_ask.hold_max_age_sec == pytest.approx(20.0)
+    assert plan.sell_churn_hold_up_active is True
+    assert plan.sell_churn_hold_dn_active is False
+    assert plan.sell_churn_hold_side == "up"
     assert plan.quote_viability_reason == "marketability_churn_confirmed"
+
+
+def test_sell_churn_hold_mode_marks_explicit_dual_bid_exception():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=4.0)
+    snapshot = _snapshot(
+        market_tradeable=True,
+        market_quality_score=0.9,
+        up_best_bid=0.49,
+        up_best_ask=0.51,
+        dn_best_bid=0.49,
+        dn_best_ask=0.51,
+    )
+    inventory = _inventory(
+        dn_shares=10.0,
+        total_inventory_value_usd=10.0,
+        excess_dn_qty=10.0,
+        excess_dn_value_usd=5.0,
+        excess_value_usd=5.0,
+        signed_excess_value_usd=-5.0,
+        free_usdc=295.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="dn",
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_churn_confirmed=True,
+        marketability_problem_side="dn",
+        marketability_guard_dn_active=True,
+        soft_mode="inventory_skewed",
+        target_soft_mode="defensive",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+    assert plan.dn_ask is not None
+    assert plan.dn_ask.hold_mode_active is True
+    assert plan.sell_churn_hold_dn_active is True
+    assert plan.sell_churn_hold_side == "dn"
+    assert plan.dual_bid_exception_active is True
+    assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
 
 
 def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
