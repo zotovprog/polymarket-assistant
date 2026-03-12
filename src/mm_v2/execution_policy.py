@@ -21,9 +21,12 @@ class ExecutionPolicyV2:
     def _materially_different(self, current: QuoteIntent, new: QuoteIntent) -> bool:
         if current.side != new.side or current.token != new.token or current.post_only != new.post_only:
             return True
+        effective_threshold_bps = float(self.requote_threshold_bps)
+        if current.side == "BUY":
+            effective_threshold_bps *= 0.6
         price_diff_bps = abs(float(current.price) - float(new.price)) / max(0.01, float(current.price)) * 10000.0
         size_diff = abs(float(current.size) - float(new.size))
-        return price_diff_bps >= self.requote_threshold_bps or size_diff >= 0.5
+        return price_diff_bps >= effective_threshold_bps or size_diff >= 0.5
 
     @staticmethod
     def _should_hold_existing(existing: Any, desired: QuoteIntent) -> bool:

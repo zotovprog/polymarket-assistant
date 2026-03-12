@@ -62,6 +62,11 @@ class FairValueEngine:
         """Which FV source was used in the last computation."""
         return self._last_source
 
+    @property
+    def last_vol(self) -> float:
+        """Last realized per-kline volatility used by the model."""
+        return float(self._last_vol)
+
     def realized_vol(self, klines: list[dict]) -> float:
         """Compute realized volatility from kline closes.
         Returns annualized vol scaled to the kline interval.

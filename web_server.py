@@ -174,6 +174,7 @@ class StartRequest(BaseModel):
     initial_usdc: float = 1000.0
     dev: bool = False
     force_normal_soft_mode: bool = False
+    force_normal_no_guards: bool = False
 
 
 class PaperSweepStartRequest(BaseModel):
@@ -2665,6 +2666,7 @@ class MMRuntimeV2(MMRuntime):
         self._live_budget_gate_passed: bool = False
         self._paper_budget_gate_passed: bool = False
         self._force_normal_soft_mode_paper: bool = False
+        self._force_normal_no_guards_paper: bool = False
         self._last_terminal_runtime_v2: dict[str, Any] = {
             "last_terminal_reason": "",
             "last_terminal_ts": 0.0,
@@ -2946,7 +2948,8 @@ class MMRuntimeV2(MMRuntime):
                 ),
                 "live_budget_gate_passed": bool(self._live_budget_gate_passed),
                 "paper_budget_gate_passed": bool(self._paper_budget_gate_passed),
-                "force_normal_soft_mode_paper": bool(self._force_normal_soft_mode_paper),
+                "force_normal_soft_mode_paper": bool(self.mm_v2 and self._force_normal_soft_mode_paper),
+                "force_normal_no_guards_paper": bool(self.mm_v2 and self._force_normal_no_guards_paper),
                 "drawdown_breach_ticks": 0,
                 "drawdown_breach_age_sec": 0.0,
             },
@@ -2993,6 +2996,7 @@ class MMRuntimeV2(MMRuntime):
         dev: bool = False,
         session_budget_usd: Optional[float] = None,
         force_normal_soft_mode: bool = False,
+        force_normal_no_guards: bool = False,
     ) -> dict:
         if self._running and self.mm_v2:
             try:
@@ -3023,6 +3027,7 @@ class MMRuntimeV2(MMRuntime):
         self._dev_mode = bool(dev)
         self._initial_usdc = float(initial_usdc)
         self._force_normal_soft_mode_paper = bool(force_normal_soft_mode and paper_mode)
+        self._force_normal_no_guards_paper = bool(force_normal_no_guards and paper_mode)
         effective_session_budget = (
             float(session_budget_usd)
             if session_budget_usd is not None
@@ -3054,6 +3059,11 @@ class MMRuntimeV2(MMRuntime):
             raise HTTPException(
                 status_code=400,
                 detail="force_normal_soft_mode is paper-only",
+            )
+        if force_normal_no_guards and not self._paper_mode:
+            raise HTTPException(
+                status_code=400,
+                detail="force_normal_no_guards is paper-only",
             )
 
         if dev:
@@ -3132,6 +3142,7 @@ class MMRuntimeV2(MMRuntime):
             clob,
             self.mm_config_v2,
             force_normal_soft_mode_paper=self._force_normal_soft_mode_paper,
+            force_normal_no_guards_paper=self._force_normal_no_guards_paper,
         )
         self.mm_v2.set_market(market)
         await self._attach_mongo_logger(
@@ -3402,6 +3413,7 @@ class PaperSweepRuntimeV2(MMRuntime):
             "paper_mode": True,
             "initial_usdc": float(self._initial_usdc or 0.0),
             "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+            "force_normal_no_guards": False,
             "base_clips": list(self.DEFAULT_BASE_CLIPS),
             "variant_count": 0,
             "running_variants": 0,
@@ -3522,6 +3534,7 @@ class PaperSweepRuntimeV2(MMRuntime):
                 "paper_mode": True,
                 "initial_usdc": float(self._initial_usdc or 0.0),
                 "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+                "force_normal_no_guards": False,
                 "base_clips": [float(variant.get("clip_usd") or 0.0) for variant in self._variants],
                 "variant_count": len(variants),
                 "running_variants": int(running_variants),
@@ -3691,6 +3704,7 @@ class PaperSweepRuntimeV2(MMRuntime):
                 "paper_mode": True,
                 "initial_usdc": float(self._initial_usdc or 0.0),
                 "force_normal_soft_mode": bool(self._force_normal_soft_mode_paper),
+                "force_normal_no_guards": False,
                 "base_clips": [float(item.get("base_clip_usd") or 0.0) for item in summaries],
                 "variant_count": len(summaries),
                 "running_variants": 0,
@@ -3952,6 +3966,7 @@ def _dashboard_snapshot_from_v2(raw: dict[str, Any]) -> dict[str, Any]:
             ),
             "failure_bucket_current": str(analytics.get("failure_bucket_current") or ""),
             "execution_replay_blocker_hint": str(analytics.get("execution_replay_blocker_hint") or ""),
+            "diagnostic_no_guards_active": bool(analytics.get("diagnostic_no_guards_active") or False),
             "gross_inventory_brake_active": bool(analytics.get("gross_inventory_brake_active") or False),
             "gross_inventory_brake_hits_60s": int(analytics.get("gross_inventory_brake_hits_60s") or 0),
             "pair_over_target_buy_blocks_60s": int(analytics.get("pair_over_target_buy_blocks_60s") or 0),
@@ -4236,6 +4251,7 @@ async def mmv2_start(req: StartRequest, request: Request):
         dev=req.dev,
         session_budget_usd=session_budget_usd,
         force_normal_soft_mode=req.force_normal_soft_mode,
+        force_normal_no_guards=req.force_normal_no_guards,
     )
     return {"ok": True, "state": result}
 

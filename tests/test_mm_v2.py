@@ -781,6 +781,13 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert cfg.base_clip_usd == pytest.approx(4.0)
     assert cfg.target_pair_value_ratio == pytest.approx(0.50)
     assert cfg.base_half_spread_bps == pytest.approx(100.0)
+    assert cfg.vol_spread_multiplier == pytest.approx(2.0)
+    assert cfg.maker_fee_bps == pytest.approx(0.0)
+    assert cfg.taker_fee_bps == pytest.approx(0.0)
+    assert cfg.min_edge_bps == pytest.approx(20.0)
+    assert cfg.inventory_skew_strength == pytest.approx(2.0)
+    assert cfg.tick_interval_sec == pytest.approx(1.0)
+    assert cfg.requote_threshold_bps == pytest.approx(8.0)
     assert cfg.defensive_spread_mult == pytest.approx(1.5)
     assert cfg.defensive_size_mult == pytest.approx(0.4)
     assert cfg.soft_excess_value_ratio == pytest.approx(0.20)
@@ -792,6 +799,37 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert soft_cap == pytest.approx(6.0)
     assert def_cap == pytest.approx(10.5)
     assert hard_cap == pytest.approx(13.5)
+
+
+def test_tradeable_valuation_exposes_realized_vol_per_min(monkeypatch):
+    cfg = MMConfigV2()
+    engine = PairValuationEngine(cfg)
+
+    def _compute(*args, **kwargs):
+        engine.provider._last_vol = 0.0017
+        return (0.48, 0.52)
+
+    monkeypatch.setattr(engine.provider, "compute", _compute)
+    market = _market()
+    feed_state = SimpleNamespace(
+        mid=100000.0,
+        klines=[],
+        pm_up=0.48,
+        pm_dn=0.52,
+        pm_last_update_ts=time.time(),
+        bids=[],
+        asks=[],
+        trades=[],
+    )
+    result, snapshot = engine.compute(
+        market=market,
+        feed_state=feed_state,
+        up_book={"best_bid": 0.47, "best_ask": 0.49, "bid_depth_usd": 100.0, "ask_depth_usd": 100.0},
+        dn_book={"best_bid": 0.51, "best_ask": 0.53, "bid_depth_usd": 100.0, "ask_depth_usd": 100.0},
+    )
+
+    assert snapshot.realized_vol_per_min == pytest.approx(0.0017)
+    assert result.realized_vol_per_min == pytest.approx(0.0017)
 
 
 def test_effective_target_ratio_activation_usd_uses_new_budget_ratio_formula():
@@ -1570,6 +1608,7 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
             "lifecycle": "defensive",
             "analytics": {
                 "mm_regime_degraded_reason": "high_emergency_ratio",
+                "diagnostic_no_guards_active": True,
                 "marketability_guard_active": True,
                 "marketability_guard_reason": "collateral_warning",
                 "marketability_churn_confirmed": True,
@@ -1617,6 +1656,7 @@ async def test_state_exposes_mm_regime_degraded_reason_and_drawdown_threshold(mo
     )
     resp = await web_server.mmv2_state(request=object())
     assert resp["analytics"]["mm_regime_degraded_reason"] == "high_emergency_ratio"
+    assert resp["analytics"]["diagnostic_no_guards_active"] is True
     assert resp["analytics"]["marketability_guard_active"] is True
     assert resp["analytics"]["marketability_guard_reason"] == "collateral_warning"
     assert resp["analytics"]["marketability_churn_confirmed"] is True
@@ -1782,6 +1822,7 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
         dev=False,
         session_budget_usd=None,
         force_normal_soft_mode=False,
+        force_normal_no_guards=False,
     ):
         captured.update(
             {
@@ -1792,6 +1833,7 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
                 "dev": dev,
                 "session_budget_usd": session_budget_usd,
                 "force_normal_soft_mode": force_normal_soft_mode,
+                "force_normal_no_guards": force_normal_no_guards,
             }
         )
         return {"ok": True}
@@ -1811,6 +1853,53 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
     assert captured["timeframe"] == "15m"
     assert captured["session_budget_usd"] == pytest.approx(30.0)
     assert captured["force_normal_soft_mode"] is True
+    assert captured["force_normal_no_guards"] is False
+
+
+@pytest.mark.asyncio
+async def test_paper_start_forwards_force_normal_no_guards(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
+    captured = {}
+
+    async def _fake_start(
+        coin,
+        timeframe,
+        paper_mode,
+        initial_usdc,
+        dev=False,
+        session_budget_usd=None,
+        force_normal_soft_mode=False,
+        force_normal_no_guards=False,
+    ):
+        captured.update(
+            {
+                "paper_mode": paper_mode,
+                "session_budget_usd": session_budget_usd,
+                "force_normal_soft_mode": force_normal_soft_mode,
+                "force_normal_no_guards": force_normal_no_guards,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(web_server._runtime_v2, "start", _fake_start)
+    req = web_server.StartRequest(
+        coin="BTC",
+        timeframe="15m",
+        paper_mode=True,
+        initial_usdc=300.0,
+        dev=True,
+        force_normal_soft_mode=True,
+        force_normal_no_guards=True,
+    )
+    resp = await web_server.mmv2_start(req=req, request=object())
+    assert resp["ok"] is True
+    assert captured["paper_mode"] is True
+    assert captured["session_budget_usd"] == pytest.approx(300.0)
+    assert captured["force_normal_soft_mode"] is True
+    assert captured["force_normal_no_guards"] is True
 
 
 @pytest.mark.asyncio
@@ -1830,6 +1919,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
         dev=False,
         session_budget_usd=None,
         force_normal_soft_mode=False,
+        force_normal_no_guards=False,
     ):
         captured.update(
             {
@@ -1840,6 +1930,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
                 "dev": dev,
                 "session_budget_usd": session_budget_usd,
                 "force_normal_soft_mode": force_normal_soft_mode,
+                "force_normal_no_guards": force_normal_no_guards,
             }
         )
         return {"ok": True}
@@ -1852,6 +1943,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     assert captured["initial_usdc"] == pytest.approx(1000.0)
     assert captured["session_budget_usd"] == pytest.approx(75.0)
     assert captured["force_normal_soft_mode"] is False
+    assert captured["force_normal_no_guards"] is False
 
 
 @pytest.mark.asyncio
@@ -1883,6 +1975,27 @@ async def test_live_start_rejects_force_normal_soft_mode(monkeypatch):
         paper_mode=False,
         dev=True,
         force_normal_soft_mode=True,
+    )
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_start(req=req, request=object())
+    assert exc.value.status_code == 400
+    assert "paper-only" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_live_start_rejects_force_normal_no_guards(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 30.0
+
+    req = web_server.StartRequest(
+        coin="BTC",
+        timeframe="15m",
+        paper_mode=False,
+        dev=True,
+        force_normal_no_guards=True,
     )
     with pytest.raises(web_server.HTTPException) as exc:
         await web_server.mmv2_start(req=req, request=object())
@@ -1986,6 +2099,7 @@ def test_runtime_v2_start_accepts_session_budget_kwarg():
     params = inspect.signature(web_server._runtime_v2.start).parameters
     assert "session_budget_usd" in params
     assert "force_normal_soft_mode" in params
+    assert "force_normal_no_guards" in params
 
 
 def test_runtime_snapshot_exposes_force_normal_soft_mode_flag():
@@ -2000,6 +2114,20 @@ def test_runtime_snapshot_exposes_force_normal_soft_mode_flag():
     )
     snap = mm.snapshot()
     assert snap["runtime"]["force_normal_soft_mode_paper"] is True
+
+
+def test_runtime_snapshot_exposes_force_normal_no_guards_flag():
+    class _MockClient:
+        pass
+
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(),
+        force_normal_no_guards_paper=True,
+    )
+    snap = mm.snapshot()
+    assert snap["runtime"]["force_normal_no_guards_paper"] is True
 
 
 @pytest.mark.asyncio
@@ -2120,6 +2248,7 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
                 "session_pnl": 1.23,
                 "session_pnl_equity_usd": 1.23,
                 "session_pnl_operator_usd": 0.78,
+                "diagnostic_no_guards_active": True,
                 "fill_count": 1,
                 "spread_capture_usd": 0.0,
                 "position_mark_value_usd": 3.12,
@@ -2217,6 +2346,7 @@ async def test_dashboard_state_adapts_running_v2_snapshot(monkeypatch):
     assert resp["mm_regime"]["max_buy_edge_gap_60s"] == pytest.approx(0.24)
     assert resp["mm_regime"]["dual_bid_exception_active"] is True
     assert resp["mm_regime"]["dual_bid_exception_reason"] == "divergence_buy_hard_suppress"
+    assert resp["mm_regime"]["diagnostic_no_guards_active"] is True
     assert resp["mm_regime"]["marketability_guard_active"] is True
     assert resp["mm_regime"]["marketability_guard_reason"] == "sell_skip_cooldown"
     assert resp["mm_regime"]["marketability_churn_confirmed"] is True

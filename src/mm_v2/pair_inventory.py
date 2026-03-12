@@ -50,6 +50,8 @@ def build_pair_inventory(
     dn_token_id: str,
     session_budget_usd: float = 0.0,
     target_pair_value_ratio: float = 0.50,
+    pair_entry_cost: float = 0.0,
+    pair_entry_pnl_per_share: float = 0.0,
 ) -> PairInventoryState:
     pending = pending_reservations(
         active_orders,
@@ -103,4 +105,6 @@ def build_pair_inventory(
         target_pair_value_usd=target_pair_value_usd,
         pair_value_ratio=pair_value_ratio,
         pair_value_over_target_usd=pair_value_over_target_usd,
+        pair_entry_cost=max(0.0, float(pair_entry_cost)),
+        pair_entry_pnl_per_share=float(pair_entry_pnl_per_share),
     )

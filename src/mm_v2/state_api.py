@@ -49,6 +49,8 @@ def serialize_engine_state(
         "target_pair_value_usd": round(state.inventory.target_pair_value_usd, 4),
         "pair_value_ratio": round(state.inventory.pair_value_ratio, 6),
         "pair_value_over_target_usd": round(state.inventory.pair_value_over_target_usd, 4),
+        "pair_entry_cost": round(state.inventory.pair_entry_cost, 6),
+        "pair_entry_pnl_per_share": round(state.inventory.pair_entry_pnl_per_share, 6),
     }
     quotes = {
         "up_bid": _serialize_quote(state.current_quotes.up_bid, suppressed_reason=state.current_quotes.suppressed_reasons.get("up_bid")),
@@ -76,6 +78,7 @@ def serialize_engine_state(
             "anchor_divergence_up": round(state.market.anchor_divergence_up, 6) if state.market else 0.0,
             "anchor_divergence_dn": round(state.market.anchor_divergence_dn, 6) if state.market else 0.0,
             "quote_anchor_mode": state.market.quote_anchor_mode if state.market else "midpoint_first",
+            "realized_vol_per_min": round(state.market.realized_vol_per_min, 6) if state.market else 0.0,
         },
         "inventory": inventory,
         "pair_inventory": pair_inventory,

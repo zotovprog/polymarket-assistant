@@ -61,6 +61,9 @@ class SoftRiskKernel:
         pressure_signed = self._clamp(signed_excess_value_usd / hard_cap, -1.0, 1.0)
         target_pair_value_usd = max(0.01, float(inventory.target_pair_value_usd))
         pair_over_target_usd = max(0.0, float(inventory.pair_value_over_target_usd))
+        pair_entry_cost = max(0.0, float(getattr(inventory, "pair_entry_cost", 0.0) or 0.0))
+        pair_entry_pnl_per_share = float(getattr(inventory, "pair_entry_pnl_per_share", 0.0) or 0.0)
+        pair_entry_loss_per_share = max(0.0, -pair_entry_pnl_per_share)
         target_ratio_pressure = self._clamp(pair_over_target_usd / target_pair_value_usd, 0.0, 1.0)
         target_ratio_activation_usd = float(self.config.effective_target_ratio_activation_usd())
         gross_brake_activation_usd = max(1.5, 0.05 * budget)
@@ -231,6 +234,13 @@ class SoftRiskKernel:
         if target_soft_mode == "normal" and excess_value_usd >= soft_cap:
             target_soft_mode = "inventory_skewed"
             soft_reason = f"soft excess ${excess_value_usd:.2f}"
+        if (
+            target_soft_mode in {"normal", "inventory_skewed"}
+            and pair_entry_loss_per_share > 0.0
+            and float(inventory.paired_qty) * pair_entry_loss_per_share >= 1.0
+        ):
+            target_soft_mode = "defensive"
+            soft_reason = f"defensive negative pair carry ${pair_entry_loss_per_share:.4f}/share"
         if target_soft_mode == "normal" and pair_over_target_usd >= target_ratio_activation_usd:
             target_soft_mode = "inventory_skewed"
             soft_reason = (
@@ -338,4 +348,10 @@ class HardSafetyKernel:
             marketability_problem_side=str(getattr(analytics, "marketability_problem_side", "") or ""),
             marketability_side_locked=str(getattr(analytics, "marketability_side_locked", "") or ""),
             marketability_side_lock_age_sec=float(getattr(analytics, "marketability_side_lock_age_sec", 0.0) or 0.0),
+            pair_entry_cost=float(getattr(analytics, "pair_entry_cost", 0.0) or 0.0),
+            pair_entry_pnl_per_share=float(getattr(analytics, "pair_entry_pnl_per_share", 0.0) or 0.0),
+            rolling_markout_up_5s=float(getattr(analytics, "rolling_markout_up_5s", 0.0) or 0.0),
+            rolling_markout_dn_5s=float(getattr(analytics, "rolling_markout_dn_5s", 0.0) or 0.0),
+            rolling_spread_capture_up=float(getattr(analytics, "rolling_spread_capture_up", 0.0) or 0.0),
+            rolling_spread_capture_dn=float(getattr(analytics, "rolling_spread_capture_dn", 0.0) or 0.0),
         )

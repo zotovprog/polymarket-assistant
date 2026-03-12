@@ -121,6 +121,57 @@ def test_helpful_buy_is_priced_more_aggressively_than_harmful_buy():
     assert skew_plan.dn_bid.price <= flat_plan.dn_bid.price
 
 
+def test_dynamic_spread_uses_realized_vol_and_fee_floor():
+    cfg = MMConfigV2(
+        base_half_spread_bps=20.0,
+        max_half_spread_bps=600.0,
+        vol_spread_multiplier=2.0,
+        maker_fee_bps=25.0,
+    )
+    policy = QuotePolicyV2(cfg)
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=_snapshot(realized_vol_per_min=0.003, time_left_sec=900.0),
+        inventory=_inventory(),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+
+    spread = policy._spread(risk, _snapshot(realized_vol_per_min=0.003, time_left_sec=900.0))
+
+    assert spread > policy._bps_to_price(20.0)
+    assert spread >= policy._bps_to_price(50.0)
+
+
+def test_negative_pair_entry_cost_blocks_one_bid_and_widens_quotes():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=14.0)
+    snapshot = _snapshot(realized_vol_per_min=0.0005)
+    inventory = _inventory(
+        up_shares=10.0,
+        dn_shares=10.0,
+        paired_qty=10.0,
+        paired_value_usd=10.0,
+        total_inventory_value_usd=10.0,
+        pair_entry_cost=1.08,
+        pair_entry_pnl_per_share=-0.08,
+        free_usdc=300.0,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(pair_entry_cost=1.08, pair_entry_pnl_per_share=-0.08),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
+    )
+
+    assert sum(1 for intent in (plan.up_bid, plan.dn_bid) if intent is not None) == 1
+    assert "pair_entry_cost_block" in plan.suppressed_reasons.values()
+
+
 def test_helpful_sell_is_priced_more_aggressively_than_harmful_sell():
     _, flat_plan = _plan_for(_inventory())
     _, skew_plan = _plan_for(
@@ -786,7 +837,7 @@ def test_marketability_churn_confirmed_keeps_only_inventory_reducing_intents():
     assert plan.up_ask.hold_mode_active is True
     assert plan.up_ask.hold_mode_reason == "sell_reprice_hold_mode"
     assert plan.up_ask.hold_reprice_threshold_ticks == 12
-    assert plan.up_ask.hold_max_age_sec == pytest.approx(6.0)
+    assert plan.up_ask.hold_max_age_sec == pytest.approx(3.0)
     assert plan.sell_churn_hold_up_active is False
     assert plan.sell_churn_hold_dn_active is False
     assert plan.sell_churn_hold_side == ""
@@ -832,7 +883,7 @@ def test_flat_start_sells_get_short_sell_reprice_hold_mode():
     assert plan.up_ask.hold_mode_active is True
     assert plan.up_ask.hold_mode_reason == "sell_reprice_hold_mode"
     assert plan.up_ask.hold_reprice_threshold_ticks == 12
-    assert plan.up_ask.hold_max_age_sec == pytest.approx(6.0)
+    assert plan.up_ask.hold_max_age_sec == pytest.approx(3.0)
     assert plan.dn_ask.hold_mode_active is True
     assert plan.dn_ask.hold_mode_reason == "sell_reprice_hold_mode"
 
@@ -1136,8 +1187,75 @@ def test_sell_skip_churn_keeps_buy_quarantine_active_in_unwind():
     assert plan.up_ask.hold_mode_reason == "sell_churn_hold_mode"
     assert plan.dn_bid is None
     assert plan.suppressed_reasons["dn_bid"] == "marketability_churn_confirmed"
-    assert plan.dual_bid_exception_active is True
-    assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
+
+
+def test_diagnostic_no_guards_keeps_two_sided_quotes_despite_guard_suppressions():
+    cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=14.0)
+    snapshot = _snapshot(
+        fv_up=0.82,
+        fv_dn=0.18,
+        pm_mid_up=0.53,
+        pm_mid_dn=0.47,
+        up_best_bid=0.52,
+        up_best_ask=0.54,
+        dn_best_bid=0.46,
+        dn_best_ask=0.48,
+        market_tradeable=True,
+        market_quality_score=0.91,
+    )
+    inventory = _inventory(
+        up_shares=9.6,
+        sellable_up_shares=9.6,
+        excess_up_qty=9.6,
+        excess_up_value_usd=4.9,
+        excess_value_usd=4.9,
+        signed_excess_value_usd=4.9,
+        total_inventory_value_usd=4.9,
+        free_usdc=295.0,
+        pair_value_over_target_usd=4.0,
+    )
+    base_risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snapshot,
+        inventory=inventory,
+        analytics=AnalyticsState(
+            marketability_guard_active=True,
+            marketability_guard_reason="sell_skip_cooldown",
+            marketability_churn_confirmed=True,
+            marketability_problem_side="up",
+            marketability_side_locked="up",
+            marketability_side_lock_age_sec=15.0,
+        ),
+        health=HealthState(),
+    )
+    risk = replace(
+        base_risk,
+        soft_mode="normal",
+        target_soft_mode="normal",
+        marketability_guard_active=True,
+        marketability_guard_reason="sell_skip_cooldown",
+        marketability_guard_up_active=True,
+        marketability_guard_dn_active=True,
+        marketability_churn_confirmed=True,
+        marketability_problem_side="up",
+        marketability_side_locked="up",
+        marketability_side_lock_age_sec=15.0,
+        inventory_side="up",
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snapshot,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=5.0, diagnostic_no_guards=True),
+    )
+    assert plan.up_bid is not None
+    assert plan.dn_bid is not None
+    assert plan.up_ask is not None
+    assert plan.dn_ask is not None
+    assert plan.up_bid.price < float(snapshot.up_best_ask)
+    assert plan.dn_bid.price < float(snapshot.dn_best_ask)
+    assert plan.quote_viability_reason == "diagnostic_no_guards_active"
+    assert plan.dual_bid_exception_active is False
+    assert plan.dual_bid_exception_reason == ""
 
 
 def test_sell_skip_guard_holds_inventory_backed_problem_side_sell_even_if_not_helpful():

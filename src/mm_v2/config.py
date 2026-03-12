@@ -56,6 +56,10 @@ class MMConfigV2:
         "harmful_buy_suppress_ratio": (0.10, 0.90),
         "base_half_spread_bps": (5.0, 5000.0),
         "max_half_spread_bps": (25.0, 10000.0),
+        "vol_spread_multiplier": (0.5, 10.0),
+        "maker_fee_bps": (0.0, 1000.0),
+        "taker_fee_bps": (0.0, 1000.0),
+        "min_edge_bps": (0.0, 1000.0),
         "inventory_skew_strength": (0.1, 10.0),
         "defensive_spread_mult": (1.0, 10.0),
         "defensive_size_mult": (0.1, 1.0),
@@ -85,7 +89,11 @@ class MMConfigV2:
     harmful_buy_suppress_ratio: float = 0.30
     base_half_spread_bps: float = 100.0
     max_half_spread_bps: float = 600.0
-    inventory_skew_strength: float = 1.0
+    vol_spread_multiplier: float = 2.0
+    maker_fee_bps: float = 0.0
+    taker_fee_bps: float = 0.0
+    min_edge_bps: float = 20.0
+    inventory_skew_strength: float = 2.0
     defensive_spread_mult: float = 1.5
     defensive_size_mult: float = 0.4
     unwind_window_sec: float = 90.0
@@ -97,14 +105,14 @@ class MMConfigV2:
     market_scope: str = "BTC_15m"
 
     # Internal/runtime parameters kept explicit for reproducibility.
-    tick_interval_sec: float = 2.0
+    tick_interval_sec: float = 1.0
     min_market_quality_score: float = 0.35
     min_entry_depth_usd: float = 50.0
     max_entry_spread_bps: float = 800.0
     reconcile_drift_threshold_shares: float = 1.5
     fill_settlement_grace_sec: float = 6.0
     sell_release_grace_sec: float = 3.0
-    requote_threshold_bps: float = 15.0
+    requote_threshold_bps: float = 8.0
     fallback_poll_cap: int = 12
 
     def effective_base_clip_usd(self) -> float:

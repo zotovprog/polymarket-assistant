@@ -24,6 +24,7 @@ class PairValuationResult:
     confidence: float
     regime: str
     pm_age_sec: float
+    realized_vol_per_min: float = 0.0005
 
 
 class PairValuationEngine:
@@ -112,6 +113,7 @@ class PairValuationEngine:
         total = max(1e-9, model_up + model_dn)
         model_up /= total
         model_dn /= total
+        realized_vol_per_min = float(getattr(self.provider, "last_vol", 0.0005) or 0.0005)
         pm_mid_up = float(pm_up) if pm_up is not None else None
         pm_mid_dn = float(pm_dn) if pm_dn is not None else None
         book_mid_up = self._book_mid(up_book)
@@ -197,6 +199,7 @@ class PairValuationEngine:
             confidence=confidence,
             regime=regime,
             pm_age_sec=pm_age,
+            realized_vol_per_min=realized_vol_per_min,
         )
         snapshot = PairMarketSnapshot(
             ts=time.time(),
@@ -219,6 +222,7 @@ class PairValuationEngine:
             dn_ask_depth_usd=self._safe_depth(dn_book, "ask"),
             market_quality_score=quality.overall_score,
             market_tradeable=quality.tradeable,
+            realized_vol_per_min=realized_vol_per_min,
             midpoint_anchor_up=float(midpoint_anchor_up),
             midpoint_anchor_dn=float(midpoint_anchor_dn),
             model_anchor_up=float(model_up),

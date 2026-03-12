@@ -151,6 +151,22 @@ def _risk(**overrides) -> RiskRegime:
     return RiskRegime(**payload)
 
 
+def test_buy_requote_threshold_is_more_sensitive_than_sell():
+    class _Gateway:
+        def active_orders(self):
+            return {}
+
+    tracker = OrderTrackerV2()
+    policy = ExecutionPolicyV2(_Gateway(), tracker, requote_threshold_bps=10.0)
+    current_buy = QuoteIntent("up-token", "BUY", 0.50, 5.0, "base_bid", True)
+    new_buy = QuoteIntent("up-token", "BUY", 0.5004, 5.0, "base_bid", True)
+    current_sell = QuoteIntent("up-token", "SELL", 0.50, 5.0, "base_ask", True)
+    new_sell = QuoteIntent("up-token", "SELL", 0.5004, 5.0, "base_ask", True)
+
+    assert policy._materially_different(current_buy, new_buy) is True
+    assert policy._materially_different(current_sell, new_sell) is False
+
+
 def test_force_normal_soft_mode_active_only_outside_terminal_and_without_hard_risk():
     class _MockClient:
         pass
@@ -170,6 +186,30 @@ def test_force_normal_soft_mode_active_only_outside_terminal_and_without_hard_ri
         risk=_risk(),
     ) is False
     assert mm._force_normal_soft_mode_active(
+        snapshot=_snapshot(time_left_sec=300.0),
+        risk=_risk(hard_mode="emergency_unwind"),
+    ) is False
+
+
+def test_force_normal_no_guards_active_only_outside_terminal_and_without_hard_risk():
+    class _MockClient:
+        pass
+
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0),
+        force_normal_no_guards_paper=True,
+    )
+    assert mm._force_normal_no_guards_active(
+        snapshot=_snapshot(time_left_sec=300.0),
+        risk=_risk(),
+    ) is True
+    assert mm._force_normal_no_guards_active(
+        snapshot=_snapshot(time_left_sec=60.0),
+        risk=_risk(),
+    ) is False
+    assert mm._force_normal_no_guards_active(
         snapshot=_snapshot(time_left_sec=300.0),
         risk=_risk(hard_mode="emergency_unwind"),
     ) is False

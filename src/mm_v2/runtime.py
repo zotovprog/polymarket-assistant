@@ -50,6 +50,7 @@ class _PendingMarkoutEval:
 
 class MarketMakerV2:
     OPERATOR_PNL_EMA_ALPHA = 0.20
+    ROLLING_MARKOUT_EMA_ALPHA = 0.20
     POST_FILL_MARKOUT_EVAL_SEC = 5.0
     TOXIC_FILL_MARKOUT_TICKS = 3
     NEGATIVE_MARKOUT_TICKS = 1
@@ -67,10 +68,12 @@ class MarketMakerV2:
         config: MMConfigV2,
         *,
         force_normal_soft_mode_paper: bool = False,
+        force_normal_no_guards_paper: bool = False,
     ):
         self.feed_state = feed_state
         self.config = config
         self._force_normal_soft_mode_paper = bool(force_normal_soft_mode_paper)
+        self._force_normal_no_guards_paper = bool(force_normal_no_guards_paper)
         self.gateway = PMGateway(clob_client, config)
         self.valuation = PairValuationEngine(config)
         self.reconcile = ReconcileV2(config)
@@ -128,6 +131,18 @@ class MarketMakerV2:
         self._session_pnl_operator_ema_usd = 0.0
         self._session_pnl_operator_usd = 0.0
         self._operator_pnl_initialized = False
+        self._avg_entry_price_up = 0.0
+        self._avg_entry_price_dn = 0.0
+        self._entry_position_up = 0.0
+        self._entry_position_dn = 0.0
+        self._total_bought_up = 0.0
+        self._total_bought_dn = 0.0
+        self._total_sold_up = 0.0
+        self._total_sold_dn = 0.0
+        self._rolling_markout_up_5s = 0.0
+        self._rolling_markout_dn_5s = 0.0
+        self._rolling_spread_capture_up = 0.0
+        self._rolling_spread_capture_dn = 0.0
         self._pending_markout_evals.clear()
         self._post_fill_markout_5s_up = 0.0
         self._post_fill_markout_5s_dn = 0.0
@@ -293,6 +308,49 @@ class MarketMakerV2:
             except Exception:
                 pass
 
+    def _record_fill_entry_metrics(self, fill: Fill, token_side: str) -> None:
+        if token_side not in {"up", "dn"}:
+            return
+        size = max(0.0, float(fill.size))
+        price = max(0.0, float(fill.price))
+        fee = max(0.0, float(getattr(fill, "fee", 0.0) or 0.0))
+        if token_side == "up":
+            avg_attr = "_avg_entry_price_up"
+            pos_attr = "_entry_position_up"
+            bought_attr = "_total_bought_up"
+            sold_attr = "_total_sold_up"
+        else:
+            avg_attr = "_avg_entry_price_dn"
+            pos_attr = "_entry_position_dn"
+            bought_attr = "_total_bought_dn"
+            sold_attr = "_total_sold_dn"
+
+        current_position = max(0.0, float(getattr(self, pos_attr)))
+        current_avg = max(0.0, float(getattr(self, avg_attr)))
+        if str(fill.side).upper() == "BUY":
+            weighted_cost = current_avg * current_position
+            new_position = current_position + size
+            if new_position > 0.0:
+                setattr(self, avg_attr, (weighted_cost + (price * size) + fee) / new_position)
+            else:
+                setattr(self, avg_attr, 0.0)
+            setattr(self, pos_attr, new_position)
+            setattr(self, bought_attr, float(getattr(self, bought_attr)) + size)
+            return
+
+        matched_size = min(size, current_position)
+        new_position = max(0.0, current_position - matched_size)
+        setattr(self, pos_attr, new_position)
+        setattr(self, sold_attr, float(getattr(self, sold_attr)) + size)
+        if new_position <= 1e-9:
+            setattr(self, avg_attr, 0.0)
+
+    @staticmethod
+    def _ema(prev: float, new_value: float, alpha: float) -> float:
+        if abs(float(prev)) <= 1e-12:
+            return float(new_value)
+        return (float(alpha) * float(new_value)) + ((1.0 - float(alpha)) * float(prev))
+
     async def _on_heartbeat_failure(self) -> None:
         self._heartbeat_failed = True
         self.set_alert("heartbeat_failure_v2", "Heartbeat failure", level="error")
@@ -356,6 +414,18 @@ class MarketMakerV2:
         self._drawdown_breach_ticks = 0
         self._drawdown_breach_started_ts = 0.0
         self._drawdown_breach_active = False
+        self._avg_entry_price_up = 0.0
+        self._avg_entry_price_dn = 0.0
+        self._entry_position_up = 0.0
+        self._entry_position_dn = 0.0
+        self._total_bought_up = 0.0
+        self._total_bought_dn = 0.0
+        self._total_sold_up = 0.0
+        self._total_sold_dn = 0.0
+        self._rolling_markout_up_5s = 0.0
+        self._rolling_markout_dn_5s = 0.0
+        self._rolling_spread_capture_up = 0.0
+        self._rolling_spread_capture_dn = 0.0
         self._mm_regime_degraded_started_ts = 0.0
         self._mm_regime_degraded_reason = ""
         self._unwind_target_mismatch_ticks = 0
@@ -675,7 +745,19 @@ class MarketMakerV2:
         risk: RiskRegime,
     ) -> bool:
         return bool(
-            self._force_normal_soft_mode_paper
+            (self._force_normal_soft_mode_paper or self._force_normal_no_guards_paper)
+            and str(risk.hard_mode or "") == "none"
+            and float(snapshot.time_left_sec) > float(self._terminal_liquidation_start_sec())
+        )
+
+    def _force_normal_no_guards_active(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        risk: RiskRegime,
+    ) -> bool:
+        return bool(
+            self._force_normal_no_guards_paper
             and str(risk.hard_mode or "") == "none"
             and float(snapshot.time_left_sec) > float(self._terminal_liquidation_start_sec())
         )
@@ -722,6 +804,16 @@ class MarketMakerV2:
 
         if token_side == "up":
             self._post_fill_markout_5s_up = float(markout)
+            self._rolling_markout_up_5s = self._ema(
+                self._rolling_markout_up_5s,
+                float(markout),
+                float(self.ROLLING_MARKOUT_EMA_ALPHA),
+            )
+            self._rolling_spread_capture_up = self._ema(
+                self._rolling_spread_capture_up,
+                float(markout),
+                float(self.ROLLING_MARKOUT_EMA_ALPHA),
+            )
             self._negative_spread_capture_streak_up = (
                 self._negative_spread_capture_streak_up + 1
                 if is_negative
@@ -743,6 +835,16 @@ class MarketMakerV2:
             return
 
         self._post_fill_markout_5s_dn = float(markout)
+        self._rolling_markout_dn_5s = self._ema(
+            self._rolling_markout_dn_5s,
+            float(markout),
+            float(self.ROLLING_MARKOUT_EMA_ALPHA),
+        )
+        self._rolling_spread_capture_dn = self._ema(
+            self._rolling_spread_capture_dn,
+            float(markout),
+            float(self.ROLLING_MARKOUT_EMA_ALPHA),
+        )
         self._negative_spread_capture_streak_dn = (
             self._negative_spread_capture_streak_dn + 1
             if is_negative
@@ -1302,10 +1404,21 @@ class MarketMakerV2:
             other_side = "dn" if locked_side == "up" else "up"
             locked_score = self._marketability_side_score(marketability_state, locked_side)
             other_score = self._marketability_side_score(marketability_state, other_side)
+            other_streak = max(
+                int(marketability_state.get(f"{other_side}_collateral_warning_streak") or 0),
+                int(marketability_state.get(f"{other_side}_sell_skip_cooldown_streak") or 0),
+                int(marketability_state.get(f"{other_side}_collateral_warning_hits_60s") or 0),
+                int(marketability_state.get(f"{other_side}_sell_skip_cooldown_hits_60s") or 0),
+            )
             if locked_score > 0 and other_score < (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN)):
                 side = locked_side
-            elif other_score >= (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN)):
+            elif (
+                other_score >= (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN))
+                and other_streak > 3
+            ):
                 side = other_side
+            else:
+                side = locked_side
         self._marketability_churn_hold_until = ref_now + float(self.MARKETABILITY_CHURN_HOLD_SEC)
         self._set_marketability_side_lock(side, now=ref_now)
         return True, side
@@ -1328,6 +1441,10 @@ class MarketMakerV2:
             abs(float(inventory.up_shares)) <= 1e-9
             and abs(float(inventory.dn_shares)) <= 1e-9
         )
+        if flat_inventory and not active_hold_order:
+            self._marketability_churn_hold_until = 0.0
+            self._clear_marketability_side_lock()
+            return False, ""
         if not flat_inventory:
             resolved_side = str(side or locked_side or "")
             if resolved_side in {"up", "dn"}:
@@ -1473,6 +1590,8 @@ class MarketMakerV2:
             self.reconcile.record_fill(fill, self.market)
             token_side = self._token_side_for_fill(fill, self.market)
             if token_side:
+                self._record_fill_entry_metrics(fill, token_side)
+            if token_side:
                 self._pending_markout_evals.append(
                     _PendingMarkoutEval(
                         ts=float(getattr(fill, "ts", time.time()) or time.time()),
@@ -1569,6 +1688,11 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
+        pair_entry_cost = 0.0
+        if float(inventory.paired_qty) > 0.0:
+            pair_entry_cost = max(0.0, float(self._avg_entry_price_up) + float(self._avg_entry_price_dn))
+        inventory.pair_entry_cost = float(pair_entry_cost)
+        inventory.pair_entry_pnl_per_share = 1.0 - float(pair_entry_cost)
         marketability_churn_confirmed, marketability_problem_side = self._normalize_marketability_churn_state(
             confirmed=bool(marketability_churn_confirmed),
             side=str(marketability_problem_side or ""),
@@ -1617,6 +1741,12 @@ class MarketMakerV2:
             session_pnl_equity_usd=self._session_pnl_equity_usd,
             session_pnl_operator_usd=self._session_pnl_operator_usd,
             session_pnl_operator_ema_usd=self._session_pnl_operator_ema_usd,
+            pair_entry_cost=float(inventory.pair_entry_cost),
+            pair_entry_pnl_per_share=float(inventory.pair_entry_pnl_per_share),
+            rolling_markout_up_5s=float(self._rolling_markout_up_5s),
+            rolling_markout_dn_5s=float(self._rolling_markout_dn_5s),
+            rolling_spread_capture_up=float(self._rolling_spread_capture_up),
+            rolling_spread_capture_dn=float(self._rolling_spread_capture_dn),
             marketability_guard_active=bool(marketability_guard_active),
             marketability_guard_reason=str(marketability_guard_reason),
             marketability_churn_confirmed=bool(marketability_churn_confirmed),
@@ -1683,6 +1813,12 @@ class MarketMakerV2:
             marketability_problem_side=str(marketability_problem_side or ""),
             marketability_side_locked=str(marketability_side_locked or ""),
             marketability_side_lock_age_sec=float(marketability_side_lock_age_sec),
+            pair_entry_cost=float(inventory.pair_entry_cost),
+            pair_entry_pnl_per_share=float(inventory.pair_entry_pnl_per_share),
+            rolling_markout_up_5s=float(self._rolling_markout_up_5s),
+            rolling_markout_dn_5s=float(self._rolling_markout_dn_5s),
+            rolling_spread_capture_up=float(self._rolling_spread_capture_up),
+            rolling_spread_capture_dn=float(self._rolling_spread_capture_dn),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -1701,10 +1837,15 @@ class MarketMakerV2:
             )
         inventory.inventory_pressure_abs = risk.inventory_pressure_abs
         inventory.inventory_pressure_signed = risk.inventory_pressure_signed
+        force_normal_no_guards_active = self._force_normal_no_guards_active(
+            snapshot=snapshot,
+            risk=risk,
+        )
         ctx = QuoteContext(
             tick_size=float(self.market.tick_size),
             min_order_size=float(self.market.min_order_size),
             allow_naked_sells=self.gateway.supports_naked_sells(),
+            diagnostic_no_guards=bool(force_normal_no_guards_active),
         )
         force_normal_soft_mode_active = self._force_normal_soft_mode_active(
             snapshot=snapshot,
@@ -2291,6 +2432,8 @@ class MarketMakerV2:
             position_mark_value_mid_usd=float(position_mark_value_mid),
             portfolio_mark_value_usd=float(portfolio_mark_value),
             tradeable_portfolio_value_usd=float(tradeable_portfolio_value),
+            pair_entry_cost=float(inventory.pair_entry_cost),
+            pair_entry_pnl_per_share=float(inventory.pair_entry_pnl_per_share),
             anchor_divergence_up=float(snapshot.anchor_divergence_up),
             anchor_divergence_dn=float(snapshot.anchor_divergence_dn),
             buy_edge_gap_up=float(getattr(snapshot, "buy_edge_gap_up", 0.0) or 0.0),
@@ -2299,6 +2442,10 @@ class MarketMakerV2:
             quote_shift_from_mid_dn=float(quote_shift_from_mid_dn),
             post_fill_markout_5s_up=float(self._post_fill_markout_5s_up),
             post_fill_markout_5s_dn=float(self._post_fill_markout_5s_dn),
+            rolling_markout_up_5s=float(self._rolling_markout_up_5s),
+            rolling_markout_dn_5s=float(self._rolling_markout_dn_5s),
+            rolling_spread_capture_up=float(self._rolling_spread_capture_up),
+            rolling_spread_capture_dn=float(self._rolling_spread_capture_dn),
             toxic_fill_streak_up=int(self._toxic_fill_streak_up),
             toxic_fill_streak_dn=int(self._toxic_fill_streak_dn),
             side_soft_brake_up_active=bool(self._side_soft_brake_active("up")),
@@ -2315,8 +2462,8 @@ class MarketMakerV2:
             pnl_mark_basis="conservative_bid",
             pnl_updated_ts=float(now),
             markout_1s=0.0,
-            markout_5s=0.0,
-            spread_capture_usd=0.0,
+            markout_5s=float(max(abs(self._rolling_markout_up_5s), abs(self._rolling_markout_dn_5s))),
+            spread_capture_usd=float(self._rolling_spread_capture_up + self._rolling_spread_capture_dn),
             fill_rate=0.0,
             quote_presence_ratio=quote_presence_ratio,
             excess_value_usd=float(inventory.excess_value_usd),
@@ -2406,6 +2553,7 @@ class MarketMakerV2:
             post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
             failure_bucket_current=str(failure_bucket_current or ""),
             execution_replay_blocker_hint=str(execution_replay_blocker_hint or ""),
+            diagnostic_no_guards_active=bool(force_normal_no_guards_active),
             unwind_deferred_hits_60s=int(unwind_deferred_hits_60s),
             forced_unwind_extreme_excess_hits_60s=int(forced_unwind_extreme_excess_hits_60s),
             mm_regime_degraded_reason=str(self._mm_regime_degraded_reason or ""),
@@ -2529,6 +2677,7 @@ class MarketMakerV2:
             "post_terminal_cleanup_grace_sec": float(grace_sec),
             "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
             "force_normal_soft_mode_paper": bool(self._force_normal_soft_mode_paper),
+            "force_normal_no_guards_paper": bool(self._force_normal_no_guards_paper),
             "drawdown_breach_age_sec": (
                 max(0.0, time.time() - self._drawdown_breach_started_ts)
                 if self._drawdown_breach_started_ts > 0.0

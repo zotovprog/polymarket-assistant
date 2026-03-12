@@ -50,6 +50,7 @@ class QuoteContext:
     tick_size: float
     min_order_size: float
     allow_naked_sells: bool = True
+    diagnostic_no_guards: bool = False
 
 
 class QuotePolicyV2:
@@ -67,7 +68,7 @@ class QuotePolicyV2:
     SELL_CHURN_HOLD_REPRICE_TICKS = 6
     SELL_CHURN_HOLD_MAX_AGE_SEC = 20.0
     SELL_REPRICE_HOLD_REPRICE_TICKS = 12
-    SELL_REPRICE_HOLD_MAX_AGE_SEC = 6.0
+    SELL_REPRICE_HOLD_MAX_AGE_SEC = 3.0
 
     def __init__(self, config: MMConfigV2):
         self.config = config
@@ -252,8 +253,16 @@ class QuotePolicyV2:
     def _inventory_backed_sell_size_from_clip(clip_usd: float, price: float) -> float:
         return clip_usd / max(0.01, float(price))
 
-    def _spread(self, risk: RiskRegime) -> float:
-        base = self._bps_to_price(self.config.base_half_spread_bps)
+    def _spread(self, risk: RiskRegime, snapshot: PairMarketSnapshot) -> float:
+        vol = max(0.0003, float(getattr(snapshot, "realized_vol_per_min", 0.0005) or 0.0005))
+        time_left_min = max(0.1, float(snapshot.time_left_sec) / 60.0)
+        vol_spread = vol * math.sqrt(time_left_min) * float(self.config.vol_spread_multiplier)
+        fee_spread = self._bps_to_price(float(self.config.maker_fee_bps) * 2.0)
+        base = max(
+            self._bps_to_price(self.config.base_half_spread_bps),
+            vol_spread,
+            fee_spread,
+        )
         if risk.soft_mode == "defensive":
             base *= float(self.config.defensive_spread_mult)
         elif risk.soft_mode == "unwind":
@@ -488,7 +497,7 @@ class QuotePolicyV2:
         midpoint_anchor_dn = self._midpoint_anchor(snapshot, "dn")
         model_anchor_up = self._model_anchor(snapshot, "up")
         model_anchor_dn = self._model_anchor(snapshot, "dn")
-        spread = self._spread(risk)
+        spread = self._spread(risk, snapshot)
         clip_usd = self._clip_usd(risk)
         free_usdc = max(0.0, float(inventory.free_usdc))
         budget_headroom_usd = max(1.0, free_usdc * 0.20)
@@ -506,6 +515,9 @@ class QuotePolicyV2:
             float(self.config.effective_hard_excess_value_ratio()) * budget_usd,
         )
         material_inventory_usd = max(6.0, 0.20 * budget_usd)
+        pair_entry_cost = max(0.0, float(getattr(inventory, "pair_entry_cost", 0.0) or 0.0))
+        pair_entry_pnl_per_share = float(getattr(inventory, "pair_entry_pnl_per_share", 0.0) or 0.0)
+        pair_entry_loss_per_share = max(0.0, -pair_entry_pnl_per_share)
         pre_protective_harmful_buy_guard_usd = max(2.0, 0.60 * defensive_cap_usd)
         harmful_side_floor_block_usd = max(
             pre_protective_harmful_buy_guard_usd,
@@ -535,16 +547,35 @@ class QuotePolicyV2:
             -model_shift_cap,
             model_shift_cap,
         ) * max(0.0, 1.0 - dn_anchor_divergence_pressure)
-        mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.0025
+        mid_shift = float(risk.inventory_pressure_signed) * float(self.config.inventory_skew_strength) * 0.01
         up_mid = max(0.01, min(0.99, market_anchor_mid + up_model_shift - mid_shift))
         dn_mid = max(0.01, min(0.99, float(midpoint_anchor_dn) + dn_model_shift + mid_shift))
         pair_reference_price = self._pair_reference_price(snapshot)
         outside_near_expiry = float(snapshot.time_left_sec) > float(self.config.unwind_window_sec)
 
+        if pair_entry_loss_per_share > 0.0 and float(inventory.paired_qty) >= float(ctx.min_order_size):
+            spread = min(
+                self._bps_to_price(self.config.max_half_spread_bps),
+                float(spread) + (pair_entry_loss_per_share * 0.5),
+            )
+
         up_bid_price = up_mid - spread
         up_ask_price = up_mid + spread
         dn_bid_price = dn_mid - spread
         dn_ask_price = dn_mid + spread
+
+        skew_factor = abs(float(risk.inventory_pressure_signed)) * float(self.config.inventory_skew_strength)
+        if skew_factor > 0.0:
+            if risk.inventory_side == "up":
+                up_bid_price -= spread * skew_factor * 0.5
+                up_ask_price -= spread * skew_factor * 0.3
+                dn_bid_price += spread * skew_factor * 0.3
+                dn_ask_price += spread * skew_factor * 0.5
+            elif risk.inventory_side == "dn":
+                dn_bid_price -= spread * skew_factor * 0.5
+                dn_ask_price -= spread * skew_factor * 0.3
+                up_bid_price += spread * skew_factor * 0.3
+                up_ask_price += spread * skew_factor * 0.5
 
         raw_quotes = {
             "up_bid": ("BUY", snapshot.up_token_id, up_bid_price, snapshot.up_best_bid, snapshot.up_best_ask, "base_bid"),
@@ -576,11 +607,16 @@ class QuotePolicyV2:
         sell_churn_hold_side = ""
         gross_inventory_brake_active_tick = False
         side_soft_brake_active_tick = False
+        diagnostic_no_guards = bool(getattr(ctx, "diagnostic_no_guards", False))
         marketability_churn_confirmed = bool(getattr(risk, "marketability_churn_confirmed", False))
         marketability_problem_side = str(getattr(risk, "marketability_side_locked", "") or "")
         if marketability_problem_side not in {"up", "dn"}:
             marketability_problem_side = str(getattr(risk, "marketability_problem_side", "") or "")
         marketability_guard_reason = str(getattr(risk, "marketability_guard_reason", "") or "")
+        if diagnostic_no_guards:
+            marketability_churn_confirmed = False
+            marketability_problem_side = ""
+            marketability_guard_reason = ""
         if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
             marketability_problem_side = str(risk.inventory_side)
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
@@ -618,6 +654,8 @@ class QuotePolicyV2:
             side_material_inventory.get(marketability_problem_side, False)
         )
         marketability_buy_quarantine_active = bool(
+            (not diagnostic_no_guards)
+            and
             marketability_churn_confirmed
             and problem_side_inventory_present
             and risk.hard_mode == "none"
@@ -628,11 +666,15 @@ class QuotePolicyV2:
             )
         )
         drawdown_brake_active = (
+            (not diagnostic_no_guards)
+            and
             risk.hard_mode == "none"
             and risk.soft_mode in {"normal", "inventory_skewed"}
             and float(getattr(risk, "early_drawdown_pressure", 0.0) or 0.0) >= 0.50
         )
         harmful_drawdown_block_active = (
+            (not diagnostic_no_guards)
+            and
             risk.hard_mode == "none"
             and risk.soft_mode in {"normal", "inventory_skewed"}
             and float(getattr(risk, "early_drawdown_pressure", 0.0) or 0.0) >= 0.75
@@ -659,6 +701,9 @@ class QuotePolicyV2:
                 snapshot=snapshot,
                 risk=risk,
             )
+            if diagnostic_no_guards:
+                token_hard_block_sec = 0.0
+                token_soft_brake_active = False
             if (
                 side == "BUY"
                 and token_soft_brake_active
@@ -698,6 +743,40 @@ class QuotePolicyV2:
                         max(self.TOXIC_SIDE_SIZE_BRAKE_MIN, 1.0 - 0.50 * float(token_divergence_pressure)),
                     )
             if (
+                not diagnostic_no_guards
+                and side == "BUY"
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
+            ):
+                rolling_markout = float(
+                    getattr(
+                        risk,
+                        "rolling_markout_up_5s" if token_side == "up" else "rolling_markout_dn_5s",
+                        0.0,
+                    )
+                    or 0.0
+                )
+                min_acceptable_edge = max(
+                    self._bps_to_price(float(self.config.min_edge_bps)),
+                    self._bps_to_price(float(self.config.maker_fee_bps) * 2.0),
+                )
+                expected_edge = max(0.0, float(spread) - abs(rolling_markout))
+                if expected_edge + 1e-9 < min_acceptable_edge:
+                    edge_shortfall = min_acceptable_edge - expected_edge
+                    extra_ticks = int(math.ceil(edge_shortfall / max(ctx.tick_size, 1e-9)))
+                    token_spread_extra_ticks = max(token_spread_extra_ticks, extra_ticks)
+                    token_buy_size_brake_mult = min(
+                        token_buy_size_brake_mult,
+                        max(0.15, 1.0 - (edge_shortfall / max(min_acceptable_edge, 1e-9))),
+                    )
+                    midpoint_first_brake_hits += 1
+                    if edge_shortfall > max(float(spread), min_acceptable_edge * 1.5):
+                        built[slot] = None
+                        suppressed_reasons[slot] = "min_edge_not_met"
+                        continue
+            if (
+                not diagnostic_no_guards
+                and
                 side == "BUY"
                 and bool(snapshot.market_tradeable)
                 and risk.hard_mode == "none"
@@ -732,6 +811,8 @@ class QuotePolicyV2:
                     else:
                         divergence_soft_brake_dn_active = True
             if (
+                not diagnostic_no_guards
+                and
                 side == "BUY"
                 and token_hard_block_sec > 0.0
                 and risk.hard_mode == "none"
@@ -742,6 +823,8 @@ class QuotePolicyV2:
                 midpoint_first_brake_hits += 1
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 risk.soft_mode in {"normal", "inventory_skewed"}
                 and risk.target_soft_mode in {"defensive", "unwind"}
                 and side == "BUY"
@@ -752,6 +835,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "harmful_buy_blocked_pre_protective"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 risk.soft_mode in {"normal", "inventory_skewed"}
                 and side == "BUY"
                 and effect == "harmful"
@@ -767,6 +852,8 @@ class QuotePolicyV2:
                     False,
                 )
             )
+            if diagnostic_no_guards:
+                marketability_guard_side_active = False
             marketability_churn_side_active = bool(
                 marketability_churn_confirmed
                 and problem_side_inventory_present
@@ -794,6 +881,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 marketability_churn_confirmed
                 and side == "SELL"
                 and effect != "helpful"
@@ -809,6 +898,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 marketability_guard_side_active
                 and side == "BUY"
                 and risk.hard_mode == "none"
@@ -818,6 +909,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "marketability_guard"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 risk.soft_mode == "inventory_skewed"
                 and side == "BUY"
                 and effect == "harmful"
@@ -827,6 +920,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "harmful_buy_blocked_high_skew"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 risk.soft_mode in {"defensive", "unwind"}
                 and effect == "harmful"
                 and not allow_defensive_churn_inventory_sell
@@ -838,13 +933,16 @@ class QuotePolicyV2:
                     else "harmful_suppressed_in_unwind"
                 )
                 continue
-            if risk.soft_mode == "unwind" and self._would_expand_excess(
+            if (
+                not diagnostic_no_guards
+                and risk.soft_mode == "unwind"
+                and self._would_expand_excess(
                 token=token,
                 side=side,
                 inventory_side=risk.inventory_side,
                 up_token_id=snapshot.up_token_id,
                 dn_token_id=snapshot.dn_token_id,
-            ):
+            )):
                 built[slot] = None
                 suppressed_reasons[slot] = "pair-expanding intent disabled in unwind"
                 continue
@@ -912,6 +1010,8 @@ class QuotePolicyV2:
                 and not sell_churn_hold_candidate
             )
             if (
+                not diagnostic_no_guards
+                and
                 marketability_churn_side_active
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
@@ -924,6 +1024,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "marketability_churn_confirmed"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 marketability_guard_side_active
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
@@ -933,6 +1035,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "marketability_guard"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 risk.soft_mode in {"defensive", "unwind"}
                 and inventory.pair_value_over_target_usd > 0.0
                 and expands_gross_inventory
@@ -941,6 +1045,8 @@ class QuotePolicyV2:
                 suppressed_reasons[slot] = "target_pair_ratio_cap"
                 continue
             if (
+                not diagnostic_no_guards
+                and
                 side == "BUY"
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed"}
@@ -956,6 +1062,8 @@ class QuotePolicyV2:
             harmful_buy_brake_mult = 1.0
             gross_inventory_brake_mult = 1.0
             if (
+                not diagnostic_no_guards
+                and
                 side == "BUY"
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed"}
@@ -978,7 +1086,7 @@ class QuotePolicyV2:
                 if gross_inventory_brake_mult < 0.999:
                     gross_inventory_brake_active_tick = True
                     gross_inventory_brake_hits += 1
-            if side == "BUY" and effect == "harmful":
+            if side == "BUY" and effect == "harmful" and not diagnostic_no_guards:
                 harmful_buy_brake_mult = self._harmful_buy_brake_mult(
                     inventory=inventory,
                     risk=risk,
@@ -1471,30 +1579,33 @@ class QuotePolicyV2:
                                         built[missing_slot] = intent
                                         suppressed_reasons[missing_slot] = "dual_bid_guard_applied"
 
-        if (
-            outside_near_expiry
-            and risk.hard_mode == "none"
-            and risk.soft_mode in {"normal", "inventory_skewed", "unwind"}
-            and bool(snapshot.market_tradeable)
-        ):
-            up_reason = str(suppressed_reasons.get("up_bid") or "")
-            dn_reason = str(suppressed_reasons.get("dn_bid") or "")
-            up_bid_active = built["up_bid"] is not None
-            dn_bid_active = built["dn_bid"] is not None
             if (
-                up_bid_active
-                and not dn_bid_active
-                and dn_reason == "divergence_buy_hard_suppress"
-            ) or (
-                dn_bid_active
-                and not up_bid_active
-                and up_reason == "divergence_buy_hard_suppress"
+                outside_near_expiry
+                and risk.hard_mode == "none"
+                and risk.soft_mode in {"normal", "inventory_skewed", "unwind"}
+                and bool(snapshot.market_tradeable)
             ):
-                dual_bid_exception_active = True
-                dual_bid_exception_reason = "divergence_buy_hard_suppress"
-            elif sell_churn_hold_side in {"up", "dn"} and (not up_bid_active or not dn_bid_active):
-                dual_bid_exception_active = True
-                dual_bid_exception_reason = "sell_churn_hold_mode"
+                up_reason = str(suppressed_reasons.get("up_bid") or "")
+                dn_reason = str(suppressed_reasons.get("dn_bid") or "")
+                up_bid_active = built["up_bid"] is not None
+                dn_bid_active = built["dn_bid"] is not None
+                if (
+                    up_bid_active
+                    and not dn_bid_active
+                    and dn_reason == "divergence_buy_hard_suppress"
+                ) or (
+                    dn_bid_active
+                    and not up_bid_active
+                    and up_reason == "divergence_buy_hard_suppress"
+                ):
+                    dual_bid_exception_active = True
+                    dual_bid_exception_reason = "divergence_buy_hard_suppress"
+                elif sell_churn_hold_side in {"up", "dn"} and (not up_bid_active or not dn_bid_active):
+                    dual_bid_exception_active = True
+                    dual_bid_exception_reason = "sell_churn_hold_mode"
+                elif diagnostic_no_guards and (not up_bid_active or not dn_bid_active):
+                    dual_bid_exception_active = True
+                    dual_bid_exception_reason = "diagnostic_no_guards_active"
 
         regime = risk.soft_mode
         reason = risk.reason
@@ -1566,6 +1677,27 @@ class QuotePolicyV2:
                 built["dn_bid"] = None
                 built["dn_ask"] = None
 
+        if (
+            not diagnostic_no_guards
+            and pair_entry_loss_per_share > 0.0
+            and float(inventory.paired_qty) >= float(ctx.min_order_size)
+            and built.get("up_bid") is not None
+            and built.get("dn_bid") is not None
+        ):
+            candidate_slots = ["up_bid", "dn_bid"]
+            suppress_slot = min(
+                candidate_slots,
+                key=lambda slot: (
+                    {"harmful": 0, "neutral": 1, "helpful": 2}.get(
+                        str(getattr(built[slot], "inventory_effect", "neutral") or "neutral"),
+                        1,
+                    ),
+                    str(slot),
+                ),
+            )
+            built[suppress_slot] = None
+            suppressed_reasons[suppress_slot] = "pair_entry_cost_block"
+
         helpful_count, harmful_count, neutral_count = self._count_effects(built)
         harmful_blocked = False
         if (
@@ -1608,6 +1740,8 @@ class QuotePolicyV2:
             quote_viability_reason = "helpful_floor_applied"
         elif neutral_floor_applied:
             quote_viability_reason = "min_viable_floor_applied"
+        elif bool(getattr(ctx, "diagnostic_no_guards", False)):
+            quote_viability_reason = "diagnostic_no_guards_active"
         elif bool(getattr(risk, "marketability_churn_confirmed", False)):
             quote_viability_reason = "marketability_churn_confirmed"
         elif bool(getattr(risk, "marketability_guard_active", False)):

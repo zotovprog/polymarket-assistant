@@ -19,6 +19,7 @@ if BASE not in sys.path:
 from mm_v2.config import MMConfigV2
 from mm_v2.runtime import MarketMakerV2
 from mm_v2.types import PairInventoryState, PairMarketSnapshot
+from mm_shared.types import Fill
 
 
 def _snapshot(**overrides) -> PairMarketSnapshot:
@@ -218,6 +219,25 @@ def test_wallet_portfolio_includes_reserved_usdc(monkeypatch):
 def test_state_exposes_pnl_component_fields():
     analytics = MarketMakerV2(SimpleNamespace(), type("_MockClient", (), {"_orders": {}})(), MMConfigV2())._last_analytics
     assert hasattr(analytics, "position_mark_value_usd")
+
+
+def test_runtime_tracks_pair_entry_cost_from_buys():
+    mm = MarketMakerV2(SimpleNamespace(), type("_MockClient", (), {"_orders": {}})(), MMConfigV2())
+    mm._record_fill_entry_metrics(Fill(ts=time.time(), side="BUY", token_id="up-token", price=0.42, size=5.0), "up")
+    mm._record_fill_entry_metrics(Fill(ts=time.time(), side="BUY", token_id="dn-token", price=0.67, size=5.0), "dn")
+
+    inventory = _inventory(
+        up_shares=5.0,
+        dn_shares=5.0,
+        paired_qty=5.0,
+        total_inventory_value_usd=5.45,
+    )
+    inventory.pair_entry_cost = mm._avg_entry_price_up + mm._avg_entry_price_dn
+    inventory.pair_entry_pnl_per_share = 1.0 - inventory.pair_entry_cost
+
+    analytics = mm._last_analytics
+    assert inventory.pair_entry_cost == pytest.approx(1.09)
+    assert inventory.pair_entry_pnl_per_share == pytest.approx(-0.09)
     assert hasattr(analytics, "position_mark_value_bid_usd")
     assert hasattr(analytics, "position_mark_value_mid_usd")
     assert hasattr(analytics, "portfolio_mark_value_usd")

@@ -885,6 +885,7 @@ function updateMMRegime(mmRegime, state) {
     const marketabilityProblemSide = String(mmRegime?.marketability_problem_side || '').trim();
     const marketabilitySideLocked = String(mmRegime?.marketability_side_locked || '').trim();
     const marketabilitySideLockAgeSec = Number(mmRegime?.marketability_side_lock_age_sec ?? 0);
+    const diagnosticNoGuardsActive = Boolean(mmRegime?.diagnostic_no_guards_active ?? false);
     const collateralWarningHits = Number(mmRegime?.collateral_warning_hits_60s ?? 0);
     const sellSkipCooldownHits = Number(mmRegime?.sell_skip_cooldown_hits_60s ?? 0);
     const executionChurnRatio = Math.max(0, Number(mmRegime?.execution_churn_ratio_60s ?? 0));
@@ -951,6 +952,9 @@ function updateMMRegime(mmRegime, state) {
     if (marketabilitySideLocked) {
         why += ` Сторона churn зафиксирована: ${marketabilitySideLocked.toUpperCase()} (${Math.max(0, marketabilitySideLockAgeSec).toFixed(0)}s).`;
     }
+    if (diagnosticNoGuardsActive) {
+        why += ' Активен диагностический режим Normal + No Guards: торговые suppressions отключены, этот run не годится как production verdict.';
+    }
     if (harmfulBuyBrakeActive) {
         why += ' Harmful BUY brake активен: скорость набора перекоса ограничена.';
     }
@@ -976,6 +980,7 @@ function updateMMRegime(mmRegime, state) {
     const signalHints = [];
     if (makerGuardHits > 0) signalHints.push(`maker_guard=${makerGuardHits}`);
     if (failureBucketCurrent) signalHints.push(`failure_bucket=${failureBucketCurrent}`);
+    if (diagnosticNoGuardsActive) signalHints.push('diagnostic_no_guards=1');
     signalHints.push(`dual_bid_ratio=${(dualBid * 100).toFixed(0)}%`);
     signalHints.push(`one_sided_streak=${Math.max(0, oneSidedBidStreak)}`);
     if (marketabilityGuardActive) signalHints.push('marketability_guard=1');
@@ -1201,10 +1206,18 @@ async function toggleMM() {
         const tf = document.getElementById('tf-select').value;
         const paper = document.getElementById('paper-mode').checked;
         const stake = parseFloat(document.getElementById('stake-usdc').value) || 10;
+        const forceNormalNoGuards = Boolean(document.getElementById('paper-force-normal-no-guards')?.checked);
         const r = await fetch(`${API_BASE}/api/mmv2/start`, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ coin, timeframe: tf, paper_mode: paper, initial_usdc: stake }),
+            body: JSON.stringify({
+                coin,
+                timeframe: tf,
+                paper_mode: paper,
+                initial_usdc: stake,
+                force_normal_soft_mode: forceNormalNoGuards,
+                force_normal_no_guards: forceNormalNoGuards,
+            }),
         });
         if (!r.ok) {
             const err = await r.json().catch(() => ({ detail: 'Failed to start MM' }));

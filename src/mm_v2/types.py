@@ -26,6 +26,7 @@ class PairMarketSnapshot:
     dn_ask_depth_usd: float
     market_quality_score: float
     market_tradeable: bool
+    realized_vol_per_min: float = 0.0005
     midpoint_anchor_up: float | None = None
     midpoint_anchor_dn: float | None = None
     model_anchor_up: float | None = None
@@ -67,6 +68,8 @@ class PairInventoryState:
     target_pair_value_usd: float = 0.0
     pair_value_ratio: float = 0.0
     pair_value_over_target_usd: float = 0.0
+    pair_entry_cost: float = 0.0
+    pair_entry_pnl_per_share: float = 0.0
     inventory_pressure_abs: float = 0.0
     inventory_pressure_signed: float = 0.0
     sellable_up_shares: float = 0.0
@@ -174,6 +177,12 @@ class RiskRegime:
     marketability_problem_side: Literal["", "up", "dn"] = ""
     marketability_side_locked: Literal["", "up", "dn"] = ""
     marketability_side_lock_age_sec: float = 0.0
+    pair_entry_cost: float = 0.0
+    pair_entry_pnl_per_share: float = 0.0
+    rolling_markout_up_5s: float = 0.0
+    rolling_markout_dn_5s: float = 0.0
+    rolling_spread_capture_up: float = 0.0
+    rolling_spread_capture_dn: float = 0.0
 
 
 @dataclass
@@ -209,6 +218,8 @@ class AnalyticsState:
     position_mark_value_mid_usd: float = 0.0
     portfolio_mark_value_usd: float = 0.0
     tradeable_portfolio_value_usd: float = 0.0
+    pair_entry_cost: float = 0.0
+    pair_entry_pnl_per_share: float = 0.0
     anchor_divergence_up: float = 0.0
     anchor_divergence_dn: float = 0.0
     buy_edge_gap_up: float = 0.0
@@ -217,6 +228,10 @@ class AnalyticsState:
     quote_shift_from_mid_dn: float = 0.0
     post_fill_markout_5s_up: float = 0.0
     post_fill_markout_5s_dn: float = 0.0
+    rolling_markout_up_5s: float = 0.0
+    rolling_markout_dn_5s: float = 0.0
+    rolling_spread_capture_up: float = 0.0
+    rolling_spread_capture_dn: float = 0.0
     toxic_fill_streak_up: int = 0
     toxic_fill_streak_dn: int = 0
     side_soft_brake_up_active: bool = False
@@ -320,6 +335,7 @@ class AnalyticsState:
     untradeable_tolerated_samples_60s: int = 0
     failure_bucket_current: str = ""
     execution_replay_blocker_hint: str = ""
+    diagnostic_no_guards_active: bool = False
     post_terminal_cleanup_grace_active: bool = False
     unwind_target_mismatch_ticks: int = 0
     unwind_target_mismatch_sec: float = 0.0
