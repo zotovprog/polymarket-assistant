@@ -1750,7 +1750,15 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
     monkeypatch.setattr(web_server._runtime, "_running", True)
     captured = {}
 
-    async def _fake_start(coin, timeframe, paper_mode, initial_usdc, dev=False, session_budget_usd=None):
+    async def _fake_start(
+        coin,
+        timeframe,
+        paper_mode,
+        initial_usdc,
+        dev=False,
+        session_budget_usd=None,
+        force_normal_soft_mode=False,
+    ):
         captured.update(
             {
                 "coin": coin,
@@ -1759,17 +1767,26 @@ async def test_mmv2_start_ignores_legacy_runtime_flag(monkeypatch):
                 "initial_usdc": initial_usdc,
                 "dev": dev,
                 "session_budget_usd": session_budget_usd,
+                "force_normal_soft_mode": force_normal_soft_mode,
             }
         )
         return {"ok": True}
 
     monkeypatch.setattr(web_server._runtime_v2, "start", _fake_start)
-    req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=True, initial_usdc=30.0, dev=True)
+    req = web_server.StartRequest(
+        coin="BTC",
+        timeframe="15m",
+        paper_mode=True,
+        initial_usdc=30.0,
+        dev=True,
+        force_normal_soft_mode=True,
+    )
     resp = await web_server.mmv2_start(req=req, request=object())
     assert resp["ok"] is True
     assert captured["coin"] == "BTC"
     assert captured["timeframe"] == "15m"
     assert captured["session_budget_usd"] == pytest.approx(30.0)
+    assert captured["force_normal_soft_mode"] is True
 
 
 @pytest.mark.asyncio
@@ -1780,7 +1797,15 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     web_server._runtime_v2.mm_config_v2.session_budget_usd = 75.0
     captured = {}
 
-    async def _fake_start(coin, timeframe, paper_mode, initial_usdc, dev=False, session_budget_usd=None):
+    async def _fake_start(
+        coin,
+        timeframe,
+        paper_mode,
+        initial_usdc,
+        dev=False,
+        session_budget_usd=None,
+        force_normal_soft_mode=False,
+    ):
         captured.update(
             {
                 "coin": coin,
@@ -1789,6 +1814,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
                 "initial_usdc": initial_usdc,
                 "dev": dev,
                 "session_budget_usd": session_budget_usd,
+                "force_normal_soft_mode": force_normal_soft_mode,
             }
         )
         return {"ok": True}
@@ -1800,6 +1826,7 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
     assert captured["paper_mode"] is False
     assert captured["initial_usdc"] == pytest.approx(1000.0)
     assert captured["session_budget_usd"] == pytest.approx(75.0)
+    assert captured["force_normal_soft_mode"] is False
 
 
 @pytest.mark.asyncio
@@ -1814,6 +1841,26 @@ async def test_live_start_rejects_budget_below_30(monkeypatch):
         await web_server.mmv2_start(req=req, request=object())
     assert exc.value.status_code == 400
     assert "live_min_budget_30_required" in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_live_start_rejects_force_normal_soft_mode(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(web_server._runtime, "_running", False)
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 30.0
+
+    req = web_server.StartRequest(
+        coin="BTC",
+        timeframe="15m",
+        paper_mode=False,
+        dev=True,
+        force_normal_soft_mode=True,
+    )
+    with pytest.raises(web_server.HTTPException) as exc:
+        await web_server.mmv2_start(req=req, request=object())
+    assert exc.value.status_code == 400
+    assert "paper-only" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio
@@ -1833,6 +1880,21 @@ def test_runtime_v2_start_accepts_session_budget_kwarg():
     web_server = importlib.import_module("web_server")
     params = inspect.signature(web_server._runtime_v2.start).parameters
     assert "session_budget_usd" in params
+    assert "force_normal_soft_mode" in params
+
+
+def test_runtime_snapshot_exposes_force_normal_soft_mode_flag():
+    class _MockClient:
+        pass
+
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(),
+        force_normal_soft_mode_paper=True,
+    )
+    snap = mm.snapshot()
+    assert snap["runtime"]["force_normal_soft_mode_paper"] is True
 
 
 @pytest.mark.asyncio

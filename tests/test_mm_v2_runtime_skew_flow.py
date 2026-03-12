@@ -133,6 +133,48 @@ def _risk_and_plan(cfg: MMConfigV2, snapshot: PairMarketSnapshot, inventory: Pai
     return risk, plan, viability
 
 
+def _risk(**overrides) -> RiskRegime:
+    payload = dict(
+        soft_mode="defensive",
+        hard_mode="none",
+        reason="x",
+        inventory_pressure=0.0,
+        edge_score=0.0,
+        drawdown_pct_budget=1.0,
+        inventory_side="flat",
+        inventory_pressure_abs=0.0,
+        inventory_pressure_signed=0.0,
+        quality_pressure=0.0,
+        target_soft_mode="defensive",
+    )
+    payload.update(overrides)
+    return RiskRegime(**payload)
+
+
+def test_force_normal_soft_mode_active_only_outside_terminal_and_without_hard_risk():
+    class _MockClient:
+        pass
+
+    mm = MarketMakerV2(
+        SimpleNamespace(),
+        _MockClient(),
+        MMConfigV2(unwind_window_sec=90.0, emergency_taker_start_sec=20.0),
+        force_normal_soft_mode_paper=True,
+    )
+    assert mm._force_normal_soft_mode_active(
+        snapshot=_snapshot(time_left_sec=300.0),
+        risk=_risk(),
+    ) is True
+    assert mm._force_normal_soft_mode_active(
+        snapshot=_snapshot(time_left_sec=60.0),
+        risk=_risk(),
+    ) is False
+    assert mm._force_normal_soft_mode_active(
+        snapshot=_snapshot(time_left_sec=300.0),
+        risk=_risk(hard_mode="emergency_unwind"),
+    ) is False
+
+
 def test_dn_excess_near_endpoint_below_hard_cap_keeps_safe_plan():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(

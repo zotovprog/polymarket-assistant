@@ -173,6 +173,7 @@ class StartRequest(BaseModel):
     paper_mode: bool = True  # Paper trading by default for safety
     initial_usdc: float = 1000.0
     dev: bool = False
+    force_normal_soft_mode: bool = False
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -2628,6 +2629,7 @@ class MMRuntimeV2(MMRuntime):
         self.mm_config_v2: MMConfigV2 = MMConfigV2()
         self._live_budget_gate_passed: bool = False
         self._paper_budget_gate_passed: bool = False
+        self._force_normal_soft_mode_paper: bool = False
         self._last_terminal_runtime_v2: dict[str, Any] = {
             "last_terminal_reason": "",
             "last_terminal_ts": 0.0,
@@ -2909,6 +2911,7 @@ class MMRuntimeV2(MMRuntime):
                 ),
                 "live_budget_gate_passed": bool(self._live_budget_gate_passed),
                 "paper_budget_gate_passed": bool(self._paper_budget_gate_passed),
+                "force_normal_soft_mode_paper": bool(self._force_normal_soft_mode_paper),
                 "drawdown_breach_ticks": 0,
                 "drawdown_breach_age_sec": 0.0,
             },
@@ -2954,6 +2957,7 @@ class MMRuntimeV2(MMRuntime):
         initial_usdc: float = 1000.0,
         dev: bool = False,
         session_budget_usd: Optional[float] = None,
+        force_normal_soft_mode: bool = False,
     ) -> dict:
         if self._running and self.mm_v2:
             try:
@@ -2983,6 +2987,7 @@ class MMRuntimeV2(MMRuntime):
         self._paper_mode = bool(paper_mode)
         self._dev_mode = bool(dev)
         self._initial_usdc = float(initial_usdc)
+        self._force_normal_soft_mode_paper = bool(force_normal_soft_mode and paper_mode)
         effective_session_budget = (
             float(session_budget_usd)
             if session_budget_usd is not None
@@ -3009,6 +3014,11 @@ class MMRuntimeV2(MMRuntime):
                     f"live_min_budget_30_required: requested={effective_session_budget:.2f} "
                     f"min={self.LIVE_MIN_BUDGET_USD:.2f}"
                 ),
+            )
+        if force_normal_soft_mode and not self._paper_mode:
+            raise HTTPException(
+                status_code=400,
+                detail="force_normal_soft_mode is paper-only",
             )
 
         if dev:
@@ -3082,7 +3092,12 @@ class MMRuntimeV2(MMRuntime):
             initial_usdc=self._initial_usdc,
         )
         self.mm_config_v2.session_budget_usd = effective_session_budget
-        self.mm_v2 = MarketMakerV2(self.feed_state, clob, self.mm_config_v2)
+        self.mm_v2 = MarketMakerV2(
+            self.feed_state,
+            clob,
+            self.mm_config_v2,
+            force_normal_soft_mode_paper=self._force_normal_soft_mode_paper,
+        )
         self.mm_v2.set_market(market)
         await self._attach_mongo_logger(
             register_fill=lambda mongo: self.mm_v2.on_fill(
@@ -3859,6 +3874,7 @@ async def mmv2_start(req: StartRequest, request: Request):
         req.initial_usdc,
         dev=req.dev,
         session_budget_usd=session_budget_usd,
+        force_normal_soft_mode=req.force_normal_soft_mode,
     )
     return {"ok": True, "state": result}
 

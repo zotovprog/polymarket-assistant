@@ -60,9 +60,17 @@ class MarketMakerV2:
     MARKETABILITY_SIDE_LOCK_SEC = 20.0
     MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN = 2
 
-    def __init__(self, feed_state: Any, clob_client: Any, config: MMConfigV2):
+    def __init__(
+        self,
+        feed_state: Any,
+        clob_client: Any,
+        config: MMConfigV2,
+        *,
+        force_normal_soft_mode_paper: bool = False,
+    ):
         self.feed_state = feed_state
         self.config = config
+        self._force_normal_soft_mode_paper = bool(force_normal_soft_mode_paper)
         self.gateway = PMGateway(clob_client, config)
         self.valuation = PairValuationEngine(config)
         self.reconcile = ReconcileV2(config)
@@ -659,6 +667,18 @@ class MarketMakerV2:
         if self._terminal_liquidation_started_ts <= 0.0:
             return 0.0
         return max(0.0, float(now - self._terminal_liquidation_started_ts))
+
+    def _force_normal_soft_mode_active(
+        self,
+        *,
+        snapshot: PairMarketSnapshot,
+        risk: RiskRegime,
+    ) -> bool:
+        return bool(
+            self._force_normal_soft_mode_paper
+            and str(risk.hard_mode or "") == "none"
+            and float(snapshot.time_left_sec) > float(self._terminal_liquidation_start_sec())
+        )
 
     def _coerce_terminal_drawdown_risk(
         self,
@@ -1686,10 +1706,24 @@ class MarketMakerV2:
             min_order_size=float(self.market.min_order_size),
             allow_naked_sells=self.gateway.supports_naked_sells(),
         )
+        force_normal_soft_mode_active = self._force_normal_soft_mode_active(
+            snapshot=snapshot,
+            risk=risk,
+        )
+        provisional_risk = (
+            replace(
+                risk,
+                soft_mode="normal",
+                target_soft_mode="normal",
+                reason="paper override: force normal soft mode",
+            )
+            if force_normal_soft_mode_active
+            else risk
+        )
         provisional_plan = QuotePolicyV2(self.config).generate(
             snapshot=snapshot,
             inventory=inventory,
-            risk=risk,
+            risk=provisional_risk,
             ctx=ctx,
         )
         terminal_window_active = float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec())
@@ -1839,28 +1873,22 @@ class MarketMakerV2:
                 self._terminal_liquidation_started_ts = 0.0
                 self._terminal_liquidation_round_idx = 0
                 self.clear_alert("terminal_liquidation_v2")
-            transition = self.state_machine.transition(
-                snapshot=snapshot,
-                inventory=inventory,
-                risk=risk,
-                viability=self._provisional_quote_viability(provisional_plan),
-            )
-            effective_risk = replace(
-                risk,
-                soft_mode=transition.effective_soft_mode,
-                target_soft_mode=transition.target_soft_mode,
-                reason=transition.reason or risk.reason,
-                emergency_taker_forced=bool(emergency_taker_forced),
-            )
-            lifecycle = transition.lifecycle
-            if lifecycle in {"halted", "expired"}:
-                await self.gateway.cancel_all()
-                self.tracker.refresh_from_active(self.gateway.active_orders())
-                plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
-                terminal_reason = risk.reason if lifecycle == "halted" else "expired"
-                self._set_terminal_reason(terminal_reason or lifecycle)
-                self._running = False
-            else:
+            if force_normal_soft_mode_active:
+                self.state_machine._set_lifecycle("quoting")
+                transition = SoftTransitionResult(
+                    lifecycle="quoting",
+                    effective_soft_mode="normal",
+                    target_soft_mode="normal",
+                    reason="paper override: force normal soft mode",
+                )
+                effective_risk = replace(
+                    risk,
+                    soft_mode="normal",
+                    target_soft_mode="normal",
+                    reason="paper override: force normal soft mode",
+                    emergency_taker_forced=bool(emergency_taker_forced),
+                )
+                lifecycle = transition.lifecycle
                 plan = QuotePolicyV2(self.config).generate(
                     snapshot=snapshot,
                     inventory=inventory,
@@ -1868,6 +1896,36 @@ class MarketMakerV2:
                     ctx=ctx,
                 )
                 await self.execution_policy.sync(plan)
+            else:
+                transition = self.state_machine.transition(
+                    snapshot=snapshot,
+                    inventory=inventory,
+                    risk=risk,
+                    viability=self._provisional_quote_viability(provisional_plan),
+                )
+                effective_risk = replace(
+                    risk,
+                    soft_mode=transition.effective_soft_mode,
+                    target_soft_mode=transition.target_soft_mode,
+                    reason=transition.reason or risk.reason,
+                    emergency_taker_forced=bool(emergency_taker_forced),
+                )
+                lifecycle = transition.lifecycle
+                if lifecycle in {"halted", "expired"}:
+                    await self.gateway.cancel_all()
+                    self.tracker.refresh_from_active(self.gateway.active_orders())
+                    plan = QuotePlan(None, None, None, None, lifecycle, risk.reason)
+                    terminal_reason = risk.reason if lifecycle == "halted" else "expired"
+                    self._set_terminal_reason(terminal_reason or lifecycle)
+                    self._running = False
+                else:
+                    plan = QuotePolicyV2(self.config).generate(
+                        snapshot=snapshot,
+                        inventory=inventory,
+                        risk=effective_risk,
+                        ctx=ctx,
+                    )
+                    await self.execution_policy.sync(plan)
         sync_metrics = self.execution_policy.consume_sync_metrics()
         lifecycle = transition.lifecycle
         unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
@@ -2470,6 +2528,7 @@ class MarketMakerV2:
             "post_terminal_cleanup_grace_active": bool(grace_active),
             "post_terminal_cleanup_grace_sec": float(grace_sec),
             "drawdown_breach_ticks": int(self._drawdown_breach_ticks),
+            "force_normal_soft_mode_paper": bool(self._force_normal_soft_mode_paper),
             "drawdown_breach_age_sec": (
                 max(0.0, time.time() - self._drawdown_breach_started_ts)
                 if self._drawdown_breach_started_ts > 0.0
