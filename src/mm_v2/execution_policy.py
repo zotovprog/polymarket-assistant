@@ -65,6 +65,24 @@ class ExecutionPolicyV2:
             return False
         return age_sec < min_rest_sec
 
+    @staticmethod
+    def _should_hold_existing_without_desired(existing: Any) -> bool:
+        current_intent = getattr(existing, "intent", None)
+        created_at = float(getattr(existing, "created_at", 0.0) or 0.0)
+        if current_intent is None or created_at <= 0.0:
+            return False
+        if current_intent.side != "SELL":
+            return False
+        if not bool(getattr(current_intent, "hold_mode_active", False)):
+            return False
+        if str(getattr(current_intent, "inventory_effect", "") or "") != "helpful":
+            return False
+        hold_max_age_sec = float(getattr(current_intent, "hold_max_age_sec", 0.0) or 0.0)
+        age_sec = max(0.0, float(time.time()) - created_at)
+        if hold_max_age_sec > 0.0 and age_sec >= hold_max_age_sec:
+            return False
+        return True
+
     def consume_sync_metrics(self) -> dict[str, int]:
         metrics = {
             "sell_churn_hold_reprice_suppressed_hits": int(self._sell_churn_hold_reprice_suppressed_hits),
@@ -78,6 +96,9 @@ class ExecutionPolicyV2:
         existing = self.tracker.get(slot_key)
         if desired is None:
             if existing:
+                if self._should_hold_existing_without_desired(existing):
+                    self._sell_churn_hold_cancel_avoided_hits += 1
+                    return
                 await self.gateway.cancel(existing.order_id)
                 self.tracker.delete(slot_key)
             return

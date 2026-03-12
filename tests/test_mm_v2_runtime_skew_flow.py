@@ -443,6 +443,61 @@ async def test_execution_policy_sell_churn_hold_reprices_on_large_move_or_age(mo
     assert len(gateway.placed) == 1
 
 
+@pytest.mark.asyncio
+async def test_execution_policy_sell_churn_hold_keeps_existing_when_plan_drops_sub_min(monkeypatch):
+    class DummyGateway:
+        def __init__(self) -> None:
+            self.cancelled: list[str] = []
+            self.placed: list[QuoteIntent] = []
+            self._active_orders = {
+                "oid-1": Quote(side="SELL", token_id="up-token", price=0.54, size=7.8),
+            }
+
+        def active_orders(self):
+            return dict(self._active_orders)
+
+        async def cancel(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            self._active_orders.pop(order_id, None)
+            return True
+
+        async def place_intent(self, intent: QuoteIntent) -> str | None:
+            self.placed.append(intent)
+            return "oid-new"
+
+    gateway = DummyGateway()
+    tracker = OrderTrackerV2()
+    tracker.set(
+        "up_sell",
+        "oid-1",
+        QuoteIntent(
+            token="up-token",
+            side="SELL",
+            price=0.54,
+            size=7.8,
+            quote_role="base_ask",
+            post_only=True,
+            inventory_effect="helpful",
+            hold_mode_active=True,
+            hold_mode_reason="sell_churn_hold_mode",
+            hold_reprice_threshold_ticks=6,
+            hold_max_age_sec=20.0,
+            hold_tick_size=0.01,
+        ),
+    )
+    tracker.slots["up_sell"].created_at = 100.0
+    policy = ExecutionPolicyV2(gateway, tracker, requote_threshold_bps=15.0)
+    monkeypatch.setattr("mm_v2.execution_policy.time.time", lambda: 110.0)
+
+    await policy.sync(QuotePlan(None, None, None, None, "defensive", "marketability"))
+
+    assert gateway.cancelled == []
+    assert gateway.placed == []
+    assert tracker.get("up_sell") is not None
+    metrics = policy.consume_sync_metrics()
+    assert metrics["sell_churn_hold_cancel_avoided_hits"] == 1
+
+
 def test_helpful_quotes_can_be_restored_by_promotion():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(

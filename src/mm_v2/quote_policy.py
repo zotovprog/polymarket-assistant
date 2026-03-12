@@ -579,13 +579,22 @@ class QuotePolicyV2:
         if marketability_problem_side not in {"up", "dn"} and risk.inventory_side in {"up", "dn"}:
             marketability_problem_side = str(risk.inventory_side)
         material_inventory = float(inventory.total_inventory_value_usd) >= material_inventory_usd
+        problem_side_inventory_present = False
         problem_side_material_inventory = False
         if marketability_problem_side == "up":
+            problem_side_inventory_present = max(
+                float(inventory.sellable_up_shares),
+                float(inventory.up_shares),
+            ) > 1e-9
             problem_side_material_inventory = max(
                 float(inventory.sellable_up_shares),
                 float(inventory.up_shares),
             ) >= float(ctx.min_order_size)
         elif marketability_problem_side == "dn":
+            problem_side_inventory_present = max(
+                float(inventory.sellable_dn_shares),
+                float(inventory.dn_shares),
+            ) > 1e-9
             problem_side_material_inventory = max(
                 float(inventory.sellable_dn_shares),
                 float(inventory.dn_shares),
@@ -738,7 +747,7 @@ class QuotePolicyV2:
             )
             marketability_churn_side_active = bool(
                 marketability_churn_confirmed
-                and problem_side_material_inventory
+                and problem_side_inventory_present
                 and token_side == marketability_problem_side
             )
             if (

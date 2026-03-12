@@ -847,6 +847,7 @@ def test_sell_churn_hold_mode_marks_explicit_dual_bid_exception():
     assert plan.dual_bid_exception_reason == "sell_churn_hold_mode"
 
 
+
 def test_helpful_floor_keeps_quotes_alive_in_defensive_below_hard_cap():
     cfg = MMConfigV2(session_budget_usd=50.0, base_clip_usd=6.0)
     snapshot = _snapshot(
