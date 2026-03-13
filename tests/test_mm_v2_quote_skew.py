@@ -142,7 +142,7 @@ def test_dynamic_spread_uses_realized_vol_and_fee_floor():
     assert spread >= policy._bps_to_price(50.0)
 
 
-def test_negative_pair_entry_cost_blocks_one_bid_and_widens_quotes():
+def test_negative_pair_entry_cost_blocks_both_bids_when_pair_is_lossmaking():
     cfg = MMConfigV2(session_budget_usd=300.0, base_clip_usd=14.0)
     snapshot = _snapshot(realized_vol_per_min=0.0005)
     inventory = _inventory(
@@ -168,8 +168,9 @@ def test_negative_pair_entry_cost_blocks_one_bid_and_widens_quotes():
         ctx=QuoteContext(tick_size=0.01, min_order_size=5.0),
     )
 
-    assert sum(1 for intent in (plan.up_bid, plan.dn_bid) if intent is not None) == 1
-    assert "pair_entry_cost_block" in plan.suppressed_reasons.values()
+    assert plan.up_bid is None
+    assert plan.dn_bid is None
+    assert "pair_entry_cost_block_both" in plan.suppressed_reasons.values()
 
 
 def test_helpful_sell_is_priced_more_aggressively_than_harmful_sell():
