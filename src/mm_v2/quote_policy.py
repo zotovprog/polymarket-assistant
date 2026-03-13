@@ -1723,22 +1723,47 @@ class QuotePolicyV2:
             not diagnostic_no_guards
             and pair_entry_loss_per_share > 0.0
             and float(inventory.paired_qty) >= float(ctx.min_order_size)
-            and built.get("up_bid") is not None
-            and built.get("dn_bid") is not None
         ):
-            candidate_slots = ["up_bid", "dn_bid"]
-            suppress_slot = min(
-                candidate_slots,
-                key=lambda slot: (
-                    {"harmful": 0, "neutral": 1, "helpful": 2}.get(
-                        str(getattr(built[slot], "inventory_effect", "neutral") or "neutral"),
-                        1,
+            pair_entry_cost_val = max(0.0, float(getattr(inventory, "pair_entry_cost", 0.0) or 0.0))
+            if pair_entry_cost_val > 1.0:
+                for slot in ("up_bid", "dn_bid"):
+                    if built.get(slot) is not None:
+                        built[slot] = None
+                        suppressed_reasons[slot] = "pair_entry_cost_block_both"
+            elif built.get("up_bid") is not None and built.get("dn_bid") is not None:
+                candidate_slots = ["up_bid", "dn_bid"]
+                suppress_slot = min(
+                    candidate_slots,
+                    key=lambda slot: (
+                        {"harmful": 0, "neutral": 1, "helpful": 2}.get(
+                            str(getattr(built[slot], "inventory_effect", "neutral") or "neutral"),
+                            1,
+                        ),
+                        str(slot),
                     ),
-                    str(slot),
-                ),
-            )
-            built[suppress_slot] = None
-            suppressed_reasons[suppress_slot] = "pair_entry_cost_block"
+                )
+                built[suppress_slot] = None
+                suppressed_reasons[suppress_slot] = "pair_entry_cost_block"
+
+        if not diagnostic_no_guards:
+            time_left = float(getattr(snapshot, "time_left_sec", 9999) or 9999)
+            unwind_window = float(getattr(self.config, "unwind_window_sec", 240) or 240)
+            if time_left <= unwind_window:
+                up_mid = float(getattr(snapshot, "pm_mid_up", 0.5) or 0.5)
+                dn_mid = float(getattr(snapshot, "pm_mid_dn", 0.5) or 0.5)
+                otm_threshold = 0.10
+                if up_mid < otm_threshold and built.get("up_bid") is not None:
+                    built["up_bid"] = None
+                    suppressed_reasons["up_bid"] = "deep_otm_near_expiry"
+                if dn_mid < otm_threshold and built.get("dn_bid") is not None:
+                    built["dn_bid"] = None
+                    suppressed_reasons["dn_bid"] = "deep_otm_near_expiry"
+
+        if not diagnostic_no_guards and bool(getattr(risk, "balance_api_degraded", False)):
+            for slot in ("up_bid", "dn_bid"):
+                if built.get(slot) is not None:
+                    built[slot] = None
+                    suppressed_reasons[slot] = "balance_api_degraded"
 
         helpful_count, harmful_count, neutral_count = self._count_effects(built)
         harmful_blocked = False

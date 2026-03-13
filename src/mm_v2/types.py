@@ -192,6 +192,7 @@ class RiskRegime:
     fast_move_soft_active: bool = False
     fast_move_hard_active: bool = False
     fast_move_pause_active: bool = False
+    balance_api_degraded: bool = False
 
 
 @dataclass

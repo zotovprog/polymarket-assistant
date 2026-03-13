@@ -172,6 +172,10 @@ class MarketMakerV2:
         self._underlying_mid_history: list[tuple[float, float]] = []
         self._fast_move_pause_until: float = 0.0
         self._last_merge_attempt_ts: float = 0.0
+        self._orders_cancelled_for_merge: bool = False
+        self._merge_consecutive_failures: int = 0
+        self._consecutive_balance_failures: int = 0
+        self._balance_api_degraded: bool = False
         self._private_key: str = ""
         self._last_snapshot: PairMarketSnapshot | None = None
         self._post_fill_markout_5s_up = 0.0
@@ -484,6 +488,10 @@ class MarketMakerV2:
         self._underlying_mid_history.clear()
         self._fast_move_pause_until = 0.0
         self._last_merge_attempt_ts = 0.0
+        self._orders_cancelled_for_merge = False
+        self._merge_consecutive_failures = 0
+        self._consecutive_balance_failures = 0
+        self._balance_api_degraded = False
         up_raw, dn_raw, total_usdc_raw, available_usdc_raw = await self.gateway.get_wallet_balances()
         up, dn, total_usdc, available_usdc, stale_wallet = self._coalesce_wallet_snapshot(
             up=up_raw,
@@ -828,6 +836,8 @@ class MarketMakerV2:
             return
         if self._force_normal_no_guards_active(snapshot=snapshot, risk=risk):
             return
+        if getattr(self, "_merge_consecutive_failures", 0) >= 5:
+            return
         time_left_sec = float(snapshot.time_left_sec)
         terminal_window_active = time_left_sec <= float(self._terminal_liquidation_start_sec())
         has_paired_shares = float(inventory.paired_qty) > 1e-9
@@ -858,7 +868,11 @@ class MarketMakerV2:
         if not hasattr(self.gateway.order_mgr.client, "_orders") and not str(self._private_key or "").strip():
             return
         self._last_merge_attempt_ts = float(now)
+        cancelled_orders = False
         try:
+            await self.gateway.cancel_all()
+            self.tracker.refresh_from_active(self.gateway.active_orders())
+            cancelled_orders = True
             result = await self.gateway.merge_pairs(
                 condition_id=str(self.market.condition_id),
                 amount_shares=float(inventory.paired_qty),
@@ -866,12 +880,19 @@ class MarketMakerV2:
             )
         except Exception as exc:
             self.set_alert("merge_pairs_v2", f"Pair merge failed: {exc}", level="warning")
+            self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
+            if cancelled_orders:
+                self._orders_cancelled_for_merge = True
             return
         if bool((result or {}).get("success")):
             self.clear_alert("merge_pairs_v2")
             self.gateway.invalidate_balance_caches()
+            self._merge_consecutive_failures = 0
         elif (result or {}).get("error"):
             self.set_alert("merge_pairs_v2", f"Pair merge skipped: {result.get('error')}", level="warning")
+            self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
+        if cancelled_orders:
+            self._orders_cancelled_for_merge = True
 
     def _terminal_liquidation_elapsed(self, *, now: float) -> float:
         if self._terminal_liquidation_started_ts <= 0.0:
@@ -1829,6 +1850,22 @@ class MarketMakerV2:
         )
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
+        sellable_balance_unknown = bool(
+            float(inventory.up_shares) > 1e-9
+            and float(inventory.sellable_up_shares) <= 1e-9
+            and float(inventory.pending_sell_up) <= 1e-9
+            and float(sell_release_lag.get("up_reserve", 0.0) or 0.0) <= 1e-9
+        ) or bool(
+            float(inventory.dn_shares) > 1e-9
+            and float(inventory.sellable_dn_shares) <= 1e-9
+            and float(inventory.pending_sell_dn) <= 1e-9
+            and float(sell_release_lag.get("dn_reserve", 0.0) or 0.0) <= 1e-9
+        )
+        if bool(effective_wallet_stale) or sellable_balance_unknown:
+            self._consecutive_balance_failures = getattr(self, "_consecutive_balance_failures", 0) + 1
+        else:
+            self._consecutive_balance_failures = 0
+        self._balance_api_degraded = bool(self._consecutive_balance_failures >= 3)
         pair_entry_cost = 0.0
         if float(inventory.paired_qty) > 0.0:
             pair_entry_cost = max(0.0, float(self._avg_entry_price_up) + float(self._avg_entry_price_dn))
@@ -1971,6 +2008,7 @@ class MarketMakerV2:
             fast_move_soft_active=bool(snapshot.fast_move_soft_active),
             fast_move_hard_active=bool(snapshot.fast_move_hard_active),
             fast_move_pause_active=bool(snapshot.fast_move_pause_active),
+            balance_api_degraded=bool(self._balance_api_degraded),
         )
         risk = self._coerce_terminal_drawdown_risk(
             snapshot=snapshot,
@@ -2213,6 +2251,7 @@ class MarketMakerV2:
                     ctx=ctx,
                 )
                 await self.execution_policy.sync(plan)
+                self._orders_cancelled_for_merge = False
             else:
                 transition = self.state_machine.transition(
                     snapshot=snapshot,
@@ -2243,6 +2282,7 @@ class MarketMakerV2:
                         ctx=ctx,
                     )
                     await self.execution_policy.sync(plan)
+                    self._orders_cancelled_for_merge = False
         sync_metrics = self.execution_policy.consume_sync_metrics()
         lifecycle = transition.lifecycle
         unwind_target_mismatch_sec = self._update_unwind_target_mismatch(
