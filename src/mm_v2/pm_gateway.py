@@ -289,7 +289,7 @@ class PMGateway:
             except Exception:
                 best_bid = 0.0
             if best_bid <= 0:
-                continue
+                best_bid = 0.01  # floor fallback when book empty
             discount_ticks = 1 + (2 * int(round_idx))
             price = max(0.01, round(best_bid - (tick * discount_ticks), 10))
             quote = Quote(

@@ -952,7 +952,6 @@ class MarketMakerV2:
                     f"Merge deferred: floor amount too small ({actual_mergeable:.2f})",
                     level="warning",
                 )
-                self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
                 self._orders_cancelled_for_merge = True
                 return
             result = await self.gateway.merge_pairs(
@@ -2183,6 +2182,7 @@ class MarketMakerV2:
                 self._terminal_liquidation_done = False
                 self._terminal_liquidation_reason = "terminal_liquidation_active"
                 just_armed_terminal = True
+                self._merge_consecutive_failures = 0  # reset merge breaker for terminal window
                 await self.gateway.cancel_all()
                 self.tracker.refresh_from_active(self.gateway.active_orders())
             terminal_timeout = (
