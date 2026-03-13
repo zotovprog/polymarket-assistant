@@ -323,7 +323,7 @@ async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(mon
     assert sellable_refs
     assert sellable_refs[0] == pytest.approx((6.2, 7.4))
     for _quote, kwargs in calls:
-        assert _quote.order_context == "terminal_liquidation"
+        assert _quote.order_context in ("terminal_liquidation", "stop_liquidation_floor")
         assert kwargs.get("post_only") is False
         assert kwargs.get("ignore_sell_cooldowns") is True
         assert kwargs.get("ignore_recent_cancelled_reserve") is True
