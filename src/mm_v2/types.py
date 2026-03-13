@@ -47,6 +47,8 @@ class PairMarketSnapshot:
     fast_move_soft_active: bool = False
     fast_move_hard_active: bool = False
     fast_move_pause_active: bool = False
+    fill_cluster_pause_up: bool = False
+    fill_cluster_pause_dn: bool = False
 
 
 @dataclass

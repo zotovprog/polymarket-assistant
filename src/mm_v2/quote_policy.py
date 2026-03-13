@@ -1752,12 +1752,22 @@ class QuotePolicyV2:
                 up_mid = float(getattr(snapshot, "pm_mid_up", 0.5) or 0.5)
                 dn_mid = float(getattr(snapshot, "pm_mid_dn", 0.5) or 0.5)
                 otm_threshold = 0.10
-                if up_mid < otm_threshold and built.get("up_bid") is not None:
+                up_bid_price = float(built["up_bid"].price) if built.get("up_bid") is not None else 999.0
+                dn_bid_price = float(built["dn_bid"].price) if built.get("dn_bid") is not None else 999.0
+                if (up_mid < otm_threshold or up_bid_price < otm_threshold) and built.get("up_bid") is not None:
                     built["up_bid"] = None
                     suppressed_reasons["up_bid"] = "deep_otm_near_expiry"
-                if dn_mid < otm_threshold and built.get("dn_bid") is not None:
+                if (dn_mid < otm_threshold or dn_bid_price < otm_threshold) and built.get("dn_bid") is not None:
                     built["dn_bid"] = None
                     suppressed_reasons["dn_bid"] = "deep_otm_near_expiry"
+
+        if not diagnostic_no_guards:
+            if bool(getattr(snapshot, "fill_cluster_pause_up", False)) and built.get("up_bid") is not None:
+                built["up_bid"] = None
+                suppressed_reasons["up_bid"] = "fill_cluster_pause"
+            if bool(getattr(snapshot, "fill_cluster_pause_dn", False)) and built.get("dn_bid") is not None:
+                built["dn_bid"] = None
+                suppressed_reasons["dn_bid"] = "fill_cluster_pause"
 
         if not diagnostic_no_guards and bool(getattr(risk, "balance_api_degraded", False)):
             for slot in ("up_bid", "dn_bid"):

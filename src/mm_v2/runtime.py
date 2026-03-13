@@ -171,6 +171,10 @@ class MarketMakerV2:
         self._marketability_side_lock_started_ts = 0.0
         self._underlying_mid_history: list[tuple[float, float]] = []
         self._fast_move_pause_until: float = 0.0
+        self._recent_fill_times_up: list[float] = []
+        self._recent_fill_times_dn: list[float] = []
+        self._fill_cluster_pause_until_up: float = 0.0
+        self._fill_cluster_pause_until_dn: float = 0.0
         self._last_merge_attempt_ts: float = 0.0
         self._orders_cancelled_for_merge: bool = False
         self._merge_consecutive_failures: int = 0
@@ -487,6 +491,10 @@ class MarketMakerV2:
         self._post_terminal_cleanup_grace_started_ts = 0.0
         self._underlying_mid_history.clear()
         self._fast_move_pause_until = 0.0
+        self._recent_fill_times_up = []
+        self._recent_fill_times_dn = []
+        self._fill_cluster_pause_until_up = 0.0
+        self._fill_cluster_pause_until_dn = 0.0
         self._last_merge_attempt_ts = 0.0
         self._orders_cancelled_for_merge = False
         self._merge_consecutive_failures = 0
@@ -824,6 +832,35 @@ class MarketMakerV2:
         snapshot.fast_move_hard_active = bool(hard_active)
         snapshot.fast_move_pause_active = bool(now < float(self._fast_move_pause_until))
 
+    def _record_fill_cluster(self, *, token_side: str, fill_side: str, now_ts: float) -> None:
+        if str(fill_side).upper() != "BUY":
+            return
+        if token_side == "up":
+            recent = [ts for ts in self._recent_fill_times_up if (now_ts - ts) <= 30.0]
+            recent.append(float(now_ts))
+            self._recent_fill_times_up = recent
+            if len(recent) >= 3:
+                self._fill_cluster_pause_until_up = max(
+                    float(self._fill_cluster_pause_until_up),
+                    float(now_ts) + 15.0,
+                )
+                self._recent_fill_times_up = []
+            return
+        if token_side == "dn":
+            recent = [ts for ts in self._recent_fill_times_dn if (now_ts - ts) <= 30.0]
+            recent.append(float(now_ts))
+            self._recent_fill_times_dn = recent
+            if len(recent) >= 3:
+                self._fill_cluster_pause_until_dn = max(
+                    float(self._fill_cluster_pause_until_dn),
+                    float(now_ts) + 15.0,
+                )
+                self._recent_fill_times_dn = []
+
+    def _apply_fill_cluster_pause_state(self, *, snapshot: PairMarketSnapshot, now: float) -> None:
+        snapshot.fill_cluster_pause_up = bool(float(now) < float(self._fill_cluster_pause_until_up))
+        snapshot.fill_cluster_pause_dn = bool(float(now) < float(self._fill_cluster_pause_until_dn))
+
     async def _maybe_merge_pairs(
         self,
         *,
@@ -873,6 +910,34 @@ class MarketMakerV2:
             await self.gateway.cancel_all()
             self.tracker.refresh_from_active(self.gateway.active_orders())
             cancelled_orders = True
+            await asyncio.sleep(4.0)
+            self.gateway.invalidate_balance_caches()
+            merge_qty = float(inventory.paired_qty)
+            wallet_up, wallet_dn = await asyncio.gather(
+                self.gateway.order_mgr.get_token_balance(
+                    self.market.up_token_id,
+                    source="merge_balance_check",
+                ),
+                self.gateway.order_mgr.get_token_balance(
+                    self.market.dn_token_id,
+                    source="merge_balance_check",
+                ),
+            )
+            if wallet_up is not None and wallet_dn is not None:
+                wallet_up_f = max(0.0, float(wallet_up))
+                wallet_dn_f = max(0.0, float(wallet_dn))
+                if wallet_up_f < (merge_qty - 0.01) or wallet_dn_f < (merge_qty - 0.01):
+                    self.set_alert(
+                        "merge_pairs_v2",
+                        (
+                            "Merge deferred: tokens not yet in wallet "
+                            f"(up={wallet_up_f:.2f}, dn={wallet_dn_f:.2f}, need={merge_qty:.2f})"
+                        ),
+                        level="warning",
+                    )
+                    self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
+                    self._orders_cancelled_for_merge = True
+                    return
             result = await self.gateway.merge_pairs(
                 condition_id=str(self.market.condition_id),
                 amount_shares=float(inventory.paired_qty),
@@ -1774,6 +1839,12 @@ class MarketMakerV2:
                     )
                 )
             self._emit_fill_callbacks(fill)
+            if token_side:
+                self._record_fill_cluster(
+                    token_side=token_side,
+                    fill_side=str(fill.side),
+                    now_ts=time.time(),
+                )
         up_book, dn_book = await self.gateway.get_books()
         valuation, snapshot = self.valuation.compute(
             market=self.market,
@@ -1783,6 +1854,7 @@ class MarketMakerV2:
         )
         now = time.time()
         self._update_fast_move_state(snapshot=snapshot, now=now)
+        self._apply_fill_cluster_pause_state(snapshot=snapshot, now=now)
         self._update_pending_markouts(snapshot=snapshot, now=now)
         self.gateway.sync_paper_prices(
             fv_up=valuation.fv_up,
