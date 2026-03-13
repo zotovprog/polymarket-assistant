@@ -57,7 +57,7 @@ class MarketMakerV2:
     HARD_BLOCK_NEGATIVE_STREAK = 3
     HARD_BLOCK_TOXIC_STREAK = 2
     SIDE_REENTRY_COOLDOWN_SEC = 12.0
-    MARKETABILITY_CHURN_HOLD_SEC = 12.0
+    MARKETABILITY_CHURN_HOLD_SEC = 6.0
     MARKETABILITY_SIDE_LOCK_SEC = 20.0
     MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN = 2
 
@@ -1610,7 +1610,7 @@ class MarketMakerV2:
                 dn_sell_skip_hits,
             )
             > 3
-            or execution_churn_ratio >= 0.50
+            or execution_churn_ratio >= 0.85
         )
         locked_side = self._marketability_locked_side(now=ref_now)
         if not confirmed:

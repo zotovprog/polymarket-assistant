@@ -150,8 +150,8 @@ def _derive_failure_bucket(state: dict[str, Any]) -> str:
     if (
         bool(analytics.get("marketability_guard_active"))
         or bool(analytics.get("marketability_churn_confirmed"))
-        or int(analytics.get("collateral_warning_streak_current") or 0) > 0
-        or int(analytics.get("sell_skip_cooldown_streak_current") or 0) > 0
+        or int(analytics.get("collateral_warning_streak_current") or 0) >= 4
+        or int(analytics.get("sell_skip_cooldown_streak_current") or 0) >= 4
         or (
             "collateral_warning_streak_current" not in analytics
             and int(analytics.get("collateral_warning_hits_60s") or 0) > 0
@@ -160,7 +160,7 @@ def _derive_failure_bucket(state: dict[str, Any]) -> str:
             "sell_skip_cooldown_streak_current" not in analytics
             and int(analytics.get("sell_skip_cooldown_hits_60s") or 0) > 0
         )
-        or float(analytics.get("execution_churn_ratio_60s") or 0.0) >= 0.50
+        or float(analytics.get("execution_churn_ratio_60s") or 0.0) >= 0.85
     ):
         return "marketability_churn"
     if (
