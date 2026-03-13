@@ -32,11 +32,24 @@ def _load_snapshots(path: Path) -> list[dict[str, Any]]:
 
 def _derive_failure_bucket(state: dict[str, Any]) -> str:
     analytics = state.get("analytics") or {}
+    runtime = state.get("runtime") or {}
+    market = state.get("market") or {}
+    lifecycle = str(state.get("lifecycle") or "")
+    if (
+        lifecycle == "expired"
+        and bool(runtime.get("terminal_liquidation_active"))
+        and bool(runtime.get("terminal_liquidation_done"))
+    ):
+        return ""
+    if (
+        bool(runtime.get("terminal_liquidation_active"))
+        and bool(runtime.get("terminal_liquidation_done"))
+        and float(market.get("time_left_sec") or 9999) <= 0.0
+    ):
+        return ""
     explicit = str(analytics.get("failure_bucket_current") or "").strip()
     health = state.get("health") or {}
     risk = state.get("risk") or {}
-    runtime = state.get("runtime") or {}
-    market = state.get("market") or {}
     min_order_size = float((state.get("config") or {}).get("min_order_size") or 5.0)
     time_left_sec = float(market.get("time_left_sec") or 0.0)
     if explicit and explicit != "terminal_execution":
@@ -49,7 +62,6 @@ def _derive_failure_bucket(state: dict[str, Any]) -> str:
         ) >= min_order_size
     ):
         return explicit
-    lifecycle = str(state.get("lifecycle") or "")
     if bool(health.get("true_drift")) or bool(health.get("wallet_snapshot_stale")):
         return "drift_transport"
     if bool(runtime.get("terminal_liquidation_active")) and time_left_sec <= 0.0 and (

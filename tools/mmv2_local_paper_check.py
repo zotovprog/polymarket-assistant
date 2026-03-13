@@ -117,14 +117,26 @@ def _start_with_retry(
 
 def _derive_failure_bucket(state: dict[str, Any]) -> str:
     analytics = state.get("analytics") or {}
+    runtime = state.get("runtime") or {}
+    market = state.get("market") or {}
+    lifecycle = str(state.get("lifecycle") or "")
+    if (
+        lifecycle == "expired"
+        and bool(runtime.get("terminal_liquidation_active"))
+        and bool(runtime.get("terminal_liquidation_done"))
+    ):
+        return ""
+    if (
+        bool(runtime.get("terminal_liquidation_active"))
+        and bool(runtime.get("terminal_liquidation_done"))
+        and float(market.get("time_left_sec") or 9999) <= 0.0
+    ):
+        return ""
     explicit = str(analytics.get("failure_bucket_current") or "").strip()
     if explicit:
         return explicit
     health = state.get("health") or {}
     risk = state.get("risk") or {}
-    runtime = state.get("runtime") or {}
-    market = state.get("market") or {}
-    lifecycle = str(state.get("lifecycle") or "")
     if bool(health.get("true_drift")) or bool(health.get("wallet_snapshot_stale")):
         return "drift_transport"
     if bool(runtime.get("terminal_liquidation_active")) and (

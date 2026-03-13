@@ -1632,6 +1632,18 @@ class MarketMakerV2:
         lifecycle: str,
         marketability_guard_active: bool,
     ) -> str:
+        if (
+            str(lifecycle or "") == "expired"
+            and self._terminal_liquidation_active
+            and bool(self._terminal_liquidation_done)
+        ):
+            return ""
+        if (
+            self._terminal_liquidation_active
+            and bool(self._terminal_liquidation_done)
+            and float(getattr(snapshot, "time_left_sec", 9999) or 9999) <= 0.0
+        ):
+            return ""
         if (not bool(getattr(health, "post_terminal_cleanup_grace_active", False))) and (
             bool(health.true_drift)
             or (
