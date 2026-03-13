@@ -73,8 +73,7 @@ def _derive_failure_bucket(state: dict[str, Any]) -> str:
     ):
         return "terminal_execution"
     if (
-        bool(analytics.get("marketability_guard_active"))
-        or bool(analytics.get("marketability_churn_confirmed"))
+        bool(analytics.get("marketability_churn_confirmed"))
         or int(analytics.get("collateral_warning_streak_current") or 0) >= 4
         or int(analytics.get("sell_skip_cooldown_streak_current") or 0) >= 4
         or (

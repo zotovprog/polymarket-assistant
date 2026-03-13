@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass, replace
 import time
 from typing import Any
@@ -938,9 +939,25 @@ class MarketMakerV2:
                     self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
                     self._orders_cancelled_for_merge = True
                     return
+            else:
+                wallet_up_f = merge_qty
+                wallet_dn_f = merge_qty
+            # Use actual wallet minimum to avoid 1-wei rounding overshoot
+            actual_mergeable = min(merge_qty, wallet_up_f, wallet_dn_f)
+            # Floor to 2 decimals (token precision)
+            actual_mergeable = math.floor(actual_mergeable * 100.0) / 100.0
+            if actual_mergeable < float(self.market.min_order_size if self.market else 1.0):
+                self.set_alert(
+                    "merge_pairs_v2",
+                    f"Merge deferred: floor amount too small ({actual_mergeable:.2f})",
+                    level="warning",
+                )
+                self._merge_consecutive_failures = getattr(self, "_merge_consecutive_failures", 0) + 1
+                self._orders_cancelled_for_merge = True
+                return
             result = await self.gateway.merge_pairs(
                 condition_id=str(self.market.condition_id),
-                amount_shares=float(inventory.paired_qty),
+                amount_shares=float(actual_mergeable),
                 private_key=str(self._private_key or ""),
             )
         except Exception as exc:
@@ -1724,7 +1741,7 @@ class MarketMakerV2:
             ) >= float(self.market.min_order_size if self.market else 5.0)
         ):
             return "terminal_execution"
-        if marketability_guard_active or bool(getattr(risk, "marketability_churn_confirmed", False)):
+        if bool(getattr(risk, "marketability_churn_confirmed", False)):
             return "marketability_churn"
         if (
             str(getattr(snapshot, "valuation_regime", "") or "") == "toxic_divergence"

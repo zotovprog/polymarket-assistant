@@ -341,7 +341,7 @@ class PMGateway:
     async def emergency_flatten_on_stop(
         self,
         *,
-        rounds: int = 5,
+        rounds: int = 8,
         round_delay_sec: float = 1.0,
     ) -> dict[str, Any]:
         """Best-effort forced inventory unwind used by manual stop().
@@ -379,6 +379,39 @@ class PMGateway:
             active_ids = set(self.order_mgr.active_order_ids)
             for order_id in per_round_order_ids:
                 if order_id in active_ids:
+                    await self.order_mgr.cancel_order(order_id)
+
+        # Aggressive retry pass if inventory remains
+        up_check, dn_check, _, _ = await self.get_wallet_balances()
+        for token_id, raw_bal in (
+            (self.market.up_token_id, up_check),
+            (self.market.dn_token_id, dn_check),
+        ):
+            bal = max(0.0, float(raw_bal or 0.0))
+            size = math.floor(bal * 100.0) / 100.0
+            if size < min_size:
+                continue
+            # Try at 0.01 floor price as last resort
+            quote = Quote(
+                side="SELL",
+                token_id=token_id,
+                price=0.01,
+                size=float(size),
+                order_context="stop_liquidation_floor",
+            )
+            attempted_orders += 1
+            order_id = await self.order_mgr.place_order(
+                quote,
+                post_only=False,
+                fallback_taker=False,
+                ignore_sell_cooldowns=True,
+                ignore_recent_cancelled_reserve=True,
+            )
+            if order_id:
+                placed_orders += 1
+                await asyncio.sleep(2.0)
+                await self.order_mgr.check_fills()
+                if order_id in set(self.order_mgr.active_order_ids):
                     await self.order_mgr.cancel_order(order_id)
 
         up_remaining, dn_remaining, _, _ = await self.get_wallet_balances()
