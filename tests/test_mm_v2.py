@@ -317,9 +317,9 @@ async def test_pmgateway_stop_liquidation_uses_owned_fallback_and_force_sell(mon
 
     result = await gateway.emergency_flatten_on_stop(rounds=1, round_delay_sec=0.01)
 
-    assert result["attempted_orders"] == 2
-    assert result["placed_orders"] == 2
-    assert len(calls) == 2
+    assert result["attempted_orders"] == 4  # 2 main + 2 aggressive retry
+    assert result["placed_orders"] == 4
+    assert len(calls) == 4
     assert sellable_refs
     assert sellable_refs[0] == pytest.approx((6.2, 7.4))
     for _quote, kwargs in calls:

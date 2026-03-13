@@ -1710,6 +1710,7 @@ def test_failure_bucket_prefers_marketability_churn():
             marketability_guard_active=True,
             marketability_guard_reason="collateral_warning",
             marketability_guard_up_active=True,
+            marketability_churn_confirmed=True,
         ),
         health=HealthState(),
         plan=QuotePlan(None, None, None, None, "defensive", "marketability"),
