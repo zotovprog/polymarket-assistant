@@ -1768,6 +1768,11 @@ class QuotePolicyV2:
             if bool(getattr(snapshot, "fill_cluster_pause_dn", False)) and built.get("dn_bid") is not None:
                 built["dn_bid"] = None
                 suppressed_reasons["dn_bid"] = "fill_cluster_pause"
+        if not diagnostic_no_guards and bool(getattr(snapshot, "post_drift_recovery_buy_pause", False)):
+            for slot in ("up_bid", "dn_bid"):
+                if built.get(slot) is not None:
+                    built[slot] = None
+                    suppressed_reasons[slot] = "post_drift_recovery_cooldown"
 
         if not diagnostic_no_guards and bool(getattr(risk, "balance_api_degraded", False)):
             for slot in ("up_bid", "dn_bid"):

@@ -174,8 +174,12 @@ class MarketMakerV2:
         self._fast_move_pause_until: float = 0.0
         self._recent_fill_times_up: list[float] = []
         self._recent_fill_times_dn: list[float] = []
+        self._recent_fill_times_cross: list[float] = []
         self._fill_cluster_pause_until_up: float = 0.0
         self._fill_cluster_pause_until_dn: float = 0.0
+        self._fill_cluster_pause_until_cross: float = 0.0
+        self._post_drift_recovery_ts: float = 0.0
+        self._was_true_drift: bool = False
         self._last_merge_attempt_ts: float = 0.0
         self._orders_cancelled_for_merge: bool = False
         self._merge_consecutive_failures: int = 0
@@ -494,8 +498,12 @@ class MarketMakerV2:
         self._fast_move_pause_until = 0.0
         self._recent_fill_times_up = []
         self._recent_fill_times_dn = []
+        self._recent_fill_times_cross = []
         self._fill_cluster_pause_until_up = 0.0
         self._fill_cluster_pause_until_dn = 0.0
+        self._fill_cluster_pause_until_cross = 0.0
+        self._post_drift_recovery_ts = 0.0
+        self._was_true_drift = False
         self._last_merge_attempt_ts = 0.0
         self._orders_cancelled_for_merge = False
         self._merge_consecutive_failures = 0
@@ -857,10 +865,29 @@ class MarketMakerV2:
                     float(now_ts) + 15.0,
                 )
                 self._recent_fill_times_dn = []
+        # Cross-side tracking (all BUY fills regardless of token side)
+        cross_recent = [ts for ts in self._recent_fill_times_cross if (now_ts - ts) <= 30.0]
+        cross_recent.append(float(now_ts))
+        self._recent_fill_times_cross = cross_recent
+        if len(cross_recent) >= 4:
+            self._fill_cluster_pause_until_cross = max(
+                float(self._fill_cluster_pause_until_cross),
+                float(now_ts) + 20.0,
+            )
+            self._recent_fill_times_cross = []
 
     def _apply_fill_cluster_pause_state(self, *, snapshot: PairMarketSnapshot, now: float) -> None:
-        snapshot.fill_cluster_pause_up = bool(float(now) < float(self._fill_cluster_pause_until_up))
-        snapshot.fill_cluster_pause_dn = bool(float(now) < float(self._fill_cluster_pause_until_dn))
+        cross_paused = bool(float(now) < float(self._fill_cluster_pause_until_cross))
+        snapshot.fill_cluster_pause_up = bool(
+            float(now) < float(self._fill_cluster_pause_until_up) or cross_paused
+        )
+        snapshot.fill_cluster_pause_dn = bool(
+            float(now) < float(self._fill_cluster_pause_until_dn) or cross_paused
+        )
+        snapshot.post_drift_recovery_buy_pause = bool(
+            self._post_drift_recovery_ts > 0.0
+            and (now - self._post_drift_recovery_ts) < float(self.config.post_drift_recovery_cooldown_sec)
+        )
 
     async def _maybe_merge_pairs(
         self,
@@ -1870,7 +1897,6 @@ class MarketMakerV2:
         )
         now = time.time()
         self._update_fast_move_state(snapshot=snapshot, now=now)
-        self._apply_fill_cluster_pause_state(snapshot=snapshot, now=now)
         self._update_pending_markouts(snapshot=snapshot, now=now)
         self.gateway.sync_paper_prices(
             fv_up=valuation.fv_up,
@@ -2059,6 +2085,12 @@ class MarketMakerV2:
             inventory,
             post_terminal_cleanup_grace_active=bool(post_terminal_cleanup_grace_active),
         )
+        current_drift = bool(self.reconcile.true_drift)
+        window_now = float(now)
+        if self._was_true_drift and not current_drift:
+            self._post_drift_recovery_ts = window_now
+        self._was_true_drift = current_drift
+        self._apply_fill_cluster_pause_state(snapshot=snapshot, now=now)
         health = self._build_health(
             api_stats=api_stats,
             sellability_lag_active=bool(sell_release_lag.get("active")),

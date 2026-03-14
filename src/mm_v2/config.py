@@ -85,6 +85,7 @@ class MMConfigV2:
         "sell_release_grace_sec": (0.5, 10.0),
         "requote_threshold_bps": (1.0, 500.0),
         "fallback_poll_cap": (1.0, 30.0),
+        "post_drift_recovery_cooldown_sec": (5.0, 120.0),
     }
 
     session_budget_usd: float = 30.0
@@ -124,10 +125,11 @@ class MMConfigV2:
     min_entry_depth_usd: float = 50.0
     max_entry_spread_bps: float = 800.0
     reconcile_drift_threshold_shares: float = 1.5
-    fill_settlement_grace_sec: float = 6.0
+    fill_settlement_grace_sec: float = 12.0
     sell_release_grace_sec: float = 3.0
     requote_threshold_bps: float = 8.0
     fallback_poll_cap: int = 12
+    post_drift_recovery_cooldown_sec: float = 30.0
 
     def effective_base_clip_usd(self) -> float:
         base = float(self.base_clip_usd)

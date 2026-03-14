@@ -49,6 +49,7 @@ class PairMarketSnapshot:
     fast_move_pause_active: bool = False
     fill_cluster_pause_up: bool = False
     fill_cluster_pause_dn: bool = False
+    post_drift_recovery_buy_pause: bool = False
 
 
 @dataclass
