@@ -1652,7 +1652,7 @@ class MarketMakerV2:
                 up_sell_skip_hits,
                 dn_sell_skip_hits,
             )
-            > 3
+            > 5
             or execution_churn_ratio >= 0.85
         )
         locked_side = self._marketability_locked_side(now=ref_now)
@@ -1683,7 +1683,7 @@ class MarketMakerV2:
                 side = locked_side
             elif (
                 other_score >= (locked_score + int(self.MARKETABILITY_SIDE_SWITCH_SCORE_MARGIN))
-                and other_streak > 3
+                and other_streak > 5
             ):
                 side = other_side
             else:
@@ -2221,9 +2221,16 @@ class MarketMakerV2:
                 self._terminal_liquidation_elapsed(now=now) >= self._terminal_liquidation_timeout_sec()
             )
             if not self._terminal_liquidation_done:
+                # Only cancel+replace every 3 rounds to give orders time to fill
+                # on thin books. Round 0 never cancels (just armed). Rounds 1,2
+                # let the order rest. Round 3 cancels and reprices deeper, etc.
+                _round = int(self._terminal_liquidation_round_idx)
+                _should_cancel = bool(
+                    not just_armed_terminal and _round > 0 and (_round % 3 == 0)
+                )
                 step = await self.gateway.run_terminal_liquidation_step(
-                    round_idx=int(self._terminal_liquidation_round_idx),
-                    cancel_existing=not just_armed_terminal,
+                    round_idx=_round,
+                    cancel_existing=_should_cancel,
                 )
                 self._terminal_liquidation_round_idx += 1
                 self._terminal_liquidation_attempted_orders += int(step.get("attempted_orders") or 0)

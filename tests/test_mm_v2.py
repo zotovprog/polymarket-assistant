@@ -791,7 +791,7 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert cfg.defensive_spread_mult == pytest.approx(1.5)
     assert cfg.defensive_size_mult == pytest.approx(0.4)
     assert cfg.unwind_window_sec == pytest.approx(240.0)
-    assert cfg.terminal_liquidation_start_sec == pytest.approx(20.0)
+    assert cfg.terminal_liquidation_start_sec == pytest.approx(45.0)
     assert cfg.soft_excess_value_ratio == pytest.approx(0.20)
     assert cfg.defensive_excess_value_ratio == pytest.approx(0.35)
     assert cfg.hard_excess_value_ratio == pytest.approx(0.45)

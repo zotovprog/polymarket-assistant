@@ -106,9 +106,9 @@ class MMConfigV2:
     defensive_spread_mult: float = 1.5
     defensive_size_mult: float = 0.4
     unwind_window_sec: float = 240.0
-    terminal_liquidation_start_sec: float = 20.0
-    emergency_unwind_timeout_sec: float = 10.0
-    emergency_taker_start_sec: float = 20.0
+    terminal_liquidation_start_sec: float = 45.0
+    emergency_unwind_timeout_sec: float = 40.0
+    emergency_taker_start_sec: float = 45.0
     hard_drawdown_usd: float = 4.0
     hard_drawdown_budget_ratio: float = 0.30
     fast_move_soft_bps_1s: float = 30.0
