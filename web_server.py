@@ -427,6 +427,7 @@ class ConfigUpdateRequestV2(BaseModel):
     defensive_spread_mult: Optional[float] = None
     defensive_size_mult: Optional[float] = None
     unwind_window_sec: Optional[float] = None
+    terminal_liquidation_start_sec: Optional[float] = None
     emergency_unwind_timeout_sec: Optional[float] = None
     emergency_taker_start_sec: Optional[float] = None
     hard_drawdown_usd: Optional[float] = None
