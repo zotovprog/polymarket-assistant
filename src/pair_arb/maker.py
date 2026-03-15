@@ -86,8 +86,15 @@ class MakerArbManager:
 
         profit_per_pair = 1.0 - total_cost - gas_per_share
 
-        # 3. Determine clip size (use available ask depth as guide)
+        # 3. Determine clip size — ensure each leg meets PM minimum notional ($1.00)
         clip = self.config.max_clip_shares
+        min_price = min(target_up, target_dn)
+        if min_price > 0:
+            min_clip_for_notional = math.ceil(1.0 / min_price)
+            if min_clip_for_notional > clip:
+                clip = float(min_clip_for_notional)
+                log.debug("Clip raised to %.0f for %s (min_price=%.2f, notional=$%.2f)",
+                          clip, self.market.scope, min_price, clip * min_price)
 
         # 4. Check if repricing needed
         need_reprice_up = (
@@ -243,5 +250,5 @@ class MakerArbManager:
             "profit_per_pair": round(1.0 - self.up_price - self.dn_price, 4) if self.up_price and self.dn_price else 0,
             "orders_posted": self.orders_posted,
             "reprices": self.reprices,
-            "has_orders": bool(self.up_order_id or self.dn_order_id),
+            "has_orders": bool(self.up_order_id and self.dn_order_id),
         }

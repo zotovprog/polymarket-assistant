@@ -1,5 +1,5 @@
 """Auto-generated version info. Updated by pre-commit hook."""
-__version__ = "1.5.145"
+__version__ = "1.5.146"
 
 
 def git_hash() -> str:
