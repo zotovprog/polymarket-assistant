@@ -188,10 +188,16 @@ class MakerArbManager:
         try:
             result = await self.order_mgr.place_order(quote, post_only=True)
             if isinstance(result, str) and result:
+                log.info("Maker order placed: %s %s@%.2f x%.1f → %s",
+                         quote.side, quote.token_id[:8], quote.price, quote.size,
+                         result[:12])
                 return result
+            log.warning("Maker order returned non-string: %s %s@%.2f → %r",
+                       quote.side, quote.token_id[:8], quote.price, result)
             return None
         except Exception as e:
-            log.debug("Maker order failed: %s", e)
+            log.warning("Maker order exception: %s %s@%.2f → %s",
+                       quote.side, quote.token_id[:8], quote.price, e)
             return None
 
     def to_dict(self) -> dict:
