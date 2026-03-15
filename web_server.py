@@ -4770,57 +4770,61 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
     if _pair_arb_engine is not None and _pair_arb_engine._running:
         raise HTTPException(status_code=409, detail="pair arb already running")
 
-    from pair_arb import PairArbEngine, PairArbConfig
-
-    config = PairArbConfig(
-        market_scopes=req.market_scopes,
-        session_budget_usd=float(req.initial_usdc),
-    )
-    config.validate()
-
-    # Create CLOB client (same pattern as MMRuntimeV2)
-    from mm_shared.order_manager import OrderManager
-    import os
-
-    private_key = os.environ.get("PM_PRIVATE_KEY", "")
-    api_key = os.environ.get("PM_API_KEY", "")
-    api_secret = os.environ.get("PM_API_SECRET", "")
-    api_passphrase = os.environ.get("PM_API_PASSPHRASE", "")
-
-    if req.paper_mode:
-        # Use MockClobClient for paper mode.
-        client = MockClobClient(usdc_balance=float(req.initial_usdc))
-        order_mgr = OrderManager(client)
-    else:
-        if not private_key:
-            raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
-        from py_clob_client.client import ClobClient
-        chain_id = int(os.environ.get("PM_CHAIN_ID", "137"))
-        client = ClobClient(
-            "https://clob.polymarket.com",
-            key=private_key,
-            chain_id=chain_id,
-            creds={"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase} if api_key else None,
-        )
-        order_mgr = OrderManager(client)
-
-    _pair_arb_engine = PairArbEngine(
-        order_mgr=order_mgr,
-        config=config,
-        private_key=private_key,
-        paper_mode=req.paper_mode,
-        app_version=APP_VERSION,
-    )
-
     try:
+        from pair_arb import PairArbEngine, PairArbConfig
+
+        arb_config = PairArbConfig(
+            market_scopes=req.market_scopes,
+            session_budget_usd=float(req.initial_usdc),
+        )
+        arb_config.validate()
+
+        # Create CLOB client (same pattern as MMRuntimeV2)
+        from mm_shared.order_manager import OrderManager
+        import os
+
+        private_key = os.environ.get("PM_PRIVATE_KEY", "")
+        api_key = os.environ.get("PM_API_KEY", "")
+        api_secret = os.environ.get("PM_API_SECRET", "")
+        api_passphrase = os.environ.get("PM_API_PASSPHRASE", "")
+
+        if req.paper_mode:
+            # Use MockClobClient for paper mode.
+            client = MockClobClient(usdc_balance=float(req.initial_usdc))
+            order_mgr = OrderManager(client)
+        else:
+            if not private_key:
+                raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
+            from py_clob_client.client import ClobClient
+            chain_id = int(os.environ.get("PM_CHAIN_ID", "137"))
+            client = ClobClient(
+                "https://clob.polymarket.com",
+                key=private_key,
+                chain_id=chain_id,
+                creds={"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase} if api_key else None,
+            )
+            order_mgr = OrderManager(client)
+
+        _pair_arb_engine = PairArbEngine(
+            order_mgr=order_mgr,
+            config=arb_config,
+            private_key=private_key,
+            paper_mode=req.paper_mode,
+            app_version=APP_VERSION,
+        )
+
         result = await _pair_arb_engine.start()
+        return result
+
+    except HTTPException:
+        raise
     except Exception as e:
         _pair_arb_engine = None
+        import traceback as tb
         return JSONResponse(
             status_code=500,
-            content={"ok": False, "error": str(e), "traceback": traceback.format_exc()},
+            content={"ok": False, "error": str(e), "traceback": tb.format_exc()},
         )
-    return result
 
 
 @app.post("/api/pair-arb/stop")
