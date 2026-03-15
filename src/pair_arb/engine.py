@@ -63,6 +63,7 @@ class PairArbEngine:
         self._last_redeem_attempt: float = 0.0
         self._task: asyncio.Task | None = None
         self._current_best_scope: str | None = None
+        self._last_scope_switch_ts: float = 0.0
 
     async def start(self) -> dict:
         """Start the arb engine. Returns initial state."""
@@ -103,7 +104,7 @@ class PairArbEngine:
 
         # Cancel any remaining orders
         try:
-            await self.order_mgr.cancel_all()
+            await self.order_mgr.cancel_all(force_exchange=True)
         except Exception as e:
             log.warning("Error cancelling orders on stop: %s", e)
 
@@ -203,22 +204,31 @@ class PairArbEngine:
                             pass
 
                     # If best market changed, cancel ALL orders first
-                    if best_scope and best_scope != self._current_best_scope:
+                    # Sticky: don't switch more than once per 30 seconds
+                    STICKY_SEC = 30.0
+                    should_switch = (
+                        best_scope
+                        and best_scope != self._current_best_scope
+                        and (
+                            self._current_best_scope is None
+                            or time.time() - self._last_scope_switch_ts >= STICKY_SEC
+                        )
+                    )
+                    if should_switch:
                         if self._current_best_scope is not None:
                             log.info(
                                 "Switching best market: %s -> %s (total=%.4f)",
                                 self._current_best_scope, best_scope, best_total,
                             )
                         try:
-                            await self.order_mgr.cancel_all()
+                            await self.order_mgr.cancel_all(force_exchange=True)
                         except Exception as e:
                             log.warning("cancel_all on market switch failed: %s", e)
                         for mgr in self._maker_managers.values():
-                            try:
-                                await mgr.cancel_all()
-                            except Exception as e:
-                                log.debug("Maker cancel_all failed for %s: %s", mgr.market.scope, e)
+                            mgr.up_order_id = None
+                            mgr.dn_order_id = None
                         self._current_best_scope = best_scope
+                        self._last_scope_switch_ts = time.time()
 
                     # Tick only the best market
                     if best_scope and best_scope in self._maker_managers:
