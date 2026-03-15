@@ -1,0 +1,209 @@
+"""Maker pair arb — posts persistent BUY limits on both sides, merges when filled."""
+from __future__ import annotations
+
+import logging
+import math
+import time
+
+from mm_shared.types import Quote
+
+from .config import PairArbConfig
+from .types import ArbMarket
+
+log = logging.getLogger(__name__)
+
+
+class MakerArbManager:
+    """Manages persistent BUY limit orders on both sides of a single market.
+
+    Flow:
+      1. Fetch order books → compute target bid prices
+      2. Post BUY UP + BUY DN at best-bid (post_only=True, 0 fee)
+      3. Monitor fills via token balance check
+      4. When min(up_bal, dn_bal) >= min_clip → merge for $1.00
+      5. Reprice if book moves significantly
+    """
+
+    REPRICE_THRESHOLD = 0.015  # Reprice if best_bid shifts by >1.5¢
+
+    def __init__(self, market: ArbMarket, order_mgr, config: PairArbConfig):
+        self.market = market
+        self.order_mgr = order_mgr
+        self.config = config
+
+        # Active order tracking
+        self.up_order_id: str | None = None
+        self.dn_order_id: str | None = None
+        self.up_price: float = 0.0
+        self.dn_price: float = 0.0
+        self.up_size: float = 0.0
+        self.dn_size: float = 0.0
+
+        # Stats
+        self.orders_posted: int = 0
+        self.reprices: int = 0
+        self.last_post_ts: float = 0.0
+        self.last_tick_ts: float = 0.0
+
+    async def tick(self) -> dict | None:
+        """One cycle: ensure orders posted at profitable levels, reprice if needed.
+
+        Returns dict with info if orders were posted/repriced, else None.
+        """
+        self.last_tick_ts = time.time()
+
+        # 1. Fetch books
+        try:
+            up_book = await self.order_mgr.get_full_book(self.market.up_token_id)
+            dn_book = await self.order_mgr.get_full_book(self.market.dn_token_id)
+        except Exception as e:
+            log.debug("Book fetch failed for %s: %s", self.market.scope, e)
+            return None
+
+        best_bid_up = up_book.get("best_bid")
+        best_bid_dn = dn_book.get("best_bid")
+        best_ask_up = up_book.get("best_ask")
+        best_ask_dn = dn_book.get("best_ask")
+
+        if not best_bid_up or not best_bid_dn:
+            return None
+
+        # 2. Check profitability at bid levels
+        target_up = best_bid_up
+        target_dn = best_bid_dn
+        total_cost = target_up + target_dn
+
+        gas_per_share = self.config.gas_cost_usd / max(self.config.min_clip_shares, 1)
+        min_profit = self.config.min_profit_bps / 10000.0
+
+        if total_cost >= 1.0 - min_profit - gas_per_share:
+            # Not profitable even at bid — cancel and wait
+            if self.up_order_id or self.dn_order_id:
+                log.debug("Maker %s: not profitable (bids %.2f+%.2f=%.4f), cancelling",
+                         self.market.scope, target_up, target_dn, total_cost)
+                await self._cancel_all()
+            return None
+
+        profit_per_pair = 1.0 - total_cost - gas_per_share
+
+        # 3. Determine clip size (use available ask depth as guide)
+        clip = self.config.max_clip_shares
+
+        # 4. Check if repricing needed
+        need_reprice_up = (
+            self.up_order_id is None
+            or abs(self.up_price - target_up) >= self.REPRICE_THRESHOLD
+        )
+        need_reprice_dn = (
+            self.dn_order_id is None
+            or abs(self.dn_price - target_dn) >= self.REPRICE_THRESHOLD
+        )
+
+        result = {"scope": self.market.scope, "action": "none"}
+
+        # 5. Post/reprice UP
+        if need_reprice_up:
+            if self.up_order_id:
+                await self._cancel_order(self.up_order_id)
+                self.up_order_id = None
+                self.reprices += 1
+
+            up_quote = Quote(
+                side="BUY",
+                token_id=self.market.up_token_id,
+                price=target_up,
+                size=clip,
+                order_context="pair_arb_maker",
+            )
+            self.up_order_id = await self._safe_place(up_quote)
+            self.up_price = target_up
+            self.up_size = clip
+
+        # 6. Post/reprice DN
+        if need_reprice_dn:
+            if self.dn_order_id:
+                await self._cancel_order(self.dn_order_id)
+                self.dn_order_id = None
+                self.reprices += 1
+
+            dn_quote = Quote(
+                side="BUY",
+                token_id=self.market.dn_token_id,
+                price=target_dn,
+                size=clip,
+                order_context="pair_arb_maker",
+            )
+            self.dn_order_id = await self._safe_place(dn_quote)
+            self.dn_price = target_dn
+            self.dn_size = clip
+
+        if need_reprice_up or need_reprice_dn:
+            self.orders_posted += 1
+            self.last_post_ts = time.time()
+            result["action"] = "posted"
+            result["up_price"] = target_up
+            result["dn_price"] = target_dn
+            result["total"] = round(total_cost, 4)
+            result["profit_per_pair"] = round(profit_per_pair, 4)
+            result["clip"] = clip
+            log.info(
+                "Maker %s: BUY UP@%.2f + DN@%.2f = %.4f (profit=%.4f/pair x%.0f)",
+                self.market.scope, target_up, target_dn, total_cost,
+                profit_per_pair, clip,
+            )
+
+        # Also check taker opportunity (asks sum < $1.00)
+        if best_ask_up and best_ask_dn:
+            ask_total = best_ask_up + best_ask_dn
+            if ask_total < 1.0 - min_profit - gas_per_share:
+                result["taker_opportunity"] = True
+                result["ask_total"] = round(ask_total, 4)
+                log.info(
+                    "TAKER ARB %s: asks %.2f+%.2f=%.4f (profit=%.4f)",
+                    self.market.scope, best_ask_up, best_ask_dn, ask_total,
+                    1.0 - ask_total - gas_per_share,
+                )
+
+        return result if result["action"] != "none" else None
+
+    async def cancel_all(self) -> None:
+        """Cancel all active orders."""
+        await self._cancel_all()
+
+    async def _cancel_all(self) -> None:
+        if self.up_order_id:
+            await self._cancel_order(self.up_order_id)
+            self.up_order_id = None
+        if self.dn_order_id:
+            await self._cancel_order(self.dn_order_id)
+            self.dn_order_id = None
+
+    async def _cancel_order(self, order_id: str) -> None:
+        try:
+            await self.order_mgr.cancel_order(order_id)
+        except Exception as e:
+            log.debug("Cancel failed for %s: %s", order_id[:12], e)
+
+    async def _safe_place(self, quote: Quote) -> str | None:
+        try:
+            result = await self.order_mgr.place_order(quote, post_only=True)
+            if isinstance(result, str) and result:
+                return result
+            return None
+        except Exception as e:
+            log.debug("Maker order failed: %s", e)
+            return None
+
+    def to_dict(self) -> dict:
+        return {
+            "scope": self.market.scope,
+            "up_order": self.up_order_id[:12] if self.up_order_id else None,
+            "dn_order": self.dn_order_id[:12] if self.dn_order_id else None,
+            "up_price": self.up_price,
+            "dn_price": self.dn_price,
+            "total_cost": round(self.up_price + self.dn_price, 4),
+            "profit_per_pair": round(1.0 - self.up_price - self.dn_price, 4) if self.up_price and self.dn_price else 0,
+            "orders_posted": self.orders_posted,
+            "reprices": self.reprices,
+            "has_orders": bool(self.up_order_id or self.dn_order_id),
+        }

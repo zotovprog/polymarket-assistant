@@ -8,6 +8,7 @@ from typing import Any
 
 from .config import PairArbConfig
 from .executor import ArbExecutor
+from .maker import MakerArbManager
 from .merger import MergeTrigger
 from .risk import ArbRiskManager
 from .scanner import ArbScanner
@@ -20,7 +21,12 @@ MARKET_REFRESH_SEC = 60.0
 
 
 class PairArbEngine:
-    """Core arb engine: discover markets → scan books → execute → merge."""
+    """Core arb engine: discover markets → post maker orders → merge.
+
+    Two modes:
+      - Maker (default): posts BUY limits on both sides at best-bid, waits for fills, merges.
+      - Taker (fallback): scans for asks summing < $1.00, takes both sides, merges.
+    """
 
     def __init__(
         self,
@@ -44,6 +50,7 @@ class PairArbEngine:
         self._running = False
         self._started_at = 0.0
         self._markets: list[ArbMarket] = []
+        self._maker_managers: dict[str, MakerArbManager] = {}  # scope -> manager
         self._last_market_refresh: float = 0.0
         self._scan_count = 0
         self._opportunities_seen = 0
@@ -65,8 +72,9 @@ class PairArbEngine:
 
         self._task = asyncio.create_task(self._run_loop())
         log.info(
-            "PairArbEngine started: paper=%s scopes=%s markets=%d",
+            "PairArbEngine started: paper=%s scopes=%s markets=%d maker=%s",
             self.paper_mode, self.config.market_scopes, len(self._markets),
+            self.config.use_maker_orders,
         )
         return {"ok": True, "markets": len(self._markets), "state": self.snapshot().to_dict()}
 
@@ -80,6 +88,13 @@ class PairArbEngine:
             except asyncio.CancelledError:
                 pass
             self._task = None
+
+        # Cancel maker orders
+        for mgr in self._maker_managers.values():
+            try:
+                await mgr.cancel_all()
+            except Exception as e:
+                log.debug("Error cancelling maker orders for %s: %s", mgr.market.scope, e)
 
         # Cancel any remaining orders
         try:
@@ -117,13 +132,33 @@ class PairArbEngine:
 
         self._markets = markets
         self._last_market_refresh = now
+
+        # Create/update maker managers
+        if self.config.use_maker_orders:
+            new_managers: dict[str, MakerArbManager] = {}
+            for m in markets:
+                if m.scope in self._maker_managers:
+                    mgr = self._maker_managers[m.scope]
+                    mgr.market = m  # Update token IDs if rotated
+                    new_managers[m.scope] = mgr
+                else:
+                    new_managers[m.scope] = MakerArbManager(m, self.order_mgr, self.config)
+            # Cancel managers for markets no longer active
+            for scope, mgr in self._maker_managers.items():
+                if scope not in new_managers:
+                    try:
+                        await mgr.cancel_all()
+                    except Exception:
+                        pass
+            self._maker_managers = new_managers
+
         if markets:
             log.info("Discovered %d markets: %s", len(markets),
                      ", ".join(m.scope for m in markets))
         return markets
 
     async def _run_loop(self) -> None:
-        """Main arb scanning loop."""
+        """Main arb loop."""
         while self._running:
             try:
                 # Refresh markets periodically
@@ -134,53 +169,60 @@ class PairArbEngine:
                     await asyncio.sleep(5.0)
                     continue
 
-                # --- 1. Scan all markets ---
                 self._scan_count += 1
-                opportunities = await self.scanner.scan_all(self._markets)
 
-                # --- 2. Execute best opportunity ---
-                if opportunities:
-                    self._opportunities_seen += len(opportunities)
-                    self._last_opportunity_ts = time.time()
-                    best = opportunities[0]
+                # === MAKER MODE: manage persistent BUY limits ===
+                if self.config.use_maker_orders:
+                    for scope, mgr in self._maker_managers.items():
+                        try:
+                            result = await mgr.tick()
+                            if result and result.get("taker_opportunity"):
+                                # Also log taker opportunities even in maker mode
+                                self._opportunities_seen += 1
+                                self._last_opportunity_ts = time.time()
+                        except Exception as e:
+                            log.debug("Maker tick error for %s: %s", scope, e)
 
-                    can_exec, reason = self.risk.can_execute(best)
-                    if can_exec:
-                        log.info(
-                            "ARB: %s UP@%.2f+DN@%.2f=%.4f profit=%.4f x%.1f",
-                            best.market.scope, best.ask_up, best.ask_dn,
-                            best.total_cost_per_pair, best.profit_per_pair,
-                            best.max_arb_shares,
-                        )
-                        execution = await self.executor.execute(best)
-                        self._opportunities_executed += 1
-                        cost = best.total_cost_per_pair * best.max_arb_shares
-                        self.risk.record_execution(cost)
-                        self._recent_executions.append(execution)
-                        # Trim history
-                        if len(self._recent_executions) > 100:
-                            self._recent_executions = self._recent_executions[-100:]
-                    else:
-                        log.debug("Arb skipped: %s (profit=%.4f)", reason, best.profit_usd)
+                # === TAKER MODE: scan asks for immediate arb ===
+                else:
+                    opportunities = await self.scanner.scan_all(self._markets)
+                    if opportunities:
+                        self._opportunities_seen += len(opportunities)
+                        self._last_opportunity_ts = time.time()
+                        best = opportunities[0]
 
-                # --- 3. Handle leg risk ---
+                        can_exec, reason = self.risk.can_execute(best)
+                        if can_exec:
+                            log.info(
+                                "ARB: %s UP@%.2f+DN@%.2f=%.4f profit=%.4f x%.1f",
+                                best.market.scope, best.ask_up, best.ask_dn,
+                                best.total_cost_per_pair, best.profit_per_pair,
+                                best.max_arb_shares,
+                            )
+                            execution = await self.executor.execute(best)
+                            self._opportunities_executed += 1
+                            cost = best.total_cost_per_pair * best.max_arb_shares
+                            self.risk.record_execution(cost)
+                            self._recent_executions.append(execution)
+                            if len(self._recent_executions) > 100:
+                                self._recent_executions = self._recent_executions[-100:]
+
+                # --- Handle leg risk ---
                 resolved = await self.executor.handle_leg_risk()
                 for ex in resolved:
                     if ex.status == "failed" and "unwind" in (ex.error or ""):
-                        # Estimate spread loss from forced sell-back
-                        estimated_loss = 0.03 * ex.target_shares  # ~3% spread loss
+                        estimated_loss = 0.03 * ex.target_shares
                         self.risk.record_leg_risk_loss(estimated_loss)
-                        log.warning("Leg risk loss: ~$%.4f on arb %s", estimated_loss, ex.id)
 
-                # --- 4. Check merges ---
+                # --- Check merges (both modes) ---
                 for market in self._markets:
                     result = await self.merger.check_and_merge(market)
                     if result and result.get("merged", 0) > 0:
                         merged = result["merged"]
                         proceeds = result.get("proceeds", merged)
-                        # Estimate cost based on recent arb cost
-                        estimated_cost = merged * 0.97  # Rough estimate
+                        estimated_cost = merged * 0.97
                         self.risk.record_merge_profit(proceeds, estimated_cost)
+                        self._opportunities_executed += 1
                         log.info(
                             "MERGED %.2f pairs on %s → $%.2f",
                             merged, market.scope, proceeds,
@@ -196,7 +238,7 @@ class PairArbEngine:
 
     def snapshot(self) -> ArbState:
         """Return full state snapshot."""
-        return ArbState(
+        state = ArbState(
             is_running=self._running,
             started_at=self._started_at,
             app_version=self.app_version,
@@ -222,13 +264,20 @@ class PairArbEngine:
                 e.to_dict() for e in self.executor.pending
             ],
         )
+        # Add maker manager info
+        if self._maker_managers:
+            state.config["maker_managers"] = {
+                scope: mgr.to_dict() for scope, mgr in self._maker_managers.items()
+            }
+        return state
 
     def update_config(self, **kwargs: Any) -> dict:
         """Update config at runtime."""
         self.config.update(**kwargs)
-        # Propagate to sub-components
         self.scanner.config = self.config
         self.executor.config = self.config
         self.merger.config = self.config
         self.risk.config = self.config
+        for mgr in self._maker_managers.values():
+            mgr.config = self.config
         return self.config.to_dict()
