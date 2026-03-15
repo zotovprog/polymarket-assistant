@@ -246,6 +246,8 @@ class MarketMakerV2:
         self._terminal_liquidation_placed_orders: int = 0
         self._terminal_liquidation_remaining_up: float = 0.0
         self._terminal_liquidation_remaining_dn: float = 0.0
+        self._terminal_liquidation_excess_remaining_up: float = 0.0
+        self._terminal_liquidation_excess_remaining_dn: float = 0.0
         self._terminal_liquidation_done: bool = False
         self._terminal_liquidation_reason: str = ""
         self._post_terminal_cleanup_grace_started_ts: float = 0.0
@@ -491,6 +493,8 @@ class MarketMakerV2:
         self._terminal_liquidation_placed_orders = 0
         self._terminal_liquidation_remaining_up = 0.0
         self._terminal_liquidation_remaining_dn = 0.0
+        self._terminal_liquidation_excess_remaining_up = 0.0
+        self._terminal_liquidation_excess_remaining_dn = 0.0
         self._terminal_liquidation_done = False
         self._terminal_liquidation_reason = ""
         self._post_terminal_cleanup_grace_started_ts = 0.0
@@ -557,7 +561,11 @@ class MarketMakerV2:
         await self.gateway.cancel_all()
         if liquidate:
             try:
-                liq = await self.gateway.emergency_flatten_on_stop()
+                protected_pair_qty = max(0.0, float(self._last_inventory.paired_qty))
+                liq = await self.gateway.emergency_flatten_on_stop(
+                    protected_up_qty=protected_pair_qty,
+                    protected_dn_qty=protected_pair_qty,
+                )
                 liquidation_result = dict(liq or {})
                 liquidation_result["enabled"] = True
                 if not bool(liq.get("done", True)):
@@ -1049,10 +1057,10 @@ class MarketMakerV2:
         if not terminal_window_active:
             return risk
         residual_inventory = max(
-            float(inventory.up_shares),
-            float(inventory.dn_shares),
-            float(self._terminal_liquidation_remaining_up),
-            float(self._terminal_liquidation_remaining_dn),
+            float(inventory.excess_up_qty),
+            float(inventory.excess_dn_qty),
+            float(self._terminal_liquidation_excess_remaining_up),
+            float(self._terminal_liquidation_excess_remaining_dn),
         )
         if residual_inventory <= 1e-9 and not self._terminal_liquidation_active:
             return risk
@@ -1280,8 +1288,8 @@ class MarketMakerV2:
             self._terminal_liquidation_active
             and self._terminal_liquidation_done
             and max(
-                float(self._terminal_liquidation_remaining_up),
-                float(self._terminal_liquidation_remaining_dn),
+                float(self._terminal_liquidation_excess_remaining_up),
+                float(self._terminal_liquidation_excess_remaining_dn),
             ) < self._terminal_cleanup_dust_threshold()
         )
         if active:
@@ -1762,8 +1770,8 @@ class MarketMakerV2:
         if self._terminal_liquidation_active and (
             (not bool(self._terminal_liquidation_done))
             or max(
-                float(self._terminal_liquidation_remaining_up),
-                float(self._terminal_liquidation_remaining_dn),
+                float(self._terminal_liquidation_excess_remaining_up),
+                float(self._terminal_liquidation_excess_remaining_dn),
             ) >= float(self.market.min_order_size if self.market else 5.0)
         ):
             return "terminal_execution"
@@ -2196,13 +2204,13 @@ class MarketMakerV2:
             ctx=ctx,
         )
         terminal_window_active = float(snapshot.time_left_sec) <= float(self._terminal_liquidation_start_sec())
-        has_any_inventory = bool(
-            float(inventory.up_shares) > 1e-9
-            or float(inventory.dn_shares) > 1e-9
+        has_any_excess_inventory = bool(
+            float(inventory.excess_up_qty) > 1e-9
+            or float(inventory.excess_dn_qty) > 1e-9
         )
         terminal_liquidation_should_arm = bool(
             risk.hard_mode != "halted"
-            and (self._has_material_inventory(inventory) or has_any_inventory)
+            and has_any_excess_inventory
             and terminal_window_active
         )
         if terminal_liquidation_should_arm or (
@@ -2217,6 +2225,8 @@ class MarketMakerV2:
                 self._terminal_liquidation_placed_orders = 0
                 self._terminal_liquidation_remaining_up = float(inventory.up_shares)
                 self._terminal_liquidation_remaining_dn = float(inventory.dn_shares)
+                self._terminal_liquidation_excess_remaining_up = float(inventory.excess_up_qty)
+                self._terminal_liquidation_excess_remaining_dn = float(inventory.excess_dn_qty)
                 self._terminal_liquidation_done = False
                 self._terminal_liquidation_reason = "terminal_liquidation_active"
                 just_armed_terminal = True
@@ -2237,27 +2247,39 @@ class MarketMakerV2:
                 step = await self.gateway.run_terminal_liquidation_step(
                     round_idx=_round,
                     cancel_existing=_should_cancel,
+                    protected_up_qty=float(inventory.paired_qty),
+                    protected_dn_qty=float(inventory.paired_qty),
                 )
                 self._terminal_liquidation_round_idx += 1
                 self._terminal_liquidation_attempted_orders += int(step.get("attempted_orders") or 0)
                 self._terminal_liquidation_placed_orders += int(step.get("placed_orders") or 0)
                 self._terminal_liquidation_remaining_up = float(step.get("remaining_up") or 0.0)
                 self._terminal_liquidation_remaining_dn = float(step.get("remaining_dn") or 0.0)
+                self._terminal_liquidation_excess_remaining_up = float(step.get("excess_remaining_up") or 0.0)
+                self._terminal_liquidation_excess_remaining_dn = float(step.get("excess_remaining_dn") or 0.0)
                 self._terminal_liquidation_done = bool(step.get("done", False))
                 remaining_inventory = replace(
                     inventory,
                     up_shares=float(self._terminal_liquidation_remaining_up),
                     dn_shares=float(self._terminal_liquidation_remaining_dn),
                 )
-                remaining_has_any_inventory = bool(
-                    float(remaining_inventory.up_shares) > 1e-9
-                    or float(remaining_inventory.dn_shares) > 1e-9
+                remaining_excess_inventory = replace(
+                    inventory,
+                    up_shares=float(self._terminal_liquidation_excess_remaining_up),
+                    dn_shares=float(self._terminal_liquidation_excess_remaining_dn),
+                    paired_qty=0.0,
+                    excess_up_qty=float(self._terminal_liquidation_excess_remaining_up),
+                    excess_dn_qty=float(self._terminal_liquidation_excess_remaining_dn),
+                )
+                remaining_has_any_excess_inventory = bool(
+                    float(self._terminal_liquidation_excess_remaining_up) > 1e-9
+                    or float(self._terminal_liquidation_excess_remaining_dn) > 1e-9
                 )
                 terminal_done_reason = ""
                 if (
                     not self._terminal_liquidation_done
-                    and not self._has_material_inventory(remaining_inventory)
-                    and remaining_has_any_inventory
+                    and not self._has_material_inventory(remaining_excess_inventory)
+                    and remaining_has_any_excess_inventory
                     and self._terminal_liquidation_round_idx >= 2
                 ):
                     self._terminal_liquidation_done = True
@@ -2312,8 +2334,8 @@ class MarketMakerV2:
                 self._running = False
                 if (
                     max(
-                        float(self._terminal_liquidation_remaining_up),
-                        float(self._terminal_liquidation_remaining_dn),
+                        float(self._terminal_liquidation_excess_remaining_up),
+                        float(self._terminal_liquidation_excess_remaining_dn),
                     )
                     >= float(self.market.min_order_size)
                 ):
@@ -2321,8 +2343,8 @@ class MarketMakerV2:
                         "terminal_liquidation_v2",
                         (
                             "Terminal liquidation incomplete: "
-                            f"rem_up={self._terminal_liquidation_remaining_up:.4f} "
-                            f"rem_dn={self._terminal_liquidation_remaining_dn:.4f}"
+                            f"excess_up={self._terminal_liquidation_excess_remaining_up:.4f} "
+                            f"excess_dn={self._terminal_liquidation_excess_remaining_dn:.4f}"
                         ),
                         level="warning",
                     )
@@ -2338,8 +2360,8 @@ class MarketMakerV2:
                         "terminal_liquidation_v2",
                         (
                             "Terminal liquidation active: "
-                            f"rem_up={self._terminal_liquidation_remaining_up:.4f} "
-                            f"rem_dn={self._terminal_liquidation_remaining_dn:.4f}"
+                            f"excess_up={self._terminal_liquidation_excess_remaining_up:.4f} "
+                            f"excess_dn={self._terminal_liquidation_excess_remaining_dn:.4f}"
                         ),
                         level="warning",
                     )
@@ -2373,6 +2395,8 @@ class MarketMakerV2:
                 self._terminal_liquidation_done = False
                 self._terminal_liquidation_started_ts = 0.0
                 self._terminal_liquidation_round_idx = 0
+                self._terminal_liquidation_excess_remaining_up = 0.0
+                self._terminal_liquidation_excess_remaining_dn = 0.0
                 self.clear_alert("terminal_liquidation_v2")
             if force_normal_soft_mode_active:
                 self.state_machine._set_lifecycle("quoting")
@@ -3046,6 +3070,8 @@ class MarketMakerV2:
             "terminal_liquidation_placed_orders": int(self._terminal_liquidation_placed_orders),
             "terminal_liquidation_remaining_up": float(self._terminal_liquidation_remaining_up),
             "terminal_liquidation_remaining_dn": float(self._terminal_liquidation_remaining_dn),
+            "terminal_liquidation_excess_remaining_up": float(self._terminal_liquidation_excess_remaining_up),
+            "terminal_liquidation_excess_remaining_dn": float(self._terminal_liquidation_excess_remaining_dn),
             "terminal_liquidation_done": bool(self._terminal_liquidation_done),
             "terminal_liquidation_reason": str(self._terminal_liquidation_reason or ""),
             "post_terminal_cleanup_grace_active": bool(grace_active),

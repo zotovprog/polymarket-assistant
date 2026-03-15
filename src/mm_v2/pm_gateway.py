@@ -240,6 +240,8 @@ class PMGateway:
         *,
         round_idx: int = 0,
         cancel_existing: bool = True,
+        protected_up_qty: float = 0.0,
+        protected_dn_qty: float = 0.0,
     ) -> dict[str, Any]:
         if not self.market:
             return {
@@ -247,6 +249,9 @@ class PMGateway:
                 "placed_orders": 0,
                 "remaining_up": 0.0,
                 "remaining_dn": 0.0,
+                "excess_remaining_up": 0.0,
+                "excess_remaining_dn": 0.0,
+                "protected_paired_qty": 0.0,
                 "done": True,
                 "reason": "no_market",
                 "placed_order_ids": [],
@@ -264,6 +269,9 @@ class PMGateway:
         had_material_inventory = False
         tick = max(0.0001, float(self.market.tick_size or 0.01))
         min_size = max(0.0, float(self.market.min_order_size or 0.0))
+        protected_up_qty = max(0.0, float(protected_up_qty))
+        protected_dn_qty = max(0.0, float(protected_dn_qty))
+        protected_paired_qty = min(protected_up_qty, protected_dn_qty)
 
         up_owned, dn_owned, _, _ = await self.get_wallet_balances()
         up_sellable, dn_sellable = await self.get_sellable_balances(
@@ -272,13 +280,27 @@ class PMGateway:
                 float(dn_owned or 0.0),
             ),
         )
-        for token_id, raw_sellable, raw_owned in (
-            (self.market.up_token_id, up_sellable, up_owned),
-            (self.market.dn_token_id, dn_sellable, dn_owned),
+        liquidatable_limits = {
+            self.market.up_token_id: max(0.0, float(up_owned or 0.0) - protected_up_qty),
+            self.market.dn_token_id: max(0.0, float(dn_owned or 0.0) - protected_dn_qty),
+        }
+        if (
+            protected_paired_qty >= min_size
+            and max(liquidatable_limits.values(), default=0.0) <= 1e-9
+        ):
+            log.info(
+                "Skipping terminal sell for %.2f paired shares (settlement guaranteed)",
+                protected_paired_qty,
+            )
+
+        for token_id, raw_sellable, raw_owned, protected_qty in (
+            (self.market.up_token_id, up_sellable, up_owned, protected_up_qty),
+            (self.market.dn_token_id, dn_sellable, dn_owned, protected_dn_qty),
         ):
             sellable = max(0.0, float(raw_sellable or 0.0))
             owned = max(0.0, float(raw_owned or 0.0))
-            size = math.floor(max(sellable, owned) * 100.0) / 100.0
+            liquidatable_qty = max(0.0, owned - max(0.0, float(protected_qty)))
+            size = math.floor(min(max(sellable, owned), liquidatable_qty) * 100.0) / 100.0
             if size < min_size:
                 continue
             had_material_inventory = True
@@ -322,15 +344,22 @@ class PMGateway:
         up_remaining, dn_remaining, total_usdc, _ = await self.get_wallet_balances()
         rem_up = max(0.0, float(up_remaining or 0.0))
         rem_dn = max(0.0, float(dn_remaining or 0.0))
-        done = rem_up < min_size and rem_dn < min_size
+        excess_rem_up = max(0.0, rem_up - protected_up_qty)
+        excess_rem_dn = max(0.0, rem_dn - protected_dn_qty)
+        done = excess_rem_up < min_size and excess_rem_dn < min_size
         reason = "ok"
         if not done and had_material_inventory and placed_orders == 0:
             reason = "no_book_liquidity"
+        elif done and protected_paired_qty > 1e-9 and max(rem_up, rem_dn) > 1e-9:
+            reason = "paired_inventory_protected"
         return {
             "attempted_orders": attempted_orders,
             "placed_orders": placed_orders,
             "remaining_up": round(rem_up, 4),
             "remaining_dn": round(rem_dn, 4),
+            "excess_remaining_up": round(excess_rem_up, 4),
+            "excess_remaining_dn": round(excess_rem_dn, 4),
+            "protected_paired_qty": round(protected_paired_qty, 4),
             "wallet_total_usdc": round(max(0.0, float(total_usdc or 0.0)), 4),
             "done": bool(done),
             "reason": reason,
@@ -343,6 +372,8 @@ class PMGateway:
         *,
         rounds: int = 8,
         round_delay_sec: float = 1.0,
+        protected_up_qty: float = 0.0,
+        protected_dn_qty: float = 0.0,
     ) -> dict[str, Any]:
         """Best-effort forced inventory unwind used by manual stop().
 
@@ -355,6 +386,9 @@ class PMGateway:
                 "placed_orders": 0,
                 "remaining_up": 0.0,
                 "remaining_dn": 0.0,
+                "excess_remaining_up": 0.0,
+                "excess_remaining_dn": 0.0,
+                "protected_paired_qty": 0.0,
                 "done": True,
                 "reason": "no_market",
             }
@@ -362,11 +396,16 @@ class PMGateway:
         attempted_orders = 0
         placed_orders = 0
         min_size = max(0.0, float(self.market.min_order_size or 0.0))
+        protected_up_qty = max(0.0, float(protected_up_qty))
+        protected_dn_qty = max(0.0, float(protected_dn_qty))
+        protected_paired_qty = min(protected_up_qty, protected_dn_qty)
 
         for round_idx in range(max(1, int(rounds))):
             step = await self.run_terminal_liquidation_step(
                 round_idx=round_idx,
                 cancel_existing=False,
+                protected_up_qty=protected_up_qty,
+                protected_dn_qty=protected_dn_qty,
             )
             attempted_orders += int(step.get("attempted_orders") or 0)
             placed_orders += int(step.get("placed_orders") or 0)
@@ -383,12 +422,12 @@ class PMGateway:
 
         # Aggressive retry pass if inventory remains
         up_check, dn_check, _, _ = await self.get_wallet_balances()
-        for token_id, raw_bal in (
-            (self.market.up_token_id, up_check),
-            (self.market.dn_token_id, dn_check),
+        for token_id, raw_bal, protected_qty in (
+            (self.market.up_token_id, up_check, protected_up_qty),
+            (self.market.dn_token_id, dn_check, protected_dn_qty),
         ):
             bal = max(0.0, float(raw_bal or 0.0))
-            size = math.floor(bal * 100.0) / 100.0
+            size = math.floor(max(0.0, bal - max(0.0, float(protected_qty))) * 100.0) / 100.0
             if size < min_size:
                 continue
             # Try at 0.01 floor price as last resort
@@ -417,13 +456,17 @@ class PMGateway:
         up_remaining, dn_remaining, _, _ = await self.get_wallet_balances()
         rem_up = max(0.0, float(up_remaining or 0.0))
         rem_dn = max(0.0, float(dn_remaining or 0.0))
-        done = rem_up < min_size and rem_dn < min_size
+        excess_rem_up = max(0.0, rem_up - protected_up_qty)
+        excess_rem_dn = max(0.0, rem_dn - protected_dn_qty)
+        done = excess_rem_up < min_size and excess_rem_dn < min_size
         log.info(
-            "Stop liquidation summary: attempted=%d placed=%d rem_up=%.4f rem_dn=%.4f done=%s",
+            "Stop liquidation summary: attempted=%d placed=%d rem_up=%.4f rem_dn=%.4f excess_up=%.4f excess_dn=%.4f done=%s",
             attempted_orders,
             placed_orders,
             rem_up,
             rem_dn,
+            excess_rem_up,
+            excess_rem_dn,
             done,
         )
         return {
@@ -431,8 +474,11 @@ class PMGateway:
             "placed_orders": placed_orders,
             "remaining_up": round(rem_up, 4),
             "remaining_dn": round(rem_dn, 4),
+            "excess_remaining_up": round(excess_rem_up, 4),
+            "excess_remaining_dn": round(excess_rem_dn, 4),
+            "protected_paired_qty": round(protected_paired_qty, 4),
             "done": bool(done),
-            "reason": "ok",
+            "reason": "paired_inventory_protected" if done and protected_paired_qty > 1e-9 and max(rem_up, rem_dn) > 1e-9 else "ok",
         }
 
     async def check_fills(self) -> list[Fill]:
