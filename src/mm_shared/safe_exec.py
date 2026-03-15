@@ -310,17 +310,14 @@ def safe_merge_positions(
     if len(cond_hex) != 64:
         return {"success": False, "error": f"condition_id must be 32 bytes, got {len(cond_hex) // 2}"}
 
-    _encode = getattr(ctf, 'encode_abi', None) or getattr(ctf, 'encodeABI')
-    inner_data = _encode(
-        fn_name="mergePositions",
-        args=[
-            w3.to_checksum_address(USDC_E),
-            b"\x00" * 32,
-            bytes.fromhex(cond_hex),
-            [1, 2],
-            amount_wei,
-        ],
+    fn_call = ctf.functions.mergePositions(
+        w3.to_checksum_address(USDC_E),
+        b"\x00" * 32,
+        bytes.fromhex(cond_hex),
+        [1, 2],
+        amount_wei,
     )
+    inner_data = fn_call._encode_transaction_data()
 
     log.info("Merging %.2f pairs via Safe %s (condition=%s...)",
              amount_shares, safe_address[:10], cond_hex[:12])
@@ -329,7 +326,7 @@ def safe_merge_positions(
         private_key=private_key,
         safe_address=safe_address,
         to=CTF_CONTRACT,
-        data=bytes.fromhex(inner_data[2:]),
+        data=bytes.fromhex(inner_data[2:]) if inner_data.startswith("0x") else bytes.fromhex(inner_data),
         gas_limit=300_000,
         rpc_url=rpc_url,
     )
@@ -359,16 +356,13 @@ def safe_redeem_positions(
     if len(cond_hex) != 64:
         return {"success": False, "error": f"condition_id must be 32 bytes, got {len(cond_hex) // 2}"}
 
-    _encode = getattr(ctf, 'encode_abi', None) or getattr(ctf, 'encodeABI')
-    inner_data = _encode(
-        fn_name="redeemPositions",
-        args=[
-            w3.to_checksum_address(USDC_E),
-            b"\x00" * 32,
-            bytes.fromhex(cond_hex),
-            [1, 2],
-        ],
+    fn_call = ctf.functions.redeemPositions(
+        w3.to_checksum_address(USDC_E),
+        b"\x00" * 32,
+        bytes.fromhex(cond_hex),
+        [1, 2],
     )
+    inner_data = fn_call._encode_transaction_data()
 
     log.info("Redeeming via Safe %s (condition=%s...)", safe_address[:10], cond_hex[:12])
 
@@ -376,7 +370,7 @@ def safe_redeem_positions(
         private_key=private_key,
         safe_address=safe_address,
         to=CTF_CONTRACT,
-        data=bytes.fromhex(inner_data[2:]),
+        data=bytes.fromhex(inner_data[2:]) if inner_data.startswith("0x") else bytes.fromhex(inner_data),
         gas_limit=300_000,
         rpc_url=rpc_url,
     )
