@@ -39,7 +39,7 @@ class PairArbConfig:
     maker_order_ttl_sec: float = 10.0  # Cancel maker orders after this TTL
 
     # Position sizing
-    max_clip_shares: float = 20.0      # Max shares per side per arb
+    max_clip_shares: float = 5.0       # Max shares per side per arb (conservative for small balance)
     min_clip_shares: float = 5.0       # PM minimum order size
 
     # Risk limits
