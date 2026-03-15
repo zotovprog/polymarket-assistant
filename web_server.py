@@ -4788,10 +4788,13 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
         api_secret = os.environ.get("PM_API_SECRET", "")
         api_passphrase = os.environ.get("PM_API_PASSPHRASE", "")
 
+        from mm_shared.mm_config import MMConfig
+        mm_config = MMConfig()  # Default config for OrderManager
+
         if req.paper_mode:
             # Use MockClobClient for paper mode.
             client = MockClobClient(usdc_balance=float(req.initial_usdc))
-            order_mgr = OrderManager(client)
+            order_mgr = OrderManager(client, mm_config)
         else:
             if not private_key:
                 raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
@@ -4803,7 +4806,7 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
                 chain_id=chain_id,
                 creds={"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase} if api_key else None,
             )
-            order_mgr = OrderManager(client)
+            order_mgr = OrderManager(client, mm_config)
 
         _pair_arb_engine = PairArbEngine(
             order_mgr=order_mgr,
