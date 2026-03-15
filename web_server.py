@@ -4877,8 +4877,12 @@ async def pair_arb_redeem(request: Request):
         raise HTTPException(status_code=500, detail="PM_PRIVATE_KEY not configured")
 
     import asyncio
-    from mm_shared.approvals import redeem_positions as _redeem
-    result = await asyncio.to_thread(_redeem, private_key, condition_id)
+    if PM_FUNDER:
+        from mm_shared.safe_exec import safe_redeem_positions
+        result = await asyncio.to_thread(safe_redeem_positions, private_key, PM_FUNDER, condition_id)
+    else:
+        from mm_shared.approvals import redeem_positions as _redeem
+        result = await asyncio.to_thread(_redeem, private_key, condition_id)
     return result
 
 
@@ -4894,7 +4898,7 @@ async def pair_arb_redeem_all(request: Request):
         raise HTTPException(status_code=500, detail="PM_FUNDER not configured")
 
     import httpx
-    from mm_shared.approvals import redeem_positions as _redeem
+    from mm_shared.safe_exec import safe_redeem_positions
 
     # Fetch all redeemable positions from Polymarket data API
     try:
@@ -4925,7 +4929,9 @@ async def pair_arb_redeem_all(request: Request):
         title = pos.get("title", pos.get("market", {}).get("question", ""))[:60]
         size = pos.get("size", 0)
         try:
-            result = await asyncio.to_thread(_redeem, private_key, cond_id)
+            result = await asyncio.to_thread(
+                safe_redeem_positions, private_key, PM_FUNDER, cond_id,
+            )
             if result.get("success"):
                 redeemed.append({
                     "condition_id": cond_id[:16] + "...",

@@ -3769,12 +3769,14 @@ class OrderManager:
         if hasattr(self.client, 'signer'):
             signer_addr = getattr(self.client.signer, 'address', lambda: None)()
         if funder and signer_addr and funder.lower() != signer_addr.lower():
-            log.warning(
-                "Merge skipped: tokens on funder (%s), not EOA (%s). "
-                "Using SELL liquidation instead.",
-                funder[:10], signer_addr[:10],
+            log.info(
+                "Merge via Safe: tokens on funder (%s), executing through Safe.execTransaction",
+                funder[:10],
             )
-            return {"success": False, "error": "funder mode — merge not supported"}
+            from .safe_exec import safe_merge_positions
+            return await asyncio.to_thread(
+                safe_merge_positions, private_key, funder, condition_id, amount_shares,
+            )
 
         from .approvals import merge_positions as _merge
         return await asyncio.to_thread(_merge, private_key, condition_id, amount_shares)
@@ -3793,11 +3795,14 @@ class OrderManager:
         if hasattr(self.client, 'signer'):
             signer_addr = getattr(self.client.signer, 'address', lambda: None)()
         if funder and signer_addr and funder.lower() != signer_addr.lower():
-            log.warning(
-                "Redeem skipped: tokens on funder (%s), not EOA (%s)",
-                funder[:10], signer_addr[:10],
+            log.info(
+                "Redeem via Safe: tokens on funder (%s), executing through Safe.execTransaction",
+                funder[:10],
             )
-            return {"success": False, "error": "funder mode — redeem not supported"}
+            from .safe_exec import safe_redeem_positions
+            return await asyncio.to_thread(
+                safe_redeem_positions, private_key, funder, condition_id,
+            )
 
         from .approvals import redeem_positions as _redeem
         return await asyncio.to_thread(_redeem, private_key, condition_id)
