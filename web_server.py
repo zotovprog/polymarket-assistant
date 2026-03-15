@@ -4812,7 +4812,14 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
         app_version=APP_VERSION,
     )
 
-    result = await _pair_arb_engine.start()
+    try:
+        result = await _pair_arb_engine.start()
+    except Exception as e:
+        _pair_arb_engine = None
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "traceback": traceback.format_exc()},
+        )
     return result
 
 
