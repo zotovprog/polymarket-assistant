@@ -62,6 +62,7 @@ class PairArbEngine:
         self._redeemed: set[str] = set()       # already redeemed
         self._last_redeem_attempt: float = 0.0
         self._task: asyncio.Task | None = None
+        self._current_best_scope: str | None = None
 
     async def start(self) -> dict:
         """Start the arb engine. Returns initial state."""
@@ -183,12 +184,11 @@ class PairArbEngine:
                 self._scan_count += 1
 
                 # === MAKER MODE: manage persistent BUY limits ===
-                # Only post orders on the BEST market (most profitable spread)
-                # to avoid exceeding USDC budget across too many markets.
+                # Only post orders on the SINGLE best market to concentrate USDC.
                 if self.config.use_maker_orders:
-                    # First: scan all markets to find best spread
+                    # Find best market (lowest total bid = highest profit)
                     best_scope = None
-                    best_spread = 1.0
+                    best_total = 2.0  # impossibly high
                     for scope, mgr in self._maker_managers.items():
                         try:
                             up_book = await self.order_mgr.get_full_book(mgr.market.up_token_id)
@@ -196,26 +196,39 @@ class PairArbEngine:
                             bid_up = up_book.get("best_bid") or 0
                             bid_dn = dn_book.get("best_bid") or 0
                             total = bid_up + bid_dn
-                            if total > 0 and total < best_spread:
-                                best_spread = total
+                            if 0 < total < best_total:
+                                best_total = total
                                 best_scope = scope
                         except Exception:
                             pass
 
-                    # Post orders only on best market, cancel others
-                    for scope, mgr in self._maker_managers.items():
+                    # If best market changed, cancel ALL orders first
+                    if best_scope and best_scope != self._current_best_scope:
+                        if self._current_best_scope is not None:
+                            log.info(
+                                "Switching best market: %s -> %s (total=%.4f)",
+                                self._current_best_scope, best_scope, best_total,
+                            )
                         try:
-                            if scope == best_scope:
-                                result = await mgr.tick()
-                                if result and result.get("taker_opportunity"):
-                                    self._opportunities_seen += 1
-                                    self._last_opportunity_ts = time.time()
-                            else:
-                                # Cancel orders on non-best markets
-                                if mgr.up_order_id or mgr.dn_order_id:
-                                    await mgr.cancel_all()
+                            await self.order_mgr.cancel_all()
                         except Exception as e:
-                            log.debug("Maker tick error for %s: %s", scope, e)
+                            log.warning("cancel_all on market switch failed: %s", e)
+                        for mgr in self._maker_managers.values():
+                            try:
+                                await mgr.cancel_all()
+                            except Exception as e:
+                                log.debug("Maker cancel_all failed for %s: %s", mgr.market.scope, e)
+                        self._current_best_scope = best_scope
+
+                    # Tick only the best market
+                    if best_scope and best_scope in self._maker_managers:
+                        try:
+                            result = await self._maker_managers[best_scope].tick()
+                            if result and result.get("taker_opportunity"):
+                                self._opportunities_seen += 1
+                                self._last_opportunity_ts = time.time()
+                        except Exception as e:
+                            log.debug("Maker tick error for %s: %s", best_scope, e)
 
                 # === TAKER MODE: scan asks for immediate arb ===
                 else:
@@ -328,6 +341,7 @@ class PairArbEngine:
                 e.to_dict() for e in self.executor.pending
             ],
         )
+        state.config["current_best_scope"] = self._current_best_scope
         # Add maker manager info
         if self._maker_managers:
             state.config["maker_managers"] = {
