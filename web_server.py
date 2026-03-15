@@ -4908,8 +4908,8 @@ async def pair_arb_redeem_all(request: Request):
                 params={
                     "user": PM_FUNDER,
                     "redeemable": "true",
-                    "sizeThreshold": "0",
-                    "limit": "500",
+                    "sizeThreshold": "1",
+                    "limit": "50",
                 },
             )
             resp.raise_for_status()
