@@ -1974,6 +1974,12 @@ class MarketMakerV2:
             wallet_snapshot_stale=effective_wallet_stale,
             terminal_cleanup_grace=bool(post_terminal_cleanup_grace_active),
         )
+        # Suppress drift when both token balances are below PM minimum order
+        # size.  The bot cannot sell sub-minimum inventory, so drift detection
+        # only causes pointless emergency_unwind thrashing.
+        _min_os = float(self.market.min_order_size if self.market else 5.0)
+        if self.reconcile.true_drift and float(up) < _min_os and float(dn) < _min_os:
+            self.reconcile.align(up, dn)
         inventory.sellable_up_shares = sellable_up
         inventory.sellable_dn_shares = sellable_dn
         sellable_balance_unknown = bool(
