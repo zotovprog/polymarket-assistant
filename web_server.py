@@ -92,6 +92,13 @@ RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC = max(
     2.0,
     float(os.environ.get("RUNTIME_WATCHDOG_LOG_COOLDOWN_SEC", "10.0")),
 )
+V2_SUPPORTED_COINS = frozenset({"BTC", "ETH", "SOL", "XRP"})
+V2_SUPPORTED_TIMEFRAMES = frozenset({"5m", "15m", "1h", "4h"})
+V2_SUPPORTED_MARKET_SCOPES = frozenset(
+    f"{coin}_{timeframe}"
+    for coin in V2_SUPPORTED_COINS
+    for timeframe in V2_SUPPORTED_TIMEFRAMES
+)
 
 
 # ── Auth ────────────────────────────────────────────────────────
@@ -422,6 +429,7 @@ class ConfigUpdateRequestV2(BaseModel):
     soft_excess_value_ratio: Optional[float] = None
     hard_excess_value_ratio: Optional[float] = None
     base_half_spread_bps: Optional[float] = None
+    min_edge_bps: Optional[float] = None
     max_half_spread_bps: Optional[float] = None
     inventory_skew_strength: Optional[float] = None
     defensive_spread_mult: Optional[float] = None
@@ -2658,7 +2666,7 @@ class MMRuntime:
 
 class MMRuntimeV2(MMRuntime):
     """Parallel runtime for the pair-first V2 engine."""
-    LIVE_MIN_BUDGET_USD = 30.0
+    LIVE_MIN_BUDGET_USD = 15.0
     PAPER_MIN_BUDGET_USD = 30.0
 
     def __init__(self):
@@ -3011,8 +3019,14 @@ class MMRuntimeV2(MMRuntime):
                 self._running = False
         if self._running:
             raise HTTPException(status_code=400, detail="V2 already running")
-        if str(coin).upper() != "BTC" or str(timeframe) not in {"15m", "1h"}:
-            raise HTTPException(status_code=400, detail="V2 scope is limited to BTC 15m/1h")
+        if str(coin).upper() not in V2_SUPPORTED_COINS or str(timeframe) not in V2_SUPPORTED_TIMEFRAMES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"V2 supports coins {sorted(V2_SUPPORTED_COINS)} "
+                    f"on timeframes {sorted(V2_SUPPORTED_TIMEFRAMES)}"
+                ),
+            )
 
         await self._cancel_strike_retry_task()
         await self._cancel_monitor_task()
@@ -3053,7 +3067,7 @@ class MMRuntimeV2(MMRuntime):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"live_min_budget_30_required: requested={effective_session_budget:.2f} "
+                    f"live_min_budget_15_required: requested={effective_session_budget:.2f} "
                     f"min={self.LIVE_MIN_BUDGET_USD:.2f}"
                 ),
             )
@@ -4317,7 +4331,7 @@ async def mmv2_start(req: StartRequest, request: Request):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"live_min_budget_30_required: requested={session_budget_usd:.2f} "
+                f"live_min_budget_15_required: requested={session_budget_usd:.2f} "
                 f"min={MMRuntimeV2.LIVE_MIN_BUDGET_USD:.2f}"
             ),
         )
@@ -4399,9 +4413,19 @@ async def mmv2_state(request: Request):
 async def mmv2_config_update(req: ConfigUpdateRequestV2, request: Request):
     _require_auth(request)
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    if req.min_edge_bps is not None:
+        updates["min_edge_bps"] = req.min_edge_bps
     market_scope = updates.get("market_scope")
-    if market_scope is not None and market_scope not in {"BTC_15m", "BTC_1h"}:
-        return JSONResponse({"error": "market_scope must be BTC_15m or BTC_1h"}, status_code=400)
+    if market_scope is not None and market_scope not in V2_SUPPORTED_MARKET_SCOPES:
+        return JSONResponse(
+            {
+                "error": (
+                    "market_scope must be one of "
+                    f"{sorted(V2_SUPPORTED_MARKET_SCOPES)}"
+                )
+            },
+            status_code=400,
+        )
     config = _runtime_v2.update_config(**updates)
     return {"ok": True, "config": config}
 

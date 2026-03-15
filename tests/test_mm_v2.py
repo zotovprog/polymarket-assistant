@@ -1949,18 +1949,18 @@ async def test_mmv2_start_live_uses_config_budget_when_initial_usdc_omitted(monk
 
 
 @pytest.mark.asyncio
-async def test_live_start_rejects_budget_below_30(monkeypatch):
+async def test_live_start_rejects_budget_below_15(monkeypatch):
     web_server = importlib.import_module("web_server")
     monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
     monkeypatch.setattr(web_server._runtime, "_running", False)
     monkeypatch.setattr(web_server._paper_sweep_v2, "snapshot", lambda: {"is_running": False})
-    web_server._runtime_v2.mm_config_v2.session_budget_usd = 15.0
+    web_server._runtime_v2.mm_config_v2.session_budget_usd = 10.0
 
     req = web_server.StartRequest(coin="BTC", timeframe="15m", paper_mode=False, dev=True)
     with pytest.raises(web_server.HTTPException) as exc:
         await web_server.mmv2_start(req=req, request=object())
     assert exc.value.status_code == 400
-    assert "live_min_budget_30_required" in str(exc.value.detail)
+    assert "live_min_budget_15_required" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio

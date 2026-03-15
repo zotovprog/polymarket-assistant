@@ -552,6 +552,13 @@ class QuotePolicyV2:
         model_anchor_dn = self._model_anchor(snapshot, "dn")
         spread = self._spread(risk, snapshot)
         clip_usd = self._clip_usd(risk)
+        # Reduce buy clip near expiry to limit adverse selection.
+        _late_p = self._late_expiry_pressure(snapshot)
+        if _late_p > 0.0:
+            clip_usd *= max(
+                float(self.config.late_expiry_buy_size_mult_min),
+                1.0 - _late_p * 0.75,
+            )
         free_usdc = max(0.0, float(inventory.free_usdc))
         budget_headroom_usd = self._buy_headroom_usd(
             free_usdc=free_usdc,
@@ -634,6 +641,12 @@ class QuotePolicyV2:
                 dn_ask_price -= spread * skew_factor * 0.3
                 up_bid_price += spread * skew_factor * 0.3
                 up_ask_price += spread * skew_factor * 0.5
+
+        # FV guard: never buy above model anchor (prevents adverse selection).
+        if up_bid_price > model_anchor_up:
+            up_bid_price = min(up_bid_price, model_anchor_up - ctx.tick_size)
+        if dn_bid_price > model_anchor_dn:
+            dn_bid_price = min(dn_bid_price, model_anchor_dn - ctx.tick_size)
 
         raw_quotes = {
             "up_bid": ("BUY", snapshot.up_token_id, up_bid_price, snapshot.up_best_bid, snapshot.up_best_ask, "base_bid"),
