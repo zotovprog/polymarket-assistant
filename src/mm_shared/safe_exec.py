@@ -310,7 +310,8 @@ def safe_merge_positions(
     if len(cond_hex) != 64:
         return {"success": False, "error": f"condition_id must be 32 bytes, got {len(cond_hex) // 2}"}
 
-    inner_data = ctf.encodeABI(
+    _encode = getattr(ctf, 'encode_abi', None) or getattr(ctf, 'encodeABI')
+    inner_data = _encode(
         fn_name="mergePositions",
         args=[
             w3.to_checksum_address(USDC_E),
@@ -358,7 +359,8 @@ def safe_redeem_positions(
     if len(cond_hex) != 64:
         return {"success": False, "error": f"condition_id must be 32 bytes, got {len(cond_hex) // 2}"}
 
-    inner_data = ctf.encodeABI(
+    _encode = getattr(ctf, 'encode_abi', None) or getattr(ctf, 'encodeABI')
+    inner_data = _encode(
         fn_name="redeemPositions",
         args=[
             w3.to_checksum_address(USDC_E),
