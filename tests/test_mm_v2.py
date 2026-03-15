@@ -30,7 +30,7 @@ from mm_v2.reconcile import ReconcileV2
 from mm_v2.risk_kernel import HardSafetyKernel
 from mm_v2.runtime import MarketMakerV2
 from mm_v2.state_machine import StateMachineV2
-from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteIntent, QuoteViabilitySummary
+from mm_v2.types import AnalyticsState, HealthState, PairInventoryState, PairMarketSnapshot, QuoteIntent, QuoteViabilitySummary, RiskRegime
 
 
 def _market() -> MarketInfo:
@@ -387,7 +387,7 @@ async def test_pmgateway_stop_liquidation_reuses_terminal_step(monkeypatch):
     gateway.set_market(_market())
     rounds: list[tuple[int, bool]] = []
 
-    async def _step(*, round_idx: int = 0, cancel_existing: bool = True):
+    async def _step(*, round_idx: int = 0, cancel_existing: bool = True, protected_up_qty: float = 0.0, protected_dn_qty: float = 0.0):
         rounds.append((round_idx, cancel_existing))
         if round_idx == 0:
             return {
@@ -703,7 +703,7 @@ async def test_mmv2_stop_runs_emergency_flatten_when_liquidate_true(monkeypatch)
         calls.append("cancel_all")
         return 0
 
-    async def _flatten():
+    async def _flatten(**kwargs):
         calls.append("flatten")
         return {"done": True, "remaining_up": 0.0, "remaining_dn": 0.0}
 
@@ -950,6 +950,89 @@ def test_quote_policy_skews_against_excess_up_inventory():
     assert skewed_plan.up_bid.inventory_effect == "harmful"
     assert skewed_plan.dn_bid.inventory_effect == "helpful"
     assert skewed_plan.regime in {"inventory_skewed", "unwind", "defensive", "normal"}
+
+
+def test_quote_policy_defensive_sell_caps_to_excess_shares():
+    cfg = MMConfigV2(base_clip_usd=50.0)
+    snap = _snapshot()
+    inventory = _inventory(
+        up_shares=8.0,
+        dn_shares=5.0,
+        paired_qty=5.0,
+        excess_up_qty=3.0,
+        paired_value_usd=5.0,
+        excess_up_value_usd=1.62,
+        excess_value_usd=1.62,
+        signed_excess_value_usd=1.62,
+        total_inventory_value_usd=6.62,
+        inventory_pressure_abs=1.0,
+        inventory_pressure_signed=1.0,
+        sellable_up_shares=8.0,
+        sellable_dn_shares=5.0,
+    )
+    risk = RiskRegime(
+        soft_mode="defensive",
+        hard_mode="none",
+        reason="test",
+        inventory_pressure=1.0,
+        edge_score=0.0,
+        drawdown_pct_budget=0.0,
+        inventory_side="up",
+        inventory_pressure_abs=1.0,
+        inventory_pressure_signed=1.0,
+    )
+
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snap,
+        inventory=inventory,
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0, allow_naked_sells=False),
+    )
+
+    assert plan.up_ask is not None
+    assert plan.up_ask.side == "SELL"
+    assert plan.up_ask.size == pytest.approx(3.0)
+
+
+def test_quote_policy_spread_widens_for_severe_negative_markout():
+    cfg = MMConfigV2(adverse_selection_spread_mult=0.0)
+    policy = QuotePolicyV2(cfg)
+    snap = _snapshot(realized_vol_per_min=0.0003, time_left_sec=900.0)
+    base_risk = RiskRegime(
+        soft_mode="normal",
+        hard_mode="none",
+        reason="test",
+        inventory_pressure=0.0,
+        edge_score=0.0,
+        drawdown_pct_budget=0.0,
+    )
+    threshold_risk = RiskRegime(
+        soft_mode="normal",
+        hard_mode="none",
+        reason="test",
+        inventory_pressure=0.0,
+        edge_score=0.0,
+        drawdown_pct_budget=0.0,
+        rolling_markout_up_5s=-0.005,
+        rolling_markout_dn_5s=-0.004,
+    )
+    severe_risk = RiskRegime(
+        soft_mode="normal",
+        hard_mode="none",
+        reason="test",
+        inventory_pressure=0.0,
+        edge_score=0.0,
+        drawdown_pct_budget=0.0,
+        rolling_markout_up_5s=-0.008,
+        rolling_markout_dn_5s=-0.004,
+    )
+
+    base_spread = policy._spread(base_risk, snap)
+    threshold_spread = policy._spread(threshold_risk, snap)
+    severe_spread = policy._spread(severe_risk, snap)
+
+    assert threshold_spread == pytest.approx(base_spread)
+    assert severe_spread == pytest.approx(base_spread + 0.004)
 
 
 def test_quote_policy_suppresses_buy_when_pm_spread_too_narrow():

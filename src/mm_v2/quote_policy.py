@@ -310,6 +310,11 @@ class QuotePolicyV2:
         )
         if adverse_markout > 0.0:
             base += adverse_markout * float(self.config.adverse_selection_spread_mult)
+        markout_up = float(getattr(risk, "rolling_markout_up_5s", 0.0) or 0.0)
+        markout_dn = float(getattr(risk, "rolling_markout_dn_5s", 0.0) or 0.0)
+        worst_markout = min(markout_up, markout_dn)
+        if worst_markout < -0.005:
+            base += abs(worst_markout) * 0.5
         late_expiry_pressure = self._late_expiry_pressure(snapshot)
         if late_expiry_pressure > 0.0:
             base *= 1.0 + (
@@ -447,6 +452,26 @@ class QuotePolicyV2:
             return max(
                 0.0,
                 float(inventory.sellable_dn_shares) - float(inventory.pending_sell_dn),
+            )
+        return 0.0
+
+    @staticmethod
+    def _excess_share_cap(
+        *,
+        token: str,
+        inventory: PairInventoryState,
+        up_token_id: str,
+        dn_token_id: str,
+    ) -> float:
+        if token == up_token_id:
+            return max(
+                0.0,
+                float(inventory.excess_up_qty) - float(inventory.pending_sell_up),
+            )
+        if token == dn_token_id:
+            return max(
+                0.0,
+                float(inventory.excess_dn_qty) - float(inventory.pending_sell_dn),
             )
         return 0.0
 
@@ -1130,6 +1155,8 @@ class QuotePolicyV2:
             size_mult = self._size_multiplier(effect, pressure)
             owned_share_cap = 0.0
             live_sellable_share_cap = 0.0
+            protected_sell_share_cap = 0.0
+            share_cap_for_sell = 0.0
             inventory_backed_sell = False
             if side == "SELL":
                 owned_share_cap = self._owned_share_cap(
@@ -1144,7 +1171,17 @@ class QuotePolicyV2:
                     up_token_id=snapshot.up_token_id,
                     dn_token_id=snapshot.dn_token_id,
                 )
-                share_cap_for_sell = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
+                protected_sell_share_cap = self._excess_share_cap(
+                    token=token,
+                    inventory=inventory,
+                    up_token_id=snapshot.up_token_id,
+                    dn_token_id=snapshot.dn_token_id,
+                )
+                share_cap_for_sell = (
+                    protected_sell_share_cap
+                    if ctx.allow_naked_sells
+                    else min(live_sellable_share_cap, protected_sell_share_cap)
+                )
                 inventory_backed_sell = share_cap_for_sell >= ctx.min_order_size
                 if not ctx.allow_naked_sells and not inventory_backed_sell:
                     built[slot] = None
@@ -1293,7 +1330,7 @@ class QuotePolicyV2:
                     (
                         side == "SELL"
                         and inventory_backed_sell
-                        and owned_share_cap >= ctx.min_order_size
+                        and share_cap_for_sell >= ctx.min_order_size
                     )
                     or min_viable_clip_usd <= helpful_headroom_usd * max(1.0, size_mult)
                 )
@@ -1348,7 +1385,7 @@ class QuotePolicyV2:
                 )
                 effective_clip_usd = max(effective_clip_usd, min_sell_clip_usd)
             if inventory_backed_sell:
-                share_cap = owned_share_cap if ctx.allow_naked_sells else live_sellable_share_cap
+                share_cap = share_cap_for_sell
             else:
                 share_cap = max(0.0, effective_clip_usd / pair_reference_price)
                 if side == "SELL" and sell_churn_hold_candidate:
@@ -1759,7 +1796,23 @@ class QuotePolicyV2:
         if risk.hard_mode == "emergency_unwind":
             regime = "emergency_unwind"
             emergency_taker_forced = bool(getattr(risk, "emergency_taker_forced", False))
-            if inventory.up_shares > 0:
+            up_excess_shares = self._excess_share_cap(
+                token=snapshot.up_token_id,
+                inventory=inventory,
+                up_token_id=snapshot.up_token_id,
+                dn_token_id=snapshot.dn_token_id,
+            )
+            if not ctx.allow_naked_sells:
+                up_excess_shares = min(
+                    up_excess_shares,
+                    self._sellable_share_cap(
+                        token=snapshot.up_token_id,
+                        inventory=inventory,
+                        up_token_id=snapshot.up_token_id,
+                        dn_token_id=snapshot.dn_token_id,
+                    ),
+                )
+            if up_excess_shares > 0:
                 up_post_only = bool(
                     snapshot.time_left_sec > self.config.emergency_taker_start_sec
                 ) and not emergency_taker_forced
@@ -1778,11 +1831,11 @@ class QuotePolicyV2:
                     side="SELL",
                     price=up_emergency_price,
                     clip_usd=clip_usd,
-                    share_cap=max(0.0, inventory.up_shares),
+                    share_cap=max(0.0, up_excess_shares),
                     ctx=ctx,
                     role="emergency_unwind",
                     post_only=up_post_only,
-                    size_override=inventory.up_shares,
+                    size_override=up_excess_shares,
                     inventory_effect="helpful" if risk.inventory_side == "up" else "neutral",
                     size_mult=1.0,
                     price_adjust_ticks=0,
@@ -1791,7 +1844,23 @@ class QuotePolicyV2:
             else:
                 built["up_bid"] = None
                 built["up_ask"] = None
-            if inventory.dn_shares > 0:
+            dn_excess_shares = self._excess_share_cap(
+                token=snapshot.dn_token_id,
+                inventory=inventory,
+                up_token_id=snapshot.up_token_id,
+                dn_token_id=snapshot.dn_token_id,
+            )
+            if not ctx.allow_naked_sells:
+                dn_excess_shares = min(
+                    dn_excess_shares,
+                    self._sellable_share_cap(
+                        token=snapshot.dn_token_id,
+                        inventory=inventory,
+                        up_token_id=snapshot.up_token_id,
+                        dn_token_id=snapshot.dn_token_id,
+                    ),
+                )
+            if dn_excess_shares > 0:
                 dn_post_only = bool(
                     snapshot.time_left_sec > self.config.emergency_taker_start_sec
                 ) and not emergency_taker_forced
@@ -1810,11 +1879,11 @@ class QuotePolicyV2:
                     side="SELL",
                     price=dn_emergency_price,
                     clip_usd=clip_usd,
-                    share_cap=max(0.0, inventory.dn_shares),
+                    share_cap=max(0.0, dn_excess_shares),
                     ctx=ctx,
                     role="emergency_unwind",
                     post_only=dn_post_only,
-                    size_override=inventory.dn_shares,
+                    size_override=dn_excess_shares,
                     inventory_effect="helpful" if risk.inventory_side == "dn" else "neutral",
                     size_mult=1.0,
                     price_adjust_ticks=0,
