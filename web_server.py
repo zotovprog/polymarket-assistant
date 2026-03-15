@@ -4799,12 +4799,20 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
             if not private_key:
                 raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
             from py_clob_client.client import ClobClient
-            chain_id = int(os.environ.get("PM_CHAIN_ID", "137"))
+            from py_clob_client.clob_types import ApiCreds
+            funder = os.environ.get("PM_FUNDER", "")
+            creds = ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            ) if api_key else None
             client = ClobClient(
-                "https://clob.polymarket.com",
+                host="https://clob.polymarket.com",
                 key=private_key,
-                chain_id=chain_id,
-                creds={"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase} if api_key else None,
+                chain_id=137,
+                creds=creds,
+                funder=funder,
+                signature_type=2,  # POLY_GNOSIS_SAFE
             )
             order_mgr = OrderManager(client, mm_config)
 
