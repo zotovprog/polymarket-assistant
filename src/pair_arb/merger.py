@@ -85,3 +85,33 @@ class MergeTrigger:
         error = result.get("error", "unknown") if result else "no_result"
         log.warning("Merge failed for %s: %s", market.scope, error)
         return {"merged": 0, "error": error}
+
+    async def check_asymmetric_fills(
+        self, market, threshold: float = 1.0,
+    ) -> dict | None:
+        """Detect when one side filled but the other didn't (naked directional exposure).
+
+        Returns dict with imbalance info, or None if balanced/empty.
+        """
+        try:
+            up_bal, dn_bal, _, _ = await self.order_mgr.get_all_token_balances(
+                market.up_token_id, market.dn_token_id,
+            )
+        except Exception:
+            return None
+
+        up_bal = float(up_bal or 0)
+        dn_bal = float(dn_bal or 0)
+        diff = abs(up_bal - dn_bal)
+
+        if diff < threshold:
+            return None
+
+        heavy_side = "up" if up_bal > dn_bal else "dn"
+        return {
+            "scope": market.scope,
+            "up_bal": up_bal,
+            "dn_bal": dn_bal,
+            "diff": diff,
+            "heavy_side": heavy_side,
+        }

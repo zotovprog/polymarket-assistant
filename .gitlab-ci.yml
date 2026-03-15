@@ -33,6 +33,7 @@ Test:
       tests/test_mm_v2_paper.py
       tests/test_mm_v2_paper_multiwindow.py
       tests/test_mm_v2_replay.py
+      tests/test_pair_arb.py
     - docker image rm --force ${IMAGE_NAME}:test-${CI_PIPELINE_IID} || true
 
 

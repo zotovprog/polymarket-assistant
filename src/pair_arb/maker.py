@@ -176,7 +176,28 @@ class MakerArbManager:
             self.dn_price = target_dn
             self.dn_size = clip
 
+        # --- Orphan cleanup: if one leg failed, cancel the other ---
         if need_reprice_up or need_reprice_dn:
+            up_ok = self.up_order_id is not None
+            dn_ok = self.dn_order_id is not None
+            if up_ok and not dn_ok:
+                log.warning(
+                    "Maker %s: DN leg failed, cancelling orphaned UP order %s",
+                    self.market.scope, self.up_order_id[:12],
+                )
+                await self._cancel_order(self.up_order_id)
+                self.up_order_id = None
+                return {"scope": self.market.scope, "action": "orphan_cleanup", "failed_leg": "dn"}
+            elif dn_ok and not up_ok:
+                log.warning(
+                    "Maker %s: UP leg failed, cancelling orphaned DN order %s",
+                    self.market.scope, self.dn_order_id[:12],
+                )
+                await self._cancel_order(self.dn_order_id)
+                self.dn_order_id = None
+                return {"scope": self.market.scope, "action": "orphan_cleanup", "failed_leg": "up"}
+
+        if (need_reprice_up or need_reprice_dn) and self.up_order_id and self.dn_order_id:
             self.orders_posted += 1
             self.last_post_ts = time.time()
             result["action"] = "posted"
@@ -250,5 +271,6 @@ class MakerArbManager:
             "profit_per_pair": round(1.0 - self.up_price - self.dn_price, 4) if self.up_price and self.dn_price else 0,
             "orders_posted": self.orders_posted,
             "reprices": self.reprices,
-            "has_orders": bool(self.up_order_id and self.dn_order_id),
+            "has_orders": bool(self.up_order_id or self.dn_order_id),
+            "has_both_orders": bool(self.up_order_id and self.dn_order_id),
         }

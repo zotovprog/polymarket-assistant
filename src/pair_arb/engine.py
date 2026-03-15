@@ -229,6 +229,9 @@ class PairArbEngine:
                             mgr.dn_order_id = None
                         self._current_best_scope = best_scope
                         self._last_scope_switch_ts = time.time()
+                        # Invalidate USDC cache so next tick gets fresh balance
+                        self.order_mgr.invalidate_usdc_cache()
+                        await asyncio.sleep(0.5)  # Let exchange process cancellations
 
                     # Tick only the best market
                     if best_scope and best_scope in self._maker_managers:
@@ -268,7 +271,9 @@ class PairArbEngine:
                 resolved = await self.executor.handle_leg_risk()
                 for ex in resolved:
                     if ex.status == "failed" and "unwind" in (ex.error or ""):
-                        estimated_loss = 0.03 * ex.target_shares
+                        # Use actual fill price for loss estimate (5% slippage on unwind)
+                        fill_price = getattr(ex, 'up_fill_price', 0) or getattr(ex, 'dn_fill_price', 0) or 0.5
+                        estimated_loss = fill_price * ex.target_shares * 0.05
                         self.risk.record_leg_risk_loss(estimated_loss)
 
                 # --- Check merges (both modes) ---
@@ -284,6 +289,23 @@ class PairArbEngine:
                             "MERGED %.2f pairs on %s → $%.2f",
                             merged, market.scope, proceeds,
                         )
+
+                # --- Detect asymmetric fills (maker mode leg risk) ---
+                if self.config.use_maker_orders:
+                    for market in self._markets:
+                        asym = await self.merger.check_asymmetric_fills(
+                            market, threshold=self.config.min_clip_shares,
+                        )
+                        if asym:
+                            log.warning(
+                                "ASYMMETRIC FILL %s: UP=%.2f DN=%.2f diff=%.2f (heavy=%s)",
+                                asym["scope"], asym["up_bal"], asym["dn_bal"],
+                                asym["diff"], asym["heavy_side"],
+                            )
+                            # Cancel maker orders on this market to stop further one-sided fills
+                            mgr = self._maker_managers.get(asym["scope"])
+                            if mgr:
+                                await mgr.cancel_all()
 
                 # --- Auto-redeem resolved markets ---
                 if self._pending_redeems and not self.paper_mode:

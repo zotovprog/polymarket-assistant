@@ -40,14 +40,14 @@ class PairArbConfig:
 
     # Position sizing
     max_clip_shares: float = 5.0       # Max shares per side per arb (conservative for small balance)
-    min_clip_shares: float = 5.0       # PM minimum order size
+    min_clip_shares: float = 1.0       # PM minimum is $1.00 notional, not 5 shares
 
     # Risk limits
-    max_unmerged_exposure_usd: float = 50.0
+    max_unmerged_exposure_usd: float = 15.0
     max_leg_risk_usd: float = 5.0
     leg_risk_retry_count: int = 3
     leg_risk_max_hold_sec: float = 30.0
-    hard_drawdown_usd: float = 3.0
+    hard_drawdown_usd: float = 5.0
 
     # Timing
     scan_interval_sec: float = 1.5
@@ -55,7 +55,7 @@ class PairArbConfig:
     cooldown_after_arb_sec: float = 2.0
 
     # Session
-    session_budget_usd: float = 50.0
+    session_budget_usd: float = 25.0
 
     def validate(self) -> None:
         for field_name, (lo, hi) in self.VALIDATION_BOUNDS.items():
