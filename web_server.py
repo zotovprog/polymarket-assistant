@@ -4779,42 +4779,30 @@ async def pair_arb_start(req: PairArbStartRequest, request: Request):
         )
         arb_config.validate()
 
-        # Create CLOB client (same pattern as MMRuntimeV2)
+        # Create CLOB client using shared factory
         from mm_shared.order_manager import OrderManager
+        from mm_shared.mm_config import MMConfig
         import os
 
         private_key = os.environ.get("PM_PRIVATE_KEY", "")
-        api_key = os.environ.get("PM_API_KEY", "")
-        api_secret = os.environ.get("PM_API_SECRET", "")
-        api_passphrase = os.environ.get("PM_API_PASSPHRASE", "")
+        mm_config = MMConfig()
 
-        from mm_shared.mm_config import MMConfig
-        mm_config = MMConfig()  # Default config for OrderManager
+        client = _create_clob_client(
+            paper_mode=req.paper_mode,
+            initial_usdc=float(req.initial_usdc),
+        )
+        order_mgr = OrderManager(client, mm_config)
 
-        if req.paper_mode:
-            # Use MockClobClient for paper mode.
-            client = MockClobClient(usdc_balance=float(req.initial_usdc))
-            order_mgr = OrderManager(client, mm_config)
-        else:
+        # For live mode, ensure on-chain approvals
+        if not req.paper_mode:
             if not private_key:
                 raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
-            funder = os.environ.get("PM_FUNDER", "")
-            creds = ApiCreds(
-                api_key=api_key,
-                api_secret=api_secret,
-                api_passphrase=api_passphrase,
-            ) if api_key else None
-            client = ClobClient(
-                host="https://clob.polymarket.com",
-                key=private_key,
-                chain_id=137,
-                creds=creds,
-                funder=funder,
-                signature_type=2,  # POLY_GNOSIS_SAFE
-            )
-            order_mgr = OrderManager(client, mm_config)
+            import asyncio
+            from mm_shared.approvals import _do_approvals
+            try:
+                await asyncio.to_thread(_do_approvals, private_key)
+            except Exception as e:
+                log.warning("Pair arb approvals warning: %s", e)
 
         _pair_arb_engine = PairArbEngine(
             order_mgr=order_mgr,
