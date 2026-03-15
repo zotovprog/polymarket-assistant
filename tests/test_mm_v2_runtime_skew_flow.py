@@ -84,6 +84,8 @@ def _inventory(**overrides) -> PairInventoryState:
         signed_excess_value_usd=0.0,
         inventory_pressure_abs=0.0,
         inventory_pressure_signed=0.0,
+        sellable_up_shares=0.0,
+        sellable_dn_shares=0.0,
     )
     payload.update(overrides)
     return PairInventoryState(**payload)
@@ -1922,6 +1924,8 @@ async def test_near_expiry_material_inventory_uses_terminal_liquidation_step_not
     )
     inventory = _inventory(
         up_shares=6.0,
+        excess_up_qty=6.0,
+        sellable_up_shares=6.0,
         total_inventory_value_usd=3.0,
         free_usdc=15.0,
         wallet_total_usdc=15.0,
@@ -1953,7 +1957,7 @@ async def test_near_expiry_material_inventory_uses_terminal_liquidation_step_not
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         calls["step"] += 1
         assert round_idx == 0
         assert cancel_existing is False
@@ -2033,6 +2037,8 @@ async def test_close_window_material_inventory_arms_terminal_liquidation_before_
     )
     inventory = _inventory(
         up_shares=6.0,
+        excess_up_qty=6.0,
+        sellable_up_shares=6.0,
         total_inventory_value_usd=3.0,
         free_usdc=15.0,
         wallet_total_usdc=15.0,
@@ -2064,7 +2070,7 @@ async def test_close_window_material_inventory_arms_terminal_liquidation_before_
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         calls["step"] += 1
         assert round_idx == 0
         assert cancel_existing is False
@@ -2139,6 +2145,8 @@ async def test_terminal_liquidation_timeout_does_not_stop_further_steps_before_e
     )
     inventory = _inventory(
         up_shares=6.0,
+        excess_up_qty=6.0,
+        sellable_up_shares=6.0,
         total_inventory_value_usd=3.0,
         free_usdc=15.0,
         wallet_total_usdc=15.0,
@@ -2171,7 +2179,7 @@ async def test_terminal_liquidation_timeout_does_not_stop_further_steps_before_e
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         calls["step"] += 1
         return {
             "attempted_orders": 1,
@@ -2242,6 +2250,8 @@ async def test_terminal_liquidation_done_at_expiry_sets_explicit_terminal_reason
     )
     inventory = _inventory(
         up_shares=6.0,
+        excess_up_qty=6.0,
+        sellable_up_shares=6.0,
         total_inventory_value_usd=3.0,
         free_usdc=15.0,
         wallet_total_usdc=15.0,
@@ -2273,7 +2283,7 @@ async def test_terminal_liquidation_done_at_expiry_sets_explicit_terminal_reason
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         del round_idx, cancel_existing
         return {
             "attempted_orders": 1,
@@ -2381,7 +2391,7 @@ async def test_terminal_liquidation_done_before_expiry_does_not_resume_normal_qu
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         calls["step"] += 1
         raise AssertionError("terminal step should not rerun once done and flat")
 
@@ -2441,6 +2451,8 @@ async def test_terminal_drawdown_cleanup_keeps_emergency_mode_not_halted(monkeyp
     )
     inventory = _inventory(
         up_shares=0.4,
+        excess_up_qty=0.4,
+        sellable_up_shares=0.4,
         total_inventory_value_usd=0.2,
         free_usdc=15.0,
         wallet_total_usdc=15.0,
@@ -2472,7 +2484,7 @@ async def test_terminal_drawdown_cleanup_keeps_emergency_mode_not_halted(monkeyp
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         calls["step"] += 1
         return {
             "attempted_orders": 1,
@@ -2589,7 +2601,7 @@ async def test_terminal_liquidation_done_reason_is_not_overwritten_by_timeout(mo
         del kwargs
         return inventory
 
-    async def _step(*, round_idx=0, cancel_existing=True):
+    async def _step(*, round_idx=0, cancel_existing=True, protected_up_qty=0.0, protected_dn_qty=0.0):
         raise AssertionError("terminal step should not rerun when terminal_liquidation_done is already true")
 
     async def _cancel_all():
