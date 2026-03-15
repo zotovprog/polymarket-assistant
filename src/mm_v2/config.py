@@ -57,14 +57,18 @@ class MMConfigV2:
         "base_half_spread_bps": (5.0, 5000.0),
         "max_half_spread_bps": (25.0, 10000.0),
         "vol_spread_multiplier": (0.5, 10.0),
+        "vol_floor": (0.0001, 0.005),
         "spread_amplifier_knee_min": (0.5, 30.0),
         "late_expiry_start_sec": (30.0, 3600.0),
         "late_expiry_max_spread_mult": (1.0, 5.0),
         "late_expiry_buy_size_mult_min": (0.05, 1.0),
+        "pair_completion_spread_mult": (0.3, 1.0),
+        "pair_completion_clip_mult": (1.0, 3.0),
         "adverse_selection_spread_mult": (0.0, 5.0),
         "maker_fee_bps": (0.0, 1000.0),
         "taker_fee_bps": (0.0, 1000.0),
         "min_edge_bps": (0.0, 1000.0),
+        "min_pm_spread_bps": (0.0, 2000.0),
         "inventory_skew_strength": (0.1, 10.0),
         "defensive_spread_mult": (1.0, 10.0),
         "defensive_size_mult": (0.1, 1.0),
@@ -102,14 +106,18 @@ class MMConfigV2:
     base_half_spread_bps: float = 100.0
     max_half_spread_bps: float = 600.0
     vol_spread_multiplier: float = 2.0
+    vol_floor: float = 0.0003
     spread_amplifier_knee_min: float = 5.0
     late_expiry_start_sec: float = 420.0
     late_expiry_max_spread_mult: float = 2.25
     late_expiry_buy_size_mult_min: float = 0.25
+    pair_completion_spread_mult: float = 0.70
+    pair_completion_clip_mult: float = 1.50
     adverse_selection_spread_mult: float = 0.75
     maker_fee_bps: float = 0.0
     taker_fee_bps: float = 78.0
     min_edge_bps: float = 20.0
+    min_pm_spread_bps: float = 0.0
     inventory_skew_strength: float = 2.0
     defensive_spread_mult: float = 1.5
     defensive_size_mult: float = 0.4

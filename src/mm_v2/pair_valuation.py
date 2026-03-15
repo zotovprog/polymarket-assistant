@@ -33,7 +33,7 @@ class PairValuationEngine:
 
     def __init__(self, config: MMConfigV2):
         self.config = config
-        self.provider = FairValueEngine(vol_floor=0.0003, signal_weight=0.0)
+        self.provider = FairValueEngine(vol_floor=self.config.vol_floor, signal_weight=0.0)
         adapter = SimpleNamespace(
             order_size_usd=self.config.base_clip_usd,
             min_market_quality_score=self.config.min_market_quality_score,
@@ -96,6 +96,7 @@ class PairValuationEngine:
         up_book: dict[str, Any],
         dn_book: dict[str, Any],
     ) -> tuple[PairValuationResult, PairMarketSnapshot]:
+        self.provider.vol_floor = float(self.config.vol_floor)
         mid = float(getattr(feed_state, "mid", 0.0) or 0.0)
         klines = list(getattr(feed_state, "klines", []) or [])
         pm_up = getattr(feed_state, "pm_up", None)

@@ -430,7 +430,9 @@ class ConfigUpdateRequestV2(BaseModel):
     hard_excess_value_ratio: Optional[float] = None
     base_half_spread_bps: Optional[float] = None
     min_edge_bps: Optional[float] = None
+    min_pm_spread_bps: Optional[float] = None
     max_half_spread_bps: Optional[float] = None
+    vol_floor: Optional[float] = None
     inventory_skew_strength: Optional[float] = None
     defensive_spread_mult: Optional[float] = None
     defensive_size_mult: Optional[float] = None
@@ -3307,6 +3309,7 @@ class MMRuntimeV2(MMRuntime):
             self.mm_v2.gateway.transport_config = self.mm_v2.config.to_mm_config()
             self.mm_v2.gateway.order_mgr.config = self.mm_v2.gateway.transport_config
             self.mm_v2.valuation.config = self.mm_v2.config
+            self.mm_v2.valuation.provider.vol_floor = float(self.mm_v2.config.vol_floor)
             self.mm_v2.reconcile.config = self.mm_v2.config
             self.mm_v2.risk_kernel.config = self.mm_v2.config
             self.mm_v2.state_machine.config = self.mm_v2.config
@@ -4415,6 +4418,8 @@ async def mmv2_config_update(req: ConfigUpdateRequestV2, request: Request):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if req.min_edge_bps is not None:
         updates["min_edge_bps"] = req.min_edge_bps
+    if req.min_pm_spread_bps is not None:
+        updates["min_pm_spread_bps"] = req.min_pm_spread_bps
     market_scope = updates.get("market_scope")
     if market_scope is not None and market_scope not in V2_SUPPORTED_MARKET_SCOPES:
         return JSONResponse(

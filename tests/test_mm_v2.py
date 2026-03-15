@@ -782,9 +782,11 @@ def test_mmv2_balanced_default_profile_and_caps():
     assert cfg.target_pair_value_ratio == pytest.approx(0.50)
     assert cfg.base_half_spread_bps == pytest.approx(100.0)
     assert cfg.vol_spread_multiplier == pytest.approx(2.0)
+    assert cfg.vol_floor == pytest.approx(0.0003)
     assert cfg.maker_fee_bps == pytest.approx(0.0)
     assert cfg.taker_fee_bps == pytest.approx(78.0)
     assert cfg.min_edge_bps == pytest.approx(20.0)
+    assert cfg.min_pm_spread_bps == pytest.approx(0.0)
     assert cfg.inventory_skew_strength == pytest.approx(2.0)
     assert cfg.tick_interval_sec == pytest.approx(1.0)
     assert cfg.requote_threshold_bps == pytest.approx(8.0)
@@ -832,6 +834,24 @@ def test_tradeable_valuation_exposes_realized_vol_per_min(monkeypatch):
 
     assert snapshot.realized_vol_per_min == pytest.approx(0.0017)
     assert result.realized_vol_per_min == pytest.approx(0.0017)
+
+
+def test_pair_valuation_engine_uses_configured_vol_floor():
+    cfg = MMConfigV2(vol_floor=0.0008)
+    engine = PairValuationEngine(cfg)
+    assert engine.provider.vol_floor == pytest.approx(0.0008)
+
+
+def test_config_update_clamps_vol_floor_to_safe_range():
+    cfg = MMConfigV2()
+    cfg.update(vol_floor=0.01)
+    assert cfg.vol_floor == pytest.approx(0.005)
+
+
+def test_config_update_clamps_min_pm_spread_bps_to_safe_range():
+    cfg = MMConfigV2()
+    cfg.update(min_pm_spread_bps=5000.0)
+    assert cfg.min_pm_spread_bps == pytest.approx(2000.0)
 
 
 def test_effective_target_ratio_activation_usd_uses_new_budget_ratio_formula():
@@ -930,6 +950,33 @@ def test_quote_policy_skews_against_excess_up_inventory():
     assert skewed_plan.up_bid.inventory_effect == "harmful"
     assert skewed_plan.dn_bid.inventory_effect == "helpful"
     assert skewed_plan.regime in {"inventory_skewed", "unwind", "defensive", "normal"}
+
+
+def test_quote_policy_suppresses_buy_when_pm_spread_too_narrow():
+    cfg = MMConfigV2(base_clip_usd=6.0, min_pm_spread_bps=200.0)
+    snap = _snapshot(
+        up_best_bid=0.52,
+        up_best_ask=0.53,
+        dn_best_bid=0.46,
+        dn_best_ask=0.48,
+    )
+    risk = HardSafetyKernel(cfg).evaluate(
+        snapshot=snap,
+        inventory=_inventory(),
+        analytics=AnalyticsState(),
+        health=HealthState(),
+    )
+    plan = QuotePolicyV2(cfg).generate(
+        snapshot=snap,
+        inventory=_inventory(),
+        risk=risk,
+        ctx=QuoteContext(tick_size=0.01, min_order_size=1.0),
+    )
+
+    assert plan.up_bid is None
+    assert plan.suppressed_reasons["up_bid"] == "pm_spread_too_narrow"
+    assert plan.up_ask is not None
+    assert plan.dn_bid is not None
 
 
 def test_reconcile_settlement_lag_does_not_trigger_true_drift():
@@ -2132,6 +2179,46 @@ def test_runtime_snapshot_exposes_force_normal_no_guards_flag():
     )
     snap = mm.snapshot()
     assert snap["runtime"]["force_normal_no_guards_paper"] is True
+
+
+def test_runtime_v2_update_config_updates_live_vol_floor():
+    web_server = importlib.import_module("web_server")
+
+    class _MockClient:
+        pass
+
+    runtime = web_server.MMRuntimeV2()
+    runtime.mm_v2 = MarketMakerV2(SimpleNamespace(), _MockClient(), MMConfigV2())
+
+    updated = runtime.update_config(vol_floor=0.0008)
+
+    assert updated["vol_floor"] == pytest.approx(0.0008)
+    assert runtime.mm_config_v2.vol_floor == pytest.approx(0.0008)
+    assert runtime.mm_v2.config.vol_floor == pytest.approx(0.0008)
+    assert runtime.mm_v2.valuation.provider.vol_floor == pytest.approx(0.0008)
+
+
+@pytest.mark.asyncio
+async def test_mmv2_config_update_accepts_min_pm_spread_bps(monkeypatch):
+    web_server = importlib.import_module("web_server")
+    monkeypatch.setattr(web_server, "_require_auth", lambda _request: None)
+
+    captured: dict[str, float] = {}
+
+    def _fake_update_config(**updates):
+        captured.update(updates)
+        return {"min_pm_spread_bps": float(updates["min_pm_spread_bps"])}
+
+    monkeypatch.setattr(web_server._runtime_v2, "update_config", _fake_update_config)
+
+    resp = await web_server.mmv2_config_update(
+        req=web_server.ConfigUpdateRequestV2(min_pm_spread_bps=77.0),
+        request=object(),
+    )
+
+    assert captured["min_pm_spread_bps"] == pytest.approx(77.0)
+    assert resp["ok"] is True
+    assert resp["config"]["min_pm_spread_bps"] == pytest.approx(77.0)
 
 
 @pytest.mark.asyncio

@@ -550,6 +550,32 @@ class QuotePolicyV2:
         midpoint_anchor_dn = self._midpoint_anchor(snapshot, "dn")
         model_anchor_up = self._model_anchor(snapshot, "up")
         model_anchor_dn = self._model_anchor(snapshot, "dn")
+        up_pm_spread_bps = 0.0
+        if (
+            snapshot.up_best_bid is not None
+            and snapshot.up_best_ask is not None
+            and float(snapshot.up_best_ask) > float(snapshot.up_best_bid)
+        ):
+            up_pm_mid = (float(snapshot.up_best_bid) + float(snapshot.up_best_ask)) / 2.0
+            if up_pm_mid > 0.0:
+                up_pm_spread_bps = (
+                    (float(snapshot.up_best_ask) - float(snapshot.up_best_bid))
+                    / up_pm_mid
+                    * 10000.0
+                )
+        dn_pm_spread_bps = 0.0
+        if (
+            snapshot.dn_best_bid is not None
+            and snapshot.dn_best_ask is not None
+            and float(snapshot.dn_best_ask) > float(snapshot.dn_best_bid)
+        ):
+            dn_pm_mid = (float(snapshot.dn_best_bid) + float(snapshot.dn_best_ask)) / 2.0
+            if dn_pm_mid > 0.0:
+                dn_pm_spread_bps = (
+                    (float(snapshot.dn_best_ask) - float(snapshot.dn_best_bid))
+                    / dn_pm_mid
+                    * 10000.0
+                )
         spread = self._spread(risk, snapshot)
         clip_usd = self._clip_usd(risk)
         # Reduce buy clip near expiry to limit adverse selection.
@@ -559,6 +585,18 @@ class QuotePolicyV2:
                 float(self.config.late_expiry_buy_size_mult_min),
                 1.0 - _late_p * 0.75,
             )
+        up_spread_mult = 1.0
+        dn_spread_mult = 1.0
+        up_clip_mult = 1.0
+        dn_clip_mult = 1.0
+        excess_up_qty = float(inventory.excess_up_qty)
+        excess_dn_qty = float(inventory.excess_dn_qty)
+        if excess_up_qty > float(ctx.min_order_size):
+            dn_spread_mult = float(self.config.pair_completion_spread_mult)
+            dn_clip_mult = float(self.config.pair_completion_clip_mult)
+        if excess_dn_qty > float(ctx.min_order_size):
+            up_spread_mult = float(self.config.pair_completion_spread_mult)
+            up_clip_mult = float(self.config.pair_completion_clip_mult)
         free_usdc = max(0.0, float(inventory.free_usdc))
         budget_headroom_usd = self._buy_headroom_usd(
             free_usdc=free_usdc,
@@ -624,22 +662,37 @@ class QuotePolicyV2:
                 float(spread) + (pair_entry_loss_per_share * 0.5),
             )
 
-        up_bid_price = up_mid - spread
+        up_spread = float(spread) * up_spread_mult
+        dn_spread = float(spread) * dn_spread_mult
+        slot_half_spreads = {
+            "up_bid": up_spread,
+            "up_ask": float(spread),
+            "dn_bid": dn_spread,
+            "dn_ask": float(spread),
+        }
+        slot_clip_mults = {
+            "up_bid": up_clip_mult,
+            "up_ask": 1.0,
+            "dn_bid": dn_clip_mult,
+            "dn_ask": 1.0,
+        }
+
+        up_bid_price = up_mid - up_spread
         up_ask_price = up_mid + spread
-        dn_bid_price = dn_mid - spread
+        dn_bid_price = dn_mid - dn_spread
         dn_ask_price = dn_mid + spread
 
         skew_factor = abs(float(risk.inventory_pressure_signed)) * float(self.config.inventory_skew_strength)
         if skew_factor > 0.0:
             if risk.inventory_side == "up":
-                up_bid_price -= spread * skew_factor * 0.5
+                up_bid_price -= up_spread * skew_factor * 0.5
                 up_ask_price -= spread * skew_factor * 0.3
-                dn_bid_price += spread * skew_factor * 0.3
+                dn_bid_price += dn_spread * skew_factor * 0.3
                 dn_ask_price += spread * skew_factor * 0.5
             elif risk.inventory_side == "dn":
-                dn_bid_price -= spread * skew_factor * 0.5
+                dn_bid_price -= dn_spread * skew_factor * 0.5
                 dn_ask_price -= spread * skew_factor * 0.3
-                up_bid_price += spread * skew_factor * 0.3
+                up_bid_price += up_spread * skew_factor * 0.3
                 up_ask_price += spread * skew_factor * 0.5
 
         # FV guard: never buy above model anchor (prevents adverse selection).
@@ -759,6 +812,8 @@ class QuotePolicyV2:
             midpoint_first_brake_hits += 1
 
         for slot, (side, token, base_price, best_bid, best_ask, role) in raw_quotes.items():
+            quote_half_spread = float(slot_half_spreads.get(slot, spread))
+            quote_clip_mult = float(slot_clip_mults.get(slot, 1.0))
             effect = self._classify_inventory_effect(
                 token=token,
                 side=side,
@@ -767,6 +822,7 @@ class QuotePolicyV2:
                 dn_token_id=snapshot.dn_token_id,
             )
             token_side = self._token_side(token, snapshot)
+            token_pm_spread_bps = up_pm_spread_bps if token_side == "up" else dn_pm_spread_bps
             token_toxic_streak, token_hard_block_sec, token_soft_brake_active = self._token_toxic_state(
                 token=token,
                 snapshot=snapshot,
@@ -816,6 +872,15 @@ class QuotePolicyV2:
             if (
                 not diagnostic_no_guards
                 and side == "BUY"
+                and float(self.config.min_pm_spread_bps) > 0.0
+                and token_pm_spread_bps + 1e-9 < float(self.config.min_pm_spread_bps)
+            ):
+                built[slot] = None
+                suppressed_reasons[slot] = "pm_spread_too_narrow"
+                continue
+            if (
+                not diagnostic_no_guards
+                and side == "BUY"
                 and risk.hard_mode == "none"
                 and risk.soft_mode in {"normal", "inventory_skewed", "defensive"}
             ):
@@ -831,7 +896,7 @@ class QuotePolicyV2:
                     self._bps_to_price(float(self.config.min_edge_bps)),
                     self._bps_to_price(float(self.config.maker_fee_bps) * 2.0),
                 )
-                expected_edge = max(0.0, float(spread) - abs(rolling_markout))
+                expected_edge = max(0.0, quote_half_spread - abs(rolling_markout))
                 if expected_edge + 1e-9 < min_acceptable_edge:
                     edge_shortfall = min_acceptable_edge - expected_edge
                     extra_ticks = int(math.ceil(edge_shortfall / max(ctx.tick_size, 1e-9)))
@@ -841,7 +906,7 @@ class QuotePolicyV2:
                         max(0.15, 1.0 - (edge_shortfall / max(min_acceptable_edge, 1e-9))),
                     )
                     midpoint_first_brake_hits += 1
-                    if edge_shortfall > max(float(spread), min_acceptable_edge * 1.5):
+                    if edge_shortfall > max(quote_half_spread, min_acceptable_edge * 1.5):
                         built[slot] = None
                         suppressed_reasons[slot] = "min_edge_not_met"
                         continue
@@ -1204,7 +1269,7 @@ class QuotePolicyV2:
                     harmful_buy_brake_hits += 1
             if side == "BUY":
                 nominal_quote_clip_usd = (
-                    min(clip_usd, buy_headroom_usd)
+                    min(clip_usd * quote_clip_mult, buy_headroom_usd)
                     * size_mult
                     * token_buy_size_brake_mult
                     * harmful_buy_brake_mult
@@ -1497,6 +1562,7 @@ class QuotePolicyV2:
                     "marketability_churn_confirmed",
                     "harmful_suppressed_in_defensive",
                     "harmful_suppressed_in_unwind",
+                    "pm_spread_too_narrow",
                     "target_pair_ratio_cap",
                     "pair_over_target_buy_block",
                     "maker_cross_guard",
