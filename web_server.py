@@ -4949,6 +4949,30 @@ async def pair_arb_redeem_all(request: Request):
     }
 
 
+@app.post("/api/cancel-all-orders")
+async def cancel_all_orders(request: Request):
+    """Cancel ALL open orders on the exchange (bypasses OrderManager tracking)."""
+    _require_auth(request)
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds
+        creds = ApiCreds(api_key=PM_API_KEY, api_secret=PM_API_SECRET, api_passphrase=PM_API_PASSPHRASE)
+        client = ClobClient(
+            host="https://clob.polymarket.com",
+            key=PM_PRIVATE_KEY,
+            chain_id=137,
+            creds=creds,
+            funder=PM_FUNDER,
+            signature_type=2,
+        )
+        resp = await asyncio.to_thread(client.cancel_all)
+        log.info("cancel-all-orders: %s", resp)
+        return {"ok": True, "result": resp}
+    except Exception as e:
+        log.error("cancel-all-orders failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
