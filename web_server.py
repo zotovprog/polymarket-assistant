@@ -4882,6 +4882,73 @@ async def pair_arb_redeem(request: Request):
     return result
 
 
+@app.post("/api/pair-arb/redeem-all")
+async def pair_arb_redeem_all(request: Request):
+    """Scan Polymarket for all redeemable (resolved) positions and redeem them."""
+    _require_auth(request)
+
+    private_key = os.environ.get("PM_PRIVATE_KEY", "")
+    if not private_key:
+        raise HTTPException(status_code=500, detail="PM_PRIVATE_KEY not configured")
+    if not PM_FUNDER:
+        raise HTTPException(status_code=500, detail="PM_FUNDER not configured")
+
+    import httpx
+    from mm_shared.approvals import redeem_positions as _redeem
+
+    # Fetch all redeemable positions from Polymarket data API
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://data-api.polymarket.com/positions",
+                params={
+                    "user": PM_FUNDER,
+                    "redeemable": "true",
+                    "sizeThreshold": "0",
+                    "limit": "500",
+                },
+            )
+            resp.raise_for_status()
+            positions = resp.json()
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to fetch positions: {e}", "redeemed": []}
+
+    if not positions:
+        return {"ok": True, "message": "No redeemable positions found", "redeemed": []}
+
+    redeemed = []
+    errors = []
+    for pos in positions:
+        cond_id = pos.get("conditionId") or pos.get("condition_id") or ""
+        if not cond_id:
+            continue
+        title = pos.get("title", pos.get("market", {}).get("question", ""))[:60]
+        size = pos.get("size", 0)
+        try:
+            result = await asyncio.to_thread(_redeem, private_key, cond_id)
+            if result.get("success"):
+                redeemed.append({
+                    "condition_id": cond_id[:16] + "...",
+                    "title": title,
+                    "size": size,
+                    "tx_hash": result.get("tx_hash", "")[:16],
+                })
+                log.info("Redeemed %s: %s (size=%.2f)", cond_id[:16], title, float(size or 0))
+            else:
+                errors.append({"condition_id": cond_id[:16], "error": result.get("error", "unknown")})
+        except Exception as e:
+            errors.append({"condition_id": cond_id[:16], "error": str(e)})
+
+    return {
+        "ok": True,
+        "total_positions": len(positions),
+        "redeemed_count": len(redeemed),
+        "error_count": len(errors),
+        "redeemed": redeemed,
+        "errors": errors[:10],  # Limit error output
+    }
+
+
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
