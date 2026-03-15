@@ -4863,6 +4863,25 @@ async def pair_arb_config_get(request: Request):
     return {"config": _pair_arb_engine.config.to_dict()}
 
 
+@app.post("/api/pair-arb/redeem")
+async def pair_arb_redeem(request: Request):
+    """Redeem winning resolved positions on-chain."""
+    _require_auth(request)
+    body = await request.json()
+    condition_id = body.get("condition_id", "").strip()
+    if not condition_id:
+        raise HTTPException(status_code=400, detail="condition_id required")
+
+    private_key = os.environ.get("PM_PRIVATE_KEY", "")
+    if not private_key:
+        raise HTTPException(status_code=500, detail="PM_PRIVATE_KEY not configured")
+
+    import asyncio
+    from mm_shared.approvals import redeem_positions as _redeem
+    result = await asyncio.to_thread(_redeem, private_key, condition_id)
+    return result
+
+
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())

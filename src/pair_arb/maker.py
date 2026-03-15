@@ -99,6 +99,38 @@ class MakerArbManager:
             or abs(self.dn_price - target_dn) >= self.REPRICE_THRESHOLD
         )
 
+        # --- Balance pre-check: ensure USDC covers BOTH legs ---
+        if need_reprice_up or need_reprice_dn:
+            total_needed = target_up * clip + target_dn * clip
+            try:
+                available = await self.order_mgr.get_usdc_available_balance(force_refresh=True)
+            except Exception:
+                available = 0.0
+
+            # Collateral freed when we cancel our own orders for reprice
+            freeable = 0.0
+            if need_reprice_up and self.up_order_id:
+                freeable += self.up_size * self.up_price
+            if need_reprice_dn and self.dn_order_id:
+                freeable += self.dn_size * self.dn_price
+
+            effective = available + freeable
+            if total_needed > effective + 0.50:  # $0.50 tolerance
+                # Try reducing clip
+                max_clip = math.floor((effective / (target_up + target_dn)) * 100) / 100
+                if max_clip < self.config.min_clip_shares:
+                    log.warning(
+                        "Balance pre-check SKIP %s: need $%.2f, available $%.2f (incl freeable $%.2f), min_clip=%.0f",
+                        self.market.scope, total_needed, effective, freeable, self.config.min_clip_shares,
+                    )
+                    return None
+                clip = max_clip
+                total_needed = target_up * clip + target_dn * clip
+                log.info(
+                    "Balance pre-check: reduced clip to %.1f for %s (need $%.2f, available $%.2f)",
+                    clip, self.market.scope, total_needed, effective,
+                )
+
         result = {"scope": self.market.scope, "action": "none"}
 
         # 5. Post/reprice UP

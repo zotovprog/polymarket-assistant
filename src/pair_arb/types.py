@@ -103,6 +103,8 @@ class ArbState:
     recent_executions: list[dict] = field(default_factory=list)
     last_opportunity_ts: float = 0.0
     leg_risk_events: int = 0
+    pending_redeems: int = 0
+    total_redeemed: int = 0
     config: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:

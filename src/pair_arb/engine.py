@@ -39,6 +39,7 @@ class PairArbEngine:
         self.order_mgr = order_mgr
         self.config = config
         self.private_key = private_key
+        self._private_key = private_key
         self.paper_mode = paper_mode
         self.app_version = app_version
 
@@ -57,6 +58,9 @@ class PairArbEngine:
         self._opportunities_executed = 0
         self._last_opportunity_ts = 0.0
         self._recent_executions: list[ArbExecution] = []
+        self._pending_redeems: list[str] = []  # condition_ids to redeem
+        self._redeemed: set[str] = set()       # already redeemed
+        self._last_redeem_attempt: float = 0.0
         self._task: asyncio.Task | None = None
 
     async def start(self) -> dict:
@@ -112,6 +116,7 @@ class PairArbEngine:
         """Discover active markets from configured scopes."""
         from feeds import fetch_pm_tokens
 
+        old_conditions = {m.scope: m.condition_id for m in self._markets}
         markets: list[ArbMarket] = []
         now = time.time()
 
@@ -129,6 +134,12 @@ class PairArbEngine:
                     ))
             except Exception as e:
                 log.debug("Market discovery failed for %s_%s: %s", coin, tf, e)
+
+        for m in markets:
+            old_cid = old_conditions.get(m.scope)
+            if old_cid and old_cid != m.condition_id and old_cid not in self._redeemed:
+                self._pending_redeems.append(old_cid)
+                log.info("Market %s rotated: queuing redeem for %s", m.scope, old_cid[:16])
 
         self._markets = markets
         self._last_market_refresh = now
@@ -251,6 +262,34 @@ class PairArbEngine:
                             merged, market.scope, proceeds,
                         )
 
+                # --- Auto-redeem resolved markets ---
+                if self._pending_redeems and not self.paper_mode:
+                    now = time.time()
+                    if now - self._last_redeem_attempt >= 30.0:
+                        self._last_redeem_attempt = now
+                        cond_id = self._pending_redeems[0]
+                        try:
+                            result = await self.order_mgr.redeem_positions(
+                                condition_id=cond_id,
+                                private_key=self._private_key,
+                            )
+                            if result.get("success"):
+                                self._redeemed.add(cond_id)
+                                self._pending_redeems.pop(0)
+                                log.info(
+                                    "Auto-redeemed %s: tx=%s",
+                                    cond_id[:16],
+                                    result.get("tx_hash", "")[:16],
+                                )
+                            else:
+                                log.debug(
+                                    "Redeem not ready for %s: %s",
+                                    cond_id[:16],
+                                    result.get("error"),
+                                )
+                        except Exception as e:
+                            log.debug("Redeem failed for %s: %s", cond_id[:16], e)
+
                 await asyncio.sleep(self.config.scan_interval_sec)
 
             except asyncio.CancelledError:
@@ -279,6 +318,8 @@ class PairArbEngine:
             leg_risk_events=sum(
                 1 for e in self._recent_executions if e.status == "failed"
             ),
+            pending_redeems=len(self._pending_redeems),
+            total_redeemed=len(self._redeemed),
             config=self.config.to_dict(),
             recent_executions=[
                 e.to_dict() for e in self._recent_executions[-20:]
