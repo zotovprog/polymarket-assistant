@@ -9,6 +9,7 @@ import aiohttp
 import requests
 import websockets
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import config
 from mm_shared.runtime_metrics import runtime_metrics
@@ -384,23 +385,13 @@ async def bootstrap(symbol: str, interval: str, state: State):
 
 
 _MONTHS = ["", "january", "february", "march", "april", "may", "june",
-           "july", "august", "september", "october", "november", "december"]
+           "july", "august", "september", "october", "november", "december"]  # 1-indexed for datetime.month
+_ET_ZONE = ZoneInfo("America/New_York")
 
 
 def _et_now() -> datetime:
     utc = datetime.now(timezone.utc)
-    year = utc.year
-
-    mar1_dow  = datetime(year, 3, 1).weekday()
-    mar_sun   = 1 + (6 - mar1_dow) % 7
-    dst_start = datetime(year, 3, mar_sun + 7, 2, 0, 0, tzinfo=timezone.utc)
-
-    nov1_dow = datetime(year, 11, 1).weekday()
-    nov_sun  = 1 + (6 - nov1_dow) % 7
-    dst_end  = datetime(year, 11, nov_sun, 6, 0, 0, tzinfo=timezone.utc)
-
-    offset = timedelta(hours=-4) if dst_start <= utc < dst_end else timedelta(hours=-5)
-    return utc + offset
+    return utc.astimezone(_ET_ZONE)
 
 
 def _to_12h(hour24: int) -> str:
@@ -443,18 +434,201 @@ def _build_slug(coin: str, tf: str) -> str | None:
     return None
 
 
+def _pm_event_slug(event: dict) -> str:
+    for key in ("slug", "ticker", "market_slug"):
+        value = str(event.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _pm_event_tags_text(event: dict) -> str:
+    raw_tags = event.get("tags", [])
+    if isinstance(raw_tags, dict):
+        tags = [raw_tags]
+    elif isinstance(raw_tags, list):
+        tags = raw_tags
+    elif raw_tags:
+        tags = [raw_tags]
+    else:
+        tags = []
+
+    parts: list[str] = []
+    for tag in tags:
+        if isinstance(tag, dict):
+            for key in ("label", "name", "slug", "title"):
+                value = str(tag.get(key, "") or "").strip().lower()
+                if value:
+                    parts.append(value)
+        else:
+            value = str(tag or "").strip().lower()
+            if value:
+                parts.append(value)
+    return " ".join(parts)
+
+
+def _pm_event_matches_slug(event: dict, slug: str) -> bool:
+    event_slug = _pm_event_slug(event)
+    if event_slug == slug:
+        return True
+    return str(event.get("ticker", "") or "").strip() == slug
+
+
+def _fetch_gamma_event_by_slug(slug: str) -> dict | None:
+    slug_url = f"{config.PM_GAMMA.rstrip('/')}/slug/{slug}"
+    try:
+        resp = requests.get(slug_url, timeout=5)
+        data = resp.json()
+        if isinstance(data, dict) and _pm_event_matches_slug(data, slug):
+            return data
+    except Exception as e:
+        print(f"  [PM] gamma event fetch failed ({slug_url}): {e}")
+
+    try:
+        resp = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 5}, timeout=5)
+        data = resp.json()
+        if isinstance(data, list):
+            for event in data:
+                if isinstance(event, dict) and _pm_event_matches_slug(event, slug):
+                    return event
+    except Exception as e:
+        print(f"  [PM] gamma event fetch failed ({slug}): {e}")
+    return None
+
+
+def _event_target_et(event: dict) -> datetime | None:
+    for key in ("startDate", "start_date", "creationDate", "createdAt"):
+        raw = str(event.get(key, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(_ET_ZONE)
+        except ValueError:
+            continue
+    return None
+
+
+def _hourly_event_score(event: dict, coin: str, target_et: datetime, expected_slug: str) -> tuple[int, int]:
+    slug = _pm_event_slug(event).lower()
+    title = str(event.get("title", "") or "").strip().lower()
+    tags_text = _pm_event_tags_text(event)
+    text_blob = " ".join(part for part in (slug.replace("-", " "), title, tags_text) if part)
+    coin_long = config.COIN_PM_LONG[coin].lower()
+    coin_short = config.COIN_PM[coin].lower()
+    prefix = f"{coin_long}-up-or-down-"
+    date_fragment = f"{_MONTHS[target_et.month]}-{target_et.day}"
+    date_phrase = f"{_MONTHS[target_et.month]} {target_et.day}"
+    hour_fragment = f"-{_to_12h(target_et.hour)}-et"
+
+    if not slug and not title and not tags_text:
+        return (-1, 9999)
+    if coin_long not in text_blob and coin_short not in text_blob:
+        return (-1, 9999)
+    if "up or down" not in text_blob and "updown" not in text_blob:
+        return (-1, 9999)
+
+    target_from_api = _event_target_et(event)
+    api_date_matches = target_from_api is not None and target_from_api.date() == target_et.date()
+    if (
+        date_fragment not in slug
+        and date_fragment not in title
+        and date_fragment not in tags_text
+        and date_phrase not in title
+        and date_phrase not in tags_text
+        and not api_date_matches
+    ):
+        return (-1, 9999)
+
+    score = 0
+    if slug == expected_slug:
+        score += 1000
+    if slug.startswith(prefix):
+        score += 400
+    if date_fragment in slug:
+        score += 250
+    if hour_fragment in slug:
+        score += 120
+    if date_phrase in title or date_fragment in title:
+        score += 120
+    if date_phrase in tags_text or date_fragment in tags_text:
+        score += 80
+    if coin_long in title or coin_short in title:
+        score += 40
+    if "up or down" in title or "updown" in title:
+        score += 40
+    if coin_long in tags_text or coin_short in tags_text:
+        score += 40
+    if "up or down" in tags_text or "updown" in tags_text:
+        score += 40
+    if bool(event.get("active")):
+        score += 40
+    if not bool(event.get("closed")):
+        score += 20
+
+    hour_delta = 9999
+    if target_from_api is not None:
+        if api_date_matches:
+            score += 120
+        hour_delta = int(abs((target_from_api - target_et).total_seconds()) // 3600)
+        score -= min(hour_delta, 12) * 15
+
+    return score, hour_delta
+
+
+def _search_hourly_pm_event(coin: str, target_et: datetime, expected_slug: str) -> dict | None:
+    query = f"{config.COIN_PM_LONG[coin]} up or down"
+    candidates: dict[str, tuple[tuple[int, int], dict]] = {}
+
+    def _consider(events: list[dict]):
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            score = _hourly_event_score(event, coin, target_et, expected_slug)
+            if score[0] < 0:
+                continue
+            slug = _pm_event_slug(event) or f"event-{event.get('id')}"
+            existing = candidates.get(slug)
+            if existing is None or score > existing[0]:
+                candidates[slug] = (score, event)
+
+    try:
+        resp = requests.get(
+            config.PM_GAMMA,
+            params={"active": True, "limit": 100},
+            timeout=5,
+        )
+        data = resp.json()
+        if isinstance(data, list):
+            _consider(data)
+    except Exception as e:
+        print(f"  [PM] active-events fallback failed ({query}): {e}")
+
+    if not candidates:
+        return None
+
+    best_score, best_event = max(candidates.values(), key=lambda item: item[0])
+    if best_score[0] < 500:
+        return None
+    return best_event
+
+
 def fetch_pm_event_data(coin: str, tf: str) -> dict | None:
     """Fetch full event data from Polymarket API."""
     slug = _build_slug(coin, tf)
     if slug is None:
         return None
-    try:
-        resp = requests.get(config.PM_GAMMA, params={"slug": slug, "limit": 1}, timeout=5)
-        data = resp.json()
-        if isinstance(data, list) and data and data[0].get("ticker") == slug:
-            return data[0]
-    except Exception as e:
-        print(f"  [PM] gamma event fetch failed ({slug}): {e}")
+    event = _fetch_gamma_event_by_slug(slug)
+    if event is not None:
+        return event
+
+    if tf == "1h":
+        target_et = _et_now().replace(minute=0, second=0, microsecond=0)
+        fallback_event = _search_hourly_pm_event(coin, target_et, slug)
+        if fallback_event is not None:
+            fallback_slug = _pm_event_slug(fallback_event)
+            if fallback_slug and fallback_slug != slug:
+                print(f"  [PM] slug miss ({slug}); using hourly fallback {fallback_slug}")
+            return fallback_event
 
     # Fallback: CLOB active sampling markets (Gamma REST can be unavailable/blocked).
     try:

@@ -258,6 +258,18 @@ class QuotePolicyV2:
             ratio = min(ratio, 0.15)
         return max(1.0, float(free_usdc) * float(ratio))
 
+    def _late_expiry_pressure(self, snapshot: PairMarketSnapshot) -> float:
+        start_sec = max(
+            float(self.config.unwind_window_sec),
+            float(self.config.late_expiry_start_sec),
+        )
+        if start_sec <= 0.0:
+            return 0.0
+        time_left = max(0.0, float(snapshot.time_left_sec))
+        if time_left >= start_sec:
+            return 0.0
+        return self._clamp((start_sec - time_left) / start_sec, 0.0, 1.0)
+
     def _min_viable_clip_usd(self, snapshot: PairMarketSnapshot, ctx: QuoteContext) -> float:
         return float(ctx.min_order_size) * self._pair_reference_price(snapshot)
 
@@ -291,6 +303,19 @@ class QuotePolicyV2:
             1.0,
             min(3.0, math.sqrt(float(self.config.spread_amplifier_knee_min) / tau_min)),
         )
+        adverse_markout = max(
+            0.0,
+            -float(getattr(risk, "rolling_markout_up_5s", 0.0) or 0.0),
+            -float(getattr(risk, "rolling_markout_dn_5s", 0.0) or 0.0),
+        )
+        if adverse_markout > 0.0:
+            base += adverse_markout * float(self.config.adverse_selection_spread_mult)
+        late_expiry_pressure = self._late_expiry_pressure(snapshot)
+        if late_expiry_pressure > 0.0:
+            base *= 1.0 + (
+                late_expiry_pressure
+                * max(0.0, float(self.config.late_expiry_max_spread_mult) - 1.0)
+            )
         if risk.soft_mode == "defensive":
             base *= float(self.config.defensive_spread_mult)
         elif risk.soft_mode == "unwind":
@@ -556,6 +581,7 @@ class QuotePolicyV2:
             0.80 * defensive_cap_usd,
         )
         pressure = max(0.0, min(1.0, float(risk.inventory_pressure_abs)))
+        late_expiry_pressure = self._late_expiry_pressure(snapshot)
         market_anchor_mid = max(0.01, min(0.99, float(midpoint_anchor_up)))
         model_shift_cap = max(
             float(ctx.tick_size),

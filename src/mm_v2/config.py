@@ -58,6 +58,10 @@ class MMConfigV2:
         "max_half_spread_bps": (25.0, 10000.0),
         "vol_spread_multiplier": (0.5, 10.0),
         "spread_amplifier_knee_min": (0.5, 30.0),
+        "late_expiry_start_sec": (30.0, 3600.0),
+        "late_expiry_max_spread_mult": (1.0, 5.0),
+        "late_expiry_buy_size_mult_min": (0.05, 1.0),
+        "adverse_selection_spread_mult": (0.0, 5.0),
         "maker_fee_bps": (0.0, 1000.0),
         "taker_fee_bps": (0.0, 1000.0),
         "min_edge_bps": (0.0, 1000.0),
@@ -99,6 +103,10 @@ class MMConfigV2:
     max_half_spread_bps: float = 600.0
     vol_spread_multiplier: float = 2.0
     spread_amplifier_knee_min: float = 5.0
+    late_expiry_start_sec: float = 420.0
+    late_expiry_max_spread_mult: float = 2.25
+    late_expiry_buy_size_mult_min: float = 0.25
+    adverse_selection_spread_mult: float = 0.75
     maker_fee_bps: float = 0.0
     taker_fee_bps: float = 78.0
     min_edge_bps: float = 20.0
