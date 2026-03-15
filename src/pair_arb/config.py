@@ -40,7 +40,7 @@ class PairArbConfig:
 
     # Position sizing
     max_clip_shares: float = 5.0       # Max shares per side per arb (conservative for small balance)
-    min_clip_shares: float = 1.0       # PM minimum is $1.00 notional, not 5 shares
+    min_clip_shares: float = 5.0       # PM enforces minimum 5 shares per order
 
     # Risk limits
     max_unmerged_exposure_usd: float = 15.0

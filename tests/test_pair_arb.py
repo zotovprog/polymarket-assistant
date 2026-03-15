@@ -298,7 +298,7 @@ async def test_config_defaults():
     await asyncio.sleep(0)
     cfg = PairArbConfig()
 
-    assert cfg.min_clip_shares == 1.0
+    assert cfg.min_clip_shares == 5.0
     assert cfg.session_budget_usd == 25.0
     assert cfg.max_unmerged_exposure_usd == 15.0
     assert cfg.hard_drawdown_usd == 5.0
