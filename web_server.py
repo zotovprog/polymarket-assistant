@@ -220,6 +220,12 @@ class PaperSweepStartRequest(BaseModel):
         return deduped
 
 
+class PairArbStartRequest(BaseModel):
+    paper_mode: bool = True
+    initial_usdc: float = 50.0
+    market_scopes: str = "BTC_5m,BTC_15m,ETH_5m,ETH_15m,SOL_5m,SOL_15m"
+
+
 class ConfigUpdateRequest(BaseModel):
     half_spread_bps: Optional[float] = Field(default=None)
     min_spread_bps: Optional[float] = None
@@ -3816,6 +3822,8 @@ class PaperSweepRuntimeV2(MMRuntime):
 # to the V2 singleton for internal helpers that still reference this name.
 _runtime_v2 = MMRuntimeV2()
 _paper_sweep_v2 = PaperSweepRuntimeV2()
+# Pair Arb runtime (initialized lazily on first start)
+_pair_arb_engine = None  # type: ignore
 _runtime = _runtime_v2
 
 
@@ -4752,6 +4760,99 @@ def _sigterm_handler(signum, frame):
 signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
+# ---------- Pair Arbitrage ----------
+
+@app.post("/api/pair-arb/start")
+async def pair_arb_start(req: PairArbStartRequest, request: Request):
+    _require_auth(request)
+    global _pair_arb_engine
+
+    if _pair_arb_engine is not None and _pair_arb_engine._running:
+        raise HTTPException(status_code=409, detail="pair arb already running")
+
+    from pair_arb import PairArbEngine, PairArbConfig
+
+    config = PairArbConfig(
+        market_scopes=req.market_scopes,
+        session_budget_usd=float(req.initial_usdc),
+    )
+    config.validate()
+
+    # Create CLOB client (same pattern as MMRuntimeV2)
+    from mm_shared.order_manager import OrderManager
+    import os
+
+    private_key = os.environ.get("PM_PRIVATE_KEY", "")
+    api_key = os.environ.get("PM_API_KEY", "")
+    api_secret = os.environ.get("PM_API_SECRET", "")
+    api_passphrase = os.environ.get("PM_API_PASSPHRASE", "")
+
+    if req.paper_mode:
+        # Use MockClobClient for paper mode.
+        client = MockClobClient(usdc_balance=float(req.initial_usdc))
+        order_mgr = OrderManager(client)
+    else:
+        if not private_key:
+            raise HTTPException(status_code=400, detail="PM_PRIVATE_KEY not set")
+        from py_clob_client.client import ClobClient
+        chain_id = int(os.environ.get("PM_CHAIN_ID", "137"))
+        client = ClobClient(
+            "https://clob.polymarket.com",
+            key=private_key,
+            chain_id=chain_id,
+            creds={"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase} if api_key else None,
+        )
+        order_mgr = OrderManager(client)
+
+    _pair_arb_engine = PairArbEngine(
+        order_mgr=order_mgr,
+        config=config,
+        private_key=private_key,
+        paper_mode=req.paper_mode,
+        app_version=APP_VERSION,
+    )
+
+    result = await _pair_arb_engine.start()
+    return result
+
+
+@app.post("/api/pair-arb/stop")
+async def pair_arb_stop(request: Request):
+    _require_auth(request)
+    global _pair_arb_engine
+    if _pair_arb_engine is None or not _pair_arb_engine._running:
+        return {"ok": False, "error": "not_running"}
+    result = await _pair_arb_engine.stop()
+    return result
+
+
+@app.get("/api/pair-arb/state")
+async def pair_arb_state(request: Request):
+    _require_auth(request)
+    if _pair_arb_engine is None:
+        return {"is_running": False, "error": "not_initialized"}
+    return _pair_arb_engine.snapshot().to_dict()
+
+
+@app.post("/api/pair-arb/config")
+async def pair_arb_config_update(request: Request):
+    _require_auth(request)
+    if _pair_arb_engine is None:
+        raise HTTPException(status_code=400, detail="pair arb not initialized")
+    body = await request.json()
+    new_config = _pair_arb_engine.update_config(**body)
+    return {"ok": True, "config": new_config}
+
+
+@app.get("/api/pair-arb/config")
+async def pair_arb_config_get(request: Request):
+    _require_auth(request)
+    if _pair_arb_engine is None:
+        from pair_arb import PairArbConfig
+        return {"config": PairArbConfig().to_dict()}
+    return {"config": _pair_arb_engine.config.to_dict()}
+
+
 @app.on_event("startup")
 async def _startup():
     _telegram.set_loop(asyncio.get_running_loop())
@@ -4779,4 +4880,9 @@ async def _shutdown():
             await asyncio.wait_for(_runtime.stop(), timeout=15.0)
         except Exception as e:
             log.error(f"Shutdown error: {e}")
+    if _pair_arb_engine is not None and _pair_arb_engine._running:
+        try:
+            await asyncio.wait_for(_pair_arb_engine.stop(), timeout=10.0)
+        except Exception as e:
+            log.error(f"Pair arb shutdown error: {e}")
     await _telegram.close()
