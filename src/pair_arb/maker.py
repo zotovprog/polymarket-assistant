@@ -1,6 +1,7 @@
 """Maker pair arb — posts persistent BUY limits on both sides, merges when filled."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import time
@@ -140,13 +141,19 @@ class MakerArbManager:
 
         result = {"scope": self.market.scope, "action": "none"}
 
-        # 5. Post/reprice UP
-        if need_reprice_up:
-            if self.up_order_id:
-                await self._cancel_order(self.up_order_id)
-                self.up_order_id = None
-                self.reprices += 1
+        # 5+6. Cancel stale orders, then place UP+DN in parallel
+        if need_reprice_up and self.up_order_id:
+            await self._cancel_order(self.up_order_id)
+            self.up_order_id = None
+            self.reprices += 1
+        if need_reprice_dn and self.dn_order_id:
+            await self._cancel_order(self.dn_order_id)
+            self.dn_order_id = None
+            self.reprices += 1
 
+        up_quote = None
+        dn_quote = None
+        if need_reprice_up:
             up_quote = Quote(
                 side="BUY",
                 token_id=self.market.up_token_id,
@@ -154,17 +161,7 @@ class MakerArbManager:
                 size=clip,
                 order_context="pair_arb_maker",
             )
-            self.up_order_id = await self._safe_place(up_quote)
-            self.up_price = target_up
-            self.up_size = clip
-
-        # 6. Post/reprice DN
         if need_reprice_dn:
-            if self.dn_order_id:
-                await self._cancel_order(self.dn_order_id)
-                self.dn_order_id = None
-                self.reprices += 1
-
             dn_quote = Quote(
                 side="BUY",
                 token_id=self.market.dn_token_id,
@@ -172,7 +169,24 @@ class MakerArbManager:
                 size=clip,
                 order_context="pair_arb_maker",
             )
+
+        # Place both legs in parallel for speed
+        if up_quote and dn_quote:
+            up_result, dn_result = await asyncio.gather(
+                self._safe_place(up_quote),
+                self._safe_place(dn_quote),
+            )
+            self.up_order_id = up_result
+            self.dn_order_id = dn_result
+        elif up_quote:
+            self.up_order_id = await self._safe_place(up_quote)
+        elif dn_quote:
             self.dn_order_id = await self._safe_place(dn_quote)
+
+        if need_reprice_up:
+            self.up_price = target_up
+            self.up_size = clip
+        if need_reprice_dn:
             self.dn_price = target_dn
             self.dn_size = clip
 

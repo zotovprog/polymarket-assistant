@@ -226,6 +226,12 @@ class PairArbStartRequest(BaseModel):
     market_scopes: str = "BTC_5m,BTC_15m,ETH_5m,ETH_15m,SOL_5m,SOL_15m"
 
 
+class LiquidatePositionsRequest(BaseModel):
+    dry_run: bool = True       # Default: only show plan, don't execute
+    limit: int = 0             # 0 = all, N = process only first N actions
+    skip_sell: bool = False    # Don't sell orphaned sides (only merge + redeem)
+
+
 class ConfigUpdateRequest(BaseModel):
     half_spread_bps: Optional[float] = Field(default=None)
     min_spread_bps: Optional[float] = None
@@ -4952,6 +4958,215 @@ async def pair_arb_redeem_all(request: Request):
         "error_count": len(errors),
         "redeemed": redeemed,
         "errors": errors[:10],  # Limit error output
+    }
+
+
+@app.post("/api/pair-arb/liquidate-positions")
+async def pair_arb_liquidate_positions(req: LiquidatePositionsRequest, request: Request):
+    """Merge paired positions + sell orphaned sides to free up USDC.
+
+    Supports dry_run (default) to preview actions before executing.
+    """
+    _require_auth(request)
+
+    private_key = os.environ.get("PM_PRIVATE_KEY", "")
+    if not private_key:
+        raise HTTPException(status_code=500, detail="PM_PRIVATE_KEY not configured")
+    if not PM_FUNDER:
+        raise HTTPException(status_code=500, detail="PM_FUNDER not configured")
+
+    import httpx
+    from collections import defaultdict
+    from mm_shared.safe_exec import safe_merge_positions
+
+    # 1. Fetch all positions
+    try:
+        async with httpx.AsyncClient(timeout=15) as http:
+            resp = await http.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": PM_FUNDER, "sizeThreshold": "0.1", "limit": "100"},
+            )
+            resp.raise_for_status()
+            positions = resp.json()
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to fetch positions: {e}"}
+
+    if not positions:
+        return {"ok": True, "message": "No positions found", "plan": [], "executed": []}
+
+    # 2. Group by conditionId
+    by_condition: dict[str, dict] = defaultdict(lambda: {"up": 0.0, "dn": 0.0, "redeemable": False, "title": "", "up_token": "", "dn_token": ""})
+    for pos in positions:
+        cond_id = pos.get("conditionId") or pos.get("condition_id") or ""
+        if not cond_id:
+            continue
+        outcome = (pos.get("outcome") or "").lower()
+        size = float(pos.get("size", 0))
+        title = (pos.get("title", "") or pos.get("market", {}).get("question", ""))[:60]
+        token_id = pos.get("asset", "") or pos.get("token_id", "")
+        redeemable = pos.get("redeemable", False)
+
+        entry = by_condition[cond_id]
+        entry["title"] = title
+        entry["redeemable"] = entry["redeemable"] or redeemable
+        if outcome in ("up", "yes"):
+            entry["up"] += size
+            entry["up_token"] = token_id
+        elif outcome in ("down", "no"):
+            entry["dn"] += size
+            entry["dn_token"] = token_id
+
+    # 3. Build action plan
+    plan = []
+    for cond_id, info in by_condition.items():
+        up, dn = info["up"], info["dn"]
+        mergeable = min(up, dn)
+        mergeable = int(mergeable * 100) / 100.0  # floor to 2 decimals
+
+        if info["redeemable"] and (up > 0 or dn > 0):
+            plan.append({
+                "action": "redeem",
+                "condition_id": cond_id[:16] + "...",
+                "title": info["title"],
+                "note": f"Resolved market, redeem UP={up:.1f} DN={dn:.1f}",
+            })
+        elif mergeable >= 1.0:
+            plan.append({
+                "action": "merge",
+                "condition_id": cond_id,
+                "condition_id_short": cond_id[:16] + "...",
+                "title": info["title"],
+                "amount": mergeable,
+                "est_usd": round(mergeable, 2),
+                "remainder_up": round(up - mergeable, 2),
+                "remainder_dn": round(dn - mergeable, 2),
+            })
+            # Sell orphaned remainder
+            remainder_up = up - mergeable
+            remainder_dn = dn - mergeable
+            if remainder_up >= 1.0 and info["up_token"]:
+                plan.append({
+                    "action": "sell",
+                    "condition_id_short": cond_id[:16] + "...",
+                    "title": info["title"],
+                    "side": "UP",
+                    "token_id": info["up_token"],
+                    "size": round(remainder_up, 2),
+                    "note": "Orphaned UP side",
+                })
+            if remainder_dn >= 1.0 and info["dn_token"]:
+                plan.append({
+                    "action": "sell",
+                    "condition_id_short": cond_id[:16] + "...",
+                    "title": info["title"],
+                    "side": "DN",
+                    "token_id": info["dn_token"],
+                    "size": round(remainder_dn, 2),
+                    "note": "Orphaned DN side",
+                })
+
+    # 4. Dry run — just return plan
+    if req.dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "plan": plan,
+            "summary": {
+                "merge_actions": sum(1 for p in plan if p["action"] == "merge"),
+                "sell_actions": sum(1 for p in plan if p["action"] == "sell"),
+                "redeem_actions": sum(1 for p in plan if p["action"] == "redeem"),
+                "est_merge_usd": sum(p.get("est_usd", 0) for p in plan if p["action"] == "merge"),
+            },
+        }
+
+    # 5. Execute (with optional limit)
+    executed = []
+    errors = []
+    actions_to_run = plan if req.limit <= 0 else plan[:req.limit]
+
+    for action in actions_to_run:
+        if action["action"] == "merge":
+            try:
+                result = await asyncio.to_thread(
+                    safe_merge_positions, private_key, PM_FUNDER,
+                    action["condition_id"], action["amount"],
+                )
+                if result.get("success"):
+                    executed.append({
+                        **action,
+                        "status": "ok",
+                        "tx_hash": result.get("tx_hash", "")[:16],
+                    })
+                    log.info("Liquidate MERGE %s: %.2f pairs → tx=%s",
+                             action["title"], action["amount"],
+                             result.get("tx_hash", "")[:16])
+                else:
+                    errors.append({**action, "status": "failed", "error": result.get("error", "unknown")})
+            except Exception as e:
+                errors.append({**action, "status": "failed", "error": str(e)})
+
+        elif action["action"] == "sell" and not req.skip_sell:
+            try:
+                # Create a temporary CLOB client for selling
+                from py_clob_client.client import ClobClient as _ClobClient
+                from py_clob_client.clob_types import ApiCreds as _ApiCreds
+                _creds = _ApiCreds(api_key=PM_API_KEY, api_secret=PM_API_SECRET, api_passphrase=PM_API_PASSPHRASE)
+                sell_client = _ClobClient(
+                    host="https://clob.polymarket.com", key=private_key,
+                    chain_id=137, creds=_creds, funder=PM_FUNDER, signature_type=2,
+                )
+                # Get best bid for pricing
+                book = await asyncio.to_thread(sell_client.get_order_book, action["token_id"])
+                bids = book.get("bids") or []
+                best_bid = float(bids[0]["price"]) if bids else 0.01
+
+                order_args = {
+                    "token_id": action["token_id"],
+                    "price": best_bid,
+                    "size": action["size"],
+                    "side": "SELL",
+                }
+                signed = sell_client.create_and_sign_order(order_args)
+                resp = await asyncio.to_thread(sell_client.post_order, signed, "GTC")
+                order_id = resp.get("orderID") or resp.get("order_id") or resp.get("id")
+                executed.append({
+                    **action,
+                    "status": "ok",
+                    "sell_price": best_bid,
+                    "order_id": str(order_id)[:16] if order_id else "none",
+                })
+                log.info("Liquidate SELL %s %s x%.1f @ %.2f",
+                         action["side"], action["title"], action["size"], best_bid)
+            except Exception as e:
+                errors.append({**action, "status": "failed", "error": str(e)})
+
+        elif action["action"] == "redeem":
+            try:
+                from mm_shared.safe_exec import safe_redeem_positions
+                cond_full = [c for c in by_condition if c[:16] == action["condition_id"][:16]]
+                cond_id = cond_full[0] if cond_full else ""
+                if cond_id:
+                    result = await asyncio.to_thread(
+                        safe_redeem_positions, private_key, PM_FUNDER, cond_id,
+                    )
+                    if result.get("success"):
+                        executed.append({**action, "status": "ok", "tx_hash": result.get("tx_hash", "")[:16]})
+                    else:
+                        errors.append({**action, "status": "failed", "error": result.get("error", "unknown")})
+            except Exception as e:
+                errors.append({**action, "status": "failed", "error": str(e)})
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "plan": plan,
+        "executed": executed,
+        "errors": errors[:10],
+        "totals": {
+            "merged_usd": sum(a.get("est_usd", 0) for a in executed if a["action"] == "merge"),
+            "sold_count": sum(1 for a in executed if a["action"] == "sell"),
+            "redeemed_count": sum(1 for a in executed if a["action"] == "redeem"),
+        },
     }
 
 

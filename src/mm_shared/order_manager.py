@@ -2010,7 +2010,24 @@ class OrderManager:
             return False
 
     async def _place_order_inner(self, quote: Quote, post_only: bool) -> str:
-        """Create, sign and send an order. Returns order_id or raises on error."""
+        """Create, sign and send an order. Returns order_id or raises on error.
+
+        Retries up to 3 times on transient 'Request exception' errors.
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return await self._place_order_inner_once(quote, post_only)
+            except Exception as e:
+                if "Request exception" in str(e) and attempt < max_retries - 1:
+                    delay = 0.3 * (attempt + 1)
+                    log.debug("Retrying order after Request exception (attempt %d, wait %.1fs)", attempt + 1, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+    async def _place_order_inner_once(self, quote: Quote, post_only: bool) -> str:
+        """Single attempt to create, sign and send an order."""
         is_mock = hasattr(self.client, '_orders')
         if is_mock:
             order_args = {

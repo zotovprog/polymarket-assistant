@@ -64,6 +64,7 @@ class PairArbEngine:
         self._task: asyncio.Task | None = None
         self._current_best_scope: str | None = None
         self._last_scope_switch_ts: float = 0.0
+        self._last_usdc_balance: float = 0.0
 
     async def start(self) -> dict:
         """Start the arb engine. Returns initial state."""
@@ -183,6 +184,13 @@ class PairArbEngine:
                     continue
 
                 self._scan_count += 1
+
+                # Update cached USDC balance for snapshot
+                try:
+                    _, avail = await self.order_mgr.get_usdc_balances()
+                    self._last_usdc_balance = float(avail or 0)
+                except Exception:
+                    pass
 
                 # === MAKER MODE: manage persistent BUY limits ===
                 # Only post orders on the SINGLE best market to concentrate USDC.
@@ -373,6 +381,7 @@ class PairArbEngine:
                 e.to_dict() for e in self.executor.pending
             ],
         )
+        state.usdc_balance = self._last_usdc_balance
         state.config["current_best_scope"] = self._current_best_scope
         # Add maker manager info
         if self._maker_managers:
