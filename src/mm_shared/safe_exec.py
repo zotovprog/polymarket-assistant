@@ -211,10 +211,16 @@ def safe_exec_transaction(
     safe_addr = w3.to_checksum_address(safe_address)
     safe = w3.eth.contract(address=safe_addr, abi=GNOSIS_SAFE_ABI)
 
+    # Gas balance pre-check
+    eoa_gas = w3.eth.get_balance(eoa_address)
+    eoa_pol = float(w3.from_wei(eoa_gas, "ether"))
+    if eoa_pol < 0.005:
+        return {"success": False, "error": f"Insufficient gas: {eoa_pol:.4f} POL (need >= 0.005)"}
+
     # Sanity checks
     owners = safe.functions.getOwners().call()
     threshold = safe.functions.getThreshold().call()
-    log.info("Safe %s: owners=%s, threshold=%d", safe_addr[:10], owners, threshold)
+    log.info("Safe %s: owners=%s, threshold=%d, gas=%.4f POL", safe_addr[:10], owners, threshold, eoa_pol)
 
     if eoa_address not in owners:
         return {"success": False, "error": f"EOA {eoa_address} is not a Safe owner"}

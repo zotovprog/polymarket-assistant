@@ -2012,16 +2012,17 @@ class OrderManager:
     async def _place_order_inner(self, quote: Quote, post_only: bool) -> str:
         """Create, sign and send an order. Returns order_id or raises on error.
 
-        Retries up to 3 times on transient 'Request exception' errors.
+        Retries up to 5 times on transient 'Request exception' errors with jitter.
         """
-        max_retries = 3
+        import random
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 return await self._place_order_inner_once(quote, post_only)
             except Exception as e:
                 if "Request exception" in str(e) and attempt < max_retries - 1:
-                    delay = 0.3 * (attempt + 1)
-                    log.debug("Retrying order after Request exception (attempt %d, wait %.1fs)", attempt + 1, delay)
+                    delay = 0.5 * (attempt + 1) + random.uniform(0, 0.3)
+                    log.debug("Retrying order after Request exception (attempt %d/%d, wait %.1fs)", attempt + 1, max_retries, delay)
                     await asyncio.sleep(delay)
                     continue
                 raise
