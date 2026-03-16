@@ -28,7 +28,7 @@ class PairArbConfig:
     }
 
     # Markets to scan (comma-separated scopes like "BTC_5m,ETH_15m")
-    market_scopes: str = "BTC_5m,BTC_15m,ETH_5m,ETH_15m,SOL_5m,SOL_15m"
+    market_scopes: str = "BTC_5m"
 
     # Profitability thresholds
     min_profit_bps: float = 10.0       # Min profit in bps of $1.00 payout
