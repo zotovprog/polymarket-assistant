@@ -97,6 +97,20 @@ class MakerArbManager:
                 log.debug("Clip raised to %.0f for %s (min_price=%.2f, notional=$%.2f)",
                           clip, self.market.scope, min_price, clip * min_price)
 
+        # 3b. Hard cap: never use more than 40% of available USDC for a single pair
+        try:
+            avail_for_cap = await self.order_mgr.get_usdc_available_balance(force_refresh=False)
+        except Exception:
+            avail_for_cap = None
+        if avail_for_cap and avail_for_cap > 0 and (target_up + target_dn) > 0:
+            max_clip_by_bal = math.floor(
+                (avail_for_cap * 0.40) / (target_up + target_dn)
+            )
+            if max_clip_by_bal < clip:
+                clip = max(float(max_clip_by_bal), self.config.min_clip_shares)
+                log.debug("Clip capped to %.0f by 40%% balance rule ($%.2f avail)",
+                          clip, avail_for_cap)
+
         # 4. Check if repricing needed
         need_reprice_up = (
             self.up_order_id is None
@@ -170,12 +184,24 @@ class MakerArbManager:
                 order_context="pair_arb_maker",
             )
 
-        # Place both legs sequentially (httpx Client is not thread-safe,
-        # asyncio.gather + to_thread causes "Request exception" on 2nd leg)
+        # Place both legs sequentially with balance check between them
         if up_quote and dn_quote:
             self.up_order_id = await self._safe_place(up_quote)
-            await asyncio.sleep(0.15)
-            self.dn_order_id = await self._safe_place(dn_quote)
+            if self.up_order_id:
+                await asyncio.sleep(0.15)
+                leg2_cost = target_dn * clip
+                can_place = await self._check_balance_for_leg2(leg2_cost)
+                if can_place:
+                    self.dn_order_id = await self._safe_place(dn_quote)
+                else:
+                    log.warning(
+                        "Maker %s: insufficient balance for DN leg ($%.2f), "
+                        "cancelling UP leg %s preemptively",
+                        self.market.scope, leg2_cost, self.up_order_id[:12],
+                    )
+                    await self._cancel_order(self.up_order_id)
+                    self.up_order_id = None
+                    return {"scope": self.market.scope, "action": "leg2_balance_skip"}
         elif up_quote:
             self.up_order_id = await self._safe_place(up_quote)
         elif dn_quote:
@@ -255,6 +281,27 @@ class MakerArbManager:
             await self.order_mgr.cancel_order(order_id)
         except Exception as e:
             log.debug("Cancel failed for %s: %s", order_id[:12], e)
+
+    async def _check_balance_for_leg2(self, leg2_cost: float) -> bool:
+        """Check if enough USDC remains for leg 2 after leg 1 was placed."""
+        try:
+            available = await self.order_mgr.get_usdc_available_balance(
+                force_refresh=True,
+            )
+        except Exception:
+            log.debug("Balance check for leg 2 failed — skipping")
+            return False
+        if available is None:
+            return False
+        # $1.00 safety margin: CLOB may not yet reflect leg 1's lock
+        safety_margin = 1.00
+        if available < leg2_cost + safety_margin:
+            log.info(
+                "Leg 2 balance check: need $%.2f + $%.2f margin, have $%.2f — skip",
+                leg2_cost, safety_margin, available,
+            )
+            return False
+        return True
 
     async def _safe_place(self, quote: Quote) -> str | None:
         try:
