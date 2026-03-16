@@ -112,14 +112,14 @@ class MakerArbManager:
                           clip, avail_for_cap)
 
         # 4. Check if repricing needed
-        need_reprice_up = (
-            self.up_order_id is None
-            or abs(self.up_price - target_up) >= self.REPRICE_THRESHOLD
-        )
-        need_reprice_dn = (
-            self.dn_order_id is None
-            or abs(self.dn_price - target_dn) >= self.REPRICE_THRESHOLD
-        )
+        # If BOTH legs are active, do NOT reprice — wait for fills.
+        # Repricing cancels+replaces, which locks additional USDC while
+        # the old order's collateral hasn't been freed yet.
+        if self.up_order_id and self.dn_order_id:
+            return None  # Both legs posted, nothing to do
+
+        need_reprice_up = self.up_order_id is None
+        need_reprice_dn = self.dn_order_id is None
 
         # --- Balance pre-check: ensure USDC covers BOTH legs ---
         if need_reprice_up or need_reprice_dn:
