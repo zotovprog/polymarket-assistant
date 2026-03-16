@@ -110,7 +110,8 @@ async def test_orphan_cleanup_dn_fails():
 
 
 @pytest.mark.asyncio
-async def test_orphan_cleanup_up_fails():
+async def test_up_fails_dn_not_attempted():
+    """If UP leg fails, DN leg should NOT be placed at all (no orphan possible)."""
     mgr = _mock_order_mgr(
         place_results=[None, "order_dn_1"],
         up_book={"best_bid": 0.40, "best_ask": 0.42},
@@ -120,10 +121,12 @@ async def test_orphan_cleanup_up_fails():
 
     result = await maker.tick()
 
-    mgr.cancel_order.assert_awaited_once_with("order_dn_1")
+    # UP failed → DN never placed → no cancel needed
+    assert maker.up_order_id is None
     assert maker.dn_order_id is None
-    assert result["action"] == "orphan_cleanup"
-    assert result["failed_leg"] == "up"
+    mgr.cancel_order.assert_not_awaited()
+    # place_order called only once (UP attempt), DN skipped
+    assert mgr.place_order.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -166,7 +169,9 @@ async def test_clip_raised_low_price():
 
     assert result["action"] == "posted"
     sizes = [call.args[0].size for call in mgr.place_order.call_args_list]
-    assert sizes == [17.0, 17.0]
+    # 40% balance cap: floor(30*0.40/0.98) = 12, but notional min ceil(1/0.06)=17
+    # cap wins: clip = max(12, min_clip=5) = 12
+    assert sizes == [12.0, 12.0]
 
 
 @pytest.mark.asyncio
@@ -200,7 +205,8 @@ async def test_balance_skip():
     assert result["action"] == "posted"
     sizes = [call.args[0].size for call in mgr.place_order.call_args_list]
     assert all(size < 5.0 for size in sizes)
-    assert all(math.isclose(size, 2.22, rel_tol=0, abs_tol=1e-9) for size in sizes)
+    # 40% cap: floor(2.0*0.40/0.90)=0, clamped to min_clip=1.0
+    assert sizes == [1.0, 1.0]
 
 
 @pytest.mark.asyncio
