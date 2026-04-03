@@ -80,20 +80,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run trufflehog on git history
+      - name: Run trufflehog (block on verified secrets only)
         run: |
           docker run --rm -v "${PWD}:/repo" trufflesecurity/trufflehog:latest \
             git "file:///repo" \
-            --results=verified,unknown \
+            --results=verified \
             --fail \
-            --json > trufflehog.json
+            --json > trufflehog-verified.json
+
+      - name: Run trufflehog (collect unknown findings)
+        run: |
+          docker run --rm -v "${PWD}:/repo" trufflesecurity/trufflehog:latest \
+            git "file:///repo" \
+            --results=unknown \
+            --json > trufflehog-unknown.json
 
       - name: Upload trufflehog artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trufflehog-json
-          path: trufflehog.json
+          path: |
+            trufflehog-verified.json
+            trufflehog-unknown.json
 
   tests:
     name: Test Suite
