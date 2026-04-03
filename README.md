@@ -60,7 +60,7 @@ Key modules:
 Single FastAPI server + dashboard:
 
 - entrypoint: `web_server.py`
-- frontend: `web`
+- frontend: `web/`
 
 Main endpoints:
 
@@ -232,7 +232,7 @@ Set the same `PM_WEB_ACCESS_KEY` in server env and request headers.
 Check:
 
 - `data/replay/mmv2_dataset_scenarios.json`
-- required artifact folders under `audit`
+- required artifact folders under `audit/`
 
 ### Live start rejected
 
