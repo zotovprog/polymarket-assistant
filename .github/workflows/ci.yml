@@ -24,7 +24,7 @@ jobs:
       - name: Validate repo safety rules
         run: ./tools/check_repo_safety.sh
 
-  secret-scan:
+  secret-scan-gitleaks:
     name: Secret Scan (gitleaks)
     runs-on: ubuntu-latest
     needs: repo-safety
@@ -66,6 +66,34 @@ jobs:
         with:
           name: gitleaks-sarif
           path: gitleaks.sarif
+
+  secret-scan-trufflehog:
+    name: Secret Scan (trufflehog)
+    runs-on: ubuntu-latest
+    needs: repo-safety
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run trufflehog on git history
+        run: |
+          docker run --rm -v "${PWD}:/repo" trufflesecurity/trufflehog:latest \
+            git "file:///repo" \
+            --results=verified,unknown \
+            --fail \
+            --json > trufflehog.json
+
+      - name: Upload trufflehog artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-json
+          path: trufflehog.json
 
   tests:
     name: Test Suite
@@ -109,7 +137,8 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - tests
-      - secret-scan
+      - secret-scan-gitleaks
+      - secret-scan-trufflehog
     steps:
       - name: Checkout
         uses: actions/checkout@v4
