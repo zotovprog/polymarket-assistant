@@ -6,7 +6,7 @@ This document describes how to use `orderFilled_complete.csv.xz` from `warproxxx
 
 Expected raw input path:
 
-`[REDACTED_PATH]/Projects/polymarket-assistant/data/raw/orderFilled_complete.csv.xz`
+`data/raw/orderFilled_complete.csv.xz`
 
 ## 1) Normalize raw CSV.XZ into parquet dataset
 

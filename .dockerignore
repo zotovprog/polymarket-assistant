@@ -9,7 +9,6 @@ executions.log.jsonl
 executions.*.jsonl
 .DS_Store
 .pytest_cache/
-
 .env
 .web_access_key
 node_modules/

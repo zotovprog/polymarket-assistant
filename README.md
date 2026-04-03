@@ -1,5 +1,9 @@
 # Polymarket Assistant (MM V2 + Pair Arb)
 
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-brightgreen)](#testing)
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![Security](https://img.shields.io/badge/Secret%20Scanning-Gitleaks%20%2B%20TruffleHog-brightgreen)
+
 ## Current Status
 
 This repository contains two live-capable strategies for Polymarket crypto Up/Down markets:

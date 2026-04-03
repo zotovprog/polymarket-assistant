@@ -31,7 +31,6 @@ backtest/sweep_results*.json
 .venv311/
 .DS_Store
 .pytest_cache/
-
 audit/
 tasks/
 codex_outputs/

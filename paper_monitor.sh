@@ -1,6 +1,16 @@
 #!/bin/bash
 # Paper mode monitor — logs state snapshots every 30s
-AUTH_KEY=$(cat [REDACTED_PATH]/Projects/polymarket-assistant/.web_access_key)
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUTH_KEY_FILE="${PM_WEB_ACCESS_KEY_FILE:-$SCRIPT_DIR/.web_access_key}"
+AUTH_KEY="${PM_WEB_ACCESS_KEY:-}"
+if [[ -z "$AUTH_KEY" && -f "$AUTH_KEY_FILE" ]]; then
+  AUTH_KEY="$(cat "$AUTH_KEY_FILE")"
+fi
+if [[ -z "$AUTH_KEY" ]]; then
+  echo "PM web access key is missing. Set PM_WEB_ACCESS_KEY or PM_WEB_ACCESS_KEY_FILE." >&2
+  exit 1
+fi
 LOG="/tmp/paper_monitor.log"
 echo "=== Paper Monitor Started $(date) ===" >> "$LOG"
 
