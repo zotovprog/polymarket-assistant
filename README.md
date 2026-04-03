@@ -1,301 +1,243 @@
-# Polymarket Crypto Assistant
+# Polymarket Assistant (MM V2 + Pair Arb)
 
-Real-time terminal dashboard that combines live Binance order flow with Polymarket prediction market prices to surface actionable crypto signals.
+## Current Status
 
-**By [@SolSt1ne](https://x.com/SolSt1ne)**
+This repository contains two live-capable strategies for Polymarket crypto Up/Down markets:
 
-**[Polymarket](https://polymarket.com/?via=SolSt1ne)**
----
+- `MM V2` (maker-first market making)
+- `Pair Arb` (two-leg buy + merge/redeem flow)
 
-## What it does
+Infrastructure is mature (feeds, order manager, CLOB integration, on-chain operations), but **strategy profitability is not consistently stable yet** on fast crypto markets (especially `5m` windows). Treat this as **research/verification code**, not unattended production trading.
 
-- Streams live trades and orderbook from **Binance**
-- Fetches Up/Down contract prices from **Polymarket** via WebSocket
-- Calculates 11 indicators across orderbook, flow, and technical analysis
-- Aggregates everything into a single **BULLISH / BEARISH / NEUTRAL** trend score
-- Renders the full dashboard in the terminal with live refresh
+## What Is Implemented
 
----
+### 1) MM V2
 
-## Supported coins & timeframes
+MM V2 runs a state machine with explicit risk regimes:
 
-| Coins | Timeframes |
-|-------|------------|
-| BTC, ETH, SOL, XRP | 5m, 15m, 1h, 4h, daily |
+- `normal`
+- `inventory_skewed`
+- `defensive`
+- `unwind`
+- `emergency_unwind` / terminal liquidation
 
-All 16 coin × timeframe combinations are supported on Polymarket.
+Core behavior:
 
----
+- maker-first quoting (`post_only`) in normal operation
+- midpoint-first valuation with bounded model influence
+- inventory-aware skew, drawdown controls, edge guards
+- terminal liquidation path near expiry
+- extensive runtime analytics and failure bucket classification
 
-## Indicators
+Key modules:
 
-**Order Book**
-- OBI (Order Book Imbalance)
-- Buy / Sell Walls
-- Liquidity Depth (0.1% / 0.5% / 1.0%)
+- `src/mm_v2/runtime.py`
+- `src/mm_v2/quote_policy.py`
+- `src/mm_v2/risk_kernel.py`
+- `src/mm_v2/state_machine.py`
+- `src/mm_v2/pair_valuation.py`
 
-**Flow & Volume**
-- CVD (Cumulative Volume Delta) — 1m / 3m / 5m
-- Delta (1m)
-- Volume Profile with POC
+### 2) Pair Arb
 
-**Technical Analysis**
-- RSI (14)
-- MACD (12/26/9) + Signal + Histogram
-- VWAP
-- EMA 5 / EMA 20 crossover
-- Heikin Ashi candle streak
+Pair Arb scans selected scopes (e.g. `BTC_5m`), tries to place both legs safely, and then merge/redeem.
 
----
+Core behavior:
+
+- maker-mode leg placement with balance and orphan cleanup rules
+- risk caps on exposure and drawdown
+- merge/redeem support, including Safe-based execution helpers
+
+Key modules:
+
+- `src/pair_arb/engine.py`
+- `src/pair_arb/maker.py`
+- `src/pair_arb/merger.py`
+- `src/mm_shared/order_manager.py`
+- `src/mm_shared/safe_exec.py`
+
+## API / UI
+
+Single FastAPI server + dashboard:
+
+- entrypoint: `web_server.py`
+- frontend: `web`
+
+Main endpoints:
+
+- `/api/mmv2/start`, `/api/mmv2/stop`, `/api/mmv2/state`
+- `/api/mmv2/paper-sweep/start`, `/api/mmv2/paper-sweep/state`
+- `/api/pair-arb/start`, `/api/pair-arb/stop`, `/api/pair-arb/state`
+- `/api/pair-arb/redeem`, `/api/pair-arb/redeem-all`, `/api/pair-arb/liquidate-positions`
+
+## Security and Sensitive Data Policy
+
+### Required rules
+
+- Never commit `.env`, `.web_access_key`, raw Mongo URIs, or private keys.
+- Keep secrets only in runtime env/CI variables.
+- Keep generated local artifacts (`audit`, datasets, task dumps, codex outputs) out of git.
+
+Current ignore list includes:
+
+- `.env`, `.env.*`, `.web_access_key`
+- `audit/`
+- `data/raw/`, `data/normalized/`, large replay datasets
+- `tasks/`, `codex_outputs/`
+
+If history was ever contaminated, rewrite git history and force-push cleaned refs.
 
 ## Setup
 
+### 1) Install
+
 ```bash
+cd polymarket-assistant
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python main.py
 ```
 
-## Web Interface (Local Server)
+### 2) Configure env
 
-This build includes a local web UI with:
+Copy `.env.example` and set values.
 
-- live market/indicator dashboard
-- session-scoped live env inputs (`PM_PRIVATE_KEY`, `PM_FUNDER`, `PM_SIGNATURE_TYPE`)
-- live preflight checks on start (key format, signature type, API collateral read test)
-- manual approve/reject buttons for pending live trades
-- optional auto-approve switch for live entries (dangerous; disables manual confirm step)
-- frontend sound alert + toast notifications for pending trades and start/runtime issues
-- compact English market summary at the top (current regime snapshot)
-- trade history + runtime logs in browser
+Minimum for local API:
 
-Access control:
+- `PM_WEB_ACCESS_KEY`
 
-- web API is protected by an access key
-- set it with env: `PM_WEB_ACCESS_KEY=...` (required)
-- browser must unlock once via key prompt; after that auth cookie is used
+For live trading you also need:
 
-Safety behavior in live mode:
+- `PM_PRIVATE_KEY`
+- `PM_FUNDER`
+- `PM_API_KEY`
+- `PM_API_SECRET`
+- `PM_API_PASSPHRASE`
 
-- on `Stop`, server attempts emergency flatten (close open position) before shutting session tasks
-- if client heartbeat disappears for too long, server blocks new entries and requests emergency close
-- tunable by env:
-  - `PM_FLATTEN_ON_STOP=1` (default)
-  - `PM_CLIENT_IDLE_FLATTEN=1` (default)
-  - `PM_CLIENT_IDLE_FLATTEN_SEC=45` (default)
-  - `PM_FLATTEN_TIMEOUT_SEC=25` (default)
-
-Run locally:
+### 3) Run server
 
 ```bash
-export PM_WEB_ACCESS_KEY='your-long-random-key'
-pip install -r requirements.txt
-pip install -r requirements-trading.txt
-uvicorn web_server:app --host 0.0.0.0 --port 8000
+PM_WEB_ACCESS_KEY='your-key' uvicorn web_server:app --host 127.0.0.1 --port 8000
 ```
 
-Open:
+Dashboard:
 
-```text
-http://localhost:8000
-```
+- [http://127.0.0.1:8000](http://127.0.0.1:8000)
 
-Important:
+## Testing
 
-- live env values are kept in-memory per browser session (not exported to shell)
-- web mode keeps manual approvals enabled by default
-- live start requires token: `I_UNDERSTAND_REAL_MONEY_RISK`
-
-### Docker
+### Unit/Regression (same suite as CI)
 
 ```bash
-export PM_WEB_ACCESS_KEY='your-long-random-key'
-docker compose up --build
+python -m pytest -q \
+  tests/test_mm_v2.py \
+  tests/test_mm_v2_pnl_accounting.py \
+  tests/test_mm_v2_quote_skew.py \
+  tests/test_mm_v2_inventory_modes.py \
+  tests/test_mm_v2_runtime_skew_flow.py \
+  tests/test_mm_v2_sell_release_lag.py \
+  tests/test_mm_v2_paper.py \
+  tests/test_mm_v2_paper_multiwindow.py \
+  tests/test_mm_v2_replay.py \
+  tests/test_pair_arb.py \
+  tests/test_safe_exec.py
 ```
 
-### Railway
+### Dataset-first dev gate
 
-In Railway project variables add:
-
-- `PM_WEB_ACCESS_KEY` = your random secret key
-
-After deploy, open app URL and enter this key in auth dialog.
-
-Then open:
-
-```text
-http://localhost:8000
-```
-
-## Trading Modes (Cautious Defaults)
-
-The app supports three modes:
-
-- `observe` (default): analytics dashboard only, no orders
-- `paper`: simulated bets (no real money)
-- `live`: real orders to Polymarket CLOB (guarded by explicit safety checks)
-
-### Paper trading
+Quick gate:
 
 ```bash
-python main.py --paper --size-usd 5 --tp-pct 15 --sl-pct 8 --max-hold-sec 900
+python tools/mmv2_dev_gate.py --mode quick
 ```
 
-### Live trading (requires extra dependency + explicit arming)
+Full gate (includes local paper stage):
 
 ```bash
-pip install -r requirements-trading.txt
-export PM_ENABLE_LIVE=1
-export PM_PRIVATE_KEY=...
-export PM_FUNDER=...
-# optional:
-# export PM_SIGNATURE_TYPE=0   # EOA/MetaMask/private key wallet (default)
-# export PM_SIGNATURE_TYPE=1   # Magic/email wallet
-# export PM_SIGNATURE_TYPE=2   # browser proxy wallet
-python main.py --live --confirm-live-token I_UNDERSTAND_REAL_MONEY_RISK --size-usd 5
+python tools/mmv2_dev_gate.py --mode full
 ```
 
-### One-Click Presets (safe / medium / aggressive)
-
-Preset launcher scripts are included:
-
-- `safe.sh`
-- `medium.sh`
-- `aggressive.sh`
-- `run_preset.sh` (generic launcher)
-
-Web preset note:
-
-- `SUPER AGGRESSIVE` exists only in web UI and is paper-only by design.
-
-Quick start:
+### Local paper verification
 
 ```bash
-bash safe.sh              # safe preset in paper mode (SIZE_USD=5 by default)
-bash medium.sh live       # medium preset in live mode
-bash aggressive.sh live   # aggressive preset in live mode
-AUTO_APPROVE=1 bash medium.sh live   # medium live without manual approve
+python tools/mmv2_local_paper_check.py \
+  --base-url http://127.0.0.1:8000 \
+  --timeframe 15m \
+  --budget 300 \
+  --duration-sec 2700 \
+  --poll-sec 5 \
+  --stop-at-end
 ```
 
-Optional overrides (examples):
+## Why It Still Does Not Work As Expected
 
-```bash
-COIN=BTC TIMEFRAME=15m SIZE_USD=5 bash safe.sh live
-CONTROL_FILE=/tmp/pm_traderctl bash medium.sh
-EXEC_LOG_FILE=/tmp/pm_execs.jsonl bash medium.sh live
-```
+Based on the latest research/audits and live-paper artifacts, the main blockers are strategy-level, not infra-level.
 
-Notes:
+### 1) Adverse selection in fast PM crypto windows
 
-- default mode is `paper`; pass `live` explicitly for real orders
-- default timeframe in preset launcher is `15m` (override with `TIMEFRAME=...`)
-- minimum order size is `5 USD` (enforced by app)
-- live mode requires `PM_ENABLE_LIVE=1`, `PM_PRIVATE_KEY`, `PM_FUNDER`
-- on some external drives direct `./safe.sh` may be blocked; use `bash safe.sh`
-- set `AUTO_APPROVE=1` to auto-approve entries for preset runs
-- successful operations (only) are appended to `executions.log.jsonl` by default
+Even with midpoint-first anchoring, fills can be toxic when microstructure shifts quickly (especially `5m` markets). Quotes get picked off before the bot re-centers edge.
 
-Safety gates in live mode:
+### 2) Marketability/execution churn
 
-- live mode is blocked unless `PM_ENABLE_LIVE=1`
-- live mode is blocked unless `--confirm-live-token I_UNDERSTAND_REAL_MONEY_RISK`
-- strict defaults: high signal thresholds, cooldown, low trade cap/day
-- every live bet requires manual approval (`approve`) before sending order
-- optional: `--auto-approve` disables manual approval gate
-- entry is considered open only after fill check (`get_order`) confirms execution
-- unfilled entry is auto-cancelled after timeout (configurable)
-- open positions are auto-exited by TP/SL/time-stop/reversal (configurable)
+A repeated pattern in bad windows:
 
-### Runtime trader commands (without restart)
+- collateral warnings
+- cancel/repost loops
+- sell skip cooldown streaks
 
-When `paper` or `live` mode is enabled, trader listens for commands in `.traderctl`
-(or custom path via `--control-file`):
+This causes `marketability_churn` as primary failure bucket and can degrade PnL before terminal cleanup.
 
-```bash
-echo "status"  > .traderctl   # show trader state
-echo "approve" > .traderctl   # approve current pending live bet
-echo "reject"  > .traderctl   # reject current pending live bet
-echo "close"   > .traderctl   # force close current open position now
-echo "reset"   > .traderctl   # clear local open position state and pending decision
-echo "help"    > .traderctl   # print command help in app logs
-```
+### 3) Inventory regime stress
 
-You can also type commands directly in the same running terminal (press Enter):
+When inventory stress escalates (`inventory_skewed -> defensive -> unwind`), PnL can depend on late-stage unwind quality, which is fragile in thin liquidity.
 
-```text
-y  -> approve
-n  -> reject
-s  -> status
-c  -> close
-r  -> reset
-h  -> help
-```
+### 4) Pair Arb economics are tighter than they look
 
-When a new `pending live trade` appears, the app emits a sound by default.
-On macOS, `afplay /System/Library/Sounds/Glass.aiff` is used automatically.
-Disable it with:
+On paper, pair merge can look safe, but real constraints reduce edge:
 
-```bash
---disable-approval-beep
-```
+- PM minimum order constraints
+- fill asymmetry / orphan risk
+- merge/redeem latency and occasional tx failures
+- inventory carrying costs during partial fills
 
-Set an explicit sound command (optional):
+## Practical Interpretation of Claude Report
 
-```bash
---approval-sound-command "afplay /System/Library/Sounds/Glass.aiff"
-```
+The report is directionally correct:
 
-### Executions Log (successful operations only)
+- infra is working
+- both strategies are still under-optimized for stable expected value on PM crypto short windows
+- the next step is disciplined verification loops, not random live retries
 
-Each successful entry/exit is appended as one JSON line:
+Recommended process:
 
-```bash
-tail -f executions.log.jsonl
-```
+1. `quick` dev gate (`dataset -> execution replay -> fixture replay`)
+2. `full` dev gate
+3. local paper windows
+4. server paper windows
+5. only then live canary
 
-You can change the file path:
+## Known Non-Goals (for now)
 
-```bash
---executions-log-file /path/to/executions.log.jsonl
-```
+- No claim of guaranteed profitability
+- No unattended live by default
+- No secret material stored in repo
 
-### Auto-exit parameters
+## Troubleshooting
 
-- `--tp-pct`: take-profit threshold from entry (default `15`)
-- `--sl-pct`: stop-loss threshold from entry (default `8`)
-- `--max-hold-sec`: max hold time before time-stop exit (default `900`)
-- `--reverse-exit-bias`: exit when bias strongly reverses (default `60`)
-- `--disable-auto-exit`: disable all automatic exits
-- `--disable-reverse-exit`: keep TP/SL/time-stop but disable reverse-bias exit
+### “Unauthorized” on API
 
-### Live fill-control parameters
+Set the same `PM_WEB_ACCESS_KEY` in server env and request headers.
 
-- `--entry-fill-timeout-sec`: wait time for entry fill confirmation (default `20`)
-- `--entry-fill-poll-sec`: order-status polling interval (default `1.0`)
-- `--allow-posted-entry`: treat posted order as open without fill confirmation (less safe)
-- `--keep-unfilled-entry-open`: do not auto-cancel unfilled entry after timeout
+### Replay/dataset stage fails
+
+Check:
+
+- `data/replay/mmv2_dataset_scenarios.json`
+- required artifact folders under `audit`
+
+### Live start rejected
+
+Verify credential envs and runtime budget gates in `MM V2` start path.
 
 ---
 
-## Project structure
-
-```
-arbi-pred/
-├── web/                   # frontend (HTML/CSS/JS)
-├── src/
-│   ├── config.py          # all constants — coins, URLs, indicator params
-│   ├── feeds.py           # Binance + Polymarket data feeds
-│   ├── indicators.py      # pure indicator calculations
-│   ├── dashboard.py       # Rich terminal UI & trend scoring
-│   └── trading.py         # paper/live execution + risk guardrails
-├── main.py                # entry point — menu & async orchestration
-├── web_server.py          # FastAPI local backend for web UI
-├── run_preset.sh          # preset launcher (safe/medium/aggressive)
-├── safe.sh                # safe preset wrapper
-├── medium.sh              # medium preset wrapper
-├── aggressive.sh          # aggressive preset wrapper
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt       # Python dependencies
-├── requirements-trading.txt # optional trading dependency
-└── README.md
-```
+If you are deciding whether to run live right now: use gate results (`primary_blocker`, `failure_buckets`, PnL windows), not a single profitable run.

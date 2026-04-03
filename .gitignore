@@ -33,3 +33,9 @@ backtest/sweep_results*.json
 .pytest_cache/
 
 audit/
+tasks/
+codex_outputs/
+.env.*
+*.pem
+*.key
+*.p12

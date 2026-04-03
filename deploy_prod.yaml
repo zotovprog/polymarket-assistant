@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   bot:
-    image: registry.gitlab.com/info_something_tools-group/polymarketbot/polymarketbot:prod
+    image: ${IMAGE_NAME:-ghcr.io/your-org/polymarket-assistant:prod}
     env_file:
       - .env
     environment:

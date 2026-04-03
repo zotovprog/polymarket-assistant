@@ -26,5 +26,5 @@
 
 - URL: `http://34.65.205.12:8000`
 - Access key: `PM_WEB_ACCESS_KEY (env)`
-- Deploy: push в main → GitLab CI → автодеплой
+- Deploy: push в main → GitHub Actions
 - Wallet: Gnosis Safe proxy, signatureType=2
